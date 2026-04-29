@@ -80,7 +80,7 @@ async fn post_event(
                 "event -> set"
             );
             let chat_id = input.id.clone();
-            state.apply_set(input, now_ms());
+            state.apply_set(input, now_ms(), &cfg.continuation_prompts);
             if let Some(tp) = transcript_path {
                 if let Some(reg) = app.try_state::<WatcherRegistry>() {
                     reg.start(app.clone(), chat_id, tp);

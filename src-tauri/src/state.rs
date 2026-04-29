@@ -38,6 +38,20 @@ pub struct SetInput {
     pub input_tokens: Option<u64>,
 }
 
+/// True when `label` (after trim, case-insensitive) matches one of the
+/// configured continuation phrases. Used by `apply_set` to suppress a
+/// task boundary so a "go" / "continue" / "proceed" reply after a Done
+/// status doesn't reset `original_prompt` and the working timer.
+fn is_continuation_prompt(label: &str, continuation_prompts: &[String]) -> bool {
+    let trimmed = label.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    continuation_prompts
+        .iter()
+        .any(|p| p.trim().eq_ignore_ascii_case(trimmed))
+}
+
 #[derive(Default)]
 pub struct AppState {
     pub sessions: Mutex<Vec<AgentSession>>,
@@ -52,18 +66,33 @@ impl AppState {
         self.sessions.lock().unwrap().clone()
     }
 
-    pub fn apply_set(&self, input: SetInput, now_ms: i64) {
+    pub fn apply_set(&self, input: SetInput, now_ms: i64, continuation_prompts: &[String]) {
         let mut sessions = self.sessions.lock().unwrap();
         if let Some(existing) = sessions.iter_mut().find(|s| s.id == input.id) {
             let prior = existing.status;
+
+            // A task boundary is any transition into Working from a state where
+            // the agent isn't already mid-conversation with us. Done/Idle covers
+            // the natural case (agent finished, user starts new task). Working
+            // covers the cancellation case (user hit Esc and submitted a fresh
+            // prompt without an intervening Stop) — Awaiting is the only prior
+            // status that genuinely *isn't* a new task, since it represents an
+            // approval cycle the agent is waiting on.
+            let raw_task_boundary = matches!(
+                prior,
+                Status::Done | Status::Idle | Status::Working
+            ) && input.status == Status::Working;
+            let is_continuation = raw_task_boundary
+                && input
+                    .label
+                    .as_deref()
+                    .is_some_and(|l| is_continuation_prompt(l, continuation_prompts));
+            let task_boundary = raw_task_boundary && !is_continuation;
 
             if prior == Status::Working && input.status != Status::Working {
                 let delta = (now_ms - existing.state_entered_at).max(0) as u64;
                 existing.working_accumulated_ms = existing.working_accumulated_ms.saturating_add(delta);
             }
-
-            let task_boundary =
-                matches!(prior, Status::Done | Status::Idle) && input.status == Status::Working;
 
             let (new_label, new_original_prompt) =
                 crate::label_policy::select(Some(&*existing), &input, task_boundary);
@@ -72,9 +101,23 @@ impl AppState {
                 existing.working_accumulated_ms = 0;
             }
 
-            if prior != input.status {
+            if prior != input.status || task_boundary {
                 existing.state_entered_at = now_ms;
             }
+
+            tracing::debug!(
+                id = %input.id,
+                path = "existing",
+                prior_status = ?prior,
+                new_status = ?input.status,
+                task_boundary,
+                continuation_suppressed = is_continuation,
+                input_label = ?input.label,
+                prior_original_prompt = ?existing.original_prompt,
+                new_label = %new_label,
+                new_original_prompt = ?new_original_prompt,
+                "apply_set"
+            );
 
             existing.status = input.status;
             existing.label = new_label;
@@ -91,6 +134,15 @@ impl AppState {
             existing.updated = now_ms;
         } else {
             let (label, original_prompt) = crate::label_policy::select(None, &input, false);
+            tracing::debug!(
+                id = %input.id,
+                path = "new",
+                new_status = ?input.status,
+                input_label = ?input.label,
+                new_label = %label,
+                new_original_prompt = ?original_prompt,
+                "apply_set"
+            );
             sessions.push(AgentSession {
                 id: input.id,
                 status: input.status,
@@ -146,10 +198,12 @@ mod tests {
             .expect("session")
     }
 
+    const NO_CONTINUATIONS: &[String] = &[];
+
     #[test]
     fn new_working_session_captures_original_prompt() {
         let state = AppState::new();
-        state.apply_set(set("a", Status::Working, "fix foo.py"), 1000);
+        state.apply_set(set("a", Status::Working, "fix foo.py"), 1000, NO_CONTINUATIONS);
 
         let s = get(&state, "a");
         assert_eq!(s.status, Status::Working);
@@ -161,7 +215,7 @@ mod tests {
     #[test]
     fn new_non_working_session_has_no_original_prompt() {
         let state = AppState::new();
-        state.apply_set(set("a", Status::Idle, ""), 1000);
+        state.apply_set(set("a", Status::Idle, ""), 1000, NO_CONTINUATIONS);
         assert_eq!(get(&state, "a").original_prompt, None);
     }
 
@@ -169,9 +223,9 @@ mod tests {
     fn approval_cycle_preserves_original_prompt_and_accumulator() {
         let state = AppState::new();
         // Initial working: task starts
-        state.apply_set(set("a", Status::Working, "fix foo.py"), 0);
+        state.apply_set(set("a", Status::Working, "fix foo.py"), 0, NO_CONTINUATIONS);
         // Claude asks for approval after 30s
-        state.apply_set(set("a", Status::Awaiting, "run bash?"), 30_000);
+        state.apply_set(set("a", Status::Awaiting, "run bash?"), 30_000, NO_CONTINUATIONS);
         let mid = get(&state, "a");
         assert_eq!(mid.status, Status::Awaiting);
         assert_eq!(mid.original_prompt.as_deref(), Some("fix foo.py"));
@@ -179,7 +233,7 @@ mod tests {
         assert_eq!(mid.state_entered_at, 30_000);
 
         // User approves after 5s; agent resumes working with noise label "yes"
-        state.apply_set(set("a", Status::Working, "yes"), 35_000);
+        state.apply_set(set("a", Status::Working, "yes"), 35_000, NO_CONTINUATIONS);
         let resumed = get(&state, "a");
         assert_eq!(resumed.status, Status::Working);
         assert_eq!(
@@ -197,8 +251,8 @@ mod tests {
     #[test]
     fn done_then_working_is_task_boundary_and_resets_state() {
         let state = AppState::new();
-        state.apply_set(set("a", Status::Working, "fix foo.py"), 0);
-        state.apply_set(set("a", Status::Done, "fixed!"), 60_000);
+        state.apply_set(set("a", Status::Working, "fix foo.py"), 0, NO_CONTINUATIONS);
+        state.apply_set(set("a", Status::Done, "fixed!"), 60_000, NO_CONTINUATIONS);
         let after_done = get(&state, "a");
         assert_eq!(
             after_done.working_accumulated_ms, 60_000,
@@ -207,7 +261,7 @@ mod tests {
         assert_eq!(after_done.original_prompt.as_deref(), Some("fix foo.py"));
 
         // New task on the same session
-        state.apply_set(set("a", Status::Working, "add tests"), 120_000);
+        state.apply_set(set("a", Status::Working, "add tests"), 120_000, NO_CONTINUATIONS);
         let new_task = get(&state, "a");
         assert_eq!(new_task.original_prompt.as_deref(), Some("add tests"));
         assert_eq!(new_task.working_accumulated_ms, 0);
@@ -217,8 +271,8 @@ mod tests {
     #[test]
     fn idle_then_working_is_also_task_boundary() {
         let state = AppState::new();
-        state.apply_set(set("a", Status::Idle, ""), 0);
-        state.apply_set(set("a", Status::Working, "new task"), 10_000);
+        state.apply_set(set("a", Status::Idle, ""), 0, NO_CONTINUATIONS);
+        state.apply_set(set("a", Status::Working, "new task"), 10_000, NO_CONTINUATIONS);
         let s = get(&state, "a");
         assert_eq!(s.original_prompt.as_deref(), Some("new task"));
         assert_eq!(s.working_accumulated_ms, 0);
@@ -227,8 +281,8 @@ mod tests {
     #[test]
     fn working_to_error_accumulates_but_does_not_reset() {
         let state = AppState::new();
-        state.apply_set(set("a", Status::Working, "do a thing"), 0);
-        state.apply_set(set("a", Status::Error, "perm denied"), 5_000);
+        state.apply_set(set("a", Status::Working, "do a thing"), 0, NO_CONTINUATIONS);
+        state.apply_set(set("a", Status::Error, "perm denied"), 5_000, NO_CONTINUATIONS);
         let s = get(&state, "a");
         assert_eq!(s.status, Status::Error);
         assert_eq!(s.working_accumulated_ms, 5_000);
@@ -237,19 +291,51 @@ mod tests {
     }
 
     #[test]
-    fn same_status_update_keeps_state_entered_at() {
+    fn same_non_working_status_update_keeps_state_entered_at() {
+        // For non-Working same-status updates (e.g. successive Awaiting events
+        // refining the question), state_entered_at must not bounce. Working →
+        // Working is now a task boundary on purpose — see the cancellation tests.
         let state = AppState::new();
-        state.apply_set(set("a", Status::Working, "task"), 0);
-        state.apply_set(set("a", Status::Working, "task"), 5_000);
+        state.apply_set(set("a", Status::Awaiting, "ask"), 0, NO_CONTINUATIONS);
+        state.apply_set(set("a", Status::Awaiting, "ask"), 5_000, NO_CONTINUATIONS);
         let s = get(&state, "a");
-        assert_eq!(s.state_entered_at, 0, "state_entered_at must not reset within the same status");
+        assert_eq!(s.state_entered_at, 0, "state_entered_at must not reset within the same non-Working status");
+    }
+
+    #[test]
+    fn working_to_working_with_new_prompt_is_task_boundary() {
+        // Cancellation case: user hits Esc mid-task and submits a new prompt
+        // without an intervening Stop, so the row never leaves Working. The
+        // new prompt must be treated as a fresh task: original_prompt
+        // re-captured, working timer reset.
+        let state = AppState::new();
+        state.apply_set(set("a", Status::Working, "first task"), 0, NO_CONTINUATIONS);
+        state.apply_set(set("a", Status::Working, "second task"), 30_000, NO_CONTINUATIONS);
+        let s = get(&state, "a");
+        assert_eq!(s.original_prompt.as_deref(), Some("second task"));
+        assert_eq!(s.working_accumulated_ms, 0, "task boundary zeroes the accumulator");
+        assert_eq!(s.state_entered_at, 30_000, "task boundary resets segment start even when status is unchanged");
+    }
+
+    #[test]
+    fn working_to_working_continuation_prompt_does_not_reset() {
+        // Even when the prior status is Working, a continuation prompt must
+        // suppress the boundary so original_prompt and the timer are preserved.
+        let state = AppState::new();
+        let cont: Vec<String> = vec!["go".into()];
+        state.apply_set(set("a", Status::Working, "fix foo"), 0, &cont);
+        state.apply_set(set("a", Status::Working, "go"), 5_000, &cont);
+        let s = get(&state, "a");
+        assert_eq!(s.original_prompt.as_deref(), Some("fix foo"));
+        assert_eq!(s.state_entered_at, 0, "continuation suppresses segment-start reset");
+        assert_eq!(s.working_accumulated_ms, 0);
     }
 
     #[test]
     fn clear_removes_session() {
         let state = AppState::new();
-        state.apply_set(set("a", Status::Working, "task"), 0);
-        state.apply_set(set("b", Status::Working, "other"), 0);
+        state.apply_set(set("a", Status::Working, "task"), 0, NO_CONTINUATIONS);
+        state.apply_set(set("b", Status::Working, "other"), 0, NO_CONTINUATIONS);
         state.apply_clear("a");
         let ids: Vec<String> = state.snapshot().into_iter().map(|s| s.id).collect();
         assert_eq!(ids, vec!["b"]);
@@ -258,7 +344,7 @@ mod tests {
     #[test]
     fn model_and_tokens_are_updated_when_provided() {
         let state = AppState::new();
-        state.apply_set(set("a", Status::Working, "task"), 0);
+        state.apply_set(set("a", Status::Working, "task"), 0, NO_CONTINUATIONS);
         state.apply_set(
             SetInput {
                 id: "a".into(),
@@ -269,6 +355,7 @@ mod tests {
                 input_tokens: Some(50_000),
             },
             1000,
+            NO_CONTINUATIONS,
         );
         let s = get(&state, "a");
         assert_eq!(s.model.as_deref(), Some("claude-opus-4-7"));
@@ -278,8 +365,8 @@ mod tests {
     #[test]
     fn missing_label_preserves_prior_label() {
         let state = AppState::new();
-        state.apply_set(set("a", Status::Working, "fix foo.py"), 0);
-        state.apply_set(set_no_label("a", Status::Awaiting), 5_000);
+        state.apply_set(set("a", Status::Working, "fix foo.py"), 0, NO_CONTINUATIONS);
+        state.apply_set(set_no_label("a", Status::Awaiting), 5_000, NO_CONTINUATIONS);
         let s = get(&state, "a");
         assert_eq!(s.label, "fix foo.py", "label must survive a set with no label field");
         assert_eq!(s.status, Status::Awaiting);
@@ -288,13 +375,81 @@ mod tests {
     #[test]
     fn task_boundary_with_missing_label_preserves_prior_original_prompt() {
         let state = AppState::new();
-        state.apply_set(set("a", Status::Working, "fix foo.py"), 0);
-        state.apply_set(set("a", Status::Done, "done"), 10_000);
+        state.apply_set(set("a", Status::Working, "fix foo.py"), 0, NO_CONTINUATIONS);
+        state.apply_set(set("a", Status::Done, "done"), 10_000, NO_CONTINUATIONS);
         // New task starts, but hook didn't send a prompt label (e.g. prompt
         // wasn't captured) — original_prompt should remain whatever it was.
-        state.apply_set(set_no_label("a", Status::Working), 20_000);
+        state.apply_set(set_no_label("a", Status::Working), 20_000, NO_CONTINUATIONS);
         let s = get(&state, "a");
         assert_eq!(s.original_prompt.as_deref(), Some("fix foo.py"));
         assert_eq!(s.working_accumulated_ms, 0, "still resets accumulator on task boundary");
+    }
+
+    #[test]
+    fn continuation_prompt_after_done_does_not_reset_task() {
+        let state = AppState::new();
+        let cont: Vec<String> = vec!["go".into(), "continue".into(), "proceed".into()];
+        // Original task
+        state.apply_set(set("a", Status::Working, "fix foo.py"), 0, &cont);
+        // Agent finishes
+        state.apply_set(set_no_label("a", Status::Done), 60_000, &cont);
+        let after_done = get(&state, "a");
+        assert_eq!(after_done.working_accumulated_ms, 60_000);
+        assert_eq!(after_done.original_prompt.as_deref(), Some("fix foo.py"));
+        // User types "go" — should be treated as a continuation, not a new task
+        state.apply_set(set("a", Status::Working, "go"), 80_000, &cont);
+        let resumed = get(&state, "a");
+        assert_eq!(
+            resumed.original_prompt.as_deref(),
+            Some("fix foo.py"),
+            "continuation prompt must NOT re-capture original_prompt"
+        );
+        assert_eq!(
+            resumed.working_accumulated_ms, 60_000,
+            "continuation prompt must NOT reset the working timer"
+        );
+        assert_eq!(resumed.label, "go");
+    }
+
+    #[test]
+    fn continuation_match_is_case_insensitive_and_trimmed() {
+        let state = AppState::new();
+        let cont: Vec<String> = vec!["go".into(), "Continue".into()];
+        state.apply_set(set("a", Status::Working, "fix foo.py"), 0, &cont);
+        state.apply_set(set_no_label("a", Status::Done), 1000, &cont);
+        // Match against "Go" (uppercase) and surrounding whitespace
+        state.apply_set(set("a", Status::Working, "  Go  "), 2000, &cont);
+        let s = get(&state, "a");
+        assert_eq!(s.original_prompt.as_deref(), Some("fix foo.py"));
+    }
+
+    #[test]
+    fn non_continuation_prompt_after_done_still_resets() {
+        let state = AppState::new();
+        let cont: Vec<String> = vec!["go".into()];
+        state.apply_set(set("a", Status::Working, "fix foo.py"), 0, &cont);
+        state.apply_set(set_no_label("a", Status::Done), 1000, &cont);
+        // "go ahead" is NOT in the list — exact match only
+        state.apply_set(set("a", Status::Working, "go ahead"), 2000, &cont);
+        let s = get(&state, "a");
+        assert_eq!(
+            s.original_prompt.as_deref(),
+            Some("go ahead"),
+            "non-exact-match prompt should re-capture as a fresh task"
+        );
+    }
+
+    #[test]
+    fn continuation_only_applies_to_task_boundary_transitions() {
+        let state = AppState::new();
+        let cont: Vec<String> = vec!["go".into()];
+        // Existing approval cycle: awaiting → working with label "go".
+        // This isn't a task boundary regardless of the continuation list,
+        // so the rule is a no-op here — original_prompt is still pinned.
+        state.apply_set(set("a", Status::Working, "fix foo.py"), 0, &cont);
+        state.apply_set(set("a", Status::Awaiting, "permission?"), 1000, &cont);
+        state.apply_set(set("a", Status::Working, "go"), 2000, &cont);
+        let s = get(&state, "a");
+        assert_eq!(s.original_prompt.as_deref(), Some("fix foo.py"));
     }
 }

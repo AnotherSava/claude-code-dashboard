@@ -58,9 +58,15 @@ pub fn run() {
 
             let config_state = ConfigState::new(config_path.clone());
             // Ensure a config.json exists on first run so external editing
-            // works without further steps.
+            // works without further steps. The same first-run signal also
+            // bootstraps autostart on by default — users can opt out via
+            // the tray menu, and the choice lives in the OS (registry on
+            // Windows, LaunchAgent on macOS), so re-enabling here would
+            // fight the user on every launch.
             if !config_path.exists() {
                 let _ = config_state.save_to_disk();
+                use tauri_plugin_autostart::ManagerExt;
+                let _ = app.autolaunch().enable();
             }
             let current_config = config_state.snapshot();
             let server_port = current_config.server_port;
@@ -165,6 +171,7 @@ fn seed_dev_sessions(app: &tauri::AppHandle) {
             input_tokens: Some(75_000),
         },
         now - 3 * min,
+        &[],
     );
 
     state.apply_set(
@@ -177,6 +184,7 @@ fn seed_dev_sessions(app: &tauri::AppHandle) {
             input_tokens: Some(152_000),
         },
         now - 4 * min - 12 * s,
+        &[],
     );
     state.apply_set(
         SetInput {
@@ -188,6 +196,7 @@ fn seed_dev_sessions(app: &tauri::AppHandle) {
             input_tokens: Some(152_000),
         },
         now - 45 * s,
+        &[],
     );
 
     emit_sessions_updated(app);

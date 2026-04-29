@@ -34,6 +34,13 @@ pub struct Config {
     /// bottom edge stays put and the window grows upward; Down keeps the top
     /// edge fixed; None leaves the window manually sized.
     pub auto_resize: AutoResize,
+    /// Read by `state::apply_set`: prompts that suppress the `done`/`idle` →
+    /// `working` task boundary. When the user types one of these as a fresh
+    /// prompt after the agent has finished, treat it as a continuation of
+    /// the previous task rather than a new one — preserve `original_prompt`
+    /// and the working timer instead of resetting them. Match is exact,
+    /// case-insensitive, after trimming whitespace.
+    pub continuation_prompts: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -120,6 +127,7 @@ impl Default for Config {
             usage_limits_poll_interval_seconds: 600,
             limit_bar_segments: 16,
             auto_resize: AutoResize::None,
+            continuation_prompts: vec!["go".into(), "continue".into(), "proceed".into()],
         }
     }
 }
@@ -241,6 +249,23 @@ mod tests {
     fn unknown_fields_are_silently_ignored_so_renames_are_survivable() {
         let with_extra = r#"{ "this_key_does_not_exist_on_config": 42 }"#;
         let cfg: Config = serde_json::from_str(with_extra).unwrap();
+        assert_eq!(cfg.server_port, 9077);
+    }
+
+    #[test]
+    fn continuation_prompts_default_includes_common_phrases() {
+        let cfg = Config::default();
+        assert!(cfg.continuation_prompts.iter().any(|s| s == "go"));
+        assert!(cfg.continuation_prompts.iter().any(|s| s == "continue"));
+        assert!(cfg.continuation_prompts.iter().any(|s| s == "proceed"));
+    }
+
+    #[test]
+    fn continuation_prompts_can_be_overridden_by_partial_json() {
+        let partial = r#"{ "continuation_prompts": ["yes", "go ahead"] }"#;
+        let cfg: Config = serde_json::from_str(partial).unwrap();
+        assert_eq!(cfg.continuation_prompts, vec!["yes".to_string(), "go ahead".to_string()]);
+        // unrelated defaults still survive
         assert_eq!(cfg.server_port, 9077);
     }
 }
