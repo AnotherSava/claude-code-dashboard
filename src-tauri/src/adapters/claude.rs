@@ -120,8 +120,10 @@ fn classify(
         }
         "Stop" => {
             if let Some(path) = transcript_path {
-                if last_assistant_ends_with_question(Path::new(path), benign_closers) {
-                    return Some((Status::Awaiting, Some("has a question".into())));
+                if let Some(text) = last_assistant_text(Path::new(path)) {
+                    if is_a_question(&text, benign_closers) {
+                        return Some((Status::Awaiting, Some("has a question".into())));
+                    }
                 }
             }
             Some((Status::Done, None))
@@ -138,8 +140,10 @@ fn classify(
             }
             if notif_type == "idle_prompt" {
                 if let Some(path) = transcript_path {
-                    if last_assistant_ends_with_question(Path::new(path), benign_closers) {
-                        return Some((Status::Awaiting, Some("has a question".into())));
+                    if let Some(text) = last_assistant_text(Path::new(path)) {
+                        if is_a_question(&text, benign_closers) {
+                            return Some((Status::Awaiting, Some("has a question".into())));
+                        }
                     }
                 }
                 return Some((Status::Done, None));
@@ -202,12 +206,11 @@ fn clean_prompt(text: &str) -> String {
     collapsed.trim().to_string()
 }
 
-/// Walk the transcript JSONL and return `true` if the latest non-empty
-/// assistant text block ends with `?` and is not a configured benign closer.
-fn last_assistant_ends_with_question(path: &Path, benign_closers: &[String]) -> bool {
-    let Ok(contents) = std::fs::read_to_string(path) else {
-        return false;
-    };
+/// Walk the transcript JSONL and return the latest non-empty assistant text
+/// block. Returns `None` when the file is missing or contains no assistant
+/// content.
+fn last_assistant_text(path: &Path) -> Option<String> {
+    let contents = std::fs::read_to_string(path).ok()?;
     let mut last_text = String::new();
     for line in contents.lines() {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
@@ -242,10 +245,18 @@ fn last_assistant_ends_with_question(path: &Path, benign_closers: &[String]) -> 
             _ => {}
         }
     }
-    if !last_text.ends_with('?') {
+    if last_text.is_empty() { None } else { Some(last_text) }
+}
+
+/// True when `text` reads as a question: ends with `?` (possibly followed by
+/// a single trailing parenthetical option list like `(all / numbers / none)`)
+/// and is not a configured benign closer.
+fn is_a_question(text: &str, benign_closers: &[String]) -> bool {
+    let effective = strip_trailing_options(text);
+    if !effective.ends_with('?') {
         return false;
     }
-    let lower = last_text.to_lowercase();
+    let lower = effective.to_lowercase();
     for closer in benign_closers {
         if closer.is_empty() {
             continue;
@@ -255,6 +266,22 @@ fn last_assistant_ends_with_question(path: &Path, benign_closers: &[String]) -> 
         }
     }
     true
+}
+
+/// Strip one trailing `(...)` group when it sits immediately after a `?`,
+/// so `"Save these? (all / numbers / none)"` reduces to `"Save these?"`.
+/// Returns the trimmed input unchanged when there's no such pattern.
+fn strip_trailing_options(text: &str) -> &str {
+    let trimmed = text.trim_end();
+    if trimmed.ends_with(')') {
+        if let Some(open_idx) = trimmed.rfind('(') {
+            let before = trimmed[..open_idx].trim_end();
+            if before.ends_with('?') {
+                return before;
+            }
+        }
+    }
+    trimmed
 }
 
 #[cfg(test)]
@@ -570,58 +597,33 @@ mod tests {
         assert!(classify("PreToolUse", &json!({}), &[]).is_none());
     }
 
-    // ----- last_assistant_ends_with_question -----
+    // ----- last_assistant_text -----
 
     #[test]
-    fn missing_file_returns_false() {
-        assert!(!last_assistant_ends_with_question(
-            Path::new("/definitely/missing/transcript.jsonl"),
-            &[]
-        ));
+    fn missing_file_returns_none() {
+        assert!(last_assistant_text(Path::new("/definitely/missing/transcript.jsonl")).is_none());
     }
 
     #[test]
-    fn skips_user_entries_and_uses_last_assistant() {
+    fn last_assistant_text_skips_user_entries() {
         let path = write_transcript(&[
             assistant_text("First answer?"),
             json!({"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": "follow"}]}}),
             assistant_text("Ok, done."),
         ]);
-        assert!(!last_assistant_ends_with_question(&path, &[]));
+        assert_eq!(last_assistant_text(&path).as_deref(), Some("Ok, done."));
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
-    fn benign_closer_not_treated_as_question() {
-        let closers = vec!["What's next?".to_string()];
-        for text in ["What's next?", "what's next?", "Done. What's next?"] {
-            let path = write_transcript(&[assistant_text(text)]);
-            assert!(
-                !last_assistant_ends_with_question(&path, &closers),
-                "text: {}",
-                text
-            );
-            let _ = std::fs::remove_dir_all(path.parent().unwrap());
-        }
-    }
-
-    #[test]
-    fn non_matching_closer_still_awaits() {
-        let closers = vec!["What's next?".to_string()];
-        let path = write_transcript(&[assistant_text("Which option do you prefer?")]);
-        assert!(last_assistant_ends_with_question(&path, &closers));
-        let _ = std::fs::remove_dir_all(path.parent().unwrap());
-    }
-
-    #[test]
-    fn empty_assistant_text_is_ignored_for_latest() {
+    fn last_assistant_text_ignores_empty_blocks() {
         let path = write_transcript(&[assistant_text("Real question?"), assistant_text("   ")]);
-        assert!(last_assistant_ends_with_question(&path, &[]));
+        assert_eq!(last_assistant_text(&path).as_deref(), Some("Real question?"));
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
-    fn malformed_json_lines_are_skipped() {
+    fn last_assistant_text_skips_malformed_lines() {
         let dir = std::env::temp_dir().join(format!(
             "ai_agent_dashboard_claude_adapter_malformed_{}",
             std::process::id()
@@ -637,8 +639,73 @@ mod tests {
         )
         .unwrap();
         drop(f);
-        assert!(last_assistant_ends_with_question(&path, &[]));
+        assert_eq!(last_assistant_text(&path).as_deref(), Some("Proceed?"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ----- is_a_question -----
+
+    #[test]
+    fn is_a_question_simple_question_mark() {
+        assert!(is_a_question("Should I proceed?", &[]));
+    }
+
+    #[test]
+    fn is_a_question_no_question_mark() {
+        assert!(!is_a_question("All done.", &[]));
+    }
+
+    #[test]
+    fn is_a_question_empty_text() {
+        assert!(!is_a_question("", &[]));
+    }
+
+    #[test]
+    fn is_a_question_strips_trailing_option_list() {
+        assert!(is_a_question(
+            "Save these? (all / numbers / none)",
+            &[]
+        ));
+    }
+
+    #[test]
+    fn is_a_question_strips_trailing_option_list_with_extra_whitespace() {
+        assert!(is_a_question(
+            "Continue?   (yes / no)  \n",
+            &[]
+        ));
+    }
+
+    #[test]
+    fn is_a_question_does_not_strip_unrelated_parens() {
+        // Trailing "(foo.py)" doesn't follow a "?", so we don't strip and the
+        // text doesn't end with "?" → not a question.
+        assert!(!is_a_question("Look at this code (foo.py)", &[]));
+    }
+
+    #[test]
+    fn is_a_question_keeps_inline_parens() {
+        assert!(is_a_question("Should I update foo (the helper)?", &[]));
+    }
+
+    #[test]
+    fn is_a_question_benign_closer_with_options_is_not_a_question() {
+        let closers = vec!["What's next?".to_string()];
+        assert!(!is_a_question("What's next? (continue / stop)", &closers));
+    }
+
+    #[test]
+    fn is_a_question_benign_closer_alone_is_not_a_question() {
+        let closers = vec!["What's next?".to_string()];
+        for text in ["What's next?", "what's next?", "Done. What's next?"] {
+            assert!(!is_a_question(text, &closers), "text: {}", text);
+        }
+    }
+
+    #[test]
+    fn is_a_question_non_matching_closer_still_awaits() {
+        let closers = vec!["What's next?".to_string()];
+        assert!(is_a_question("Which option do you prefer?", &closers));
     }
 
     // ----- dispatch: integration -----
