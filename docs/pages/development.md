@@ -3,7 +3,7 @@ layout: default
 title: Development
 ---
 
-[Home](..) | [Claude Code](claude-code) | [HTTP API](http-api) | [Development](development)
+[Home](..) | [Claude Code](claude-code) | [HTTP API](http-api) | [Classification](classification) | [Sticky labels](sticky-labels) | [Data flow](data-flow) | [Development](development)
 
 ---
 
@@ -100,6 +100,8 @@ tauri-dashboard/
 
 ## Architecture reference
 
+- [Classification](classification) — how the Claude adapter turns a raw lifecycle payload into the `(chat_id, status, label)` tuple the widget renders.
+- [Sticky labels](sticky-labels) — the state machine that keeps a meaningful caption next to a session row across approval cycles, cancellations, and continuation prompts.
 - [Data flow](data-flow) — end-to-end paths from a Python hook POST or a transcript file change to a rendered pixel.
 
 ## Testing
@@ -109,6 +111,6 @@ Rust tests live inline in `#[cfg(test)]` modules next to the code they cover:
 - `state::tests` — sticky-label machine, working-time accumulator, error transitions.
 - `label_policy::tests` — the `(label, original_prompt)` decision extracted from `apply_set`.
 - `log_watcher::tests` — the transcript parser (`infer_state`, `split_complete`) and the upgrade-only merge policy.
-- `adapters::claude::tests` — `classify`, `derive_chat_id`, `clean_prompt`, `last_assistant_ends_with_question`, and the outer `dispatch`.
+- `adapters::claude::tests` — `classify`, `derive_chat_id`, `clean_prompt`, `last_assistant_text`, `is_a_question`, and the outer `dispatch`.
 
 CI (`.github/workflows/release.yml`) runs Rust tests before bundling on every tag push, so a broken state machine can't ship a release.

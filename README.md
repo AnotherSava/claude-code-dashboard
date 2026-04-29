@@ -20,3 +20,6 @@ See full project documentation at **[anothersava.github.io/tauri-dashboard](http
   - [Claude Code](https://anothersava.github.io/tauri-dashboard/pages/claude-code)
   - [HTTP API](https://anothersava.github.io/tauri-dashboard/pages/http-api)
 - [Developer guide](https://anothersava.github.io/tauri-dashboard/pages/development)
+  - [Classification](https://anothersava.github.io/tauri-dashboard/pages/classification)
+  - [Sticky labels](https://anothersava.github.io/tauri-dashboard/pages/sticky-labels)
+  - [Data flow](https://anothersava.github.io/tauri-dashboard/pages/data-flow)

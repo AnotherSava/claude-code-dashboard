@@ -3,7 +3,7 @@ layout: default
 title: Claude Code
 ---
 
-[Home](..) | [Claude Code](claude-code) | [HTTP API](http-api) | [Development](development)
+[Home](..) | [Claude Code](claude-code) | [HTTP API](http-api) | [Classification](classification) | [Sticky labels](sticky-labels) | [Data flow](data-flow) | [Development](development)
 
 ---
 
@@ -25,7 +25,7 @@ The row's state pill tracks the agent in real time:
 
 ### Sticky original prompt
 
-During approval cycles — when Claude asks *"Can I run bash X?"* and waits for you to type *yes* — the row keeps displaying your **original task prompt** rather than the approval question or the *yes*. The pill still flips to WAIT so you see the agent is blocked, but the label reads what you actually asked for. The timer pauses during WAIT and resumes on the next WORK. A new top-level prompt after DONE / IDLE starts a fresh task boundary and captures a new original prompt.
+During approval cycles — when Claude asks *"Can I run bash X?"* and waits for you to type *yes* — the row keeps displaying your **original task prompt** rather than the approval question or the *yes*. The pill still flips to WAIT so you see the agent is blocked, but the label reads what you actually asked for. The timer pauses during WAIT and resumes on the next WORK. A new top-level prompt after DONE / IDLE starts a fresh task boundary. See [Sticky labels](sticky-labels) for the full state machine and the rules that pick between the current label and the original prompt.
 
 ### Live token count
 

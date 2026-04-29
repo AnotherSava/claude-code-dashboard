@@ -3,7 +3,7 @@ layout: default
 title: Data flow
 ---
 
-[Home](..) | [Claude Code](claude-code) | [HTTP API](http-api) | [Development](development)
+[Home](..) | [Claude Code](claude-code) | [HTTP API](http-api) | [Classification](classification) | [Sticky labels](sticky-labels) | [Data flow](data-flow) | [Development](development)
 
 ---
 
@@ -86,19 +86,4 @@ Tauri commands have two possible targets: native window/tray APIs (`hide_window`
 
 ## Sticky-label state machine
 
-| Existing session? | Prior status             | New status | Action on `original_prompt` |
-|---                |---                       |---         |---                          |
-| no                | —                        | `working`  | set to incoming `label`     |
-| no                | —                        | anything   | leave `None`                |
-| yes               | `None` / `done` / `idle` | `working`  | **re-capture** to `label` (new task); reset `working_accumulated_ms = 0` |
-| yes               | any                      | any        | leave pinned                |
-
-UI display rule:
-
-| Status                      | Label shown                                         |
-|---                          |---                                                  |
-| `awaiting`                  | current `label` (the agent's question)              |
-| `error`                     | current `label` (the error message from the agent)  |
-| `working` / `done` / `idle` | `original_prompt` if set, else current `label`      |
-
-This is why an approval cycle — `working → awaiting → working` with `label = "yes"` — keeps "fix foo.py" visible across the round-trip, while a genuinely new task after `done` gets a fresh display.
+The `(label, original_prompt)` decision rules and the UI display rule live in [Sticky labels](sticky-labels). Every `apply_set` call funnels through `src-tauri/src/label_policy.rs::select`, so the rules are enforced in one place regardless of which path fired the event.

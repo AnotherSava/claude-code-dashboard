@@ -3,7 +3,7 @@ layout: default
 title: HTTP API
 ---
 
-[Home](..) | [Claude Code](claude-code) | [HTTP API](http-api) | [Development](development)
+[Home](..) | [Claude Code](claude-code) | [HTTP API](http-api) | [Classification](classification) | [Sticky labels](sticky-labels) | [Data flow](data-flow) | [Development](development)
 
 ---
 
@@ -43,15 +43,7 @@ The adapter derives a friendly `chat_id` from `payload.cwd` and the `projects_ro
 
 ### Sticky label state machine
 
-A session's *display* label is not always the latest `label` produced by the adapter:
-
-- `status = working`, `done`, or `idle`: the widget shows the **original prompt** (the label captured when the current task started), falling back to the latest `label` if none was captured.
-- `status = awaiting`: the widget shows the **current label** (e.g. the question being asked).
-- `status = error`: the widget shows the current label (the error message).
-
-A task boundary — transitioning from `done` or `idle` into `working` — resets the original prompt to whatever label the boundary event carried. An approval cycle — `working → awaiting → working` — preserves it. This is what keeps "fix foo.py" visible on screen while Claude asks for a bash approval, and what flips it back to a fresh prompt after the task finishes.
-
-When an adapter emits `label: None` on a `set`, the row keeps its previous label. Useful when the adapter is just changing status without a new description.
+A session's *display* label is not always the latest `label` produced by the adapter — an approval cycle keeps the original task visible, while a new task captures a fresh prompt. See [Sticky labels](sticky-labels) for the full state machine and display rules.
 
 ### Port
 

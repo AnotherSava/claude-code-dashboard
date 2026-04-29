@@ -3,7 +3,7 @@ layout: default
 title: AI Agent Dashboard
 ---
 
-[Home](.) | [Claude Code](pages/claude-code) | [HTTP API](pages/http-api) | [Development](pages/development)
+[Home](.) | [Claude Code](pages/claude-code) | [HTTP API](pages/http-api) | [Classification](pages/classification) | [Sticky labels](pages/sticky-labels) | [Data flow](pages/data-flow) | [Development](pages/development)
 
 ---
 
