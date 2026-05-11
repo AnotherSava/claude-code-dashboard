@@ -51,7 +51,18 @@
       listH = 36
     }
     const desired = headerEl.offsetHeight + listH
-    if (Math.abs(desired - lastSentHeight) < 1) return
+    // Always fire when content actually exceeds the viewport — that's the
+    // overflow case we're guarding against. Drift sources (DPI shift, OS
+    // clamp on a prior request, external resize) leave `lastSentHeight`
+    // stale but `window.innerHeight` accurate, so this comparison catches
+    // them where a request-based dedup wouldn't.
+    const overflowing = desired > window.innerHeight + 1
+    // For non-overflow cases, dedup against what we last requested. Crucial
+    // for the OS-clamp scenario: if we asked for 87 but Windows enforced a
+    // ~150 minimum, viewport stays at 150 while desired stays at 87 — and
+    // re-asking for 87 every event would feedback-loop. The request-based
+    // dedup pins this at one fire per measurement.
+    if (!overflowing && Math.abs(desired - lastSentHeight) < 1) return
     lastSentHeight = desired
     applyAutoResize(desired).catch((err) => console.error('apply_auto_resize failed', err))
   }
@@ -124,9 +135,17 @@
     }
     document.addEventListener('visibilitychange', onVisibility)
 
+    // Re-measure when the viewport itself changes — DPI shifts from a monitor
+    // move, manual horizontal drag, anything the OS does to the window outside
+    // our own `apply_auto_resize` call. The dedup inside measureAndSend
+    // short-circuits when the viewport already matches `desired`, so our own
+    // resize calls don't recurse.
+    window.addEventListener('resize', scheduleMeasure)
+
     return () => {
       clearInterval(tickId)
       document.removeEventListener('visibilitychange', onVisibility)
+      window.removeEventListener('resize', scheduleMeasure)
       unlistenSessions?.()
       unlistenConfig?.()
       unlistenUsage?.()
