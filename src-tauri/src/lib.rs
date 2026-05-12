@@ -46,6 +46,12 @@ pub fn run() {
         .setup(|app| {
             use tauri::Manager;
 
+            // Run as a macOS accessory: no Dock icon, no app menu bar — the
+            // tray icon is the only entry point, mirroring Windows where
+            // skipTaskbar hides the window from the taskbar / Alt-Tab.
+            #[cfg(target_os = "macos")]
+            app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+
             let app_data = app.path().app_data_dir()?;
             std::fs::create_dir_all(&app_data).ok();
 
