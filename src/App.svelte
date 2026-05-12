@@ -115,6 +115,13 @@
         console.error('failed to initialize', err)
       } finally {
         await tick()
+        // Wait two animation frames before revealing the window: tick() flushes
+        // the Svelte update queue, but the browser still needs to composite at
+        // least one frame before the WKWebView's layer has dark pixels. Showing
+        // any earlier produces a brief white flash on first open on macOS.
+        await new Promise<void>((resolve) =>
+          requestAnimationFrame(() => requestAnimationFrame(() => resolve()))
+        )
         try {
           await showWindow()
         } catch (err) {
@@ -191,7 +198,10 @@
     margin: 0;
     padding: 0;
     height: 100%;
-    background: transparent;
+    /* Match the .widget bg so WKWebView's first-paint snapshot on macOS is
+       dark even before the .widget layout completes — otherwise the layer
+       backing flashes white briefly before the Svelte tree composits. */
+    background: #1c1c1e;
     overflow: hidden;
     font-family: system-ui, 'Segoe UI', Roboto, sans-serif;
   }

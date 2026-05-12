@@ -85,7 +85,20 @@ pub fn set_dark_window_background(window: &WebviewWindow) {
     win_chrome::set_class_background(hwnd.0 as isize);
 }
 
-#[cfg(not(windows))]
+/// Set NSWindow.backgroundColor (and the WKWebView's underlay) to the dark
+/// theme color so the very first frame after `show()` is dark instead of
+/// flashing white. `tauri.conf.json`'s `backgroundColor` field is supposed
+/// to do this but isn't applied early enough on macOS — the runtime call is
+/// reliable.
+#[cfg(target_os = "macos")]
+pub fn set_dark_window_background(window: &WebviewWindow) {
+    use tauri::window::Color;
+    if let Err(e) = window.set_background_color(Some(Color(0x1c, 0x1c, 0x1e, 0xff))) {
+        tracing::warn!(?e, "set_background_color failed on macOS");
+    }
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 pub fn set_dark_window_background(_window: &WebviewWindow) {}
 
 #[cfg(windows)]
