@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+#[cfg(not(target_os = "macos"))]
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -150,6 +151,98 @@ enum CredsError {
     Expired,
 }
 
+/// Load the raw credentials JSON blob from the platform-appropriate source.
+///
+/// - macOS: Keychain (service `Claude Code-credentials`, account `$USER`) —
+///   this is what Claude Code uses on macOS; there's no JSON file.
+/// - Windows / Linux: `<home>/.claude/.credentials.json`.
+///
+/// Returns `None` when the entry/file is absent or unreadable.
+fn load_credentials_blob() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        // Shell out to `/usr/bin/security` (Apple-signed, on the partition list
+        // of items Claude Code creates) — this avoids the SecurityAgent prompt
+        // that direct API access from our unsigned bundle would trigger.
+        let Ok(username) = std::env::var("USER") else {
+            tracing::warn!("load_credentials_blob: USER env var unset");
+            return None;
+        };
+        let output = std::process::Command::new("/usr/bin/security")
+            .args([
+                "find-generic-password",
+                "-s",
+                "Claude Code-credentials",
+                "-a",
+                &username,
+                "-w",
+            ])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            tracing::warn!(%stderr, "security find-generic-password failed");
+            return None;
+        }
+        let s = String::from_utf8(output.stdout).ok()?;
+        Some(s.trim().to_string())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let path = resolve_credentials_path()?;
+        if !path.exists() {
+            return None;
+        }
+        std::fs::read_to_string(path).ok()
+    }
+}
+
+/// Persist the credentials JSON blob to the platform-appropriate sink.
+fn save_credentials_blob(json: &str) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        // `-U` updates if exists, creates otherwise. The JSON is briefly
+        // visible via `ps` for the duration of this call (security has no
+        // stdin path for passwords) — accepted: the OAuth token is not
+        // catastrophic if locally observed, refresh writes happen only on
+        // token rotation (~30 days), and Claude Code itself uses the same
+        // approach internally.
+        let username = std::env::var("USER").map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "USER env var unset")
+        })?;
+        let output = std::process::Command::new("/usr/bin/security")
+            .args([
+                "add-generic-password",
+                "-s",
+                "Claude Code-credentials",
+                "-a",
+                &username,
+                "-w",
+                json,
+                "-U",
+            ])
+            .output()?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            return Err(std::io::Error::other(format!(
+                "security add-generic-password failed: {stderr}"
+            )));
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let path = resolve_credentials_path().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "no credentials path")
+        })?;
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, json.as_bytes())?;
+        std::fs::rename(&tmp, &path)?;
+        Ok(())
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
 fn resolve_credentials_path() -> Option<PathBuf> {
     let home = if cfg!(windows) {
         std::env::var("USERPROFILE").ok()?
@@ -159,13 +252,10 @@ fn resolve_credentials_path() -> Option<PathBuf> {
     Some(PathBuf::from(home).join(".claude").join(".credentials.json"))
 }
 
-fn read_credentials(path: &Path) -> Result<String, CredsError> {
-    if !path.exists() {
-        return Err(CredsError::Missing);
-    }
-    let bytes = std::fs::read(path).map_err(|_| CredsError::Unreadable)?;
+fn read_credentials() -> Result<String, CredsError> {
+    let blob = load_credentials_blob().ok_or(CredsError::Missing)?;
     let wrapper: OauthWrapper =
-        serde_json::from_slice(&bytes).map_err(|_| CredsError::Unreadable)?;
+        serde_json::from_str(&blob).map_err(|_| CredsError::Unreadable)?;
     let creds = wrapper.claude_ai_oauth.ok_or(CredsError::Unreadable)?;
     let token = creds
         .access_token
@@ -179,12 +269,12 @@ fn read_credentials(path: &Path) -> Result<String, CredsError> {
     Ok(token)
 }
 
-/// Pull only the refresh token out of the credentials file. Returns None
-/// if the file is missing/unparseable or the refresh_token is absent or
+/// Pull only the refresh token out of the credentials store. Returns None
+/// if the entry is missing/unparseable or the refresh_token is absent or
 /// blank. Used by the OAuth refresh flow when the access token expires.
-fn read_refresh_token(path: &Path) -> Option<String> {
-    let bytes = std::fs::read(path).ok()?;
-    let wrapper: OauthWrapper = serde_json::from_slice(&bytes).ok()?;
+fn read_refresh_token() -> Option<String> {
+    let blob = load_credentials_blob()?;
+    let wrapper: OauthWrapper = serde_json::from_str(&blob).ok()?;
     wrapper
         .claude_ai_oauth?
         .refresh_token
@@ -192,15 +282,14 @@ fn read_refresh_token(path: &Path) -> Option<String> {
 }
 
 /// Update accessToken / refreshToken / expiresAt in-place while preserving
-/// every other field in the credentials file (scopes, subscriptionType,
-/// rateLimitTier, etc.). Atomic via temp-file + rename.
+/// every other field in the credentials store (scopes, subscriptionType,
+/// rateLimitTier, etc.).
 fn write_credentials(
-    path: &Path,
     access_token: &str,
     refresh_token: &str,
     expires_at: i64,
 ) -> std::io::Result<()> {
-    let existing = std::fs::read_to_string(path)?;
+    let existing = load_credentials_blob().unwrap_or_default();
     let mut value: serde_json::Value =
         serde_json::from_str(&existing).unwrap_or_else(|_| serde_json::json!({}));
 
@@ -226,10 +315,7 @@ fn write_credentials(
     oauth.insert("expiresAt".into(), serde_json::Value::from(expires_at));
 
     let serialized = serde_json::to_string_pretty(&value)?;
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, serialized.as_bytes())?;
-    std::fs::rename(&tmp, path)?;
-    Ok(())
+    save_credentials_blob(&serialized)
 }
 
 // dead_code lint doesn't see Debug-derived reads; fields are consumed via `?err`.
@@ -347,13 +433,10 @@ enum RefreshError {
 ///
 /// Note: Claude Code may refresh concurrently using the same refresh_token.
 /// Whichever client calls second gets a 4xx and we return Err — the next
-/// poll cycle will re-read the credentials file (now updated by Claude
+/// poll cycle will re-read the credentials store (now updated by Claude
 /// Code's successful refresh) and proceed normally.
-async fn do_oauth_refresh(
-    client: &reqwest::Client,
-    creds_path: &Path,
-) -> Result<String, RefreshError> {
-    let refresh_token = read_refresh_token(creds_path).ok_or(RefreshError::NoRefreshToken)?;
+async fn do_oauth_refresh(client: &reqwest::Client) -> Result<String, RefreshError> {
+    let refresh_token = read_refresh_token().ok_or(RefreshError::NoRefreshToken)?;
     let body = serde_json::json!({
         "grant_type": "refresh_token",
         "refresh_token": refresh_token,
@@ -381,13 +464,8 @@ async fn do_oauth_refresh(
         .await
         .map_err(|e| RefreshError::JsonParse(e.to_string()))?;
     let new_expires_at = now_ms() + (parsed.expires_in as i64) * 1000;
-    write_credentials(
-        creds_path,
-        &parsed.access_token,
-        &parsed.refresh_token,
-        new_expires_at,
-    )
-    .map_err(|e| RefreshError::FileWrite(e.to_string()))?;
+    write_credentials(&parsed.access_token, &parsed.refresh_token, new_expires_at)
+        .map_err(|e| RefreshError::FileWrite(e.to_string()))?;
     Ok(parsed.access_token)
 }
 
@@ -397,14 +475,13 @@ async fn do_oauth_refresh(
 async fn try_refresh_token(
     state: &UsageLimitsState,
     client: &reqwest::Client,
-    path: &Path,
 ) -> Option<String> {
     if !state.claim_refresh_slot() {
         tracing::debug!("token refresh skipped (cooldown active)");
         return None;
     }
     tracing::info!("auth expired; calling OAuth refresh endpoint");
-    match do_oauth_refresh(client, path).await {
+    match do_oauth_refresh(client).await {
         Ok(t) => {
             tracing::info!("token refresh succeeded");
             Some(t)
@@ -428,18 +505,7 @@ async fn poll_once(app: &AppHandle, client: &reqwest::Client) {
     let previous = state.snapshot();
     let now = now_ms();
 
-    let Some(path) = resolve_credentials_path() else {
-        state.replace(UsageLimits {
-            five_hour: None,
-            seven_day: None,
-            status: UsageStatus::Unavailable,
-            updated: now,
-        });
-        emit_usage_limits_updated(app);
-        return;
-    };
-
-    let token = match read_credentials(&path) {
+    let token = match read_credentials() {
         Ok(t) => {
             state.saw_expired_last_poll.store(false, Ordering::SeqCst);
             t
@@ -478,7 +544,7 @@ async fn poll_once(app: &AppHandle, client: &reqwest::Client) {
             // Either cold start, or this is the second consecutive expired
             // poll. Hit the OAuth endpoint with the stored refresh_token.
             // On failure fall through to AuthExpired so the user knows.
-            match try_refresh_token(&state, client, &path).await {
+            match try_refresh_token(&state, client).await {
                 Some(t) => {
                     state.saw_expired_last_poll.store(false, Ordering::SeqCst);
                     t
@@ -501,7 +567,7 @@ async fn poll_once(app: &AppHandle, client: &reqwest::Client) {
     if matches!(result, Err(PollError::Auth(_))) {
         // Server rejected even though our local expiresAt said the token
         // was fresh — try a forced refresh and retry once.
-        if let Some(new_token) = try_refresh_token(&state, client, &path).await {
+        if let Some(new_token) = try_refresh_token(&state, client).await {
             result = fetch_usage(client, &new_token).await;
         }
     }
