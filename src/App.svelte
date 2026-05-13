@@ -45,12 +45,17 @@
     const list = widgetEl.querySelector('.list')
     if (list) {
       for (const child of list.children) {
-        listH += (child as HTMLElement).offsetHeight
+        listH += (child as HTMLElement).getBoundingClientRect().height
       }
     } else if (widgetEl.querySelector('.empty')) {
       listH = 36
     }
-    const desired = headerEl.offsetHeight + listH
+    // Use subpixel-accurate getBoundingClientRect() heights, then ceil the
+    // total. `offsetHeight` rounds each child down to an integer, and the
+    // accumulated fractional loss across rows would leave us asking for ~3-6
+    // px less than the content needs — the OS resizes to exactly what we
+    // asked, and a scrollbar appears.
+    const desired = Math.ceil(headerEl.getBoundingClientRect().height + listH)
     // Always fire when content actually exceeds the viewport — that's the
     // overflow case we're guarding against. Drift sources (DPI shift, OS
     // clamp on a prior request, external resize) leave `lastSentHeight`

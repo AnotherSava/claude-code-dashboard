@@ -1,6 +1,7 @@
 <script lang="ts">
   import type { LimitBucket, UsageStatus } from '../types'
   import { formatCompactRemaining } from '../types'
+  import { refreshUsageLimits } from '../api'
 
   interface Props {
     bucket: LimitBucket | null
@@ -12,6 +13,20 @@
   }
 
   let { bucket, status, updated, now, format, segments }: Props = $props()
+
+  // When the window's resets_at has passed but we still hold the old snapshot
+  // (the poller fires once per 10 min by default), the displayed remaining
+  // goes negative and formatCompactRemaining renders "--:--". Ask the backend
+  // for a fresh poll — its 60s floor protects against spam, and a single
+  // refresh per stale snapshot brings the new window's resets_at in.
+  let lastRefreshForStale = 0
+  $effect(() => {
+    if (!bucket || bucket.resets_at === null) return
+    if (bucket.resets_at - now > 0) return
+    if (updated === lastRefreshForStale) return
+    lastRefreshForStale = updated
+    refreshUsageLimits().catch(() => {})
+  })
 
   const segmentCount = $derived(Math.max(1, Math.floor(segments)))
   const hasData = $derived(bucket !== null)
