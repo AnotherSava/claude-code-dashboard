@@ -107,7 +107,7 @@ pub fn setup(app: &AppHandle) -> tauri::Result<()> {
 
     let _tray = TrayIconBuilder::with_id("main-tray")
         .icon(icon)
-        .tooltip("AI Agent Dashboard")
+        .tooltip("Claude Code Dashboard")
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| handle_menu_event(app, event.id.as_ref()))
@@ -245,7 +245,7 @@ fn open_data_dir(app: &AppHandle) {
 fn show_about(app: &AppHandle) {
     let version = app.package_info().version.to_string();
     let body = format!(
-        "AI Agent Dashboard\nv{version}\n\nAlways-on-top widget for tracking AI coding agents."
+        "Claude Code Dashboard\nv{version}\n\nAlways-on-top widget for tracking AI coding agents."
     );
     let handle = app.clone();
     app.dialog()

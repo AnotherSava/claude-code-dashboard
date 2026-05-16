@@ -19,8 +19,8 @@ title: Development
 ### Install
 
 ```bash
-git clone git@github.com:AnotherSava/tauri-dashboard.git
-cd tauri-dashboard
+git clone git@github.com:AnotherSava/claude-code-dashboard.git
+cd claude-code-dashboard
 npm install
 ```
 
@@ -49,7 +49,7 @@ The source-of-truth `AgentSession` state lives behind a `Mutex` in Rust. Three p
 ## Project structure
 
 ```
-tauri-dashboard/
+claude-code-dashboard/
 ├── src/                                Svelte frontend (Vite)
 │   ├── App.svelte                       top-level layout, subscribes to Tauri events
 │   ├── main.ts                          mount entry point
@@ -94,9 +94,9 @@ tauri-dashboard/
 
 - **In-memory** — `AppState` (sessions) and `ConfigState` (config) via `tauri::State`.
 - **On disk** — `config.json` and `widget.jsonl` under `app_data_dir()`:
-  - Windows: `%APPDATA%\com.anothersava.ai-agent-dashboard\`
-  - macOS: `~/Library/Application Support/com.anothersava.ai-agent-dashboard/`
-  - Linux: `$XDG_CONFIG_HOME/com.anothersava.ai-agent-dashboard/` (or `~/.config/...`)
+  - Windows: `%APPDATA%\com.anothersava.claude-code-dashboard\`
+  - macOS: `~/Library/Application Support/com.anothersava.claude-code-dashboard/`
+  - Linux: `$XDG_CONFIG_HOME/com.anothersava.claude-code-dashboard/` (or `~/.config/...`)
 
 ## Architecture reference
 

@@ -53,7 +53,7 @@ impl FrontendLogger {
             timestamp: Utc::now().to_rfc3339_opts(SecondsFormat::Micros, true),
             level: normalized_level,
             fields: Value::Object(fields),
-            target: "ai_agent_dashboard_lib::frontend",
+            target: "claude_code_dashboard_lib::frontend",
         };
         let Ok(mut bytes) = serde_json::to_vec(&line) else {
             return;
@@ -70,7 +70,7 @@ pub fn init(log_dir: &Path) -> (LogGuard, FrontendLogger) {
     let (writer, guard) = tracing_appender::non_blocking(appender);
 
     let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info,ai_agent_dashboard_lib=debug"));
+        .unwrap_or_else(|_| EnvFilter::new("info,claude_code_dashboard_lib=debug"));
 
     let frontend = FrontendLogger {
         writer: writer.clone(),

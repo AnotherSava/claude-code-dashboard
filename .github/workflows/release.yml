@@ -43,7 +43,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tagName: ${{ github.ref_type == 'tag' && github.ref_name || format('v-{0}', github.sha) }}
-          releaseName: 'AI Agent Dashboard ${{ github.ref_name }}'
+          releaseName: 'Claude Code Dashboard ${{ github.ref_name }}'
           releaseDraft: true
           prerelease: false
           includeUpdaterJson: false

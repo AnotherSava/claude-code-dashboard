@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "AI Agent Dashboard",
+  "productName": "Claude Code Dashboard",
   "version": "0.1.0",
-  "identifier": "com.anothersava.ai-agent-dashboard",
+  "identifier": "com.anothersava.claude-code-dashboard",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
@@ -13,7 +13,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "AI Agent Dashboard",
+        "title": "Claude Code Dashboard",
         "width": 420,
         "height": 320,
         "decorations": false,

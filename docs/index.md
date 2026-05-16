@@ -1,6 +1,6 @@
 ---
 layout: default
-title: AI Agent Dashboard
+title: Claude Code Dashboard
 ---
 
 [Home](.) | [Claude Code](pages/claude-code) | [HTTP API](pages/http-api) | [Classification](pages/classification) | [Sticky labels](pages/sticky-labels) | [Data flow](pages/data-flow) | [Development](pages/development)
@@ -11,11 +11,11 @@ title: AI Agent Dashboard
 
 Anything that can POST JSON to `localhost` can report status. Each session appears as a row in a compact always-on-top window, with a state pill that transitions between WORK / WAIT / IDLE / DONE / ERROR, a live timer, and a token counter colored by how close the session is to its context limit.
 
-![AI Agent Dashboard](screenshots/screenshot.png)
+![Claude Code Dashboard](screenshots/screenshot.png)
 
 ## Install
 
-Download the latest `AI Agent Dashboard_<version>_x64-setup.exe` from the [Releases page](https://github.com/AnotherSava/tauri-dashboard/releases) and run it. Windows 10 version 1803 or newer. WebView2 is fetched automatically during install if missing.
+Download the latest `Claude Code Dashboard_<version>_x64-setup.exe` from the [Releases page](https://github.com/AnotherSava/claude-code-dashboard/releases) and run it. Windows 10 version 1803 or newer. WebView2 is fetched automatically during install if missing.
 
 After installation, configure the agents you want to track:
 
@@ -35,4 +35,4 @@ After installation, configure the agents you want to track:
 
 ## Settings
 
-All settings live in `config.json` under the app data directory (`%APPDATA%\com.anothersava.ai-agent-dashboard\` on Windows). The tray menu has an "Open config/logs location" shortcut that opens the folder, and the widget hot-reloads `config.json` on save — no restart needed except when changing the HTTP server port.
+All settings live in `config.json` under the app data directory (`%APPDATA%\com.anothersava.claude-code-dashboard\` on Windows). The tray menu has an "Open config/logs location" shortcut that opens the folder, and the widget hot-reloads `config.json` on save — no restart needed except when changing the HTTP server port.

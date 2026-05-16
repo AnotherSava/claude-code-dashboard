@@ -1,12 +1,12 @@
 [package]
-name = "ai-agent-dashboard"
+name = "claude-code-dashboard"
 version = "0.1.0"
-description = "AI Agent Dashboard - always-on-top widget for tracking AI coding agents"
+description = "Claude Code Dashboard - always-on-top widget for tracking AI coding agents"
 authors = ["Oleg Savelyev"]
 edition = "2021"
 
 [lib]
-name = "ai_agent_dashboard_lib"
+name = "claude_code_dashboard_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]

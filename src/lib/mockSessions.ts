@@ -18,7 +18,7 @@ export const mockSessions: AgentSession[] = [
     working_accumulated_ms: 0,
   },
   {
-    id: 'tauri-dashboard',
+    id: 'claude-code-dashboard',
     status: 'working',
     label: 'I want to migrate an existing electron project to tauri framework',
     original_prompt: 'I want to migrate an existing electron project to tauri framework',

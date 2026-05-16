@@ -438,21 +438,21 @@ Common timestamp servers:
 
 ### Asset filename normalization
 
-When a Tauri NSIS installer is uploaded to a GitHub Release (via the REST API, `gh release create`, or `tauri-apps/tauri-action`), **spaces in the filename are replaced with dots**. A `productName` of `"AI Agent Dashboard"` produces an on-disk file named:
+When a Tauri NSIS installer is uploaded to a GitHub Release (via the REST API, `gh release create`, or `tauri-apps/tauri-action`), **spaces in the filename are replaced with dots**. A `productName` of `"Claude Code Dashboard"` produces an on-disk file named:
 
 ```
-AI Agent Dashboard_0.1.0_x64-setup.exe
+Claude Code Dashboard_0.1.0_x64-setup.exe
 ```
 
 …but lands on the release page as:
 
 ```
-AI.Agent.Dashboard_0.1.0_x64-setup.exe
+Claude.Code.Dashboard_0.1.0_x64-setup.exe
 ```
 
 This matters for anything that references the asset by name — README download links, release-notes tables, update-manifest URLs. Write the dot-normalized name in those places; the on-disk name is only used locally at build time. If you want the filename and the displayed name to match, either:
 
-- Use a `productName` without spaces (`"AIAgentDashboard"` or `"ai-agent-dashboard"`), or
+- Use a `productName` without spaces (`"ClaudeCodeDashboard"` or `"claude-code-dashboard"`), or
 - Override `bundle.windows.nsis.artifactName` to an explicit template: `"{{productName}}_{{version}}_{{arch}}-setup.exe"` with a space-free `productName`.
 
 `tauri-apps/tauri-action` reports the rewritten name in the action's `appAssets` output — if a later CI step needs to patch the release body with the real asset URL, read it from there rather than reconstructing it.

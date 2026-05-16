@@ -169,7 +169,7 @@ fn seed_dev_sessions(app: &tauri::AppHandle) {
 
     state.apply_set(
         SetInput {
-            id: "tauri-dashboard".into(),
+            id: "claude-code-dashboard".into(),
             status: Status::Working,
             label: Some("I want to migrate an existing electron project to tauri framework".into()),
             source: Some("claude-code".into()),
