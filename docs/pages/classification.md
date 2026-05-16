@@ -34,17 +34,20 @@ Backslashes are normalized to forward slashes before matching, so Windows paths 
 
 ## Event → status
 
-The adapter recognizes five event names. Anything else returns `Ignore` and the widget state is untouched.
+The adapter recognizes six event names. Anything else returns `Ignore` and the widget state is untouched.
 
 | Event              | Status produced                                                                     | Notes                                                          |
 |---                 |---                                                                                  |---                                                             |
 | `SessionStart`     | `idle` (no fields) — otherwise treated like `Notification`                          | Used to seed an empty row before any user activity.            |
 | `UserPromptSubmit` | `working`                                                                           | Label is the cleaned prompt; blank prompt → label `None`.      |
 | `Notification`     | `awaiting` (default) — `done` if `notification_type == "idle_prompt"` with no question | See the notification-type table below.                      |
+| `PreToolUse`       | `awaiting` for `AskUserQuestion` / `ExitPlanMode` only; other tools ignored         | Label: `"has a question"` for `AskUserQuestion`, `"plan approval"` for `ExitPlanMode`. The matcher in `~/.claude/settings.json` should restrict the hook to these two tools (see [Claude Code setup](claude-code#setup)) — Claude Code buffers the `tool_use` block until the user answers, so the JSONL transcript can't carry the signal in flight. |
 | `Stop`             | `done` — flips to `awaiting` if last assistant turn ends with `?`                   | Question check ignores configured benign closers.              |
 | `SessionEnd`       | emits `Clear` (removes the row)                                                     | Bypasses status classification entirely.                       |
 
 `SessionStart` and `Notification` share a code path because Claude Code occasionally emits notifications under either name; the dispatcher merges them.
+
+`PostToolUse` is intentionally ignored. Once the user answers an `AskUserQuestion` / `ExitPlanMode`, the next `UserPromptSubmit` or the transcript watcher carries the row out of `awaiting`.
 
 ### Notification subtypes
 

@@ -44,12 +44,15 @@ Copy `integrations/claude_hook.py` — distributed with the widget source — an
     "UserPromptSubmit":  [{"hooks": [{"type": "command", "command": "python3 <repo>/integrations/claude_hook.py"}]}],
     "Notification":      [{"hooks": [{"type": "command", "command": "python3 <repo>/integrations/claude_hook.py"}]}],
     "Stop":              [{"hooks": [{"type": "command", "command": "python3 <repo>/integrations/claude_hook.py"}]}],
-    "SessionEnd":        [{"hooks": [{"type": "command", "command": "python3 <repo>/integrations/claude_hook.py"}]}]
+    "SessionEnd":        [{"hooks": [{"type": "command", "command": "python3 <repo>/integrations/claude_hook.py"}]}],
+    "PreToolUse":        [{"matcher": "^(AskUserQuestion|ExitPlanMode)$", "hooks": [{"type": "command", "command": "python3 <repo>/integrations/claude_hook.py"}]}]
   }
 }
 ```
 
 Replace `<repo>` with the absolute path to your clone of this repo. Restart Claude Code — new sessions will appear in the widget.
+
+The `PreToolUse` matcher restricts the hook to user-gating tools (`AskUserQuestion`, `ExitPlanMode`) — Claude Code buffers their `tool_use` blocks until the user answers, so without this hook the dashboard can't detect those calls in flight. The matcher also avoids per-Bash/Read/Grep fork overhead an unfiltered `PreToolUse` would incur.
 
 Optional: set `projects_root` in `config.json` to the folder your projects live under, so session ids become short folder-relative names instead of bare folder basenames.
 

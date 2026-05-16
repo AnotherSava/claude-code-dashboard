@@ -13,10 +13,25 @@ use crate::adapters::AdapterOutput;
 use crate::config::Config;
 use crate::state::{SetInput, Status};
 
+/// Built-in Claude Code tools that pause the model on a user decision. The
+/// model's `tool_use` block isn't flushed to the JSONL transcript until the
+/// user responds, so the watcher cannot see these calls in flight — the
+/// PreToolUse hook is the only timely signal.
+const USER_GATING_TOOLS: &[&str] = &["AskUserQuestion", "ExitPlanMode"];
+
+fn awaiting_label_for(tool_name: &str) -> &'static str {
+    match tool_name {
+        "ExitPlanMode" => "plan approval",
+        _ => "has a question",
+    }
+}
+
 /// Translate a Claude Code hook event + payload into an [`AdapterOutput`].
 ///
 /// Known events: `UserPromptSubmit`, `Stop`, `SessionStart`, `Notification`,
-/// `SessionEnd`. Unknown events → [`AdapterOutput::Ignore`].
+/// `PreToolUse`, `SessionEnd`. Unknown events → [`AdapterOutput::Ignore`].
+/// `PostToolUse` is intentionally ignored — once the user answers, the
+/// transcript watcher (and eventually `Stop`) carry the row out of `Awaiting`.
 pub fn dispatch(event: &str, payload: &Value, cfg: &Config) -> AdapterOutput {
     let cwd = payload.get("cwd").and_then(|v| v.as_str());
     let session_id = payload.get("session_id").and_then(|v| v.as_str()).unwrap_or("");
@@ -127,6 +142,13 @@ fn classify(
                 }
             }
             Some((Status::Done, None))
+        }
+        "PreToolUse" => {
+            let tool_name = payload.get("tool_name").and_then(|v| v.as_str()).unwrap_or("");
+            if !USER_GATING_TOOLS.contains(&tool_name) {
+                return None;
+            }
+            Some((Status::Awaiting, Some(awaiting_label_for(tool_name).into())))
         }
         "Notification" | "SessionStart" => {
             let notif_type = payload
@@ -299,7 +321,7 @@ mod tests {
 
     fn write_transcript(lines: &[Value]) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
-            "ai_agent_dashboard_claude_adapter_{}_{}",
+            "claude_code_dashboard_claude_adapter_{}_{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -581,6 +603,35 @@ mod tests {
         assert_eq!(label.as_deref(), Some("Error: pattern blocked"));
     }
 
+    // ----- classify: PreToolUse -----
+
+    #[test]
+    fn pre_tool_use_ask_user_question_is_awaiting_with_question_label() {
+        let p = json!({"tool_name": "AskUserQuestion", "tool_input": {"questions": [{"question": "?"}]}});
+        let (status, label) = classify("PreToolUse", &p, &[]).unwrap();
+        assert_eq!(status, Status::Awaiting);
+        assert_eq!(label.as_deref(), Some("has a question"));
+    }
+
+    #[test]
+    fn pre_tool_use_exit_plan_mode_is_awaiting_with_plan_label() {
+        let p = json!({"tool_name": "ExitPlanMode", "tool_input": {"plan": "..."}});
+        let (status, label) = classify("PreToolUse", &p, &[]).unwrap();
+        assert_eq!(status, Status::Awaiting);
+        assert_eq!(label.as_deref(), Some("plan approval"));
+    }
+
+    #[test]
+    fn pre_tool_use_for_unrelated_tool_is_ignored() {
+        let p = json!({"tool_name": "Bash", "tool_input": {"command": "ls"}});
+        assert!(classify("PreToolUse", &p, &[]).is_none());
+    }
+
+    #[test]
+    fn pre_tool_use_without_tool_name_is_ignored() {
+        assert!(classify("PreToolUse", &json!({}), &[]).is_none());
+    }
+
     // ----- classify: SessionStart -----
 
     #[test]
@@ -625,7 +676,7 @@ mod tests {
     #[test]
     fn last_assistant_text_skips_malformed_lines() {
         let dir = std::env::temp_dir().join(format!(
-            "ai_agent_dashboard_claude_adapter_malformed_{}",
+            "claude_code_dashboard_claude_adapter_malformed_{}",
             std::process::id()
         ));
         std::fs::create_dir_all(&dir).unwrap();

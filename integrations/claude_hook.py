@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Claude Code hook — forward lifecycle events to the AI Agent Dashboard widget.
+"""Claude Code hook — forward lifecycle events to the Claude Code Dashboard widget.
 
 This script is intentionally minimal: read Claude Code's event payload from
 stdin, wrap it in `{client, event, payload}`, and POST to the widget's
@@ -15,9 +15,16 @@ Install in `~/.claude/settings.json`:
         "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "python <repo>/integrations/claude_hook.py"}]}],
         "Notification":     [{"hooks": [{"type": "command", "command": "python <repo>/integrations/claude_hook.py"}]}],
         "Stop":             [{"hooks": [{"type": "command", "command": "python <repo>/integrations/claude_hook.py"}]}],
-        "SessionEnd":       [{"hooks": [{"type": "command", "command": "python <repo>/integrations/claude_hook.py"}]}]
+        "SessionEnd":       [{"hooks": [{"type": "command", "command": "python <repo>/integrations/claude_hook.py"}]}],
+        "PreToolUse":       [{"matcher": "^(AskUserQuestion|ExitPlanMode)$", "hooks": [{"type": "command", "command": "python <repo>/integrations/claude_hook.py"}]}]
       }
     }
+
+The `PreToolUse` matcher restricts the hook to user-gating tools whose
+`tool_use` blocks aren't flushed to the JSONL transcript until the user
+responds — without this hook, the dashboard cannot detect those calls in
+flight. The matcher avoids the per-Bash/Read/Grep fork overhead of an
+unfiltered hook.
 
 Server URL resolution: `$TAURI_DASHBOARD_URL` if set, else `http://127.0.0.1:9077`.
 """
