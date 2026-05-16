@@ -612,6 +612,75 @@ async fn poll_once(app: &AppHandle, client: &reqwest::Client) {
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::sync::{Mutex, OnceLock};
+
+    /// Serializes tests that override the per-platform credentials env var
+    /// (`USERPROFILE` on Windows, `HOME` elsewhere) — cargo test runs them in
+    /// parallel by default and a global env var is shared across threads.
+    /// macOS path goes through the Keychain, so credentials path tests are
+    /// already gated `#[cfg(not(target_os = "macos"))]`.
+    #[cfg(not(target_os = "macos"))]
+    fn cred_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static M: OnceLock<Mutex<()>> = OnceLock::new();
+        // Poison the lock if a prior test panicked; we still want to run.
+        match M.get_or_init(|| Mutex::new(())).lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    const HOME_VAR: &str = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+
+    /// Point credentials resolution at a test-owned `<temp>/.claude/`. Returns
+    /// `(temp_root, credentials_path, restore_guard)` — drop the guard to put
+    /// the env var back. Caller must hold [`cred_test_lock`].
+    #[cfg(not(target_os = "macos"))]
+    fn override_credentials_home(tag: &str) -> (PathBuf, PathBuf, EnvVarGuard) {
+        let temp = std::env::temp_dir().join(format!(
+            "claude_code_dashboard_usage_test_{}_{}",
+            tag,
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(temp.join(".claude")).unwrap();
+        let prior = std::env::var(HOME_VAR).ok();
+        // SAFETY: tests serialized via cred_test_lock() ensure no concurrent reads.
+        unsafe { std::env::set_var(HOME_VAR, &temp) };
+        let creds = temp.join(".claude").join(".credentials.json");
+        (
+            temp.clone(),
+            creds,
+            EnvVarGuard {
+                key: HOME_VAR,
+                prior,
+                cleanup: Some(temp),
+            },
+        )
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    struct EnvVarGuard {
+        key: &'static str,
+        prior: Option<String>,
+        cleanup: Option<PathBuf>,
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            // SAFETY: tests serialized via cred_test_lock() ensure no concurrent reads.
+            unsafe {
+                match self.prior.take() {
+                    Some(v) => std::env::set_var(self.key, v),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+            if let Some(p) = self.cleanup.take() {
+                let _ = std::fs::remove_dir_all(p);
+            }
+        }
+    }
 
     #[test]
     fn parses_happy_credentials() {
@@ -723,22 +792,19 @@ mod tests {
         assert!((b.utilization - 1.0).abs() < 1e-6);
     }
 
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn missing_file_returns_missing() {
-        let path = std::env::temp_dir().join("ai_agent_dashboard_missing_xyz.json");
-        // Ensure it doesn't exist
-        let _ = std::fs::remove_file(&path);
-        assert!(matches!(read_credentials(&path), Err(CredsError::Missing)));
+        let _g = cred_test_lock();
+        let (_temp, _path, _restore) = override_credentials_home("missing");
+        assert!(matches!(read_credentials(), Err(CredsError::Missing)));
     }
 
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn expired_token_returns_expired() {
-        let dir = std::env::temp_dir().join(format!(
-            "ai_agent_dashboard_usage_test_expired_{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join(".credentials.json");
+        let _g = cred_test_lock();
+        let (_temp, path, _restore) = override_credentials_home("expired");
         let mut f = std::fs::File::create(&path).unwrap();
         write!(
             f,
@@ -746,18 +812,14 @@ mod tests {
         )
         .unwrap();
         drop(f);
-        assert!(matches!(read_credentials(&path), Err(CredsError::Expired)));
-        let _ = std::fs::remove_dir_all(&dir);
+        assert!(matches!(read_credentials(), Err(CredsError::Expired)));
     }
 
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn valid_token_returned() {
-        let dir = std::env::temp_dir().join(format!(
-            "ai_agent_dashboard_usage_test_valid_{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join(".credentials.json");
+        let _g = cred_test_lock();
+        let (_temp, path, _restore) = override_credentials_home("valid");
         let mut f = std::fs::File::create(&path).unwrap();
         let future = now_ms() + 60 * 60 * 1000;
         write!(
@@ -766,18 +828,14 @@ mod tests {
         )
         .unwrap();
         drop(f);
-        assert_eq!(read_credentials(&path).unwrap(), "tok");
-        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(read_credentials().unwrap(), "tok");
     }
 
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn write_credentials_preserves_unrelated_fields() {
-        let dir = std::env::temp_dir().join(format!(
-            "ai_agent_dashboard_usage_test_write_{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join(".credentials.json");
+        let _g = cred_test_lock();
+        let (_temp, path, _restore) = override_credentials_home("write");
         std::fs::write(
             &path,
             r#"{
@@ -793,7 +851,7 @@ mod tests {
         )
         .unwrap();
 
-        write_credentials(&path, "new_a", "new_r", 9_999_999_999_999).unwrap();
+        write_credentials("new_a", "new_r", 9_999_999_999_999).unwrap();
 
         let written: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
@@ -805,39 +863,29 @@ mod tests {
         assert_eq!(oauth.get("scopes").unwrap(), &serde_json::json!(["a", "b"]));
         assert_eq!(oauth.get("subscriptionType").unwrap(), "max");
         assert_eq!(written.get("otherTopLevel").unwrap(), 42);
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn read_refresh_token_extracts_when_present() {
-        let dir = std::env::temp_dir().join(format!(
-            "ai_agent_dashboard_usage_test_refresh_read_{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join(".credentials.json");
+        let _g = cred_test_lock();
+        let (_temp, path, _restore) = override_credentials_home("refresh_read");
         std::fs::write(
             &path,
             r#"{"claudeAiOauth":{"accessToken":"a","refreshToken":"r-123","expiresAt":1}}"#,
         )
         .unwrap();
-        assert_eq!(read_refresh_token(&path).as_deref(), Some("r-123"));
-        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(read_refresh_token().as_deref(), Some("r-123"));
     }
 
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn blank_token_treated_as_unreadable() {
-        let dir = std::env::temp_dir().join(format!(
-            "ai_agent_dashboard_usage_test_blank_{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join(".credentials.json");
+        let _g = cred_test_lock();
+        let (_temp, path, _restore) = override_credentials_home("blank");
         let mut f = std::fs::File::create(&path).unwrap();
         write!(f, r#"{{"claudeAiOauth":{{"accessToken":"  "}}}}"#).unwrap();
         drop(f);
-        assert!(matches!(read_credentials(&path), Err(CredsError::Unreadable)));
-        let _ = std::fs::remove_dir_all(&dir);
+        assert!(matches!(read_credentials(), Err(CredsError::Unreadable)));
     }
 }
