@@ -42,7 +42,7 @@ The adapter recognizes six event names. Anything else returns `Ignore` and the w
 | `UserPromptSubmit` | `working`                                                                           | Label is the cleaned prompt; blank prompt → label `None`.      |
 | `Notification`     | `awaiting` (default) — `done` if `notification_type == "idle_prompt"` with no question | See the notification-type table below.                      |
 | `PreToolUse`       | `awaiting` for `AskUserQuestion` / `ExitPlanMode` only; other tools ignored         | Label: `"has a question"` for `AskUserQuestion`, `"plan approval"` for `ExitPlanMode`. The matcher in `~/.claude/settings.json` should restrict the hook to these two tools (see [Claude Code setup](claude-code#setup)) — Claude Code buffers the `tool_use` block until the user answers, so the JSONL transcript can't carry the signal in flight. |
-| `Stop`             | `done` — flips to `awaiting` if last assistant turn ends with `?`                   | Question check ignores configured benign closers.              |
+| `Stop`             | `done` — flips to `awaiting` if last assistant turn contains a question (see [detection rules](#transcript-question-detection)) | Question check ignores configured benign closers.              |
 | `SessionEnd`       | emits `Clear` (removes the row)                                                     | Bypasses status classification entirely.                       |
 
 `SessionStart` and `Notification` share a code path because Claude Code occasionally emits notifications under either name; the dispatcher merges them.
@@ -88,11 +88,23 @@ Other Unicode passes through untouched — accents, emoji, CJK, math symbols. Th
    - if it's an array, walk each block and take the trimmed `text` from blocks where `type == "text"`.
 5. Track the last non-empty text seen (so trailing whitespace-only assistant turns don't reset the state) and return it.
 
-**`is_a_question(text, benign_closers)`** — pure check on a string:
+**`is_a_question(text, benign_closers)`** — pure check on a string, two detection paths:
+
+**Path 1 — trailing `?`:**
 
 1. If `text` (after trim) ends with `)`, peel off one trailing `(...)` group **only when** the substring before the matching `(` ends with `?`. This handles option lists like `"Save these? (all / numbers / none)"` → `"Save these?"`. Other trailing parens (e.g. `"Look at this code (foo.py)"`) are left alone — there's no `?` before them, so the text falls through unchanged.
-2. After that strip, if the text doesn't end with `?`, return `false`.
-3. If it does end with `?`, check the (still-stripped) text against `Config::benign_closers` — case-insensitive suffix match. A hit returns `false`. Defaults: `"What's next?"`, `"Anything else?"`. They exist because Claude often signs off with a polite question that isn't a real ask — flipping to `awaiting` on every `What's next?` would be noise.
+2. After that strip, if the text ends with `?`, check against `Config::benign_closers` — case-insensitive suffix match. A hit skips this path. Defaults: `"What's next?"`, `"Anything else?"`. They exist because Claude often signs off with a polite question that isn't a real ask — flipping to `awaiting` on every `What's next?` would be noise.
+
+**Path 2 — permission-seeking phrase in last paragraph:**
+
+If path 1 doesn't match, extract the last paragraph of `text` (split by `\n\n`) and check whether it contains any of these phrases (case-insensitive) followed by `?` somewhere later in the same paragraph:
+
+- `"want me to"`
+- `"shall i"`
+- `"should i"`
+- `"do you want"`
+
+This catches questions embedded mid-paragraph like `"Want me to add that? The plan: write sessions.json to disk."` where the response continues past the `?`. The phrase list is empirically derived from ~216 real assistant messages — only patterns that actually appeared are included; new ones are added as observed. Only the **last** paragraph is scanned: a question in an earlier paragraph followed by a concluding statement (e.g. `"Want me to fix it?\n\nI went ahead and fixed it."`) correctly returns `false`.
 
 Only round brackets `()` are recognized for the option-list strip; `[]` and `{}` aren't peeled.
 

@@ -270,24 +270,55 @@ fn last_assistant_text(path: &Path) -> Option<String> {
     if last_text.is_empty() { None } else { Some(last_text) }
 }
 
-/// True when `text` reads as a question: ends with `?` (possibly followed by
-/// a single trailing parenthetical option list like `(all / numbers / none)`)
-/// and is not a configured benign closer.
+/// Permission-seeking phrases that indicate the agent is blocked waiting for
+/// user approval. Empirically derived from ~216 real assistant messages — only
+/// patterns that actually appeared are included; new ones are added as they're
+/// observed. Checked case-insensitively in the last paragraph of the response.
+const PERMISSION_SEEKING: &[&str] = &[
+    "want me to",
+    "shall i",
+    "should i",
+    "do you want",
+];
+
+/// True when `text` reads as a question: either the whole text ends with `?`
+/// (possibly followed by a trailing option list), or the last paragraph
+/// contains a known permission-seeking phrase followed by `?`.
 fn is_a_question(text: &str, benign_closers: &[String]) -> bool {
     let effective = strip_trailing_options(text);
-    if !effective.ends_with('?') {
-        return false;
-    }
-    let lower = effective.to_lowercase();
-    for closer in benign_closers {
-        if closer.is_empty() {
-            continue;
-        }
-        if lower.ends_with(&closer.to_lowercase()) {
-            return false;
+    if effective.ends_with('?') {
+        let lower = effective.to_lowercase();
+        let is_benign = benign_closers.iter().any(|c| {
+            !c.is_empty() && lower.ends_with(&c.to_lowercase())
+        });
+        if !is_benign {
+            return true;
         }
     }
-    true
+    has_permission_seeking_question(text)
+}
+
+/// Check the last paragraph for a permission-seeking phrase followed by `?`.
+/// Catches questions embedded mid-paragraph like "Want me to add that? The
+/// plan: ..." where the response continues after the question.
+fn has_permission_seeking_question(text: &str) -> bool {
+    let last_para = last_paragraph(text);
+    let lower = last_para.to_lowercase();
+    PERMISSION_SEEKING.iter().any(|phrase| {
+        if let Some(phrase_start) = lower.find(phrase) {
+            let after_phrase = &lower[phrase_start + phrase.len()..];
+            after_phrase.contains('?')
+        } else {
+            false
+        }
+    })
+}
+
+fn last_paragraph(text: &str) -> &str {
+    text.rsplit("\n\n")
+        .map(str::trim)
+        .find(|p| !p.is_empty())
+        .unwrap_or("")
 }
 
 /// Strip one trailing `(...)` group when it sits immediately after a `?`,
@@ -757,6 +788,75 @@ mod tests {
     fn is_a_question_non_matching_closer_still_awaits() {
         let closers = vec!["What's next?".to_string()];
         assert!(is_a_question("Which option do you prefer?", &closers));
+    }
+
+    // ----- permission-seeking in last paragraph -----
+
+    #[test]
+    fn permission_seeking_want_me_to_mid_paragraph() {
+        assert!(is_a_question(
+            "The state is ephemeral. Want me to add persistence? The plan: write sessions.json to disk.",
+            &[]
+        ));
+    }
+
+    #[test]
+    fn permission_seeking_shall_i_mid_paragraph() {
+        assert!(is_a_question(
+            "Three changes here. Shall I proceed? I'll create separate commits.",
+            &[]
+        ));
+    }
+
+    #[test]
+    fn permission_seeking_should_i_mid_paragraph() {
+        assert!(is_a_question(
+            "Found the issue. Should I use the cached value? It would avoid the network call.",
+            &[]
+        ));
+    }
+
+    #[test]
+    fn permission_seeking_do_you_want_mid_paragraph() {
+        assert!(is_a_question(
+            "Deployed. Do you want me to run the tests? I can also check coverage.",
+            &[]
+        ));
+    }
+
+    #[test]
+    fn permission_seeking_only_checks_last_paragraph() {
+        // Question in first paragraph, statement in last — should NOT match.
+        assert!(!is_a_question(
+            "Want me to fix it?\n\nI went ahead and fixed it. All tests pass.",
+            &[]
+        ));
+    }
+
+    #[test]
+    fn permission_seeking_case_insensitive() {
+        assert!(is_a_question(
+            "WANT ME TO add this? Here's the plan.",
+            &[]
+        ));
+    }
+
+    #[test]
+    fn permission_seeking_no_question_mark_after_phrase() {
+        assert!(!is_a_question(
+            "I want me to clarify: the fix is in place. All done.",
+            &[]
+        ));
+    }
+
+    #[test]
+    fn permission_seeking_does_not_match_unrelated_question_in_last_para() {
+        // "?" exists in last paragraph but no permission-seeking phrase.
+        // The text also doesn't end with "?" so neither check fires.
+        assert!(!is_a_question(
+            "Let me investigate — does the bug have a cleaner fix at the rotate_vector level? This affects what we do next.",
+            &[]
+        ));
     }
 
     // ----- dispatch: integration -----
