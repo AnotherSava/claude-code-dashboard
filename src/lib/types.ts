@@ -1,10 +1,17 @@
 export type Status = 'idle' | 'working' | 'awaiting' | 'done' | 'error'
 
+export interface PromptHistoryEntry {
+  prompt: string
+  started_at: number
+}
+
 export interface AgentSession {
   id: string
   status: Status
   label: string
   original_prompt: string | null
+  task_started_at: number
+  previous_prompts: PromptHistoryEntry[]
   source: string
   model: string | null
   input_tokens: number | null

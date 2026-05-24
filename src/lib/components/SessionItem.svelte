@@ -18,6 +18,8 @@
 
   let { session, config, now }: Props = $props()
 
+  const HISTORY_VISIBLE = 4
+
   const label = $derived(displayLabel(session))
   const time = $derived(formatTime(displayTimeMs(session, now)))
   const tokensText = $derived(
@@ -25,6 +27,29 @@
   )
   const tokColor = $derived(tokenColor(session, config))
   const shouldPulse = $derived(session.status === 'awaiting' || session.status === 'error')
+
+  function formatClock(ms: number): string {
+    if (!ms) return ' --:--'
+    const d = new Date(ms)
+    const pad = (n: number) => n.toString().padStart(2, '0')
+    return `${pad(d.getHours())}:${pad(d.getMinutes())}`
+  }
+
+  // Multi-line plain-text history rendered by the OS-native title tooltip,
+  // which is what gives us the ability to exceed the dashboard window's
+  // width. Format: each line is `HH:MM  prompt`. Older prompts on top,
+  // current on the bottom, prefixed with an arrow marker.
+  const titleText = $derived.by(() => {
+    const recent = session.previous_prompts.slice(0, HISTORY_VISIBLE)
+    const lines: string[] = recent
+      .slice()
+      .reverse()
+      .map((e) => `${formatClock(e.started_at)}    ${e.prompt}`)
+    if (session.original_prompt) {
+      lines.push(`${formatClock(session.task_started_at)}  ▸ ${session.original_prompt}`)
+    }
+    return lines.join('\n')
+  })
 
   function onRemove(e: MouseEvent) {
     e.stopPropagation()
@@ -44,7 +69,7 @@
       <span class="tokens" style:color={tokColor}>{#if tokensText}{tokensText}<span class="k">k</span>{/if}</span>
     </div>
     {#if label}
-      <div class="label" title={label}>{label}</div>
+      <div class="label" title={titleText}>{label}</div>
     {/if}
   </div>
 </div>

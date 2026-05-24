@@ -82,6 +82,8 @@ mod tests {
             status: Status::Idle,
             label: label.into(),
             original_prompt: original_prompt.map(str::to_string),
+            task_started_at: 0,
+            previous_prompts: Vec::new(),
             source: "claude-code".into(),
             model: None,
             input_tokens: None,

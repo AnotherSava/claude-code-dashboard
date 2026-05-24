@@ -12,11 +12,30 @@ pub enum Status {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PromptHistoryEntry {
+    pub prompt: String,
+    /// Wall-clock ms when this task began (the task_boundary that captured
+    /// `prompt` as `original_prompt`).
+    pub started_at: i64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AgentSession {
     pub id: String,
     pub status: Status,
     pub label: String,
     pub original_prompt: Option<String>,
+    /// Wall-clock ms when the current task began. Set at task boundary when
+    /// `original_prompt` is captured/replaced; preserved across approval
+    /// cycles and continuation prompts. Zero when no task has started yet.
+    #[serde(default)]
+    pub task_started_at: i64,
+    /// All prior task prompts, most-recent-first. Captured at task boundaries
+    /// when `original_prompt` is being replaced with a different value.
+    /// Approval-cycle replies and continuation prompts are excluded (same
+    /// gating as `original_prompt`). Unbounded — the frontend caps display.
+    #[serde(default)]
+    pub previous_prompts: Vec<PromptHistoryEntry>,
     pub source: String,
     pub model: Option<String>,
     pub input_tokens: Option<u64>,
@@ -119,6 +138,31 @@ impl AppState {
                 "apply_set"
             );
 
+            if task_boundary
+                && new_original_prompt.is_some()
+                && new_original_prompt != existing.original_prompt
+            {
+                if let Some(prior) = existing.original_prompt.take() {
+                    existing.previous_prompts.insert(
+                        0,
+                        PromptHistoryEntry {
+                            prompt: prior,
+                            started_at: existing.task_started_at,
+                        },
+                    );
+                }
+                existing.task_started_at = now_ms;
+            } else if task_boundary
+                && new_original_prompt.is_some()
+                && existing.original_prompt.is_none()
+            {
+                // First-ever task prompt for a session that previously had no
+                // original_prompt (e.g. started in idle/awaiting then went to
+                // working with a prompt). No prior to push, but anchor the
+                // task start.
+                existing.task_started_at = now_ms;
+            }
+
             existing.status = input.status;
             existing.label = new_label;
             existing.original_prompt = new_original_prompt;
@@ -143,11 +187,14 @@ impl AppState {
                 new_original_prompt = ?original_prompt,
                 "apply_set"
             );
+            let task_started_at = if original_prompt.is_some() { now_ms } else { 0 };
             sessions.push(AgentSession {
                 id: input.id,
                 status: input.status,
                 label,
                 original_prompt,
+                task_started_at,
+                previous_prompts: Vec::new(),
                 source: input.source.unwrap_or_else(|| "claude-code".to_string()),
                 model: input.model,
                 input_tokens: input.input_tokens,
@@ -437,6 +484,98 @@ mod tests {
             Some("go ahead"),
             "non-exact-match prompt should re-capture as a fresh task"
         );
+    }
+
+    #[test]
+    fn task_boundary_pushes_prior_prompt_into_history_with_started_at() {
+        let state = AppState::new();
+        state.apply_set(set("a", Status::Working, "first task"), 1_000, NO_CONTINUATIONS);
+        state.apply_set(set("a", Status::Done, "done"), 30_000, NO_CONTINUATIONS);
+        state.apply_set(set("a", Status::Working, "second task"), 60_000, NO_CONTINUATIONS);
+        let s = get(&state, "a");
+        assert_eq!(s.original_prompt.as_deref(), Some("second task"));
+        assert_eq!(s.task_started_at, 60_000);
+        assert_eq!(s.previous_prompts.len(), 1);
+        assert_eq!(s.previous_prompts[0].prompt, "first task");
+        assert_eq!(
+            s.previous_prompts[0].started_at, 1_000,
+            "history entry preserves the prior task's start time, not the boundary time"
+        );
+    }
+
+    #[test]
+    fn approval_cycle_does_not_push_history() {
+        let state = AppState::new();
+        state.apply_set(set("a", Status::Working, "fix foo"), 0, NO_CONTINUATIONS);
+        state.apply_set(set("a", Status::Awaiting, "permission?"), 5_000, NO_CONTINUATIONS);
+        state.apply_set(set("a", Status::Working, "yes"), 6_000, NO_CONTINUATIONS);
+        let s = get(&state, "a");
+        assert_eq!(s.original_prompt.as_deref(), Some("fix foo"));
+        assert!(s.previous_prompts.is_empty(), "approval cycle must not push history");
+        assert_eq!(s.task_started_at, 0, "task_started_at survives the approval cycle");
+    }
+
+    #[test]
+    fn continuation_prompt_does_not_push_history() {
+        let state = AppState::new();
+        let cont: Vec<String> = vec!["go".into()];
+        state.apply_set(set("a", Status::Working, "fix foo"), 0, &cont);
+        state.apply_set(set_no_label("a", Status::Done), 10_000, &cont);
+        state.apply_set(set("a", Status::Working, "go"), 20_000, &cont);
+        let s = get(&state, "a");
+        assert_eq!(s.original_prompt.as_deref(), Some("fix foo"));
+        assert!(s.previous_prompts.is_empty(), "continuation must not push history");
+        assert_eq!(s.task_started_at, 0, "continuation preserves task_started_at");
+    }
+
+    #[test]
+    fn history_is_unbounded_and_most_recent_first() {
+        let state = AppState::new();
+        state.apply_set(set("a", Status::Working, "t1"), 1, NO_CONTINUATIONS);
+        for i in 2..=7u64 {
+            state.apply_set(set("a", Status::Done, "d"), (i * 1_000 - 500) as i64, NO_CONTINUATIONS);
+            state.apply_set(set("a", Status::Working, &format!("t{i}")), (i * 1_000) as i64, NO_CONTINUATIONS);
+        }
+        let s = get(&state, "a");
+        assert_eq!(s.original_prompt.as_deref(), Some("t7"));
+        assert_eq!(s.task_started_at, 7_000);
+        let prompts: Vec<&str> = s.previous_prompts.iter().map(|e| e.prompt.as_str()).collect();
+        assert_eq!(prompts, vec!["t6", "t5", "t4", "t3", "t2", "t1"], "all prior prompts retained, most-recent-first");
+        assert_eq!(s.previous_prompts[0].started_at, 6_000);
+        assert_eq!(s.previous_prompts.last().unwrap().started_at, 1);
+    }
+
+    #[test]
+    fn first_working_prompt_sets_task_started_at() {
+        let state = AppState::new();
+        state.apply_set(set("a", Status::Working, "fix foo"), 1_000, NO_CONTINUATIONS);
+        let s = get(&state, "a");
+        assert_eq!(s.task_started_at, 1_000);
+        assert!(s.previous_prompts.is_empty());
+    }
+
+    #[test]
+    fn idle_then_working_first_task_anchors_task_started_at_without_history_push() {
+        let state = AppState::new();
+        state.apply_set(set("a", Status::Idle, ""), 0, NO_CONTINUATIONS);
+        state.apply_set(set("a", Status::Working, "first"), 5_000, NO_CONTINUATIONS);
+        let s = get(&state, "a");
+        assert_eq!(s.original_prompt.as_deref(), Some("first"));
+        assert_eq!(s.task_started_at, 5_000);
+        assert!(s.previous_prompts.is_empty(), "no prior prompt to push");
+    }
+
+    #[test]
+    fn boundary_with_missing_label_preserves_history_and_task_started_at() {
+        let state = AppState::new();
+        state.apply_set(set("a", Status::Working, "first"), 1_000, NO_CONTINUATIONS);
+        state.apply_set(set("a", Status::Done, "done"), 5_000, NO_CONTINUATIONS);
+        // Task boundary but no new label — original_prompt is preserved, no push.
+        state.apply_set(set_no_label("a", Status::Working), 10_000, NO_CONTINUATIONS);
+        let s = get(&state, "a");
+        assert_eq!(s.original_prompt.as_deref(), Some("first"));
+        assert_eq!(s.task_started_at, 1_000, "preserved when prompt is preserved");
+        assert!(s.previous_prompts.is_empty());
     }
 
     #[test]

@@ -232,6 +232,8 @@ mod tests {
             status,
             label: String::new(),
             original_prompt: None,
+            task_started_at: 0,
+            previous_prompts: Vec::new(),
             source: "test".to_string(),
             model: None,
             input_tokens: None,
