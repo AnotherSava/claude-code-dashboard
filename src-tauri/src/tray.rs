@@ -139,7 +139,15 @@ fn handle_menu_event(app: &AppHandle, id: &str) {
         MENU_AUTO_RESIZE_DOWN => select_auto_resize_mode(app, AutoResize::Down),
         MENU_OPEN_DATA_DIR => open_data_dir(app),
         MENU_ABOUT => show_about(app),
-        MENU_QUIT => app.exit(0),
+        MENU_QUIT => {
+            tracing::info!("tray quit invoked");
+            // `app.exit(0)` going through Tauri's exit pipeline can silently
+            // no-op when called from a menu handler with multiple windows
+            // registered (observed after adding the tooltip overlay window).
+            // `std::process::exit` bypasses the runtime entirely — fine for a
+            // tray widget where there's no graceful work to flush on quit.
+            std::process::exit(0);
+        }
         _ => {}
     }
 }

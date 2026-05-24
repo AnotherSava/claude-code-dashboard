@@ -75,8 +75,9 @@ pub fn toggle_window(window: WebviewWindow) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn quit_app(app: AppHandle) {
-    app.exit(0);
+pub fn quit_app(_app: AppHandle) {
+    tracing::info!("quit_app invoked");
+    std::process::exit(0);
 }
 
 #[tauri::command]
