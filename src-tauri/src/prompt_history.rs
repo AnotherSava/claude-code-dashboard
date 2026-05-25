@@ -41,6 +41,7 @@ impl PromptHistoryStore {
                 dialog: session.dialog.clone(),
                 original_prompt: session.original_prompt.clone(),
                 task_started_at: session.task_started_at,
+                last_input_tokens: session.input_tokens,
             },
         );
     }
@@ -67,7 +68,7 @@ impl PromptHistoryStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::{DialogRole, Status};
+    use crate::state::{DialogEntry, DialogRole, Status};
 
     #[test]
     fn round_trip_save_and_load() {
@@ -93,6 +94,7 @@ mod tests {
                     dialog: vec![entry],
                     original_prompt: Some("fix foo".into()),
                     task_started_at: 1000,
+                    last_input_tokens: None,
                 },
             );
         }

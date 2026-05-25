@@ -16,6 +16,7 @@ pub enum Status {
 pub enum DialogRole {
     User,
     Assistant,
+    Separator,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -44,6 +45,8 @@ pub struct PersistedSession {
     pub original_prompt: Option<String>,
     #[serde(default)]
     pub task_started_at: i64,
+    #[serde(default)]
+    pub last_input_tokens: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -211,6 +214,20 @@ impl AppState {
                 r.task_started_at
             };
             let mut dialog = r.dialog;
+
+            let is_new_session = !dialog.is_empty()
+                && match (r.last_input_tokens, input.input_tokens) {
+                    (Some(prev), Some(cur)) => cur < prev / 2,
+                    _ => false,
+                };
+            if is_new_session {
+                dialog.push(DialogEntry {
+                    role: DialogRole::Separator,
+                    text: String::new(),
+                    timestamp: now_ms,
+                    status: Status::Idle,
+                });
+            }
 
             let has_new_entry = if let Some(pending) = dialog_entry {
                 dialog.push(DialogEntry {
@@ -655,6 +672,7 @@ mod tests {
             ],
             original_prompt: Some("old task".into()),
             task_started_at: 100,
+            last_input_tokens: None,
         };
         state.apply_set(set("a", Status::Done, "done"), 1_000, NO_CONTINUATIONS, Some(restored));
         let s = get(&state, "a");

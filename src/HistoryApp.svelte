@@ -65,12 +65,25 @@
     return `${pad(d.getHours())}:${pad(d.getMinutes())}`
   }
 
+  function deduplicatedDialog(): import('./lib/types').DialogEntry[] {
+    if (!session) return []
+    const d = session.dialog
+    return d.filter((entry, i) => {
+      if (entry.role !== 'user') return true
+      const next = d[i + 1]
+      if (!next || next.role !== 'user') return true
+      const prefixLen = Math.min(entry.text.length, 10)
+      return entry.text.slice(0, prefixLen) !== next.text.slice(0, prefixLen)
+    })
+  }
+
+  let dialog = $derived(deduplicatedDialog())
+
   function isTaskBoundary(idx: number): boolean {
-    if (!session) return false
-    const entry = session.dialog[idx]
-    if (entry.role !== 'user') return false
+    const entry = dialog[idx]
+    if (!entry || entry.role !== 'user') return false
     if (idx === 0) return true
-    return session.dialog[idx - 1].status !== 'awaiting'
+    return dialog[idx - 1].status !== 'awaiting'
   }
 
 
@@ -105,13 +118,17 @@
 {:else if session}
   <div class="entries" bind:this={entriesEl} onscroll={onEntriesScroll} style:font-size="{SIZE_PX[fontSize]}px">
     <div class="entries-inner">
-      {#each session.dialog as entry, i}
-        <div class="entry" class:sticky={isTaskBoundary(i)} class:assistant={entry.role === 'assistant'}>
-          <span class="ts">{formatClock(entry.timestamp)}</span>
-          <span class="text">{#each entry.text.split('\n') as line, j}{#if j > 0}<br />{/if}{line}{/each}</span>
-        </div>
+      {#each dialog as entry, i}
+        {#if entry.role === 'separator'}
+          <div class="separator"><hr /></div>
+        {:else}
+          <div class="entry" class:sticky={isTaskBoundary(i)} class:assistant={entry.role === 'assistant'}>
+            <span class="ts">{formatClock(entry.timestamp)}</span>
+            <span class="text">{#each entry.text.split('\n') as line, j}{#if j > 0}<br />{/if}{line}{/each}</span>
+          </div>
+        {/if}
       {/each}
-      {#if session.dialog.length === 0}
+      {#if dialog.length === 0}
         <div class="msg">No history</div>
       {/if}
     </div>
@@ -151,12 +168,20 @@
     min-width: 0;
     white-space: pre-wrap;
   }
-  .sticky .text {
-    font-weight: 600;
+  .sticky {
+    background: rgba(255, 255, 255, 0.04);
   }
   .assistant .text {
     font-style: italic;
     color: #6b7280;
+  }
+  .separator {
+    padding: 4px 12px;
+  }
+  .separator hr {
+    border: none;
+    border-top: 1px solid rgba(255, 255, 255, 0.1);
+    margin: 0;
   }
   .msg {
     display: flex;

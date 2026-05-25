@@ -1,6 +1,6 @@
 export type Status = 'idle' | 'working' | 'awaiting' | 'done' | 'error'
 
-export type DialogRole = 'user' | 'assistant'
+export type DialogRole = 'user' | 'assistant' | 'separator'
 
 export interface DialogEntry {
   role: DialogRole
