@@ -1,8 +1,12 @@
 export type Status = 'idle' | 'working' | 'awaiting' | 'done' | 'error'
 
-export interface PromptHistoryEntry {
-  prompt: string
-  started_at: number
+export type DialogRole = 'user' | 'assistant'
+
+export interface DialogEntry {
+  role: DialogRole
+  text: string
+  timestamp: number
+  status: Status
 }
 
 export interface AgentSession {
@@ -11,7 +15,7 @@ export interface AgentSession {
   label: string
   original_prompt: string | null
   task_started_at: number
-  previous_prompts: PromptHistoryEntry[]
+  dialog: DialogEntry[]
   source: string
   model: string | null
   input_tokens: number | null

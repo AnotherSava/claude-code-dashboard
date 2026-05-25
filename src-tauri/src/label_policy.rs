@@ -73,6 +73,7 @@ mod tests {
             source: None,
             model: None,
             input_tokens: None,
+            dialog_entry: None,
         }
     }
 
@@ -83,7 +84,7 @@ mod tests {
             label: label.into(),
             original_prompt: original_prompt.map(str::to_string),
             task_started_at: 0,
-            previous_prompts: Vec::new(),
+            dialog: Vec::new(),
             source: "claude-code".into(),
             model: None,
             input_tokens: None,

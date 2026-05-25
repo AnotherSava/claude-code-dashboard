@@ -88,6 +88,10 @@ pub fn remove_session(id: String, app: AppHandle) {
     if let Some(reg) = app.try_state::<WatcherRegistry>() {
         reg.stop(&id);
     }
+    if let Some(store) = app.try_state::<crate::prompt_history::PromptHistoryStore>() {
+        store.remove(&id);
+        store.save_to_disk();
+    }
     emit_sessions_updated(&app);
 }
 

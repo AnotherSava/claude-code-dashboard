@@ -40,14 +40,18 @@
   // width. Format: each line is `HH:MM  prompt`. Older prompts on top,
   // current on the bottom, prefixed with an arrow marker.
   const titleText = $derived.by(() => {
-    const recent = session.previous_prompts.slice(0, HISTORY_VISIBLE)
-    const lines: string[] = recent
-      .slice()
-      .reverse()
-      .map((e) => `${formatClock(e.started_at)}    ${e.prompt}`)
-    if (session.original_prompt) {
-      lines.push(`${formatClock(session.task_started_at)}  ▸ ${session.original_prompt}`)
-    }
+    const taskPrompts = session.dialog.filter((e) => {
+      if (e.role !== 'user') return false
+      const idx = session.dialog.indexOf(e)
+      if (idx === 0) return true
+      const prev = session.dialog[idx - 1]
+      return prev.status !== 'awaiting'
+    })
+    const visible = taskPrompts.slice(-(HISTORY_VISIBLE + 1))
+    const lines: string[] = visible.map((e, i) => {
+      const marker = i === visible.length - 1 ? '  ▸ ' : '    '
+      return `${formatClock(e.timestamp)}${marker}${e.text}`
+    })
     return lines.join('\n')
   })
 

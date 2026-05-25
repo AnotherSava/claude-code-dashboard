@@ -11,7 +11,7 @@ use serde_json::Value;
 
 use crate::adapters::AdapterOutput;
 use crate::config::Config;
-use crate::state::{SetInput, Status};
+use crate::state::{DialogRole, PendingDialogEntry, SetInput, Status};
 
 /// Built-in Claude Code tools that pause the model on a user decision. The
 /// model's `tool_use` block isn't flushed to the JSONL transcript until the
@@ -52,6 +52,21 @@ pub fn dispatch(event: &str, payload: &Value, cfg: &Config) -> AdapterOutput {
         .filter(|s| !s.trim().is_empty())
         .map(PathBuf::from);
 
+    let dialog_entry = match event {
+        "UserPromptSubmit" => label.as_ref().map(|text| PendingDialogEntry {
+            role: DialogRole::User,
+            text: text.clone(),
+        }),
+        "Stop" => transcript_path
+            .as_ref()
+            .and_then(|p| last_assistant_text(p))
+            .map(|text| PendingDialogEntry {
+                role: DialogRole::Assistant,
+                text,
+            }),
+        _ => None,
+    };
+
     AdapterOutput::Set {
         input: SetInput {
             id: chat_id,
@@ -60,6 +75,7 @@ pub fn dispatch(event: &str, payload: &Value, cfg: &Config) -> AdapterOutput {
             source: Some("claude".into()),
             model: None,
             input_tokens: None,
+            dialog_entry,
         },
         transcript_path,
     }

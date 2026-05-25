@@ -11,12 +11,39 @@ pub enum Status {
     Error,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DialogRole {
+    User,
+    Assistant,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct PromptHistoryEntry {
-    pub prompt: String,
-    /// Wall-clock ms when this task began (the task_boundary that captured
-    /// `prompt` as `original_prompt`).
-    pub started_at: i64,
+pub struct DialogEntry {
+    pub role: DialogRole,
+    pub text: String,
+    pub timestamp: i64,
+    pub status: Status,
+}
+
+/// Built by the adapter, converted to a full [`DialogEntry`] by `apply_set`
+/// (which adds `timestamp` and `status`).
+#[derive(Clone, Debug)]
+pub struct PendingDialogEntry {
+    pub role: DialogRole,
+    pub text: String,
+}
+
+/// Fields persisted to `prompt_history.json` and restored on session
+/// re-creation after an app restart.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct PersistedSession {
+    #[serde(default)]
+    pub dialog: Vec<DialogEntry>,
+    #[serde(default)]
+    pub original_prompt: Option<String>,
+    #[serde(default)]
+    pub task_started_at: i64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -25,17 +52,10 @@ pub struct AgentSession {
     pub status: Status,
     pub label: String,
     pub original_prompt: Option<String>,
-    /// Wall-clock ms when the current task began. Set at task boundary when
-    /// `original_prompt` is captured/replaced; preserved across approval
-    /// cycles and continuation prompts. Zero when no task has started yet.
     #[serde(default)]
     pub task_started_at: i64,
-    /// All prior task prompts, most-recent-first. Captured at task boundaries
-    /// when `original_prompt` is being replaced with a different value.
-    /// Approval-cycle replies and continuation prompts are excluded (same
-    /// gating as `original_prompt`). Unbounded — the frontend caps display.
     #[serde(default)]
-    pub previous_prompts: Vec<PromptHistoryEntry>,
+    pub dialog: Vec<DialogEntry>,
     pub source: String,
     pub model: Option<String>,
     pub input_tokens: Option<u64>,
@@ -48,13 +68,11 @@ pub struct AgentSession {
 pub struct SetInput {
     pub id: String,
     pub status: Status,
-    /// None = preserve prior label. Adapters emit None when the incoming event
-    /// has no fresh label to report (e.g. transitioning to `working` without a
-    /// new prompt); the state layer keeps whatever was there.
     pub label: Option<String>,
     pub source: Option<String>,
     pub model: Option<String>,
     pub input_tokens: Option<u64>,
+    pub dialog_entry: Option<PendingDialogEntry>,
 }
 
 /// True when `label` (after trim, case-insensitive) matches one of the
@@ -85,18 +103,22 @@ impl AppState {
         self.sessions.lock().unwrap().clone()
     }
 
-    pub fn apply_set(&self, input: SetInput, now_ms: i64, continuation_prompts: &[String]) {
+    /// Returns `true` when the session's dialog was modified (caller should
+    /// persist). The `restored` parameter is used only when creating a new
+    /// session to pre-populate dialog + original_prompt + task_started_at
+    /// from the persistence store.
+    pub fn apply_set(
+        &self,
+        input: SetInput,
+        now_ms: i64,
+        continuation_prompts: &[String],
+        restored: Option<PersistedSession>,
+    ) -> bool {
         let mut sessions = self.sessions.lock().unwrap();
+        let dialog_entry = input.dialog_entry.clone();
         if let Some(existing) = sessions.iter_mut().find(|s| s.id == input.id) {
             let prior = existing.status;
 
-            // A task boundary is any transition into Working from a state where
-            // the agent isn't already mid-conversation with us. Done/Idle covers
-            // the natural case (agent finished, user starts new task). Working
-            // covers the cancellation case (user hit Esc and submitted a fresh
-            // prompt without an intervening Stop) — Awaiting is the only prior
-            // status that genuinely *isn't* a new task, since it represents an
-            // approval cycle the agent is waiting on.
             let raw_task_boundary = matches!(
                 prior,
                 Status::Done | Status::Idle | Status::Working
@@ -142,24 +164,6 @@ impl AppState {
                 && new_original_prompt.is_some()
                 && new_original_prompt != existing.original_prompt
             {
-                if let Some(prior) = existing.original_prompt.take() {
-                    existing.previous_prompts.insert(
-                        0,
-                        PromptHistoryEntry {
-                            prompt: prior,
-                            started_at: existing.task_started_at,
-                        },
-                    );
-                }
-                existing.task_started_at = now_ms;
-            } else if task_boundary
-                && new_original_prompt.is_some()
-                && existing.original_prompt.is_none()
-            {
-                // First-ever task prompt for a session that previously had no
-                // original_prompt (e.g. started in idle/awaiting then went to
-                // working with a prompt). No prior to push, but anchor the
-                // task start.
                 existing.task_started_at = now_ms;
             }
 
@@ -176,25 +180,58 @@ impl AppState {
                 existing.input_tokens = input.input_tokens;
             }
             existing.updated = now_ms;
+
+            if let Some(pending) = dialog_entry {
+                existing.dialog.push(DialogEntry {
+                    role: pending.role,
+                    text: pending.text,
+                    timestamp: now_ms,
+                    status: existing.status,
+                });
+                return true;
+            }
+            false
         } else {
-            let (label, original_prompt) = crate::label_policy::select(None, &input, false);
+            let (label, event_prompt) = crate::label_policy::select(None, &input, false);
             tracing::debug!(
                 id = %input.id,
                 path = "new",
                 new_status = ?input.status,
                 input_label = ?input.label,
                 new_label = %label,
-                new_original_prompt = ?original_prompt,
+                new_original_prompt = ?event_prompt,
                 "apply_set"
             );
-            let task_started_at = if original_prompt.is_some() { now_ms } else { 0 };
+
+            let r = restored.unwrap_or_default();
+            let original_prompt = event_prompt.or(r.original_prompt);
+            let task_started_at = if original_prompt.is_some() && r.task_started_at == 0 {
+                now_ms
+            } else {
+                r.task_started_at
+            };
+            let mut dialog = r.dialog;
+
+            let has_new_entry = if let Some(pending) = dialog_entry {
+                dialog.push(DialogEntry {
+                    role: pending.role,
+                    text: pending.text,
+                    timestamp: now_ms,
+                    status: input.status,
+                });
+                true
+            } else {
+                false
+            };
+
+            let dialog_restored = !dialog.is_empty();
             sessions.push(AgentSession {
                 id: input.id,
                 status: input.status,
                 label,
                 original_prompt,
                 task_started_at,
-                previous_prompts: Vec::new(),
+                dialog,
                 source: input.source.unwrap_or_else(|| "claude-code".to_string()),
                 model: input.model,
                 input_tokens: input.input_tokens,
@@ -202,6 +239,7 @@ impl AppState {
                 state_entered_at: now_ms,
                 working_accumulated_ms: 0,
             });
+            has_new_entry || dialog_restored
         }
     }
 
@@ -223,6 +261,7 @@ mod tests {
             source: None,
             model: None,
             input_tokens: None,
+            dialog_entry: None,
         }
     }
 
@@ -234,6 +273,7 @@ mod tests {
             source: None,
             model: None,
             input_tokens: None,
+            dialog_entry: None,
         }
     }
 
@@ -250,7 +290,7 @@ mod tests {
     #[test]
     fn new_working_session_captures_original_prompt() {
         let state = AppState::new();
-        state.apply_set(set("a", Status::Working, "fix foo.py"), 1000, NO_CONTINUATIONS);
+        state.apply_set(set("a", Status::Working, "fix foo.py"), 1000, NO_CONTINUATIONS, None);
 
         let s = get(&state, "a");
         assert_eq!(s.status, Status::Working);
@@ -262,7 +302,7 @@ mod tests {
     #[test]
     fn new_non_working_session_has_no_original_prompt() {
         let state = AppState::new();
-        state.apply_set(set("a", Status::Idle, ""), 1000, NO_CONTINUATIONS);
+        state.apply_set(set("a", Status::Idle, ""), 1000, NO_CONTINUATIONS, None);
         assert_eq!(get(&state, "a").original_prompt, None);
     }
 
@@ -270,9 +310,9 @@ mod tests {
     fn approval_cycle_preserves_original_prompt_and_accumulator() {
         let state = AppState::new();
         // Initial working: task starts
-        state.apply_set(set("a", Status::Working, "fix foo.py"), 0, NO_CONTINUATIONS);
+        state.apply_set(set("a", Status::Working, "fix foo.py"), 0, NO_CONTINUATIONS, None);
         // Claude asks for approval after 30s
-        state.apply_set(set("a", Status::Awaiting, "run bash?"), 30_000, NO_CONTINUATIONS);
+        state.apply_set(set("a", Status::Awaiting, "run bash?"), 30_000, NO_CONTINUATIONS, None);
         let mid = get(&state, "a");
         assert_eq!(mid.status, Status::Awaiting);
         assert_eq!(mid.original_prompt.as_deref(), Some("fix foo.py"));
@@ -280,7 +320,7 @@ mod tests {
         assert_eq!(mid.state_entered_at, 30_000);
 
         // User approves after 5s; agent resumes working with noise label "yes"
-        state.apply_set(set("a", Status::Working, "yes"), 35_000, NO_CONTINUATIONS);
+        state.apply_set(set("a", Status::Working, "yes"), 35_000, NO_CONTINUATIONS, None);
         let resumed = get(&state, "a");
         assert_eq!(resumed.status, Status::Working);
         assert_eq!(
@@ -298,8 +338,8 @@ mod tests {
     #[test]
     fn done_then_working_is_task_boundary_and_resets_state() {
         let state = AppState::new();
-        state.apply_set(set("a", Status::Working, "fix foo.py"), 0, NO_CONTINUATIONS);
-        state.apply_set(set("a", Status::Done, "fixed!"), 60_000, NO_CONTINUATIONS);
+        state.apply_set(set("a", Status::Working, "fix foo.py"), 0, NO_CONTINUATIONS, None);
+        state.apply_set(set("a", Status::Done, "fixed!"), 60_000, NO_CONTINUATIONS, None);
         let after_done = get(&state, "a");
         assert_eq!(
             after_done.working_accumulated_ms, 60_000,
@@ -308,7 +348,7 @@ mod tests {
         assert_eq!(after_done.original_prompt.as_deref(), Some("fix foo.py"));
 
         // New task on the same session
-        state.apply_set(set("a", Status::Working, "add tests"), 120_000, NO_CONTINUATIONS);
+        state.apply_set(set("a", Status::Working, "add tests"), 120_000, NO_CONTINUATIONS, None);
         let new_task = get(&state, "a");
         assert_eq!(new_task.original_prompt.as_deref(), Some("add tests"));
         assert_eq!(new_task.working_accumulated_ms, 0);
@@ -318,8 +358,8 @@ mod tests {
     #[test]
     fn idle_then_working_is_also_task_boundary() {
         let state = AppState::new();
-        state.apply_set(set("a", Status::Idle, ""), 0, NO_CONTINUATIONS);
-        state.apply_set(set("a", Status::Working, "new task"), 10_000, NO_CONTINUATIONS);
+        state.apply_set(set("a", Status::Idle, ""), 0, NO_CONTINUATIONS, None);
+        state.apply_set(set("a", Status::Working, "new task"), 10_000, NO_CONTINUATIONS, None);
         let s = get(&state, "a");
         assert_eq!(s.original_prompt.as_deref(), Some("new task"));
         assert_eq!(s.working_accumulated_ms, 0);
@@ -328,8 +368,8 @@ mod tests {
     #[test]
     fn working_to_error_accumulates_but_does_not_reset() {
         let state = AppState::new();
-        state.apply_set(set("a", Status::Working, "do a thing"), 0, NO_CONTINUATIONS);
-        state.apply_set(set("a", Status::Error, "perm denied"), 5_000, NO_CONTINUATIONS);
+        state.apply_set(set("a", Status::Working, "do a thing"), 0, NO_CONTINUATIONS, None);
+        state.apply_set(set("a", Status::Error, "perm denied"), 5_000, NO_CONTINUATIONS, None);
         let s = get(&state, "a");
         assert_eq!(s.status, Status::Error);
         assert_eq!(s.working_accumulated_ms, 5_000);
@@ -343,8 +383,8 @@ mod tests {
         // refining the question), state_entered_at must not bounce. Working →
         // Working is now a task boundary on purpose — see the cancellation tests.
         let state = AppState::new();
-        state.apply_set(set("a", Status::Awaiting, "ask"), 0, NO_CONTINUATIONS);
-        state.apply_set(set("a", Status::Awaiting, "ask"), 5_000, NO_CONTINUATIONS);
+        state.apply_set(set("a", Status::Awaiting, "ask"), 0, NO_CONTINUATIONS, None);
+        state.apply_set(set("a", Status::Awaiting, "ask"), 5_000, NO_CONTINUATIONS, None);
         let s = get(&state, "a");
         assert_eq!(s.state_entered_at, 0, "state_entered_at must not reset within the same non-Working status");
     }
@@ -356,8 +396,8 @@ mod tests {
         // new prompt must be treated as a fresh task: original_prompt
         // re-captured, working timer reset.
         let state = AppState::new();
-        state.apply_set(set("a", Status::Working, "first task"), 0, NO_CONTINUATIONS);
-        state.apply_set(set("a", Status::Working, "second task"), 30_000, NO_CONTINUATIONS);
+        state.apply_set(set("a", Status::Working, "first task"), 0, NO_CONTINUATIONS, None);
+        state.apply_set(set("a", Status::Working, "second task"), 30_000, NO_CONTINUATIONS, None);
         let s = get(&state, "a");
         assert_eq!(s.original_prompt.as_deref(), Some("second task"));
         assert_eq!(s.working_accumulated_ms, 0, "task boundary zeroes the accumulator");
@@ -370,8 +410,8 @@ mod tests {
         // suppress the boundary so original_prompt and the timer are preserved.
         let state = AppState::new();
         let cont: Vec<String> = vec!["go".into()];
-        state.apply_set(set("a", Status::Working, "fix foo"), 0, &cont);
-        state.apply_set(set("a", Status::Working, "go"), 5_000, &cont);
+        state.apply_set(set("a", Status::Working, "fix foo"), 0, &cont, None);
+        state.apply_set(set("a", Status::Working, "go"), 5_000, &cont, None);
         let s = get(&state, "a");
         assert_eq!(s.original_prompt.as_deref(), Some("fix foo"));
         assert_eq!(s.state_entered_at, 0, "continuation suppresses segment-start reset");
@@ -381,8 +421,8 @@ mod tests {
     #[test]
     fn clear_removes_session() {
         let state = AppState::new();
-        state.apply_set(set("a", Status::Working, "task"), 0, NO_CONTINUATIONS);
-        state.apply_set(set("b", Status::Working, "other"), 0, NO_CONTINUATIONS);
+        state.apply_set(set("a", Status::Working, "task"), 0, NO_CONTINUATIONS, None);
+        state.apply_set(set("b", Status::Working, "other"), 0, NO_CONTINUATIONS, None);
         state.apply_clear("a");
         let ids: Vec<String> = state.snapshot().into_iter().map(|s| s.id).collect();
         assert_eq!(ids, vec!["b"]);
@@ -391,7 +431,7 @@ mod tests {
     #[test]
     fn model_and_tokens_are_updated_when_provided() {
         let state = AppState::new();
-        state.apply_set(set("a", Status::Working, "task"), 0, NO_CONTINUATIONS);
+        state.apply_set(set("a", Status::Working, "task"), 0, NO_CONTINUATIONS, None);
         state.apply_set(
             SetInput {
                 id: "a".into(),
@@ -400,9 +440,11 @@ mod tests {
                 source: None,
                 model: Some("claude-opus-4-7".into()),
                 input_tokens: Some(50_000),
+                dialog_entry: None,
             },
             1000,
             NO_CONTINUATIONS,
+            None,
         );
         let s = get(&state, "a");
         assert_eq!(s.model.as_deref(), Some("claude-opus-4-7"));
@@ -412,8 +454,8 @@ mod tests {
     #[test]
     fn missing_label_preserves_prior_label() {
         let state = AppState::new();
-        state.apply_set(set("a", Status::Working, "fix foo.py"), 0, NO_CONTINUATIONS);
-        state.apply_set(set_no_label("a", Status::Awaiting), 5_000, NO_CONTINUATIONS);
+        state.apply_set(set("a", Status::Working, "fix foo.py"), 0, NO_CONTINUATIONS, None);
+        state.apply_set(set_no_label("a", Status::Awaiting), 5_000, NO_CONTINUATIONS, None);
         let s = get(&state, "a");
         assert_eq!(s.label, "fix foo.py", "label must survive a set with no label field");
         assert_eq!(s.status, Status::Awaiting);
@@ -422,11 +464,11 @@ mod tests {
     #[test]
     fn task_boundary_with_missing_label_preserves_prior_original_prompt() {
         let state = AppState::new();
-        state.apply_set(set("a", Status::Working, "fix foo.py"), 0, NO_CONTINUATIONS);
-        state.apply_set(set("a", Status::Done, "done"), 10_000, NO_CONTINUATIONS);
+        state.apply_set(set("a", Status::Working, "fix foo.py"), 0, NO_CONTINUATIONS, None);
+        state.apply_set(set("a", Status::Done, "done"), 10_000, NO_CONTINUATIONS, None);
         // New task starts, but hook didn't send a prompt label (e.g. prompt
         // wasn't captured) — original_prompt should remain whatever it was.
-        state.apply_set(set_no_label("a", Status::Working), 20_000, NO_CONTINUATIONS);
+        state.apply_set(set_no_label("a", Status::Working), 20_000, NO_CONTINUATIONS, None);
         let s = get(&state, "a");
         assert_eq!(s.original_prompt.as_deref(), Some("fix foo.py"));
         assert_eq!(s.working_accumulated_ms, 0, "still resets accumulator on task boundary");
@@ -437,14 +479,14 @@ mod tests {
         let state = AppState::new();
         let cont: Vec<String> = vec!["go".into(), "continue".into(), "proceed".into()];
         // Original task
-        state.apply_set(set("a", Status::Working, "fix foo.py"), 0, &cont);
+        state.apply_set(set("a", Status::Working, "fix foo.py"), 0, &cont, None);
         // Agent finishes
-        state.apply_set(set_no_label("a", Status::Done), 60_000, &cont);
+        state.apply_set(set_no_label("a", Status::Done), 60_000, &cont, None);
         let after_done = get(&state, "a");
         assert_eq!(after_done.working_accumulated_ms, 60_000);
         assert_eq!(after_done.original_prompt.as_deref(), Some("fix foo.py"));
         // User types "go" — should be treated as a continuation, not a new task
-        state.apply_set(set("a", Status::Working, "go"), 80_000, &cont);
+        state.apply_set(set("a", Status::Working, "go"), 80_000, &cont, None);
         let resumed = get(&state, "a");
         assert_eq!(
             resumed.original_prompt.as_deref(),
@@ -462,10 +504,10 @@ mod tests {
     fn continuation_match_is_case_insensitive_and_trimmed() {
         let state = AppState::new();
         let cont: Vec<String> = vec!["go".into(), "Continue".into()];
-        state.apply_set(set("a", Status::Working, "fix foo.py"), 0, &cont);
-        state.apply_set(set_no_label("a", Status::Done), 1000, &cont);
+        state.apply_set(set("a", Status::Working, "fix foo.py"), 0, &cont, None);
+        state.apply_set(set_no_label("a", Status::Done), 1000, &cont, None);
         // Match against "Go" (uppercase) and surrounding whitespace
-        state.apply_set(set("a", Status::Working, "  Go  "), 2000, &cont);
+        state.apply_set(set("a", Status::Working, "  Go  "), 2000, &cont, None);
         let s = get(&state, "a");
         assert_eq!(s.original_prompt.as_deref(), Some("fix foo.py"));
     }
@@ -474,10 +516,10 @@ mod tests {
     fn non_continuation_prompt_after_done_still_resets() {
         let state = AppState::new();
         let cont: Vec<String> = vec!["go".into()];
-        state.apply_set(set("a", Status::Working, "fix foo.py"), 0, &cont);
-        state.apply_set(set_no_label("a", Status::Done), 1000, &cont);
+        state.apply_set(set("a", Status::Working, "fix foo.py"), 0, &cont, None);
+        state.apply_set(set_no_label("a", Status::Done), 1000, &cont, None);
         // "go ahead" is NOT in the list — exact match only
-        state.apply_set(set("a", Status::Working, "go ahead"), 2000, &cont);
+        state.apply_set(set("a", Status::Working, "go ahead"), 2000, &cont, None);
         let s = get(&state, "a");
         assert_eq!(
             s.original_prompt.as_deref(),
@@ -487,95 +529,147 @@ mod tests {
     }
 
     #[test]
-    fn task_boundary_pushes_prior_prompt_into_history_with_started_at() {
+    fn task_boundary_updates_task_started_at() {
         let state = AppState::new();
-        state.apply_set(set("a", Status::Working, "first task"), 1_000, NO_CONTINUATIONS);
-        state.apply_set(set("a", Status::Done, "done"), 30_000, NO_CONTINUATIONS);
-        state.apply_set(set("a", Status::Working, "second task"), 60_000, NO_CONTINUATIONS);
+        state.apply_set(set("a", Status::Working, "first task"), 1_000, NO_CONTINUATIONS, None);
+        state.apply_set(set("a", Status::Done, "done"), 30_000, NO_CONTINUATIONS, None);
+        state.apply_set(set("a", Status::Working, "second task"), 60_000, NO_CONTINUATIONS, None);
         let s = get(&state, "a");
         assert_eq!(s.original_prompt.as_deref(), Some("second task"));
         assert_eq!(s.task_started_at, 60_000);
-        assert_eq!(s.previous_prompts.len(), 1);
-        assert_eq!(s.previous_prompts[0].prompt, "first task");
-        assert_eq!(
-            s.previous_prompts[0].started_at, 1_000,
-            "history entry preserves the prior task's start time, not the boundary time"
-        );
     }
 
     #[test]
-    fn approval_cycle_does_not_push_history() {
+    fn approval_cycle_preserves_task_started_at() {
         let state = AppState::new();
-        state.apply_set(set("a", Status::Working, "fix foo"), 0, NO_CONTINUATIONS);
-        state.apply_set(set("a", Status::Awaiting, "permission?"), 5_000, NO_CONTINUATIONS);
-        state.apply_set(set("a", Status::Working, "yes"), 6_000, NO_CONTINUATIONS);
+        state.apply_set(set("a", Status::Working, "fix foo"), 0, NO_CONTINUATIONS, None);
+        state.apply_set(set("a", Status::Awaiting, "permission?"), 5_000, NO_CONTINUATIONS, None);
+        state.apply_set(set("a", Status::Working, "yes"), 6_000, NO_CONTINUATIONS, None);
         let s = get(&state, "a");
         assert_eq!(s.original_prompt.as_deref(), Some("fix foo"));
-        assert!(s.previous_prompts.is_empty(), "approval cycle must not push history");
         assert_eq!(s.task_started_at, 0, "task_started_at survives the approval cycle");
     }
 
     #[test]
-    fn continuation_prompt_does_not_push_history() {
+    fn continuation_prompt_preserves_task_started_at() {
         let state = AppState::new();
         let cont: Vec<String> = vec!["go".into()];
-        state.apply_set(set("a", Status::Working, "fix foo"), 0, &cont);
-        state.apply_set(set_no_label("a", Status::Done), 10_000, &cont);
-        state.apply_set(set("a", Status::Working, "go"), 20_000, &cont);
+        state.apply_set(set("a", Status::Working, "fix foo"), 0, &cont, None);
+        state.apply_set(set_no_label("a", Status::Done), 10_000, &cont, None);
+        state.apply_set(set("a", Status::Working, "go"), 20_000, &cont, None);
         let s = get(&state, "a");
         assert_eq!(s.original_prompt.as_deref(), Some("fix foo"));
-        assert!(s.previous_prompts.is_empty(), "continuation must not push history");
         assert_eq!(s.task_started_at, 0, "continuation preserves task_started_at");
-    }
-
-    #[test]
-    fn history_is_unbounded_and_most_recent_first() {
-        let state = AppState::new();
-        state.apply_set(set("a", Status::Working, "t1"), 1, NO_CONTINUATIONS);
-        for i in 2..=7u64 {
-            state.apply_set(set("a", Status::Done, "d"), (i * 1_000 - 500) as i64, NO_CONTINUATIONS);
-            state.apply_set(set("a", Status::Working, &format!("t{i}")), (i * 1_000) as i64, NO_CONTINUATIONS);
-        }
-        let s = get(&state, "a");
-        assert_eq!(s.original_prompt.as_deref(), Some("t7"));
-        assert_eq!(s.task_started_at, 7_000);
-        let prompts: Vec<&str> = s.previous_prompts.iter().map(|e| e.prompt.as_str()).collect();
-        assert_eq!(prompts, vec!["t6", "t5", "t4", "t3", "t2", "t1"], "all prior prompts retained, most-recent-first");
-        assert_eq!(s.previous_prompts[0].started_at, 6_000);
-        assert_eq!(s.previous_prompts.last().unwrap().started_at, 1);
     }
 
     #[test]
     fn first_working_prompt_sets_task_started_at() {
         let state = AppState::new();
-        state.apply_set(set("a", Status::Working, "fix foo"), 1_000, NO_CONTINUATIONS);
+        state.apply_set(set("a", Status::Working, "fix foo"), 1_000, NO_CONTINUATIONS, None);
         let s = get(&state, "a");
         assert_eq!(s.task_started_at, 1_000);
-        assert!(s.previous_prompts.is_empty());
     }
 
     #[test]
-    fn idle_then_working_first_task_anchors_task_started_at_without_history_push() {
+    fn boundary_with_missing_label_preserves_task_started_at() {
         let state = AppState::new();
-        state.apply_set(set("a", Status::Idle, ""), 0, NO_CONTINUATIONS);
-        state.apply_set(set("a", Status::Working, "first"), 5_000, NO_CONTINUATIONS);
-        let s = get(&state, "a");
-        assert_eq!(s.original_prompt.as_deref(), Some("first"));
-        assert_eq!(s.task_started_at, 5_000);
-        assert!(s.previous_prompts.is_empty(), "no prior prompt to push");
-    }
-
-    #[test]
-    fn boundary_with_missing_label_preserves_history_and_task_started_at() {
-        let state = AppState::new();
-        state.apply_set(set("a", Status::Working, "first"), 1_000, NO_CONTINUATIONS);
-        state.apply_set(set("a", Status::Done, "done"), 5_000, NO_CONTINUATIONS);
-        // Task boundary but no new label — original_prompt is preserved, no push.
-        state.apply_set(set_no_label("a", Status::Working), 10_000, NO_CONTINUATIONS);
+        state.apply_set(set("a", Status::Working, "first"), 1_000, NO_CONTINUATIONS, None);
+        state.apply_set(set("a", Status::Done, "done"), 5_000, NO_CONTINUATIONS, None);
+        state.apply_set(set_no_label("a", Status::Working), 10_000, NO_CONTINUATIONS, None);
         let s = get(&state, "a");
         assert_eq!(s.original_prompt.as_deref(), Some("first"));
         assert_eq!(s.task_started_at, 1_000, "preserved when prompt is preserved");
-        assert!(s.previous_prompts.is_empty());
+    }
+
+    // ----- dialog entry creation -----
+
+    fn set_with_dialog(id: &str, status: Status, label: &str) -> SetInput {
+        SetInput {
+            id: id.to_string(),
+            status,
+            label: Some(label.to_string()),
+            source: None,
+            model: None,
+            input_tokens: None,
+            dialog_entry: Some(PendingDialogEntry {
+                role: DialogRole::User,
+                text: label.to_string(),
+            }),
+        }
+    }
+
+    fn stop_with_dialog(id: &str, status: Status, agent_text: &str) -> SetInput {
+        SetInput {
+            id: id.to_string(),
+            status,
+            label: None,
+            source: None,
+            model: None,
+            input_tokens: None,
+            dialog_entry: Some(PendingDialogEntry {
+                role: DialogRole::Assistant,
+                text: agent_text.to_string(),
+            }),
+        }
+    }
+
+    #[test]
+    fn dialog_entry_pushed_for_user_prompt() {
+        let state = AppState::new();
+        state.apply_set(set_with_dialog("a", Status::Working, "fix foo"), 1_000, NO_CONTINUATIONS, None);
+        let s = get(&state, "a");
+        assert_eq!(s.dialog.len(), 1);
+        assert_eq!(s.dialog[0].role, DialogRole::User);
+        assert_eq!(s.dialog[0].text, "fix foo");
+        assert_eq!(s.dialog[0].timestamp, 1_000);
+        assert_eq!(s.dialog[0].status, Status::Working);
+    }
+
+    #[test]
+    fn dialog_entry_pushed_for_assistant_stop() {
+        let state = AppState::new();
+        state.apply_set(set("a", Status::Working, "fix foo"), 0, NO_CONTINUATIONS, None);
+        state.apply_set(stop_with_dialog("a", Status::Done, "All fixed."), 5_000, NO_CONTINUATIONS, None);
+        let s = get(&state, "a");
+        assert_eq!(s.dialog.len(), 1);
+        assert_eq!(s.dialog[0].role, DialogRole::Assistant);
+        assert_eq!(s.dialog[0].text, "All fixed.");
+        assert_eq!(s.dialog[0].status, Status::Done);
+    }
+
+    #[test]
+    fn dialog_not_pushed_without_pending_entry() {
+        let state = AppState::new();
+        state.apply_set(set("a", Status::Working, "fix foo"), 0, NO_CONTINUATIONS, None);
+        let s = get(&state, "a");
+        assert!(s.dialog.is_empty());
+    }
+
+    #[test]
+    fn dialog_restored_on_new_session() {
+        let state = AppState::new();
+        let restored = PersistedSession {
+            dialog: vec![
+                DialogEntry { role: DialogRole::User, text: "old task".into(), timestamp: 100, status: Status::Working },
+                DialogEntry { role: DialogRole::Assistant, text: "Done.".into(), timestamp: 200, status: Status::Done },
+            ],
+            original_prompt: Some("old task".into()),
+            task_started_at: 100,
+        };
+        state.apply_set(set("a", Status::Done, "done"), 1_000, NO_CONTINUATIONS, Some(restored));
+        let s = get(&state, "a");
+        assert_eq!(s.dialog.len(), 2);
+        assert_eq!(s.original_prompt.as_deref(), Some("old task"));
+        assert_eq!(s.task_started_at, 100);
+    }
+
+    #[test]
+    fn apply_set_returns_true_when_dialog_changes() {
+        let state = AppState::new();
+        let changed = state.apply_set(set_with_dialog("a", Status::Working, "fix foo"), 0, NO_CONTINUATIONS, None);
+        assert!(changed);
+        let not_changed = state.apply_set(set("a", Status::Awaiting, "question?"), 1_000, NO_CONTINUATIONS, None);
+        assert!(!not_changed);
     }
 
     #[test]
@@ -585,9 +679,9 @@ mod tests {
         // Existing approval cycle: awaiting → working with label "go".
         // This isn't a task boundary regardless of the continuation list,
         // so the rule is a no-op here — original_prompt is still pinned.
-        state.apply_set(set("a", Status::Working, "fix foo.py"), 0, &cont);
-        state.apply_set(set("a", Status::Awaiting, "permission?"), 1000, &cont);
-        state.apply_set(set("a", Status::Working, "go"), 2000, &cont);
+        state.apply_set(set("a", Status::Working, "fix foo.py"), 0, &cont, None);
+        state.apply_set(set("a", Status::Awaiting, "permission?"), 1000, &cont, None);
+        state.apply_set(set("a", Status::Working, "go"), 2000, &cont, None);
         let s = get(&state, "a");
         assert_eq!(s.original_prompt.as_deref(), Some("fix foo.py"));
     }

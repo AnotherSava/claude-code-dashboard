@@ -8,6 +8,7 @@ mod label_policy;
 mod log_watcher;
 mod logging;
 mod notifications;
+mod prompt_history;
 mod state;
 mod telegram;
 mod tray;
@@ -59,6 +60,10 @@ pub fn run() {
             app.manage(log_guard);
             app.manage(frontend_logger);
             tracing::info!(version = env!("CARGO_PKG_VERSION"), "widget starting");
+
+            let history_store =
+                prompt_history::PromptHistoryStore::new(app_data.join("prompt_history.json"));
+            app.manage(history_store);
 
             let config_path = app_data.join("config.json");
 
@@ -175,9 +180,11 @@ fn seed_dev_sessions(app: &tauri::AppHandle) {
             source: Some("claude-code".into()),
             model: Some("claude-opus-4-7".into()),
             input_tokens: Some(75_000),
+            dialog_entry: None,
         },
         now - 3 * min,
         &[],
+        None,
     );
 
     state.apply_set(
@@ -188,9 +195,11 @@ fn seed_dev_sessions(app: &tauri::AppHandle) {
             source: Some("claude-code".into()),
             model: Some("claude-sonnet-4-6".into()),
             input_tokens: Some(152_000),
+            dialog_entry: None,
         },
         now - 4 * min - 12 * s,
         &[],
+        None,
     );
     state.apply_set(
         SetInput {
@@ -200,9 +209,11 @@ fn seed_dev_sessions(app: &tauri::AppHandle) {
             source: None,
             model: None,
             input_tokens: Some(152_000),
+            dialog_entry: None,
         },
         now - 45 * s,
         &[],
+        None,
     );
 
     emit_sessions_updated(app);

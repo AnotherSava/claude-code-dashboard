@@ -12,6 +12,7 @@ use crate::adapters::{self, AdapterOutput};
 use crate::commands::{emit_sessions_updated, now_ms};
 use crate::config::ConfigState;
 use crate::log_watcher::WatcherRegistry;
+use crate::prompt_history::PromptHistoryStore;
 use crate::state::AppState;
 
 pub async fn run(app: AppHandle, port: u16) {
@@ -80,7 +81,19 @@ async fn post_event(
                 "event -> set"
             );
             let chat_id = input.id.clone();
-            state.apply_set(input, now_ms(), &cfg.continuation_prompts);
+            let history = app.try_state::<PromptHistoryStore>();
+            let restored = history.as_ref().and_then(|h| h.get(&chat_id));
+            let dialog_changed = state.apply_set(input, now_ms(), &cfg.continuation_prompts, restored);
+            if dialog_changed {
+                if let Some(ref h) = history {
+                    let sessions = state.sessions.lock().unwrap();
+                    if let Some(s) = sessions.iter().find(|s| s.id == chat_id) {
+                        h.save_session(s);
+                    }
+                    drop(sessions);
+                    h.save_to_disk();
+                }
+            }
             if let Some(tp) = transcript_path {
                 if let Some(reg) = app.try_state::<WatcherRegistry>() {
                     reg.start(app.clone(), chat_id, tp);
