@@ -31,6 +31,8 @@ export interface ContextBarThreshold {
 
 export type AutoResize = 'none' | 'up' | 'down'
 
+export type HistoryFontSize = 'smallest' | 'small' | 'regular' | 'large' | 'largest'
+
 export interface Config {
   server_port: number
   always_on_top: boolean
@@ -42,6 +44,7 @@ export interface Config {
   usage_limits_poll_interval_seconds: number
   limit_bar_segments: number
   auto_resize: AutoResize
+  history_font_size: HistoryFontSize
 }
 
 export type UsageStatus = 'ok' | 'unavailable' | 'auth_expired' | 'network_error'

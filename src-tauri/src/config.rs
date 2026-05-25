@@ -34,6 +34,7 @@ pub struct Config {
     /// bottom edge stays put and the window grows upward; Down keeps the top
     /// edge fixed; None leaves the window manually sized.
     pub auto_resize: AutoResize,
+    pub history_font_size: HistoryFontSize,
     /// Read by `state::apply_set`: prompts that suppress the `done`/`idle` →
     /// `working` task boundary. When the user types one of these as a fresh
     /// prompt after the agent has finished, treat it as a continuation of
@@ -50,6 +51,17 @@ pub enum AutoResize {
     None,
     Up,
     Down,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoryFontSize {
+    Smallest,
+    Small,
+    #[default]
+    Regular,
+    Large,
+    Largest,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -127,6 +139,7 @@ impl Default for Config {
             usage_limits_poll_interval_seconds: 600,
             limit_bar_segments: 16,
             auto_resize: AutoResize::None,
+            history_font_size: HistoryFontSize::Regular,
             continuation_prompts: vec!["go".into(), "continue".into(), "proceed".into()],
         }
     }

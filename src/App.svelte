@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount, tick } from 'svelte'
   import SessionList from './lib/components/SessionList.svelte'
+  import HistoryApp from './HistoryApp.svelte'
   import LimitBar from './lib/components/LimitBar.svelte'
   import {
     applyAutoResize,
@@ -8,6 +9,7 @@
     getConfig,
     getSessions,
     getUsageLimits,
+    getWindowLabel,
     hideWindow,
     onConfigUpdated,
     onSessionsUpdated,
@@ -17,6 +19,7 @@
   } from './lib/api'
   import type { AgentSession, Config, UsageLimits } from './lib/types'
 
+  let historyMode = $state(false)
   let sessions = $state<AgentSession[]>([])
   let config = $state<Config | null>(null)
   let usage = $state<UsageLimits | null>(null)
@@ -90,6 +93,11 @@
 
     ;(async () => {
       try {
+        const label = await getWindowLabel()
+        if (label === 'history') {
+          historyMode = true
+          return
+        }
         config = await getConfig()
         sessions = await getSessions()
         usage = await getUsageLimits()
@@ -117,6 +125,7 @@
         // protects Anthropic from thrash on real reloads.
         refreshUsageLimits().catch((err) => console.error('mount refresh failed', err))
       } catch (err) {
+        frontendLog('error', 'init_failed', { error: String(err) }).catch(() => {})
         console.error('failed to initialize', err)
       } finally {
         await tick()
@@ -127,10 +136,12 @@
         await new Promise<void>((resolve) =>
           requestAnimationFrame(() => requestAnimationFrame(() => resolve()))
         )
-        try {
-          await showWindow()
-        } catch (err) {
-          console.error('failed to reveal window', err)
+        if (!historyMode) {
+          try {
+            await showWindow()
+          } catch (err) {
+            console.error('failed to reveal window', err)
+          }
         }
       }
     })()
@@ -170,6 +181,9 @@
   }
 </script>
 
+{#if historyMode}
+  <HistoryApp />
+{:else}
 <div class="widget" bind:this={widgetEl}>
   <header data-tauri-drag-region>
     <span class="title" data-tauri-drag-region>AI AGENTS</span>
@@ -197,6 +211,7 @@
     <SessionList {sessions} {config} {now} />
   {/if}
 </div>
+{/if}
 
 <style>
   :global(html, body) {

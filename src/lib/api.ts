@@ -50,6 +50,26 @@ export function removeSession(id: string): Promise<void> {
   return invoke('remove_session', { id })
 }
 
+export function openHistory(id: string): Promise<void> {
+  return invoke('open_history', { id })
+}
+
+export function closeWindow(): Promise<void> {
+  return invoke('close_window')
+}
+
+export function getWindowLabel(): Promise<string> {
+  return invoke<string>('get_window_label')
+}
+
+export function setHistoryFontSize(size: string): Promise<void> {
+  return invoke('set_history_font_size', { size })
+}
+
+export function hideHistory(): Promise<void> {
+  return invoke('hide_history')
+}
+
 export function onSessionsUpdated(
   handler: (sessions: AgentSession[]) => void,
 ): Promise<UnlistenFn> {

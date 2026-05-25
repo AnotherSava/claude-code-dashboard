@@ -23,6 +23,15 @@
         "transparent": false,
         "visible": false,
         "backgroundColor": "#1c1c1e"
+      },
+      {
+        "label": "history",
+        "title": "History",
+        "width": 450,
+        "height": 400,
+        "decorations": true,
+        "resizable": true,
+        "visible": false
       }
     ],
     "security": {

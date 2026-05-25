@@ -95,6 +95,62 @@ pub fn remove_session(id: String, app: AppHandle) {
     emit_sessions_updated(&app);
 }
 
+#[tauri::command]
+pub fn open_history(id: String, app: AppHandle) -> Result<(), String> {
+    if let Some(target) = app.try_state::<HistoryTarget>() {
+        *target.0.lock().unwrap() = Some(id.clone());
+    }
+    if let Some(window) = app.get_webview_window("history") {
+        let _ = window.set_title(&id);
+        let _ = window.emit("history_target", &id);
+        window.show().map_err(|e| e.to_string())?;
+        window.set_focus().map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+pub struct HistoryTarget(pub std::sync::Mutex<Option<String>>);
+
+#[tauri::command]
+pub fn get_history_target(state: State<HistoryTarget>) -> Option<String> {
+    state.0.lock().unwrap().clone()
+}
+
+#[tauri::command]
+pub fn get_window_label(window: WebviewWindow) -> String {
+    window.label().to_string()
+}
+
+#[tauri::command]
+pub fn close_window(window: WebviewWindow) -> Result<(), String> {
+    use tauri::Emitter;
+    window.hide().map_err(|e| e.to_string())?;
+    if window.label() == "history" {
+        let _ = window.emit("history_hidden", ());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn hide_history(app: AppHandle) -> Result<(), String> {
+    use tauri::Emitter;
+    if let Some(window) = app.get_webview_window("history") {
+        window.hide().map_err(|e| e.to_string())?;
+        let _ = window.emit("history_hidden", ());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn set_history_font_size(size: crate::config::HistoryFontSize, app: AppHandle) {
+    if let Some(state) = app.try_state::<crate::config::ConfigState>() {
+        state.with_mut(|c| c.history_font_size = size);
+        let _ = state.save_to_disk();
+    }
+    crate::tray::sync_history_font_checks(&app, size);
+    emit_config_updated(&app);
+}
+
 pub fn now_ms() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()

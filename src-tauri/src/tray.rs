@@ -7,7 +7,7 @@ use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
 
 use crate::commands::emit_config_updated;
-use crate::config::{AutoResize, ConfigState};
+use crate::config::{AutoResize, ConfigState, HistoryFontSize};
 
 const MENU_SHOW_HIDE: &str = "show_hide";
 const MENU_ALWAYS_ON_TOP: &str = "always_on_top";
@@ -16,6 +16,11 @@ const MENU_AUTOSTART: &str = "autostart";
 const MENU_AUTO_RESIZE_NONE: &str = "auto_resize_none";
 const MENU_AUTO_RESIZE_UP: &str = "auto_resize_up";
 const MENU_AUTO_RESIZE_DOWN: &str = "auto_resize_down";
+const MENU_HIST_FONT_SMALLEST: &str = "hist_font_smallest";
+const MENU_HIST_FONT_SMALL: &str = "hist_font_small";
+const MENU_HIST_FONT_REGULAR: &str = "hist_font_regular";
+const MENU_HIST_FONT_LARGE: &str = "hist_font_large";
+const MENU_HIST_FONT_LARGEST: &str = "hist_font_largest";
 const MENU_OPEN_DATA_DIR: &str = "open_data_dir";
 const MENU_ABOUT: &str = "about";
 const MENU_QUIT: &str = "quit";
@@ -29,6 +34,11 @@ pub struct TrayHandles {
     pub auto_resize_none: CheckMenuItem<Wry>,
     pub auto_resize_up: CheckMenuItem<Wry>,
     pub auto_resize_down: CheckMenuItem<Wry>,
+    pub hist_font_smallest: CheckMenuItem<Wry>,
+    pub hist_font_small: CheckMenuItem<Wry>,
+    pub hist_font_regular: CheckMenuItem<Wry>,
+    pub hist_font_large: CheckMenuItem<Wry>,
+    pub hist_font_largest: CheckMenuItem<Wry>,
 }
 
 pub fn setup(app: &AppHandle) -> tauri::Result<()> {
@@ -70,6 +80,19 @@ pub fn setup(app: &AppHandle) -> tauri::Result<()> {
         .items(&[&auto_resize_none, &auto_resize_up, &auto_resize_down])
         .build()?;
 
+    let hist_font_initial = app
+        .try_state::<ConfigState>()
+        .map(|s| s.snapshot().history_font_size)
+        .unwrap_or_default();
+    let hist_font_smallest = CheckMenuItem::with_id(app, MENU_HIST_FONT_SMALLEST, "Smallest", true, hist_font_initial == HistoryFontSize::Smallest, None::<&str>)?;
+    let hist_font_small = CheckMenuItem::with_id(app, MENU_HIST_FONT_SMALL, "Small", true, hist_font_initial == HistoryFontSize::Small, None::<&str>)?;
+    let hist_font_regular = CheckMenuItem::with_id(app, MENU_HIST_FONT_REGULAR, "Regular", true, hist_font_initial == HistoryFontSize::Regular, None::<&str>)?;
+    let hist_font_large = CheckMenuItem::with_id(app, MENU_HIST_FONT_LARGE, "Large", true, hist_font_initial == HistoryFontSize::Large, None::<&str>)?;
+    let hist_font_largest = CheckMenuItem::with_id(app, MENU_HIST_FONT_LARGEST, "Largest", true, hist_font_initial == HistoryFontSize::Largest, None::<&str>)?;
+    let hist_font_submenu = SubmenuBuilder::new(app, "History font size")
+        .items(&[&hist_font_smallest, &hist_font_small, &hist_font_regular, &hist_font_large, &hist_font_largest])
+        .build()?;
+
     let open_data_dir = MenuItem::with_id(app, MENU_OPEN_DATA_DIR, "Open config/logs location", true, None::<&str>)?;
     let about = MenuItem::with_id(app, MENU_ABOUT, "About", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, MENU_QUIT, "Quit", true, None::<&str>)?;
@@ -83,6 +106,7 @@ pub fn setup(app: &AppHandle) -> tauri::Result<()> {
             &save_position,
             &autostart,
             &auto_resize_submenu,
+            &hist_font_submenu,
             &PredefinedMenuItem::separator(app)?,
             &open_data_dir,
             &PredefinedMenuItem::separator(app)?,
@@ -98,6 +122,11 @@ pub fn setup(app: &AppHandle) -> tauri::Result<()> {
         auto_resize_none: auto_resize_none.clone(),
         auto_resize_up: auto_resize_up.clone(),
         auto_resize_down: auto_resize_down.clone(),
+        hist_font_smallest: hist_font_smallest.clone(),
+        hist_font_small: hist_font_small.clone(),
+        hist_font_regular: hist_font_regular.clone(),
+        hist_font_large: hist_font_large.clone(),
+        hist_font_largest: hist_font_largest.clone(),
     });
 
     let icon = app
@@ -137,6 +166,11 @@ fn handle_menu_event(app: &AppHandle, id: &str) {
         MENU_AUTO_RESIZE_NONE => select_auto_resize_mode(app, AutoResize::None),
         MENU_AUTO_RESIZE_UP => select_auto_resize_mode(app, AutoResize::Up),
         MENU_AUTO_RESIZE_DOWN => select_auto_resize_mode(app, AutoResize::Down),
+        MENU_HIST_FONT_SMALLEST => select_history_font_size(app, HistoryFontSize::Smallest),
+        MENU_HIST_FONT_SMALL => select_history_font_size(app, HistoryFontSize::Small),
+        MENU_HIST_FONT_REGULAR => select_history_font_size(app, HistoryFontSize::Regular),
+        MENU_HIST_FONT_LARGE => select_history_font_size(app, HistoryFontSize::Large),
+        MENU_HIST_FONT_LARGEST => select_history_font_size(app, HistoryFontSize::Largest),
         MENU_OPEN_DATA_DIR => open_data_dir(app),
         MENU_ABOUT => show_about(app),
         MENU_QUIT => {
@@ -224,6 +258,27 @@ fn sync_auto_resize_checks(app: &AppHandle, mode: AutoResize) {
     let _ = handles.auto_resize_none.set_checked(mode == AutoResize::None);
     let _ = handles.auto_resize_up.set_checked(mode == AutoResize::Up);
     let _ = handles.auto_resize_down.set_checked(mode == AutoResize::Down);
+}
+
+fn select_history_font_size(app: &AppHandle, size: HistoryFontSize) {
+    let Some(state) = app.try_state::<ConfigState>() else { return };
+    if state.snapshot().history_font_size == size {
+        sync_history_font_checks(app, size);
+        return;
+    }
+    state.with_mut(|c| c.history_font_size = size);
+    let _ = state.save_to_disk();
+    sync_history_font_checks(app, size);
+    emit_config_updated(app);
+}
+
+pub fn sync_history_font_checks(app: &AppHandle, size: HistoryFontSize) {
+    let Some(handles) = app.try_state::<TrayHandles>() else { return };
+    let _ = handles.hist_font_smallest.set_checked(size == HistoryFontSize::Smallest);
+    let _ = handles.hist_font_small.set_checked(size == HistoryFontSize::Small);
+    let _ = handles.hist_font_regular.set_checked(size == HistoryFontSize::Regular);
+    let _ = handles.hist_font_large.set_checked(size == HistoryFontSize::Large);
+    let _ = handles.hist_font_largest.set_checked(size == HistoryFontSize::Largest);
 }
 
 fn toggle_autostart(app: &AppHandle) {

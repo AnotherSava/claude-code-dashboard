@@ -30,6 +30,7 @@ pub fn run() {
         .manage(AppState::new())
         .manage(WatcherRegistry::new())
         .manage(UsageLimitsState::new())
+        .manage(commands::HistoryTarget(std::sync::Mutex::new(None)))
         .invoke_handler(tauri::generate_handler![
             commands::get_sessions,
             commands::get_config,
@@ -42,6 +43,12 @@ pub fn run() {
             commands::toggle_window,
             commands::quit_app,
             commands::remove_session,
+            commands::open_history,
+            commands::get_window_label,
+            commands::get_history_target,
+            commands::close_window,
+            commands::hide_history,
+            commands::set_history_font_size,
             commands::test_telegram_notification,
         ])
         .setup(|app| {
@@ -130,11 +137,17 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(|window, event| {
-            match event {
-                tauri::WindowEvent::CloseRequested { .. } => {
-                    save_window_position_if_enabled(window);
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                match window.label() {
+                    "main" => save_window_position_if_enabled(window),
+                    "history" => {
+                        use tauri::Emitter;
+                        api.prevent_close();
+                        let _ = window.hide();
+                        let _ = window.emit("history_hidden", ());
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
         })
         .run(tauri::generate_context!())

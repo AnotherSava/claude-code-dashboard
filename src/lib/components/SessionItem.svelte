@@ -1,3 +1,18 @@
+<script module lang="ts">
+  import { writable } from 'svelte/store'
+  import { listen } from '@tauri-apps/api/event'
+
+  const historyOpen = writable(false)
+  const historyTarget = writable<string | null>(null)
+  const historyClosedAt = writable(0)
+
+  listen('history_hidden', () => {
+    historyOpen.set(false)
+    historyTarget.set(null)
+    historyClosedAt.set(Date.now())
+  })
+</script>
+
 <script lang="ts">
   import type { AgentSession, Config } from '../types'
   import {
@@ -8,7 +23,7 @@
     stateLabel,
     tokenColor,
   } from '../types'
-  import { removeSession } from '../api'
+  import { hideHistory, openHistory, removeSession } from '../api'
 
   interface Props {
     session: AgentSession
@@ -55,6 +70,23 @@
     return lines.join('\n')
   })
 
+  const effectiveTitle = $derived.by(() => {
+    if ($historyOpen) return ''
+    if ($historyClosedAt > 0 && now - $historyClosedAt < 2000) return ''
+    return titleText
+  })
+
+  function onLabelClick() {
+    if ($historyOpen && $historyTarget === session.id) {
+      hideHistory().catch(() => {})
+      return
+    }
+    historyOpen.set(true)
+    historyTarget.set(session.id)
+    historyClosedAt.set(0)
+    openHistory(session.id).catch((err) => console.error('open_history failed', err))
+  }
+
   function onRemove(e: MouseEvent) {
     e.stopPropagation()
     removeSession(session.id).catch((err) => console.error('remove failed', err))
@@ -73,7 +105,7 @@
       <span class="tokens" style:color={tokColor}>{#if tokensText}{tokensText}<span class="k">k</span>{/if}</span>
     </div>
     {#if label}
-      <div class="label" title={titleText}>{label}</div>
+      <div class="label" title={effectiveTitle} onclick={onLabelClick} onkeydown={(e) => { if (e.key === 'Enter') onLabelClick() }} role="button" tabindex="-1">{label}</div>
     {/if}
   </div>
 </div>
@@ -213,5 +245,10 @@
     overflow: hidden;
     text-overflow: ellipsis;
     line-height: 1.3;
+    cursor: pointer;
+    transition: color 120ms ease;
+  }
+  .label:hover {
+    color: #b0b0b4;
   }
 </style>
