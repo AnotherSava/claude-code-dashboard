@@ -13,6 +13,51 @@
   // markdown `---` / `___` / `***` / `===`, and box-drawing horizontals like
   // `━━━` / `───` / `═══`. Three or more identical chars on a line.
   const SEPARATOR_RE = /^[-_*=━─═]{3,}$/
+  const BORDER_RE = /^[┌┐└┘├┤┬┴┼─━═╔╗╚╝╠╣╦╩╬║\s]+$/
+
+  type ParsedTable = { headers: string[]; rows: string[][] }
+  type Segment = { kind: 'text' | 'code' | 'table'; lines: string[]; table?: ParsedTable }
+
+  function parseBoxTable(lines: string[]): ParsedTable | null {
+    const dataLines: string[] = []
+    let hasBorder = false
+    for (const line of lines) {
+      const t = line.trim()
+      if (!t) continue
+      if (t.startsWith('│')) dataLines.push(t)
+      else if (BORDER_RE.test(t)) hasBorder = true
+      else return null
+    }
+    if (!hasBorder || dataLines.length < 2) return null
+    const parse = (l: string) => l.split('│').slice(1, -1).map((c) => c.trim())
+    return { headers: parse(dataLines[0]), rows: dataLines.slice(1).map(parse) }
+  }
+
+  function segmentLines(lines: string[]): Segment[] {
+    const segments: Segment[] = []
+    let inCode = false
+    let codeLines: string[] = []
+    for (const line of lines) {
+      if (line.trimEnd().startsWith('```')) {
+        if (inCode) {
+          const tbl = parseBoxTable(codeLines)
+          if (tbl) segments.push({ kind: 'table', lines: codeLines, table: tbl })
+          else segments.push({ kind: 'code', lines: codeLines })
+          codeLines = []
+        }
+        inCode = !inCode
+        continue
+      }
+      if (inCode) {
+        codeLines.push(line)
+      } else {
+        const last = segments[segments.length - 1]
+        if (last && last.kind === 'text') last.lines.push(line)
+        else segments.push({ kind: 'text', lines: [line] })
+      }
+    }
+    return segments
+  }
 
   function collapseRange(lines: string[]): [number, number] | null {
     const hrs: number[] = []
@@ -141,14 +186,23 @@
         {:else}
           {@const lines = entry.text.split('\n')}
           {@const range = expanded.has(i) ? null : collapseRange(lines)}
+          {@const displayLines = range ? [...lines.slice(0, range[0]), '\x00collapse', ...lines.slice(range[1] + 1)] : lines}
+          {@const segments = segmentLines(displayLines)}
           <div class="entry" class:sticky={isTaskBoundary(dialog, i)} class:assistant={entry.role === 'assistant'}>
             <span class="ts">{formatClock(entry.timestamp)}</span>
             <span class="text">
-              {#if range}
-                {#each lines.slice(0, range[0]) as line, j}{#if j > 0}<br />{/if}{line}{/each}<br /><button type="button" class="ellipsis" onclick={() => expandEntry(i)} title="Expand {range[1] - range[0] + 1} hidden lines">&lt;...&gt;</button><br />{#each lines.slice(range[1] + 1) as line, j}{#if j > 0}<br />{/if}{line}{/each}
-              {:else}
-                {#each lines as line, j}{#if j > 0}<br />{/if}{line}{/each}
-              {/if}
+              {#each segments as seg}
+                {#if seg.kind === 'table' && seg.table}
+                  <table class="box-table">
+                    <thead><tr>{#each seg.table.headers as h}<th>{h}</th>{/each}</tr></thead>
+                    <tbody>{#each seg.table.rows as row}<tr>{#each row as cell}<td>{cell}</td>{/each}</tr>{/each}</tbody>
+                  </table>
+                {:else if seg.kind === 'code'}
+                  <pre class="code">{seg.lines.join('\n')}</pre>
+                {:else}
+                  {#each seg.lines as line, j}{#if line === '\x00collapse'}<button type="button" class="ellipsis" onclick={() => expandEntry(i)} title="Expand {range ? range[1] - range[0] + 1 : 0} hidden lines">&lt;...&gt;</button>{:else}{#if j > 0}<br />{/if}{line}{/if}{/each}
+                {/if}
+              {/each}
             </span>
           </div>
         {/if}
@@ -195,6 +249,31 @@
   }
   .sticky {
     background: rgba(255, 255, 255, 0.04);
+  }
+  .code {
+    font-family: ui-monospace, Consolas, monospace;
+    font-style: normal;
+    color: inherit;
+    margin: 0;
+    white-space: pre;
+    overflow-x: auto;
+  }
+  .box-table {
+    border-collapse: collapse;
+    font-style: normal;
+    color: inherit;
+    margin: 2px 0;
+    font-size: 0.9em;
+  }
+  .box-table th, .box-table td {
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    padding: 2px 6px;
+    text-align: left;
+    white-space: nowrap;
+  }
+  .box-table th {
+    opacity: 0.7;
+    font-weight: 500;
   }
   .assistant .text {
     font-style: italic;
