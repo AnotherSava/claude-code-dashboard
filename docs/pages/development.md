@@ -11,10 +11,11 @@ title: Development
 
 ### Prerequisites
 
-- **Rust** 1.70+ (`rustup default stable-msvc` on Windows).
-- **Microsoft C++ Build Tools** (Visual Studio Installer → "Desktop development with C++").
-- **Node.js** 20+ and **npm** 10+.
-- **WebView2** (preinstalled on Windows 10 1803+ — the installer fetches it if missing on older machines).
+- **Rust** 1.70+ (`rustup default stable-msvc` on Windows; `rustup default stable` on macOS).
+- **Node.js** 20+ and **npm** 10+ (CI uses Node 24).
+- **Platform toolchain**:
+  - **Windows**: Microsoft C++ Build Tools (Visual Studio Installer → "Desktop development with C++") and WebView2 (preinstalled on Windows 10 1803+; the installer fetches it if missing on older machines).
+  - **macOS**: Xcode Command Line Tools (`xcode-select --install`). WKWebView ships with the OS — nothing to install.
 
 ### Install
 
@@ -35,14 +36,14 @@ Compiles the Rust backend, starts Vite on `localhost:1420`, and launches the nat
 ## Commands
 
 - `npm run tauri dev` — dev build with HMR.
-- `npm run tauri build` — release build; NSIS installer lands in `src-tauri/target/release/bundle/nsis/`.
+- `npm run tauri build` — release build; bundles land in `src-tauri/target/release/bundle/` (`nsis/` on Windows, `dmg/` on macOS).
 - `npm run check` — TypeScript + Svelte check (no build).
 - `npm run tauri icon <path/to/1024.png>` — regenerate the Windows / Linux / macOS icon set from a source PNG.
 - `cargo test --manifest-path src-tauri/Cargo.toml --lib` — Rust unit tests (state machine, transcript parser, merge policy, Claude adapter, label policy).
 
 ## Architecture
 
-The app pairs a Rust backend (Tauri v2) with a Svelte 5 + Vite frontend rendered in a native WebView2 window. The Rust side owns all state and external I/O; the frontend is a pure view that subscribes to Tauri events and issues invoke-style commands for window control. External tools integrate via an embedded `axum` HTTP server on `127.0.0.1:9077`, bypassing the frontend entirely.
+The app pairs a Rust backend (Tauri v2) with a Svelte 5 + Vite frontend rendered in the system webview (WebView2 on Windows, WKWebView on macOS). The Rust side owns all state and external I/O; the frontend is a pure view that subscribes to Tauri events and issues invoke-style commands for window control. External tools integrate via an embedded `axum` HTTP server on `127.0.0.1:9077`, bypassing the frontend entirely.
 
 The source-of-truth `AgentSession` state lives behind a `Mutex` in Rust. Three paths mutate it — the HTTP server, the per-session transcript watcher, and Tauri commands invoked from the Svelte UI — and every mutation funnels through `state::apply_set` or `state::apply_clear` so the sticky-label state machine is enforced in exactly one place.
 
@@ -65,7 +66,7 @@ claude-code-dashboard/
 │           └── LimitBar.svelte          header 5h / 7d usage bar (segmented fill, percent + timer caps)
 ├── src-tauri/
 │   ├── Cargo.toml                       Rust deps: tauri, axum, notify, tracing, serde, reqwest, chrono, open
-│   ├── tauri.conf.json                  NSIS target, WebView2 bootstrapper, window config
+│   ├── tauri.conf.json                  NSIS + DMG bundle targets, WebView2 bootstrapper, window config
 │   ├── capabilities/default.json        capability-based permissions for the main window
 │   └── src/
 │       ├── main.rs                      entry; calls lib::run()
@@ -89,7 +90,9 @@ claude-code-dashboard/
 ├── integrations/
 │   └── claude_hook.py                   thin Claude Code hook — forwards stdin payload to /api/event
 ├── docs/                                this site
-└── .github/workflows/release.yml        CI: build NSIS installer on tag push
+└── .github/workflows/
+    ├── build.yml                        CI: check + cargo test + frontend build on push/PR (Windows + macOS matrix)
+    └── release.yml                      CI: build NSIS + DMG installers on tag push (Windows + macOS matrix)
 ```
 
 ### Where state lives at runtime
@@ -115,4 +118,4 @@ Rust tests live inline in `#[cfg(test)]` modules next to the code they cover:
 - `log_watcher::tests` — the transcript parser (`infer_state`, `split_complete`) and the upgrade-only merge policy.
 - `adapters::claude::tests` — `classify`, `derive_chat_id`, `clean_prompt`, `last_assistant_text`, `is_a_question`, and the outer `dispatch`.
 
-CI (`.github/workflows/release.yml`) runs Rust tests before bundling on every tag push, so a broken state machine can't ship a release.
+CI runs Rust tests on every push and PR (`build.yml`) and again before bundling on every tag push (`release.yml`), so a broken state machine can't ship a release.

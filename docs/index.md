@@ -15,7 +15,10 @@ Anything that can POST JSON to `localhost` can report status. Each session appea
 
 ## Install
 
-Download the latest `Claude Code Dashboard_<version>_x64-setup.exe` from the [Releases page](https://github.com/AnotherSava/claude-code-dashboard/releases) and run it. Windows 10 version 1803 or newer. WebView2 is fetched automatically during install if missing.
+Download the latest installer for your platform from the [Releases page](https://github.com/AnotherSava/claude-code-dashboard/releases) and run it:
+
+- **Windows**: `Claude Code Dashboard_<version>_x64-setup.exe` — Windows 10 version 1803 or newer; WebView2 is fetched automatically during install if missing.
+- **macOS**: `Claude Code Dashboard_<version>_aarch64.dmg` — macOS 11+ on Apple Silicon. The build is not yet code-signed, so on first launch right-click the app → **Open** to bypass Gatekeeper.
 
 After installation, configure the agents you want to track:
 
@@ -35,4 +38,4 @@ After installation, configure the agents you want to track:
 
 ## Settings
 
-All settings live in `config.json` under the app data directory (`%APPDATA%\com.anothersava.claude-code-dashboard\` on Windows). The tray menu has an "Open config/logs location" shortcut that opens the folder, and the widget hot-reloads `config.json` on save — no restart needed except when changing the HTTP server port.
+All settings live in `config.json` under the app data directory — `%APPDATA%\com.anothersava.claude-code-dashboard\` on Windows, `~/Library/Application Support/com.anothersava.claude-code-dashboard/` on macOS. The tray menu has an "Open config/logs location" shortcut that opens the folder, and the widget hot-reloads `config.json` on save — no restart needed except when changing the HTTP server port.

@@ -12,7 +12,10 @@ Anything that can POST JSON to `localhost` can report status. Each session appea
 
 ---
 
-Download the latest `Claude Code Dashboard_<version>_x64-setup.exe` from the [Releases page](https://github.com/AnotherSava/claude-code-dashboard/releases). Windows 10 version 1803 or newer; WebView2 is fetched during install if missing.
+Download the latest installer for your platform from the [Releases page](https://github.com/AnotherSava/claude-code-dashboard/releases):
+
+- **Windows**: `Claude Code Dashboard_<version>_x64-setup.exe` — Windows 10 version 1803 or newer; WebView2 is fetched during install if missing.
+- **macOS**: `Claude Code Dashboard_<version>_aarch64.dmg` — macOS 11+ on Apple Silicon.
 
 See full project documentation at **[anothersava.github.io/claude-code-dashboard](https://anothersava.github.io/claude-code-dashboard/)**:
 
