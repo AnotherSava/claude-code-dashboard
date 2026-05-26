@@ -121,6 +121,25 @@ async fn post_event(
                 chat_id = %id,
                 "event -> clear"
             );
+            // Mark a boundary on the existing dialog before destroying the
+            // in-memory session. Claude `/clear` fires SessionEnd → SessionStart,
+            // so the path-rotation check in the Set branch can't help (the
+            // watcher is gone by the time SessionStart arrives). Appending the
+            // separator to the persisted dialog lets the next SessionStart's
+            // "new" branch restore a dialog that already ends with the
+            // separator — so the upcoming UserPromptSubmit lands after it.
+            let now = now_ms();
+            let history = app.try_state::<PromptHistoryStore>();
+            if state.mark_session_boundary(&id, now) {
+                if let Some(ref h) = history {
+                    let sessions = state.sessions.lock().unwrap();
+                    if let Some(s) = sessions.iter().find(|s| s.id == id) {
+                        h.save_session(s);
+                    }
+                    drop(sessions);
+                    h.save_to_disk();
+                }
+            }
             state.apply_clear(&id);
             if let Some(reg) = app.try_state::<WatcherRegistry>() {
                 reg.stop(&id);
