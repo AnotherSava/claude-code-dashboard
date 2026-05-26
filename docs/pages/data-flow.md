@@ -48,10 +48,12 @@ Every mutation to session state funnels through `state::apply_set` or `state::ap
 2. `claude_hook.py` reads the payload, extracts `hook_event_name`, and POSTs `{client: "claude", event: <name>, payload: <verbatim>}` to `$TAURI_DASHBOARD_URL/api/event` (default `http://127.0.0.1:9077/api/event`). The hook does no classification or config reading.
 3. `POST /api/event` hits the axum handler. Origin guard rejects non-null cross-origin requests.
 4. `adapters::dispatch` routes by `client`; `adapters::claude::dispatch` matches on `event` and produces an `AdapterOutput::Set { input, transcript_path } | Clear { id } | Ignore`. All chat-id derivation, prompt cleaning, and transcript question-detection happen here.
-5. For `Set`, `label_policy::select` decides the `(label, original_prompt)` pair and `AppState::apply_set` runs: if status transitions out of `working`, it accumulates elapsed time into `working_accumulated_ms`; if the transition is a task boundary (`done` / `idle` → `working`), it zeroes the accumulator; otherwise existing timers are preserved.
-6. If `transcript_path` is present, `WatcherRegistry::start` spawns a per-session tokio task with a `notify::RecommendedWatcher` on the transcript's parent directory.
-7. `emit_sessions_updated` broadcasts the fresh snapshot on the `sessions_updated` event.
-8. The Svelte frontend's `listen` callback replaces its `$state` sessions array, Svelte's reactivity re-renders the list, the row updates within a frame.
+5. For `Set`, `label_policy::select` decides the `(label, original_prompt)` pair.
+6. If the hook's `transcript_path` differs from the path `WatcherRegistry` is already watching for this chat_id (Claude `/clear` rotates the JSONL file but keeps the cwd, so the chat_id is unchanged), `AppState::mark_session_boundary` pushes a `Separator` into the dialog before `apply_set` runs — the next user entry then lands after a visible session marker in the history window.
+7. `AppState::apply_set` runs: if status transitions out of `working`, it accumulates elapsed time into `working_accumulated_ms`; if the transition is a task boundary (`done` / `idle` → `working`), it zeroes the accumulator; otherwise existing timers are preserved.
+8. If `transcript_path` is present, `WatcherRegistry::start` spawns a per-session tokio task with a `notify::RecommendedWatcher` on the transcript's parent directory.
+9. `emit_sessions_updated` broadcasts the fresh snapshot on the `sessions_updated` event.
+10. The Svelte frontend's `listen` callback replaces its `$state` sessions array, Svelte's reactivity re-renders the list, the row updates within a frame.
 
 ## Path 2 — Transcript-driven updates
 

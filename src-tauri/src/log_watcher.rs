@@ -250,6 +250,10 @@ impl WatcherRegistry {
             task.abort.abort();
         }
     }
+
+    pub fn current_path(&self, chat_id: &str) -> Option<PathBuf> {
+        self.entries.lock().unwrap().get(chat_id).map(|t| t.path.clone())
+    }
 }
 
 async fn watch_loop(app: AppHandle, chat_id: String, path: PathBuf) {

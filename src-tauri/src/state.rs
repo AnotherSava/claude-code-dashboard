@@ -265,6 +265,34 @@ impl AppState {
         sessions.retain(|s| s.id != id);
     }
 
+    /// Mark a session-boundary in the in-memory dialog. Called when the
+    /// hook reports a transcript_path different from the one we're already
+    /// watching for this chat_id — Claude Code's `/clear` keeps the cwd
+    /// (so the dashboard chat_id is unchanged) but rotates the JSONL file.
+    /// The "new" branch of `apply_set` handles the same boundary at
+    /// app-restart time via `last_input_tokens`; this covers the case where
+    /// the dashboard is already running and the session stays in memory.
+    pub fn mark_session_boundary(&self, id: &str, now_ms: i64) -> bool {
+        let mut sessions = self.sessions.lock().unwrap();
+        let Some(session) = sessions.iter_mut().find(|s| s.id == id) else {
+            return false;
+        };
+        if session.dialog.is_empty() {
+            return false;
+        }
+        if session.dialog.last().is_some_and(|e| e.role == DialogRole::Separator) {
+            return false;
+        }
+        session.dialog.push(DialogEntry {
+            role: DialogRole::Separator,
+            text: String::new(),
+            timestamp: now_ms,
+            status: Status::Idle,
+        });
+        session.updated = now_ms;
+        true
+    }
+
     /// Watcher-driven assistant text capture. Updates the latest Assistant
     /// entry that sits after the most recent User entry; appends if there
     /// isn't one. Works around the Stop-hook-before-transcript-flush race:
@@ -830,6 +858,45 @@ mod tests {
     fn upsert_assistant_text_missing_session_is_noop() {
         let state = AppState::new();
         assert!(!state.upsert_assistant_text("nope", "x".into(), 0));
+    }
+
+    #[test]
+    fn mark_session_boundary_appends_separator() {
+        let state = AppState::new();
+        seed(&state, vec![user_entry("u1", 10), assistant_entry("a1", 20)]);
+        let changed = state.mark_session_boundary("a", 100);
+        assert!(changed);
+        let s = get(&state, "a");
+        assert_eq!(s.dialog.len(), 3);
+        assert_eq!(s.dialog[2].role, DialogRole::Separator);
+        assert_eq!(s.dialog[2].timestamp, 100);
+        assert_eq!(s.updated, 100);
+    }
+
+    #[test]
+    fn mark_session_boundary_noop_on_empty_dialog() {
+        let state = AppState::new();
+        seed(&state, vec![]);
+        let changed = state.mark_session_boundary("a", 100);
+        assert!(!changed);
+        let s = get(&state, "a");
+        assert!(s.dialog.is_empty());
+    }
+
+    #[test]
+    fn mark_session_boundary_idempotent_on_trailing_separator() {
+        let state = AppState::new();
+        seed(&state, vec![user_entry("u1", 10), separator_entry(20)]);
+        let changed = state.mark_session_boundary("a", 100);
+        assert!(!changed);
+        let s = get(&state, "a");
+        assert_eq!(s.dialog.len(), 2);
+    }
+
+    #[test]
+    fn mark_session_boundary_missing_session_is_noop() {
+        let state = AppState::new();
+        assert!(!state.mark_session_boundary("nope", 100));
     }
 
     #[test]

@@ -83,8 +83,21 @@ async fn post_event(
             let chat_id = input.id.clone();
             let history = app.try_state::<PromptHistoryStore>();
             let restored = history.as_ref().and_then(|h| h.get(&chat_id));
-            let dialog_changed = state.apply_set(input, now_ms(), &cfg.continuation_prompts, restored);
-            if dialog_changed {
+            let now = now_ms();
+            let watcher = app.try_state::<WatcherRegistry>();
+            let session_rotated = match (&transcript_path, watcher.as_ref()) {
+                (Some(new_path), Some(reg)) => reg
+                    .current_path(&chat_id)
+                    .is_some_and(|old| old != *new_path),
+                _ => false,
+            };
+            let boundary_changed = if session_rotated {
+                state.mark_session_boundary(&chat_id, now)
+            } else {
+                false
+            };
+            let set_changed = state.apply_set(input, now, &cfg.continuation_prompts, restored);
+            if boundary_changed || set_changed {
                 if let Some(ref h) = history {
                     let sessions = state.sessions.lock().unwrap();
                     if let Some(s) = sessions.iter().find(|s| s.id == chat_id) {
@@ -95,7 +108,7 @@ async fn post_event(
                 }
             }
             if let Some(tp) = transcript_path {
-                if let Some(reg) = app.try_state::<WatcherRegistry>() {
+                if let Some(reg) = watcher {
                     reg.start(app.clone(), chat_id, tp);
                 }
             }
