@@ -58,11 +58,21 @@ pub fn dispatch(event: &str, payload: &Value, cfg: &Config) -> AdapterOutput {
     // final assistant turn to disk, so reading the transcript here would
     // record the previous turn's text. The watcher catches the post-Stop
     // write via `notify` and upserts the latest text instead.
+    //
+    // For UserPromptSubmit, take the *raw* prompt — not the cleaned `label`
+    // — so the history window preserves newlines and the user's original
+    // formatting. `clean_prompt` strips newlines for the one-line dashboard
+    // row preview, which is the wrong shape for the multi-line history view.
     let dialog_entry = match event {
-        "UserPromptSubmit" => label.as_ref().map(|text| PendingDialogEntry {
-            role: DialogRole::User,
-            text: text.clone(),
-        }),
+        "UserPromptSubmit" => payload
+            .get("prompt")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|text| PendingDialogEntry {
+                role: DialogRole::User,
+                text: text.to_string(),
+            }),
         _ => None,
     };
 
@@ -911,6 +921,27 @@ mod tests {
                 assert_eq!(input.label.as_deref(), Some("fix bug"));
                 assert_eq!(input.source.as_deref(), Some("claude"));
                 assert_eq!(transcript_path.as_deref(), Some(Path::new("/tmp/t.jsonl")));
+            }
+            _ => panic!("expected Set"),
+        }
+    }
+
+    #[test]
+    fn dispatch_user_prompt_preserves_newlines_in_dialog_entry() {
+        let cfg = cfg_with(Some("d:/projects"), &[]);
+        let p = json!({
+            "cwd": "d:/projects/demo",
+            "session_id": "s",
+            "prompt": "line one\n\nline two\nline three",
+        });
+        match dispatch("UserPromptSubmit", &p, &cfg) {
+            AdapterOutput::Set { input, .. } => {
+                // Label is collapsed for the one-line dashboard preview
+                assert_eq!(input.label.as_deref(), Some("line one line two line three"));
+                // Dialog entry keeps the raw prompt so the history view can format it
+                let entry = input.dialog_entry.expect("dialog_entry present");
+                assert_eq!(entry.role, DialogRole::User);
+                assert_eq!(entry.text, "line one\n\nline two\nline three");
             }
             _ => panic!("expected Set"),
         }

@@ -72,6 +72,8 @@ User-visible text comes from `payload.prompt` (UserPromptSubmit) or `payload.mes
 3. Replaces all characters in U+2500–U+259F (Box Drawing + Block Elements, e.g. `│ ▌`) with a space.
 4. Collapses runs of spaces into one and trims.
 
+This cleaning applies to the **label** (the one-line preview shown in the dashboard row). The dialog entry persisted for the multi-line history view takes `payload.prompt` raw on UserPromptSubmit instead, so the history preserves newlines and the user's original formatting.
+
 Other Unicode passes through untouched — accents, emoji, CJK, math symbols. The U+2300/U+2500 ranges are stripped because Claude Code's terminal output frequently leaks box-drawing glyphs into prompt and notification text.
 
 ## Transcript question detection
