@@ -52,11 +52,13 @@ The source-of-truth `AgentSession` state lives behind a `Mutex` in Rust. Three p
 claude-code-dashboard/
 ├── src/                                Svelte frontend (Vite)
 │   ├── App.svelte                       top-level layout, subscribes to Tauri events
+│   ├── HistoryApp.svelte                root component of the second (history) window
 │   ├── main.ts                          mount entry point
 │   └── lib/
 │       ├── types.ts                     shared TS types and display helpers
 │       ├── mockSessions.ts              dev-only fixtures (unused in release)
 │       ├── api.ts                       invoke / listen wrappers
+│       ├── dialog.ts                    shared isTaskBoundary + isAQuestion helpers used by history view and tooltip
 │       └── components/
 │           ├── SessionList.svelte       list container, empty-state
 │           ├── SessionItem.svelte       per-row rendering (pill, timer, tokens, label)

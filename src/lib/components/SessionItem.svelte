@@ -24,6 +24,7 @@
     tokenColor,
   } from '../types'
   import { hideHistory, openHistory, removeSession } from '../api'
+  import { isTaskBoundary } from '../dialog'
 
   interface Props {
     session: AgentSession
@@ -55,13 +56,7 @@
   // width. Format: each line is `HH:MM  prompt`. Older prompts on top,
   // current on the bottom, prefixed with an arrow marker.
   const titleText = $derived.by(() => {
-    const taskPrompts = session.dialog.filter((e) => {
-      if (e.role !== 'user') return false
-      const idx = session.dialog.indexOf(e)
-      if (idx === 0) return true
-      const prev = session.dialog[idx - 1]
-      return prev.status !== 'awaiting'
-    })
+    const taskPrompts = session.dialog.filter((_, idx) => isTaskBoundary(session.dialog, idx))
     const visible = taskPrompts.slice(-(HISTORY_VISIBLE + 1))
     const lines: string[] = visible.map((e, i) => {
       const marker = i === visible.length - 1 ? '  ▸ ' : '    '

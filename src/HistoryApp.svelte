@@ -3,6 +3,7 @@
   import { invoke } from '@tauri-apps/api/core'
   import { listen, type UnlistenFn } from '@tauri-apps/api/event'
   import { closeWindow, getConfig, getSessions, onConfigUpdated, onSessionsUpdated, setHistoryFontSize } from './lib/api'
+  import { isTaskBoundary } from './lib/dialog'
   import type { AgentSession, HistoryFontSize } from './lib/types'
 
   const SIZE_ORDER: HistoryFontSize[] = ['smallest', 'small', 'regular', 'large', 'largest']
@@ -79,14 +80,6 @@
 
   let dialog = $derived(deduplicatedDialog())
 
-  function isTaskBoundary(idx: number): boolean {
-    const entry = dialog[idx]
-    if (!entry || entry.role !== 'user') return false
-    if (idx === 0) return true
-    return dialog[idx - 1].status !== 'awaiting'
-  }
-
-
   let wasAtBottom = true
 
   function onEntriesScroll() {
@@ -122,7 +115,7 @@
         {#if entry.role === 'separator'}
           <div class="separator"><hr /></div>
         {:else}
-          <div class="entry" class:sticky={isTaskBoundary(i)} class:assistant={entry.role === 'assistant'}>
+          <div class="entry" class:sticky={isTaskBoundary(dialog, i)} class:assistant={entry.role === 'assistant'}>
             <span class="ts">{formatClock(entry.timestamp)}</span>
             <span class="text">{#each entry.text.split('\n') as line, j}{#if j > 0}<br />{/if}{line}{/each}</span>
           </div>
