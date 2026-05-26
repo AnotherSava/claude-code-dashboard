@@ -22,7 +22,8 @@
         "resizable": true,
         "transparent": false,
         "visible": false,
-        "backgroundColor": "#1c1c1e"
+        "backgroundColor": "#1c1c1e",
+        "acceptFirstMouse": true
       },
       {
         "label": "history",
@@ -31,7 +32,8 @@
         "height": 400,
         "decorations": true,
         "resizable": true,
-        "visible": false
+        "visible": false,
+        "acceptFirstMouse": true
       }
     ],
     "security": {
