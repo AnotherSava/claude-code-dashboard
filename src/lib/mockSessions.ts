@@ -137,4 +137,5 @@ export const mockConfig: Config = {
   usage_limits_poll_interval_seconds: 600,
   limit_bar_segments: 16,
   auto_resize: 'none',
+  history_font_size: 'regular',
 }
