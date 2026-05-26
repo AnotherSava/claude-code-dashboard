@@ -75,7 +75,7 @@ claude-code-dashboard/
 │       ├── config_watcher.rs            notify watcher for config.json hot-reload
 │       ├── commands.rs                  Tauri commands + event emitters
 │       ├── http_server.rs               axum routes for POST /api/event
-│       ├── log_watcher.rs               per-session transcript tailing + infer_state
+│       ├── log_watcher.rs               per-session transcript tailing + infer_state + assistant text upsert
 │       ├── tray.rs                      TrayIconBuilder, menu handlers, autostart
 │       ├── notifications.rs             1s-tick reconciler + Notifier trait
 │       ├── telegram.rs                  reqwest-based Telegram Bot API client

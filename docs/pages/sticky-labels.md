@@ -93,5 +93,5 @@ Step 7 is the only point after step 1 where `original_prompt` gets re-captured: 
 ## Implementation pointers
 
 - The state machine is enforced by `src-tauri/src/state.rs::apply_set`, which delegates the `(label, original_prompt)` decision to `src-tauri/src/label_policy.rs::select`. Every mutation to session state — from HTTP events, the transcript watcher, or Tauri commands — funnels through `apply_set` so the rules are applied in exactly one place.
-- The transcript watcher (`src-tauri/src/log_watcher.rs::apply_watcher_update`) is allowed to upgrade status to `working` and update model / token counts, but it cannot touch `label` or `original_prompt` — those stay hook-authoritative.
+- The transcript watcher (`src-tauri/src/log_watcher.rs::apply_watcher_update`) is allowed to upgrade status to `working`, update model / token counts, and upsert the latest Assistant dialog text, but it cannot touch `label` or `original_prompt` — those stay hook-authoritative.
 - See [Data flow](data-flow) for how `apply_set` fits into the full event pipeline, and [Classification](classification) for how the per-event `(status, label)` pair is computed before reaching the state layer.

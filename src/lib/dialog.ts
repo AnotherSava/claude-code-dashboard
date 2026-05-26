@@ -24,9 +24,19 @@ function isAQuestion(text: string): boolean {
   return hasPermissionSeekingQuestion(text)
 }
 
+// Short confirmations / selections that are almost always replies, not new
+// tasks — e.g. "y" to a skill's "proceed?" prompt that the JSONL transcript
+// doesn't carry (the question lives in a tool result, not assistant text).
+const SHORT_REPLY = /^(y|n|yes|no|ok|okay|sure|go|continue|proceed|done|skip|stop|all|none|both|some|\d+([\s,]+\d+)*)$/i
+
+function isShortReply(text: string): boolean {
+  return SHORT_REPLY.test(text.trim())
+}
+
 export function isTaskBoundary(dialog: DialogEntry[], idx: number): boolean {
   const entry = dialog[idx]
   if (!entry || entry.role !== 'user') return false
+  if (isShortReply(entry.text)) return false
   if (idx === 0) return true
   const prev = dialog[idx - 1]
   if (prev.status === 'awaiting') return false

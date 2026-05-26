@@ -52,18 +52,17 @@ pub fn dispatch(event: &str, payload: &Value, cfg: &Config) -> AdapterOutput {
         .filter(|s| !s.trim().is_empty())
         .map(PathBuf::from);
 
+    // Assistant text capture is owned by the transcript watcher
+    // (`log_watcher::apply_and_emit` → `AppState::upsert_assistant_text`).
+    // Stop's hook payload reaches the widget before Claude Code flushes the
+    // final assistant turn to disk, so reading the transcript here would
+    // record the previous turn's text. The watcher catches the post-Stop
+    // write via `notify` and upserts the latest text instead.
     let dialog_entry = match event {
         "UserPromptSubmit" => label.as_ref().map(|text| PendingDialogEntry {
             role: DialogRole::User,
             text: text.clone(),
         }),
-        "Stop" => transcript_path
-            .as_ref()
-            .and_then(|p| last_assistant_text(p))
-            .map(|text| PendingDialogEntry {
-                role: DialogRole::Assistant,
-                text,
-            }),
         _ => None,
     };
 

@@ -1,4 +1,5 @@
 use crate::commands::{emit_sessions_updated, now_ms};
+use crate::prompt_history::PromptHistoryStore;
 use crate::state::{AgentSession, AppState, Status};
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::Deserialize;
@@ -17,6 +18,7 @@ pub struct InferredState {
     pub state: Option<Status>,
     pub model: Option<String>,
     pub input_tokens: Option<u64>,
+    pub latest_assistant_text: Option<String>,
 }
 
 /// Walk JSONL lines newest-first and derive current state, last-known model,
@@ -68,6 +70,22 @@ pub fn infer_state(lines: &[&str]) -> Option<InferredState> {
                     }
                 }
             }
+            if result.latest_assistant_text.is_none() {
+                let mut latest: Option<String> = None;
+                for b in &content {
+                    if b.block_type == "text" {
+                        if let Some(ref t) = b.text {
+                            let trimmed = t.trim();
+                            if !trimmed.is_empty() {
+                                latest = Some(trimmed.to_string());
+                            }
+                        }
+                    }
+                }
+                if latest.is_some() {
+                    result.latest_assistant_text = latest;
+                }
+            }
         }
 
         if result.state.is_none() {
@@ -86,7 +104,11 @@ pub fn infer_state(lines: &[&str]) -> Option<InferredState> {
             }
         }
 
-        if result.state.is_some() && result.model.is_some() && result.input_tokens.is_some() {
+        if result.state.is_some()
+            && result.model.is_some()
+            && result.input_tokens.is_some()
+            && result.latest_assistant_text.is_some()
+        {
             break;
         }
     }
@@ -329,12 +351,14 @@ async fn drain(app: &AppHandle, chat_id: &str, path: &Path, state: &Arc<Mutex<Dr
         return;
     };
 
-    // Suppress state on the initial read — the hook owns current status
-    // (e.g. `idle` on SessionStart), while a past assistant text in the
-    // transcript would otherwise roll us back to `done`.
+    // Suppress state + dialog updates on the initial read — the hook owns
+    // current status (e.g. `idle` on SessionStart), and the dialog was
+    // already restored from `prompt_history.json`, so re-pushing the
+    // transcript's last assistant text would duplicate that entry.
     if initial_read {
         state.lock().unwrap().initial_read = false;
         update.state = None;
+        update.latest_assistant_text = None;
     }
 
     apply_and_emit(app, chat_id, &update);
@@ -344,14 +368,29 @@ fn apply_and_emit(app: &AppHandle, chat_id: &str, update: &InferredState) {
     let Some(app_state) = app.try_state::<AppState>() else {
         return;
     };
-    let changed = {
+    let now = now_ms();
+    let metric_changed = {
         let mut sessions = app_state.sessions.lock().unwrap();
         match sessions.iter_mut().find(|s| s.id == chat_id) {
-            Some(session) => apply_watcher_update(session, update, now_ms()),
+            Some(session) => apply_watcher_update(session, update, now),
             None => false,
         }
     };
-    if changed {
+    let dialog_changed = match update.latest_assistant_text {
+        Some(ref text) => app_state.upsert_assistant_text(chat_id, text.clone(), now),
+        None => false,
+    };
+    if dialog_changed {
+        if let Some(h) = app.try_state::<PromptHistoryStore>() {
+            let sessions = app_state.sessions.lock().unwrap();
+            if let Some(s) = sessions.iter().find(|s| s.id == chat_id) {
+                h.save_session(s);
+            }
+            drop(sessions);
+            h.save_to_disk();
+        }
+    }
+    if metric_changed || dialog_changed {
         emit_sessions_updated(app);
     }
 }
@@ -456,6 +495,56 @@ mod tests {
             meta("last-prompt"),
         ];
         assert_eq!(infer_state(&refs(&lines)).unwrap().state, Some(Status::Done));
+    }
+
+    #[test]
+    fn latest_assistant_text_picks_last_text_in_chunk() {
+        let lines = [
+            assistant_text("first"),
+            assistant_tool_use(),
+            assistant_text("second"),
+        ];
+        let r = infer_state(&refs(&lines)).unwrap();
+        assert_eq!(r.latest_assistant_text.as_deref(), Some("second"));
+    }
+
+    #[test]
+    fn latest_assistant_text_none_when_only_tools() {
+        let lines = [user_text("hi"), assistant_tool_use(), user_tool_result()];
+        let r = infer_state(&refs(&lines)).unwrap();
+        assert_eq!(r.latest_assistant_text, None);
+    }
+
+    #[test]
+    fn latest_assistant_text_skips_sidechain() {
+        let sidechain = json!({
+            "type": "assistant",
+            "isSidechain": true,
+            "message": { "role": "assistant", "content": [{ "type": "text", "text": "sub-agent" }] }
+        })
+        .to_string();
+        let lines = [assistant_text("main"), sidechain];
+        let r = infer_state(&refs(&lines)).unwrap();
+        assert_eq!(r.latest_assistant_text.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn latest_assistant_text_takes_last_block_in_entry() {
+        let multi = json!({
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    { "type": "text", "text": "first block" },
+                    { "type": "tool_use", "name": "Read" },
+                    { "type": "text", "text": "second block" }
+                ]
+            }
+        })
+        .to_string();
+        let lines = [multi];
+        let r = infer_state(&refs(&lines)).unwrap();
+        assert_eq!(r.latest_assistant_text.as_deref(), Some("second block"));
     }
 
     #[test]
@@ -661,6 +750,7 @@ mod tests {
                 state: Some(Status::Working),
                 model: Some("claude-opus-4-7".into()),
                 input_tokens: Some(42_100),
+                latest_assistant_text: None,
             },
             500,
         );
@@ -680,6 +770,7 @@ mod tests {
                 state: Some(Status::Working),
                 model: Some("claude-opus-4-7".into()),
                 input_tokens: Some(100),
+                latest_assistant_text: None,
             },
             500,
         );
