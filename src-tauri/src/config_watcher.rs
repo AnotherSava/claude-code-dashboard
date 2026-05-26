@@ -101,19 +101,20 @@ pub fn apply_config_to_window(app: &AppHandle, cfg: &Config, prior: Option<&Conf
     }
 }
 
-/// Position the window in the bottom-right of the primary monitor with a
-/// small margin. Called at startup when `save_window_position` is off or when
-/// no saved position is available.
+/// Position the window in the bottom-right of the primary monitor's work area
+/// (i.e. inside the region not covered by the macOS Dock/menu bar or Windows
+/// taskbar) with a small margin. Called at startup when `save_window_position`
+/// is off or when no saved position is available.
 pub fn apply_default_position(window: &tauri::WebviewWindow) {
     let monitor = match window.primary_monitor() {
         Ok(Some(m)) => m,
         _ => return,
     };
-    let screen = monitor.size();
+    let work = monitor.work_area();
     let size = window.outer_size().unwrap_or_default();
-    let margin: i32 = 16;
-    let taskbar_allowance: i32 = 60;
-    let x = screen.width as i32 - size.width as i32 - margin;
-    let y = screen.height as i32 - size.height as i32 - margin - taskbar_allowance;
+    let margin_x: i32 = 16;
+    let margin_y: i32 = 4;
+    let x = work.position.x + work.size.width as i32 - size.width as i32 - margin_x;
+    let y = work.position.y + work.size.height as i32 - size.height as i32 - margin_y;
     let _ = window.set_position(tauri::PhysicalPosition::new(x, y));
 }
