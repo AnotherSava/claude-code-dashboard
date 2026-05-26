@@ -9,11 +9,29 @@
   const SIZE_ORDER: HistoryFontSize[] = ['smallest', 'small', 'regular', 'large', 'largest']
   const SIZE_PX: Record<HistoryFontSize, number> = { smallest: 11, small: 12, regular: 14, large: 16, largest: 18 }
 
+  // Horizontal-rule-like separators used by the assistant to delimit chunks:
+  // markdown `---` / `___` / `***` / `===`, and box-drawing horizontals like
+  // `━━━` / `───` / `═══`. Three or more identical chars on a line.
+  const SEPARATOR_RE = /^[-_*=━─═]{3,}$/
+
+  function collapseRange(lines: string[]): [number, number] | null {
+    const hrs: number[] = []
+    for (let i = 0; i < lines.length; i++) {
+      if (SEPARATOR_RE.test(lines[i].trim())) hrs.push(i)
+    }
+    if (hrs.length < 2) return null
+    const first = hrs[0]
+    const last = hrs[hrs.length - 1]
+    if (last - first < 2) return null
+    return [first, last]
+  }
+
   let sessionId = $state<string | null>(null)
   let session = $state<AgentSession | null>(null)
   let fontSize = $state<HistoryFontSize>('regular')
   let error = $state<string | null>(null)
   let entriesEl: HTMLDivElement | undefined = $state()
+  let expanded = $state<Set<number>>(new Set())
   let unlistenSessions: (() => void) | undefined
   let unlistenConfig: (() => void) | undefined
   let unlistenTarget: UnlistenFn | undefined
@@ -21,6 +39,7 @@
   async function loadSession(id: string) {
     sessionId = id
     error = null
+    expanded = new Set()
     try {
       const sessions = await getSessions()
       session = sessions.find((s) => s.id === id) ?? null
@@ -80,6 +99,11 @@
 
   let dialog = $derived(deduplicatedDialog())
 
+  function expandEntry(idx: number) {
+    expanded.add(idx)
+    expanded = new Set(expanded)
+  }
+
   let wasAtBottom = true
 
   function onEntriesScroll() {
@@ -115,9 +139,17 @@
         {#if entry.role === 'separator'}
           <div class="separator"><hr /></div>
         {:else}
+          {@const lines = entry.text.split('\n')}
+          {@const range = expanded.has(i) ? null : collapseRange(lines)}
           <div class="entry" class:sticky={isTaskBoundary(dialog, i)} class:assistant={entry.role === 'assistant'}>
             <span class="ts">{formatClock(entry.timestamp)}</span>
-            <span class="text">{#each entry.text.split('\n') as line, j}{#if j > 0}<br />{/if}{line}{/each}</span>
+            <span class="text">
+              {#if range}
+                {#each lines.slice(0, range[0]) as line, j}{#if j > 0}<br />{/if}{line}{/each}<br /><button type="button" class="ellipsis" onclick={() => expandEntry(i)} title="Expand {range[1] - range[0] + 1} hidden lines">&lt;...&gt;</button><br />{#each lines.slice(range[1] + 1) as line, j}{#if j > 0}<br />{/if}{line}{/each}
+              {:else}
+                {#each lines as line, j}{#if j > 0}<br />{/if}{line}{/each}
+              {/if}
+            </span>
           </div>
         {/if}
       {/each}
@@ -167,6 +199,19 @@
   .assistant .text {
     font-style: italic;
     color: #6b7280;
+  }
+  .ellipsis {
+    background: none;
+    border: none;
+    padding: 0;
+    margin: 0;
+    color: #7aa2f7;
+    font: inherit;
+    cursor: pointer;
+  }
+  .ellipsis:hover {
+    color: #a4c0ff;
+    text-decoration: underline;
   }
   .separator {
     padding: 4px 12px;
