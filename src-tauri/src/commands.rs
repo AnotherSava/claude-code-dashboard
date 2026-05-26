@@ -11,8 +11,8 @@ pub fn get_sessions(state: State<AppState>) -> Vec<AgentSession> {
 }
 
 #[tauri::command]
-pub fn get_config(state: State<ConfigState>) -> Config {
-    state.snapshot()
+pub fn get_config(app: AppHandle) -> Config {
+    app.try_state::<ConfigState>().map(|s| s.snapshot()).unwrap_or_default()
 }
 
 #[tauri::command]
