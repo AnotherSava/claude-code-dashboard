@@ -362,7 +362,6 @@ async fn drain(app: &AppHandle, chat_id: &str, path: &Path, state: &Arc<Mutex<Dr
     if initial_read {
         state.lock().unwrap().initial_read = false;
         update.state = None;
-        update.latest_assistant_text = None;
     }
 
     apply_and_emit(app, chat_id, &update);
