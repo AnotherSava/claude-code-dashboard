@@ -1,10 +1,8 @@
 ---
 layout: default
 title: Development
----
-
-[Home](..) | [Claude Code](claude-code) | [HTTP API](http-api) | [Classification](classification) | [Sticky labels](sticky-labels) | [Data flow](data-flow) | [Development](development)
-
+nav_order: 4
+has_children: true
 ---
 
 ## Setup

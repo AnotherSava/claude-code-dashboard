@@ -1,10 +1,7 @@
 ---
 layout: default
-title: Claude Code Dashboard
----
-
-[Home](.) | [Claude Code](pages/claude-code) | [HTTP API](pages/http-api) | [Classification](pages/classification) | [Sticky labels](pages/sticky-labels) | [Data flow](pages/data-flow) | [Development](pages/development)
-
+title: Home
+nav_order: 1
 ---
 
 *A real-time desktop widget that tracks what your AI coding agents are doing.*

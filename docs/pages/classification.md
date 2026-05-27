@@ -1,10 +1,8 @@
 ---
 layout: default
 title: Classification
----
-
-[Home](..) | [Claude Code](claude-code) | [HTTP API](http-api) | [Classification](classification) | [Sticky labels](sticky-labels) | [Data flow](data-flow) | [Development](development)
-
+parent: Development
+nav_order: 1
 ---
 
 How the Claude adapter turns a raw lifecycle payload into the `(chat_id, status, label)` tuple the widget renders. All logic in this page lives in `src-tauri/src/adapters/claude.rs`; the Python hook (`integrations/claude_hook.py`) is a pure transport layer and does no classification.

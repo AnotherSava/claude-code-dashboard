@@ -1,10 +1,8 @@
 ---
 layout: default
 title: Sticky labels
----
-
-[Home](..) | [Claude Code](claude-code) | [HTTP API](http-api) | [Classification](classification) | [Sticky labels](sticky-labels) | [Data flow](data-flow) | [Development](development)
-
+parent: Development
+nav_order: 2
 ---
 
 How the widget keeps a meaningful caption next to a session row across the whole approval-cycle dance — and what determines whether you see the *task* you asked for or the *thing happening right now*.

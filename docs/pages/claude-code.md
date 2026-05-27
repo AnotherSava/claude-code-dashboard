@@ -1,10 +1,7 @@
 ---
 layout: default
 title: Claude Code
----
-
-[Home](..) | [Claude Code](claude-code) | [HTTP API](http-api) | [Classification](classification) | [Sticky labels](sticky-labels) | [Data flow](data-flow) | [Development](development)
-
+nav_order: 2
 ---
 
 [Claude Code](https://docs.claude.com/en/docs/claude-code) is Anthropic's official command-line coding agent. The dashboard integrates via lifecycle hooks — Claude Code fires named events at specific moments during a session, and a small Python script turns each event into a status update for the widget.

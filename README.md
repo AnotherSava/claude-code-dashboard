@@ -19,10 +19,9 @@ Download the latest installer for your platform from the [Releases page](https:/
 
 See full project documentation at **[anothersava.github.io/claude-code-dashboard](https://anothersava.github.io/claude-code-dashboard/)**:
 
-- [Installation and usage](https://anothersava.github.io/claude-code-dashboard/)
-  - [Claude Code](https://anothersava.github.io/claude-code-dashboard/pages/claude-code)
-  - [HTTP API](https://anothersava.github.io/claude-code-dashboard/pages/http-api)
-- [Developer guide](https://anothersava.github.io/claude-code-dashboard/pages/development)
+- [Claude Code](https://anothersava.github.io/claude-code-dashboard/pages/claude-code)
+- [HTTP API](https://anothersava.github.io/claude-code-dashboard/pages/http-api)
+- [Development](https://anothersava.github.io/claude-code-dashboard/pages/development)
   - [Classification](https://anothersava.github.io/claude-code-dashboard/pages/classification)
   - [Sticky labels](https://anothersava.github.io/claude-code-dashboard/pages/sticky-labels)
   - [Data flow](https://anothersava.github.io/claude-code-dashboard/pages/data-flow)

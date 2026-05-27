@@ -1,10 +1,8 @@
 ---
 layout: default
 title: Data flow
----
-
-[Home](..) | [Claude Code](claude-code) | [HTTP API](http-api) | [Classification](classification) | [Sticky labels](sticky-labels) | [Data flow](data-flow) | [Development](development)
-
+parent: Development
+nav_order: 3
 ---
 
 End-to-end: what happens when a Claude Code hook fires, when a transcript file gets a new line, or when you toggle a tray menu item.
