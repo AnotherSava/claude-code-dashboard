@@ -19,6 +19,10 @@ use crate::state::{DialogRole, PendingDialogEntry, SetInput, Status};
 /// PreToolUse hook is the only timely signal.
 const USER_GATING_TOOLS: &[&str] = &["AskUserQuestion", "ExitPlanMode"];
 
+fn is_system_injected(prompt: &str) -> bool {
+    prompt.starts_with("<task-notification>")
+}
+
 fn awaiting_label_for(tool_name: &str) -> &'static str {
     match tool_name {
         "ExitPlanMode" => "plan approval",
@@ -69,6 +73,7 @@ pub fn dispatch(event: &str, payload: &Value, cfg: &Config) -> AdapterOutput {
             .and_then(|v| v.as_str())
             .map(str::trim)
             .filter(|s| !s.is_empty())
+            .filter(|s| !is_system_injected(s))
             .map(|text| PendingDialogEntry {
                 role: DialogRole::User,
                 text: text.to_string(),
