@@ -103,6 +103,14 @@ pub fn open_history(id: String, app: AppHandle) -> Result<(), String> {
     if let Some(window) = app.get_webview_window("history") {
         let _ = window.set_title(&id);
         let _ = window.emit("history_target", &id);
+        if let Some(cfg) = app.try_state::<crate::config::ConfigState>() {
+            let snap = cfg.snapshot();
+            if snap.save_window_position {
+                if let Some(pos) = snap.history_window_position {
+                    let _ = window.set_position(tauri::PhysicalPosition::new(pos.x, pos.y));
+                }
+            }
+        }
         window.show().map_err(|e| e.to_string())?;
         window.set_focus().map_err(|e| e.to_string())?;
     }

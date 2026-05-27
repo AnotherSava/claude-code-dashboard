@@ -143,6 +143,7 @@ pub fn run() {
                     "history" => {
                         use tauri::Emitter;
                         api.prevent_close();
+                        save_history_position_if_enabled(window);
                         let _ = window.hide();
                         let _ = window.emit("history_hidden", ());
                     }
@@ -152,6 +153,15 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+fn save_history_position_if_enabled(window: &tauri::Window) {
+    use tauri::Manager;
+    let Some(state) = window.try_state::<ConfigState>() else { return };
+    if !state.snapshot().save_window_position { return }
+    let Ok(pos) = window.outer_position() else { return };
+    state.with_mut(|c| { c.history_window_position = Some(config::WindowPosition { x: pos.x, y: pos.y }) });
+    let _ = state.save_to_disk();
 }
 
 fn save_window_position_if_enabled(window: &tauri::Window) {

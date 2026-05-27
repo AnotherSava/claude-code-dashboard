@@ -35,6 +35,7 @@ pub struct Config {
     /// edge fixed; None leaves the window manually sized.
     pub auto_resize: AutoResize,
     pub history_font_size: HistoryFontSize,
+    pub history_window_position: Option<WindowPosition>,
     /// Read by `state::apply_set`: prompts that suppress the `done`/`idle` →
     /// `working` task boundary. When the user types one of these as a fresh
     /// prompt after the agent has finished, treat it as a continuation of
@@ -119,7 +120,7 @@ impl Default for Config {
         Self {
             server_port: 9077,
             always_on_top: true,
-            save_window_position: false,
+            save_window_position: true,
             window_position: None,
             context_window_tokens: [
                 ("claude-opus-4-7".to_string(), 1_000_000),
@@ -140,6 +141,7 @@ impl Default for Config {
             limit_bar_segments: 16,
             auto_resize: AutoResize::None,
             history_font_size: HistoryFontSize::Regular,
+            history_window_position: None,
             continuation_prompts: vec!["go".into(), "continue".into(), "proceed".into()],
         }
     }
