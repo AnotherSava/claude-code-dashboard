@@ -4,9 +4,9 @@ title: Home
 nav_order: 1
 ---
 
-*A real-time desktop widget that tracks what your AI coding agents are doing.*
+*An always-on-top desktop widget that tracks your Claude Code sessions in real time.*
 
-Anything that can POST JSON to `localhost` can report status. Each session appears as a row in a compact always-on-top window, with a state pill that transitions between WORK / WAIT / IDLE / DONE / ERROR, a live timer, and a token counter colored by how close the session is to its context limit.
+Each session appears as a row in a compact window with a state pill (WORK / WAIT / IDLE / DONE / ERROR), a live timer, and a token counter colored by how close the session is to its context limit. Integrates via [lifecycle hooks](pages/claude-code) — a thin Python script turns each Claude Code event into a status update for the widget.
 
 ![Claude Code Dashboard](screenshots/screenshot.png)
 
@@ -17,21 +17,14 @@ Download the latest installer for your platform from the [Releases page](https:/
 - **Windows**: `Claude Code Dashboard_<version>_x64-setup.exe` — Windows 10 version 1803 or newer; WebView2 is fetched automatically during install if missing.
 - **macOS**: `Claude Code Dashboard_<version>_aarch64.dmg` — macOS 11+ on Apple Silicon. The build is not yet code-signed, so on first launch right-click the app → **Open** to bypass Gatekeeper.
 
-After installation, configure the agents you want to track:
+## Setup
 
-## Claude Code
-
-[First-class integration](pages/claude-code) via lifecycle hooks in `~/.claude/settings.json`. Each Claude Code session becomes a row named after its working directory, with state tracked through SessionStart / UserPromptSubmit / Notification / Stop / SessionEnd events. A transcript watcher tails each session's JSONL to update token counts live between hook firings.
-
-## HTTP API
-
-[A generic POST endpoint](pages/http-api) — any tool, language, or CI script that can send JSON can report status. A three-line curl is enough, and the payload format is the same as Claude Code's.
+Follow the [Claude Code integration guide](pages/claude-code) to wire the hook into `~/.claude/settings.json`. New sessions will appear in the widget as soon as you start Claude Code.
 
 ## Usage
 
 1. Launch the widget — it lives in the system tray; left-click the tray icon to show or hide the window.
-2. Wire your agent of choice by following the [Claude Code](pages/claude-code) or [HTTP API](pages/http-api) guide.
-3. Start a session — the first POST creates a row, status transitions animate the pill, and `clear` removes the row when a session ends.
+2. Start a Claude Code session — the first hook event creates a row, status transitions animate the pill, and the row disappears when the session ends.
 
 ## Settings
 

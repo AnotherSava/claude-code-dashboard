@@ -1,5 +1,5 @@
 title: Claude Code Dashboard
-description: A real-time desktop widget that tracks what your AI coding agents are doing.
+description: An always-on-top desktop widget that tracks your Claude Code sessions in real time.
 remote_theme: just-the-docs/just-the-docs
 baseurl: /claude-code-dashboard
 plugins:

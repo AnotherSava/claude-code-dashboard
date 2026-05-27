@@ -1,7 +1,8 @@
 ---
 layout: default
 title: HTTP API
-nav_order: 3
+parent: Development
+nav_order: 4
 ---
 
 The widget listens on `http://127.0.0.1:9077` (default) for lifecycle events from external agents. One endpoint, one envelope shape, adapter-dispatched on the server side.
@@ -50,10 +51,3 @@ The widget listens on `server_port` from `config.json` (default 9077). The Claud
 
 Writing a new adapter is a ~100 LOC pure Rust function: `src-tauri/src/adapters/<your_client>.rs` exposing `dispatch(event, payload, cfg) -> AdapterOutput`, plus a match arm in `adapters::dispatch`. See `src-tauri/src/adapters/claude.rs` for the reference implementation. No HTTP layer changes — the envelope already carries `client` as the discriminator.
 
-### Standard features
-
-- Always-on-top tray-only window (no taskbar entry), draggable by the header strip; a hover-revealed × in the header hides it back to tray.
-- System tray with show/hide toggle, always-on-top toggle, autostart toggle, save-position-on-exit toggle, and an "open config/logs location" shortcut.
-- Color-coded state pills with a pulse animation on WAIT and ERROR.
-- Sticky original-prompt label across approval cycles; same trigger resets the WORK accumulator on a new task.
-- Config hot-reload from `config.json` on the next save — except `server_port`, which requires a restart.

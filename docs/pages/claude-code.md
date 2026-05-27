@@ -37,12 +37,15 @@ Copy `integrations/claude_hook.py` — distributed with the widget source — an
 ```json
 {
   "hooks": {
-    "SessionStart":      [{"hooks": [{"type": "command", "command": "python3 <repo>/integrations/claude_hook.py"}]}],
-    "UserPromptSubmit":  [{"hooks": [{"type": "command", "command": "python3 <repo>/integrations/claude_hook.py"}]}],
-    "Notification":      [{"hooks": [{"type": "command", "command": "python3 <repo>/integrations/claude_hook.py"}]}],
-    "Stop":              [{"hooks": [{"type": "command", "command": "python3 <repo>/integrations/claude_hook.py"}]}],
-    "SessionEnd":        [{"hooks": [{"type": "command", "command": "python3 <repo>/integrations/claude_hook.py"}]}],
-    "PreToolUse":        [{"matcher": "^(AskUserQuestion|ExitPlanMode)$", "hooks": [{"type": "command", "command": "python3 <repo>/integrations/claude_hook.py"}]}]
+    "SessionStart":     [{"hooks": [{"type": "command", "command": "python3 <repo>/integrations/claude_hook.py"}]}],
+    "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "python3 <repo>/integrations/claude_hook.py"}]}],
+    "Notification":     [{"hooks": [{"type": "command", "command": "python3 <repo>/integrations/claude_hook.py"}]}],
+    "Stop":             [{"hooks": [{"type": "command", "command": "python3 <repo>/integrations/claude_hook.py"}]}],
+    "SessionEnd":       [{"hooks": [{"type": "command", "command": "python3 <repo>/integrations/claude_hook.py"}]}],
+    "PreToolUse": [{
+      "matcher": "^(AskUserQuestion|ExitPlanMode)$",
+      "hooks": [{"type": "command", "command": "python3 <repo>/integrations/claude_hook.py"}]
+    }]
   }
 }
 ```
@@ -57,15 +60,11 @@ The hook talks to the widget at `http://127.0.0.1:9077` by default. To use a dif
 
 ### Features
 
-- **Transcript-based token tracking**: each session's `.jsonl` is tailed in place; updates surface within milliseconds of an assistant turn being written.
-- **Approval-cycle-aware label**: the visible label and the WORK timer both treat a same-task approval round-trip as one continuous unit of work.
-- **Benign closers**: configurable list of conversational closers (e.g. *"What's next?"*) that end with `?` but shouldn't flip the session into WAIT.
-- **Session-scoped watchers**: each session gets its own filesystem watcher; `clear` events tear it down so idle sessions don't hold handles.
-
-### Standard features
-
 - Always-on-top tray-only window (no taskbar entry), draggable by the header strip; a hover-revealed × in the header hides it back to tray.
 - System tray with show/hide toggle, always-on-top toggle, autostart toggle, save-position-on-exit toggle, open-config-file and open-log-file shortcuts.
 - Color-coded state pills with a pulse animation on WAIT and ERROR.
-- Sticky original-prompt label across approval cycles; same trigger resets the WORK accumulator on a new task.
+- Transcript-based token tracking: each session's `.jsonl` is tailed in place; updates surface within milliseconds of an assistant turn being written.
+- Sticky original-prompt label across approval cycles; the WORK timer treats a same-task approval round-trip as one continuous unit of work.
+- Benign closers: configurable list of conversational closers (e.g. *"What's next?"*) that end with `?` but shouldn't flip the session into WAIT.
+- Session-scoped watchers: each session gets its own filesystem watcher; `clear` events tear it down so idle sessions don't hold handles.
 - Config hot-reload from `config.json` on the next save — except `server_port`, which requires a restart.
