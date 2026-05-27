@@ -18,7 +18,6 @@ pub struct InferredState {
     pub state: Option<Status>,
     pub model: Option<String>,
     pub input_tokens: Option<u64>,
-    pub latest_assistant_text: Option<String>,
 }
 
 /// Walk JSONL lines newest-first and derive current state, last-known model,
@@ -70,22 +69,6 @@ pub fn infer_state(lines: &[&str]) -> Option<InferredState> {
                     }
                 }
             }
-            if result.latest_assistant_text.is_none() {
-                let mut latest: Option<String> = None;
-                for b in &content {
-                    if b.block_type == "text" {
-                        if let Some(ref t) = b.text {
-                            let trimmed = t.trim();
-                            if !trimmed.is_empty() {
-                                latest = Some(trimmed.to_string());
-                            }
-                        }
-                    }
-                }
-                if latest.is_some() {
-                    result.latest_assistant_text = latest;
-                }
-            }
         }
 
         if result.state.is_none() {
@@ -104,11 +87,7 @@ pub fn infer_state(lines: &[&str]) -> Option<InferredState> {
             }
         }
 
-        if result.state.is_some()
-            && result.model.is_some()
-            && result.input_tokens.is_some()
-            && result.latest_assistant_text.is_some()
-        {
+        if result.state.is_some() && result.model.is_some() && result.input_tokens.is_some() {
             break;
         }
     }
@@ -117,6 +96,50 @@ pub fn infer_state(lines: &[&str]) -> Option<InferredState> {
         return None;
     }
     Some(result)
+}
+
+use crate::state::DialogRole;
+
+/// Walk lines forward (chronological) and extract text entries for the dialog.
+/// Captures assistant text blocks and user interrupts (attachment entries with
+/// a `prompt` field).
+pub fn extract_text_entries(lines: &[&str]) -> Vec<(DialogRole, String)> {
+    let mut entries = Vec::new();
+    for line in lines {
+        let entry: TranscriptEntry = match serde_json::from_str(line) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        if entry.entry_type == "attachment" {
+            if let Some(prompt) = entry.prompt {
+                let trimmed = prompt.trim();
+                if !trimmed.is_empty() {
+                    entries.push((DialogRole::User, trimmed.to_string()));
+                }
+            }
+            continue;
+        }
+        if entry.entry_type == "assistant" && !entry.is_sidechain {
+            let content = entry.message.as_ref().and_then(|m| m.content.as_ref());
+            if let Some(blocks) = content {
+                let mut latest: Option<String> = None;
+                for b in blocks {
+                    if b.block_type == "text" {
+                        if let Some(ref t) = b.text {
+                            let trimmed = t.trim();
+                            if !trimmed.is_empty() {
+                                latest = Some(trimmed.to_string());
+                            }
+                        }
+                    }
+                }
+                if let Some(text) = latest {
+                    entries.push((DialogRole::Assistant, text));
+                }
+            }
+        }
+    }
+    entries
 }
 
 /// Split a JSONL chunk on newlines, returning complete lines and the trailing
@@ -180,6 +203,7 @@ struct TranscriptEntry {
     #[serde(default, rename = "isSidechain")]
     is_sidechain: bool,
     message: Option<TranscriptMessage>,
+    prompt: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -355,19 +379,19 @@ async fn drain(app: &AppHandle, chat_id: &str, path: &Path, state: &Arc<Mutex<Dr
         return;
     };
 
-    // Suppress state + dialog updates on the initial read — the hook owns
-    // current status (e.g. `idle` on SessionStart), and the dialog was
-    // already restored from `prompt_history.json`, so re-pushing the
-    // transcript's last assistant text would duplicate that entry.
-    if initial_read {
+    let text_entries = if initial_read {
         state.lock().unwrap().initial_read = false;
         update.state = None;
-    }
+        let all = extract_text_entries(&borrowed);
+        all.into_iter().rev().find(|(r, _)| *r == DialogRole::Assistant).into_iter().collect()
+    } else {
+        extract_text_entries(&borrowed)
+    };
 
-    apply_and_emit(app, chat_id, &update);
+    apply_and_emit(app, chat_id, &update, text_entries);
 }
 
-fn apply_and_emit(app: &AppHandle, chat_id: &str, update: &InferredState) {
+fn apply_and_emit(app: &AppHandle, chat_id: &str, update: &InferredState, text_entries: Vec<(DialogRole, String)>) {
     let Some(app_state) = app.try_state::<AppState>() else {
         return;
     };
@@ -379,9 +403,10 @@ fn apply_and_emit(app: &AppHandle, chat_id: &str, update: &InferredState) {
             None => false,
         }
     };
-    let dialog_changed = match update.latest_assistant_text {
-        Some(ref text) => app_state.upsert_assistant_text(chat_id, text.clone(), now),
-        None => false,
+    let dialog_changed = if !text_entries.is_empty() {
+        app_state.apply_text_entries(chat_id, &text_entries, now)
+    } else {
+        false
     };
     if dialog_changed {
         if let Some(h) = app.try_state::<PromptHistoryStore>() {
@@ -500,26 +525,30 @@ mod tests {
         assert_eq!(infer_state(&refs(&lines)).unwrap().state, Some(Status::Done));
     }
 
-    #[test]
-    fn latest_assistant_text_picks_last_text_in_chunk() {
-        let lines = [
-            assistant_text("first"),
-            assistant_tool_use(),
-            assistant_text("second"),
-        ];
-        let r = infer_state(&refs(&lines)).unwrap();
-        assert_eq!(r.latest_assistant_text.as_deref(), Some("second"));
+    // -------- extract_text_entries tests --------
+
+    fn attachment(prompt: &str) -> String {
+        json!({ "type": "attachment", "prompt": prompt }).to_string()
     }
 
     #[test]
-    fn latest_assistant_text_none_when_only_tools() {
+    fn extract_captures_assistant_text_in_order() {
+        let lines = [assistant_text("first"), assistant_tool_use(), assistant_text("second")];
+        let entries = extract_text_entries(&refs(&lines));
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0], (DialogRole::Assistant, "first".into()));
+        assert_eq!(entries[1], (DialogRole::Assistant, "second".into()));
+    }
+
+    #[test]
+    fn extract_skips_tool_only_entries() {
         let lines = [user_text("hi"), assistant_tool_use(), user_tool_result()];
-        let r = infer_state(&refs(&lines)).unwrap();
-        assert_eq!(r.latest_assistant_text, None);
+        let entries = extract_text_entries(&refs(&lines));
+        assert!(entries.is_empty());
     }
 
     #[test]
-    fn latest_assistant_text_skips_sidechain() {
+    fn extract_skips_sidechain() {
         let sidechain = json!({
             "type": "assistant",
             "isSidechain": true,
@@ -527,12 +556,13 @@ mod tests {
         })
         .to_string();
         let lines = [assistant_text("main"), sidechain];
-        let r = infer_state(&refs(&lines)).unwrap();
-        assert_eq!(r.latest_assistant_text.as_deref(), Some("main"));
+        let entries = extract_text_entries(&refs(&lines));
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].1, "main");
     }
 
     #[test]
-    fn latest_assistant_text_takes_last_block_in_entry() {
+    fn extract_takes_last_block_in_entry() {
         let multi = json!({
             "type": "assistant",
             "message": {
@@ -546,8 +576,27 @@ mod tests {
         })
         .to_string();
         let lines = [multi];
-        let r = infer_state(&refs(&lines)).unwrap();
-        assert_eq!(r.latest_assistant_text.as_deref(), Some("second block"));
+        let entries = extract_text_entries(&refs(&lines));
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].1, "second block");
+    }
+
+    #[test]
+    fn extract_captures_attachment_as_user() {
+        let lines = [assistant_text("working..."), attachment("check the build failure"), assistant_text("done")];
+        let entries = extract_text_entries(&refs(&lines));
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0], (DialogRole::Assistant, "working...".into()));
+        assert_eq!(entries[1], (DialogRole::User, "check the build failure".into()));
+        assert_eq!(entries[2], (DialogRole::Assistant, "done".into()));
+    }
+
+    #[test]
+    fn extract_skips_empty_attachment() {
+        let lines = [attachment("  "), assistant_text("answer")];
+        let entries = extract_text_entries(&refs(&lines));
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].1, "answer");
     }
 
     #[test]
@@ -753,7 +802,6 @@ mod tests {
                 state: Some(Status::Working),
                 model: Some("claude-opus-4-7".into()),
                 input_tokens: Some(42_100),
-                latest_assistant_text: None,
             },
             500,
         );
@@ -773,7 +821,6 @@ mod tests {
                 state: Some(Status::Working),
                 model: Some("claude-opus-4-7".into()),
                 input_tokens: Some(100),
-                latest_assistant_text: None,
             },
             500,
         );

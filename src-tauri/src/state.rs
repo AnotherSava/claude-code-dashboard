@@ -293,44 +293,51 @@ impl AppState {
         true
     }
 
-    /// Watcher-driven assistant text capture. Updates the latest Assistant
-    /// entry that sits after the most recent User entry; appends if there
-    /// isn't one. Works around the Stop-hook-before-transcript-flush race:
-    /// when the model's final text-only turn isn't on disk at Stop time,
-    /// the file watcher catches the line later and we update the dialog
-    /// in place instead of leaving the earlier-turn text stale. Returns
-    /// `true` when the dialog was modified.
-    pub fn upsert_assistant_text(&self, id: &str, text: String, now_ms: i64) -> bool {
+    /// Watcher-driven text capture. Processes transcript text entries in
+    /// chronological order. User entries append (with dedup). Assistant
+    /// entries replace the last assistant in the current turn (same-turn
+    /// update), or append if a user entry separates them (new turn after
+    /// an interrupt).
+    pub fn apply_text_entries(&self, id: &str, entries: &[(DialogRole, String)], now_ms: i64) -> bool {
         let mut sessions = self.sessions.lock().unwrap();
         let Some(session) = sessions.iter_mut().find(|s| s.id == id) else {
             return false;
         };
-        let last_assistant_idx = session
-            .dialog
-            .iter()
-            .enumerate()
-            .rev()
-            .take_while(|(_, e)| e.role != DialogRole::User)
-            .find(|(_, e)| e.role == DialogRole::Assistant)
-            .map(|(i, _)| i);
-        if let Some(i) = last_assistant_idx {
-            if session.dialog[i].text == text {
-                return false;
+        let mut changed = false;
+        for (role, text) in entries {
+            match role {
+                DialogRole::User => {
+                    let last_user = session.dialog.iter().rev().find(|e| e.role == DialogRole::User);
+                    if last_user.is_some_and(|e| e.text == *text) {
+                        continue;
+                    }
+                    session.dialog.push(DialogEntry { role: *role, text: text.clone(), timestamp: now_ms, status: session.status });
+                    changed = true;
+                }
+                DialogRole::Assistant => {
+                    let tail_idx = session.dialog.iter().enumerate().rev()
+                        .take_while(|(_, e)| e.role != DialogRole::User)
+                        .find(|(_, e)| e.role == DialogRole::Assistant)
+                        .map(|(i, _)| i);
+                    if let Some(i) = tail_idx {
+                        if session.dialog[i].text == *text {
+                            continue;
+                        }
+                        session.dialog[i].text = text.clone();
+                        session.dialog[i].timestamp = now_ms;
+                        session.dialog[i].status = session.status;
+                    } else {
+                        session.dialog.push(DialogEntry { role: *role, text: text.clone(), timestamp: now_ms, status: session.status });
+                    }
+                    changed = true;
+                }
+                _ => {}
             }
-            session.dialog[i].text = text;
-            session.dialog[i].timestamp = now_ms;
-            session.dialog[i].status = session.status;
-            session.updated = now_ms;
-            return true;
         }
-        session.dialog.push(DialogEntry {
-            role: DialogRole::Assistant,
-            text,
-            timestamp: now_ms,
-            status: session.status,
-        });
-        session.updated = now_ms;
-        true
+        if changed {
+            session.updated = now_ms;
+        }
+        changed
     }
 }
 
@@ -786,10 +793,10 @@ mod tests {
     }
 
     #[test]
-    fn upsert_assistant_text_appends_when_empty() {
+    fn apply_text_appends_assistant_when_empty() {
         let state = AppState::new();
         seed(&state, vec![]);
-        let changed = state.upsert_assistant_text("a", "first".into(), 100);
+        let changed = state.apply_text_entries("a", &[(DialogRole::Assistant, "first".into())], 100);
         assert!(changed);
         let s = get(&state, "a");
         assert_eq!(s.dialog.len(), 1);
@@ -798,10 +805,10 @@ mod tests {
     }
 
     #[test]
-    fn upsert_assistant_text_appends_after_user() {
+    fn apply_text_appends_after_user() {
         let state = AppState::new();
         seed(&state, vec![user_entry("hi", 10)]);
-        let changed = state.upsert_assistant_text("a", "answer".into(), 20);
+        let changed = state.apply_text_entries("a", &[(DialogRole::Assistant, "answer".into())], 20);
         assert!(changed);
         let s = get(&state, "a");
         assert_eq!(s.dialog.len(), 2);
@@ -809,55 +816,54 @@ mod tests {
     }
 
     #[test]
-    fn upsert_assistant_text_replaces_latest_assistant_in_current_turn() {
+    fn apply_text_replaces_assistant_in_same_turn() {
         let state = AppState::new();
         seed(&state, vec![user_entry("hi", 10), assistant_entry("partial", 20)]);
-        let changed = state.upsert_assistant_text("a", "full".into(), 30);
+        let changed = state.apply_text_entries("a", &[(DialogRole::Assistant, "full".into())], 30);
         assert!(changed);
         let s = get(&state, "a");
-        assert_eq!(s.dialog.len(), 2, "no new entry — last assistant updated in place");
+        assert_eq!(s.dialog.len(), 2, "replaced in place, not appended");
         assert_eq!(s.dialog[1].text, "full");
-        assert_eq!(s.dialog[1].timestamp, 30);
     }
 
     #[test]
-    fn upsert_assistant_text_no_op_when_unchanged() {
+    fn apply_text_no_op_when_unchanged() {
         let state = AppState::new();
         seed(&state, vec![user_entry("hi", 10), assistant_entry("same", 20)]);
-        let changed = state.upsert_assistant_text("a", "same".into(), 30);
+        let changed = state.apply_text_entries("a", &[(DialogRole::Assistant, "same".into())], 30);
         assert!(!changed);
-        let s = get(&state, "a");
-        assert_eq!(s.dialog[1].timestamp, 20, "timestamp not bumped");
     }
 
     #[test]
-    fn upsert_assistant_text_does_not_touch_prior_turn() {
+    fn apply_text_interrupt_appends_after_user_boundary() {
         let state = AppState::new();
-        seed(&state, vec![user_entry("u1", 10), assistant_entry("a1", 20), user_entry("u2", 30)]);
-        let changed = state.upsert_assistant_text("a", "a2".into(), 40);
+        seed(&state, vec![user_entry("task", 10)]);
+        let entries = vec![
+            (DialogRole::User, "interrupt".into()),
+            (DialogRole::Assistant, "ack + pivot".into()),
+            (DialogRole::Assistant, "final answer".into()),
+        ];
+        let changed = state.apply_text_entries("a", &entries, 50);
         assert!(changed);
         let s = get(&state, "a");
-        assert_eq!(s.dialog.len(), 4);
-        assert_eq!(s.dialog[1].text, "a1", "previous turn's text preserved");
-        assert_eq!(s.dialog[3].text, "a2");
+        assert_eq!(s.dialog.len(), 3);
+        assert_eq!(s.dialog[1].role, DialogRole::User);
+        assert_eq!(s.dialog[1].text, "interrupt");
+        assert_eq!(s.dialog[2].text, "final answer", "same-turn assistant texts replace");
     }
 
     #[test]
-    fn upsert_assistant_text_skips_separator() {
+    fn apply_text_dedup_user_from_hook() {
         let state = AppState::new();
-        seed(&state, vec![user_entry("u1", 10), assistant_entry("old", 20), separator_entry(25)]);
-        let changed = state.upsert_assistant_text("a", "fresh".into(), 30);
-        assert!(changed);
-        let s = get(&state, "a");
-        assert_eq!(s.dialog.len(), 3, "separator does not block in-turn replace");
-        assert_eq!(s.dialog[1].text, "fresh");
-        assert_eq!(s.dialog[2].role, DialogRole::Separator);
+        seed(&state, vec![user_entry("fix bug", 10)]);
+        let changed = state.apply_text_entries("a", &[(DialogRole::User, "fix bug".into())], 20);
+        assert!(!changed, "hook already captured this prompt");
     }
 
     #[test]
-    fn upsert_assistant_text_missing_session_is_noop() {
+    fn apply_text_missing_session_is_noop() {
         let state = AppState::new();
-        assert!(!state.upsert_assistant_text("nope", "x".into(), 0));
+        assert!(!state.apply_text_entries("nope", &[(DialogRole::Assistant, "x".into())], 0));
     }
 
     #[test]
