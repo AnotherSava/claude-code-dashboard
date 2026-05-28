@@ -240,6 +240,7 @@ mod tests {
             updated: state_entered_at,
             state_entered_at,
             working_accumulated_ms: 0,
+            display_name: None,
         }
     }
 

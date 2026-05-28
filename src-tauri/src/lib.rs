@@ -1,8 +1,10 @@
 mod adapters;
 mod auto_resize;
+mod chat_id_registry;
 mod commands;
 mod config;
 mod config_watcher;
+mod custom_names;
 mod http_server;
 mod label_policy;
 mod log_watcher;
@@ -49,6 +51,7 @@ pub fn run() {
             commands::close_window,
             commands::hide_history,
             commands::set_history_font_size,
+            commands::set_chat_name,
             commands::test_telegram_notification,
         ])
         .setup(|app| {
@@ -71,6 +74,14 @@ pub fn run() {
             let history_store =
                 prompt_history::PromptHistoryStore::new(app_data.join("prompt_history.json"));
             app.manage(history_store);
+
+            app.manage(chat_id_registry::ChatIdRegistry::new(
+                app_data.join("session_chat_ids.json"),
+            ));
+
+            app.manage(custom_names::CustomNamesStore::new(
+                app_data.join("custom_names.json"),
+            ));
 
             let config_path = app_data.join("config.json");
 

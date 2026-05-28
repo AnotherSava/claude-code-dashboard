@@ -30,6 +30,8 @@ Backslashes are normalized to forward slashes before matching, so Windows paths 
 | `d:/projects`                      | `projects`          |
 | `c:/Users/foo/bar`                 | `bar`               |
 
+This derivation runs per event, but the result is only the **first-seen anchor**: `http_server` locks each `session_id` to the `chat_id` derived on its first event (`chat_id_registry`), so a mid-session `cd` into a subdirectory reuses the original id instead of spawning a second row. `/clear` mints a new `session_id` with the same `cwd`, so it re-derives — and re-locks — the same id.
+
 ## Event → status
 
 The adapter recognizes six event names. Anything else returns `Ignore` and the widget state is untouched.

@@ -8,7 +8,9 @@ nav_order: 2
 
 ### Session identity
 
-Each Claude Code session becomes one row in the widget. The row's `id` is derived from the session's current working directory — if `cwd` sits under the configured `projects_root`, the relative path becomes the id with slashes, dashes, and underscores replaced by spaces. Sessions outside `projects_root` fall back to the folder's base name; sessions with no `cwd` use the first eight characters of the Claude session id.
+Each Claude Code session becomes one row in the widget. The row's `id` is derived from the working directory of the session's **first** event — if `cwd` sits under the configured `projects_root`, the relative path becomes the id with slashes, dashes, and underscores replaced by spaces. Sessions outside `projects_root` fall back to the folder's base name; sessions with no `cwd` use the first eight characters of the Claude session id. The id is then locked to the session, so if the agent `cd`s into a subdirectory mid-conversation the row stays put rather than splitting into a second row.
+
+**Renaming a row.** Double-click a row's name to edit it — Enter saves, Esc cancels, an empty value reverts to the derived id. The custom name is remembered per project, so a later Claude session in the same directory shows the same name.
 
 ### Live status
 

@@ -1,13 +1,30 @@
 use crate::config::{Config, ConfigState};
+use crate::custom_names::CustomNamesStore;
 use crate::log_watcher::WatcherRegistry;
 use crate::state::{AgentSession, AppState};
 use crate::telegram::TelegramNotifier;
 use crate::usage_limits::{UsageLimits, UsageLimitsState};
 use tauri::{AppHandle, Emitter, Manager, State, WebviewWindow};
 
+/// Snapshot the sessions and fill each `display_name` from the custom-names
+/// store. The name rides on the session so the frontend renders it without a
+/// separate lookup channel.
+fn resolved_snapshot(app: &AppHandle) -> Vec<AgentSession> {
+    let Some(state) = app.try_state::<AppState>() else {
+        return Vec::new();
+    };
+    let mut sessions = state.snapshot();
+    if let Some(names) = app.try_state::<CustomNamesStore>() {
+        for s in &mut sessions {
+            s.display_name = names.get(&s.id);
+        }
+    }
+    sessions
+}
+
 #[tauri::command]
-pub fn get_sessions(state: State<AppState>) -> Vec<AgentSession> {
-    state.snapshot()
+pub fn get_sessions(app: AppHandle) -> Vec<AgentSession> {
+    resolved_snapshot(&app)
 }
 
 #[tauri::command]
@@ -159,6 +176,17 @@ pub fn set_history_font_size(size: crate::config::HistoryFontSize, app: AppHandl
     emit_config_updated(&app);
 }
 
+/// Set or clear a user display name for a chat_id. Empty/whitespace clears
+/// it (reverts to the chat_id). Keyed by chat_id so it persists across
+/// sessions for the same project.
+#[tauri::command]
+pub fn set_chat_name(chat_id: String, name: String, app: AppHandle) {
+    if let Some(names) = app.try_state::<CustomNamesStore>() {
+        names.set(&chat_id, &name);
+    }
+    emit_sessions_updated(&app);
+}
+
 pub fn now_ms() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
@@ -168,9 +196,7 @@ pub fn now_ms() -> i64 {
 }
 
 pub fn emit_sessions_updated(app: &AppHandle) {
-    if let Some(state) = app.try_state::<AppState>() {
-        let _ = app.emit("sessions_updated", state.snapshot());
-    }
+    let _ = app.emit("sessions_updated", resolved_snapshot(app));
 }
 
 pub fn emit_config_updated(app: &AppHandle) {

@@ -65,6 +65,11 @@ pub struct AgentSession {
     pub updated: i64,
     pub state_entered_at: i64,
     pub working_accumulated_ms: u64,
+    /// User-assigned display name, resolved from `CustomNamesStore` at emit
+    /// time (keyed by `id`). Always `None` in `AppState`; filled on the way
+    /// to the frontend. Not persisted in `prompt_history`.
+    #[serde(default)]
+    pub display_name: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -255,6 +260,7 @@ impl AppState {
                 updated: now_ms,
                 state_entered_at: now_ms,
                 working_accumulated_ms: 0,
+                display_name: None,
             });
             has_new_entry || dialog_restored
         }
@@ -789,6 +795,7 @@ mod tests {
             updated: 0,
             state_entered_at: 0,
             working_accumulated_ms: 0,
+            display_name: None,
         });
     }
 

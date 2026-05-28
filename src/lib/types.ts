@@ -22,6 +22,7 @@ export interface AgentSession {
   updated: number
   state_entered_at: number
   working_accumulated_ms: number
+  display_name?: string | null
 }
 
 export interface ContextBarThreshold {

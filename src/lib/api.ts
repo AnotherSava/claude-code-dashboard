@@ -66,6 +66,10 @@ export function setHistoryFontSize(size: string): Promise<void> {
   return invoke('set_history_font_size', { size })
 }
 
+export function setChatName(chatId: string, name: string): Promise<void> {
+  return invoke('set_chat_name', { chatId, name })
+}
+
 export function hideHistory(): Promise<void> {
   return invoke('hide_history')
 }

@@ -23,7 +23,7 @@
     stateLabel,
     tokenColor,
   } from '../types'
-  import { hideHistory, openHistory, removeSession } from '../api'
+  import { hideHistory, openHistory, removeSession, setChatName } from '../api'
   import { isTaskBoundary } from '../dialog'
 
   interface Props {
@@ -35,6 +35,36 @@
   let { session, config, now }: Props = $props()
 
   const HISTORY_VISIBLE = 4
+
+  const displayName = $derived(session.display_name ?? session.id)
+
+  let editing = $state(false)
+  let draft = $state('')
+
+  function focusSelect(node: HTMLInputElement) {
+    node.focus()
+    node.select()
+  }
+
+  function startEdit() {
+    draft = displayName
+    editing = true
+  }
+
+  function commitEdit() {
+    if (!editing) return
+    editing = false
+    setChatName(session.id, draft).catch((err) => console.error('set_chat_name failed', err))
+  }
+
+  function cancelEdit() {
+    editing = false
+  }
+
+  function onNameKeydown(e: KeyboardEvent) {
+    if (e.key === 'Enter') { e.preventDefault(); commitEdit() }
+    else if (e.key === 'Escape') { e.preventDefault(); cancelEdit() }
+  }
 
   const label = $derived(displayLabel(session))
   const time = $derived(formatTime(displayTimeMs(session, now)))
@@ -91,7 +121,17 @@
 <div class="row">
   <div class="content">
     <div class="top">
-      <span class="id" title={session.id}>{session.id}</span>
+      {#if editing}
+        <input
+          class="id-edit"
+          use:focusSelect
+          bind:value={draft}
+          onkeydown={onNameKeydown}
+          onblur={cancelEdit}
+        />
+      {:else}
+        <span class="id" title="{displayName} — double-click to rename" ondblclick={startEdit} role="textbox" tabindex="-1">{displayName}</span>
+      {/if}
       <span class="pill state-{session.status}" class:pulse={shouldPulse}>{stateLabel[session.status]}</span>
       <span class="time-slot">
         <span class="time">{time}</span>
@@ -145,6 +185,19 @@
     text-overflow: ellipsis;
     flex: 1;
     min-width: 0;
+  }
+  .id-edit {
+    font-size: 13px;
+    font-weight: 600;
+    color: #e8e8ea;
+    flex: 1;
+    min-width: 0;
+    background: #1c1c1e;
+    border: 1px solid #3b82f6;
+    border-radius: 4px;
+    padding: 0 4px;
+    outline: none;
+    font-family: inherit;
   }
   .pill {
     font-size: 9px;

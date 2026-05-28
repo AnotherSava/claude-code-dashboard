@@ -9,6 +9,7 @@ use std::net::SocketAddr;
 use tauri::{AppHandle, Manager};
 
 use crate::adapters::{self, AdapterOutput};
+use crate::chat_id_registry::ChatIdRegistry;
 use crate::commands::{emit_sessions_updated, now_ms};
 use crate::config::ConfigState;
 use crate::log_watcher::WatcherRegistry;
@@ -68,7 +69,25 @@ async fn post_event(
     };
     let cfg = cfg_state.snapshot();
 
-    let output = adapters::dispatch(&req.client, &req.event, &req.payload, &cfg);
+    let mut output = adapters::dispatch(&req.client, &req.event, &req.payload, &cfg);
+
+    // Lock the row to the Claude session_id so a mid-session cwd change (the
+    // agent `cd`s into a subdirectory) doesn't fragment one conversation across
+    // multiple rows. `/clear` mints a new session_id with the same cwd, so it
+    // re-derives the same id and the row stays continuous.
+    let session_id = req.payload.get("session_id").and_then(|v| v.as_str()).unwrap_or("");
+    if let Some(registry) = app.try_state::<ChatIdRegistry>() {
+        match &mut output {
+            AdapterOutput::Set { input, .. } => {
+                input.id = registry.resolve(session_id, &input.id);
+            }
+            AdapterOutput::Clear { id } => {
+                *id = registry.resolve(session_id, id);
+                registry.forget(session_id);
+            }
+            AdapterOutput::Ignore => {}
+        }
+    }
 
     match output {
         AdapterOutput::Set { input, transcript_path } => {
