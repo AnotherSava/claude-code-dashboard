@@ -90,25 +90,35 @@ Other Unicode passes through untouched — accents, emoji, CJK, math symbols. Th
    - if it's an array, walk each block and take the trimmed `text` from blocks where `type == "text"`.
 5. Track the last non-empty text seen (so trailing whitespace-only assistant turns don't reset the state) and return it.
 
-**`is_a_question(text, benign_closers)`** — pure check on a string, two detection paths:
+**`is_a_question(text, benign_closers)`** — pure check on a string, three detection paths:
 
 **Path 1 — trailing `?`:**
 
 1. If `text` (after trim) ends with `)`, peel off one trailing `(...)` group **only when** the substring before the matching `(` ends with `?`. This handles option lists like `"Save these? (all / numbers / none)"` → `"Save these?"`. Other trailing parens (e.g. `"Look at this code (foo.py)"`) are left alone — there's no `?` before them, so the text falls through unchanged.
 2. After that strip, if the text ends with `?`, check against `Config::benign_closers` — case-insensitive suffix match. A hit skips this path. Defaults: `"What's next?"`, `"Anything else?"`. They exist because Claude often signs off with a polite question that isn't a real ask — flipping to `awaiting` on every `What's next?` would be noise.
 
-**Path 2 — permission-seeking phrase in last paragraph:**
+**Path 2 — hand-back phrase in last paragraph:**
 
-If path 1 doesn't match, extract the last paragraph of `text` (split by `\n\n`) and check whether it contains any of these phrases (case-insensitive) followed by `?` somewhere later in the same paragraph:
+If path 1 doesn't match, extract the last paragraph of `text` (split by `\n\n`) and check whether it contains any of these phrases (case-insensitive). A phrase that already ends in `?` matches literally; the rest only count when a `?` follows them later in the same paragraph:
 
 - `"want me to"`
 - `"shall i"`
 - `"should i"`
 - `"do you want"`
+- `"save this?"`
+- `"save these?"`
+- `"can you"`
+- `"could you"`
+- `"did you"`
+- `"want to"`
 
-This catches questions embedded mid-paragraph like `"Want me to add that? The plan: write sessions.json to disk."` where the response continues past the `?`. The phrase list is empirically derived from ~216 real assistant messages — only patterns that actually appeared are included; new ones are added as observed. Only the **last** paragraph is scanned: a question in an earlier paragraph followed by a concluding statement (e.g. `"Want me to fix it?\n\nI went ahead and fixed it."`) correctly returns `false`.
+This catches questions embedded mid-paragraph like `"Want me to add that? The plan: write sessions.json to disk."` where the response continues past the `?`. The phrase list is empirically derived from real assistant messages — only patterns that actually appeared are included; new ones are added as observed. `"save this?"` / `"save these?"` were added for the `/reflect` and `/commit` save prompts, whose `"Save this? (all / 1 / none)"` menu can be trailed by a clause like `"— then I'll run /commit."` that defeats path 1 (the text no longer ends with `?`); the baked-in `?` keeps a declarative `"save this config"` from matching. `"can you"` / `"could you"` / `"did you"` / `"want to"` catch directed second-person questions whose paragraph continues past the `?` (`"Did you try the admin launch? That's the most likely fix."`). Only the **last** paragraph is scanned: a question in an earlier paragraph followed by a concluding statement (e.g. `"Want me to fix it?\n\nI went ahead and fixed it."`) correctly returns `false`.
 
 Only round brackets `()` are recognized for the option-list strip; `[]` and `{}` aren't peeled.
+
+**Path 3 — `Paste …` request in last paragraph:**
+
+If neither path above matches, check whether any sentence in the last paragraph (split on `.!?` and newlines) starts with `"paste "` (case-insensitive). This catches the imperative hand-back where the agent waits for the user to paste output but never ends on a `?` — `"Paste the tableinfos output and I'll finish arena."`, `"Paste whatever it prints."`. Only a **sentence-initial** `Paste` counts, so a mid-sentence mention like `"you can paste this"` or `"I'll paste the result"` doesn't trigger.
 
 Failure modes are silent: a missing transcript file returns `None` from `last_assistant_text` (treated as "no question"), and malformed JSONL lines are individually skipped. The adapter never crashes a status update because of a transcript read error.
 

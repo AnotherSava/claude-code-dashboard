@@ -304,20 +304,35 @@ fn last_assistant_text(path: &Path) -> Option<String> {
     if last_text.is_empty() { None } else { Some(last_text) }
 }
 
-/// Permission-seeking phrases that indicate the agent is blocked waiting for
-/// user approval. Empirically derived from ~216 real assistant messages — only
-/// patterns that actually appeared are included; new ones are added as they're
-/// observed. Checked case-insensitively in the last paragraph of the response.
+/// Phrases that signal the agent has handed control back to the user — asking
+/// permission, or asking a direct second-person question. Empirically derived
+/// from real assistant messages — only patterns that actually appeared are
+/// included; new ones are added as they're observed. Checked case-insensitively
+/// in the last paragraph. A phrase ending in `?` matches literally; the rest
+/// only count when a `?` follows them later in the paragraph.
+/// `save this?` / `save these?` catch the `/reflect` and `/commit` save prompts,
+/// whose menu can be trailed by a clause (`"… — then I'll run /commit."`) that
+/// defeats the trailing-`?` path; the baked-in `?` keeps a declarative
+/// `"save this config"` from matching. `can you` / `could you` / `did you` /
+/// `want to` catch directed questions whose paragraph continues past the `?`
+/// (`"Did you try the admin launch? That's the most likely fix."`).
 const PERMISSION_SEEKING: &[&str] = &[
     "want me to",
     "shall i",
     "should i",
     "do you want",
+    "save this?",
+    "save these?",
+    "can you",
+    "could you",
+    "did you",
+    "want to",
 ];
 
-/// True when `text` reads as a question: either the whole text ends with `?`
-/// (possibly followed by a trailing option list), or the last paragraph
-/// contains a known permission-seeking phrase followed by `?`.
+/// True when `text` reads as a hand-back to the user: the whole text ends with
+/// `?` (possibly after a trailing option list); the last paragraph contains a
+/// known hand-back phrase (permission-seeking or a direct second-person
+/// question); or the last paragraph issues a `Paste …` request for output.
 fn is_a_question(text: &str, benign_closers: &[String]) -> bool {
     let effective = strip_trailing_options(text);
     if effective.ends_with('?') {
@@ -329,10 +344,11 @@ fn is_a_question(text: &str, benign_closers: &[String]) -> bool {
             return true;
         }
     }
-    has_permission_seeking_question(text)
+    has_permission_seeking_question(text) || has_paste_request(text)
 }
 
-/// Check the last paragraph for a permission-seeking phrase followed by `?`.
+/// Check the last paragraph for a permission-seeking phrase. A phrase ending in
+/// `?` matches as-is; the rest must be followed by a `?` later in the paragraph.
 /// Catches questions embedded mid-paragraph like "Want me to add that? The
 /// plan: ..." where the response continues after the question.
 fn has_permission_seeking_question(text: &str) -> bool {
@@ -341,11 +357,22 @@ fn has_permission_seeking_question(text: &str) -> bool {
     PERMISSION_SEEKING.iter().any(|phrase| {
         if let Some(phrase_start) = lower.find(phrase) {
             let after_phrase = &lower[phrase_start + phrase.len()..];
-            after_phrase.contains('?')
+            phrase.ends_with('?') || after_phrase.contains('?')
         } else {
             false
         }
     })
+}
+
+/// True when the last paragraph issues a sentence-initial `Paste …` request —
+/// the agent is waiting for the user to paste output back. Only a
+/// sentence-initial imperative counts; a mid-sentence mention like
+/// "you can paste this" or "I'll paste the result" does not.
+fn has_paste_request(text: &str) -> bool {
+    last_paragraph(text)
+        .to_lowercase()
+        .split(|c| matches!(c, '.' | '!' | '?' | '\n'))
+        .any(|sentence| sentence.trim_start().starts_with("paste "))
 }
 
 fn last_paragraph(text: &str) -> &str {
@@ -856,6 +883,58 @@ mod tests {
             "Deployed. Do you want me to run the tests? I can also check coverage.",
             &[]
         ));
+    }
+
+    #[test]
+    fn permission_seeking_save_prompt_with_trailing_clause() {
+        // The /reflect and /commit skills close with "Save this/these? (...)"
+        // menus a trailing clause can follow, so the text doesn't end with "?".
+        // The "save this?"/"save these?" phrasing flips it to awaiting.
+        assert!(is_a_question(
+            "Save this? (all / 1 / none) — then I'll run /commit.",
+            &[]
+        ));
+        assert!(is_a_question(
+            "Save these? (all / numbers / none) — I'll commit after.",
+            &[]
+        ));
+    }
+
+    #[test]
+    fn permission_seeking_save_without_question_mark_is_not_awaiting() {
+        // The "?" is baked into the phrase, so a declarative "save this ..."
+        // must not match — only the literal "save this?" question does.
+        assert!(!is_a_question(
+            "Let me save this config before continuing. Running the build now.",
+            &[]
+        ));
+    }
+
+    #[test]
+    fn directed_question_mid_paragraph_is_awaiting() {
+        // Direct second-person questions whose paragraph continues past the "?".
+        for text in [
+            "Can you reopen the history and confirm the line is there? If not, I'll dig in.",
+            "Could you paste that line? It'll look like a JSON blob.",
+            "Did you try the admin launch? That's the most likely fix.",
+            "Want to try a clean test? Reset the config and relaunch.",
+        ] {
+            assert!(is_a_question(text, &[]), "text: {}", text);
+        }
+    }
+
+    #[test]
+    fn paste_request_is_awaiting() {
+        // A sentence-initial "Paste ..." imperative means the agent is waiting.
+        assert!(is_a_question("Paste the tableinfos output and I'll finish arena.", &[]));
+        assert!(is_a_question("Looks good. Paste whatever it prints.", &[]));
+    }
+
+    #[test]
+    fn paste_mention_mid_sentence_is_not_awaiting() {
+        // Only a sentence-initial imperative counts — a mention does not.
+        assert!(!is_a_question("You can paste this into the terminal later. All set.", &[]));
+        assert!(!is_a_question("I'll paste the result here once it's done.", &[]));
     }
 
     #[test]
