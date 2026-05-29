@@ -101,8 +101,10 @@ pub fn infer_state(lines: &[&str]) -> Option<InferredState> {
 use crate::state::DialogRole;
 
 /// Walk lines forward (chronological) and extract text entries for the dialog.
-/// Captures assistant text blocks and user interrupts (attachment entries with
-/// a `prompt` field).
+/// Captures assistant text blocks and mid-turn queued/interrupt prompts
+/// (`queued_command` attachments), which carry their text at
+/// `attachment.prompt`. System-injected prompts (task notifications) are
+/// skipped, mirroring the hook path's filter.
 pub fn extract_text_entries(lines: &[&str]) -> Vec<(DialogRole, String)> {
     let mut entries = Vec::new();
     for line in lines {
@@ -111,11 +113,16 @@ pub fn extract_text_entries(lines: &[&str]) -> Vec<(DialogRole, String)> {
             Err(_) => continue,
         };
         if entry.entry_type == "attachment" {
-            if let Some(prompt) = entry.prompt {
-                let trimmed = prompt.trim();
-                if !trimmed.is_empty() {
-                    entries.push((DialogRole::User, trimmed.to_string()));
-                }
+            let queued = entry
+                .attachment
+                .as_ref()
+                .filter(|a| a.attachment_type.as_deref() == Some("queued_command"))
+                .and_then(|a| a.prompt.as_deref())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .filter(|s| !crate::adapters::claude::is_system_injected(s));
+            if let Some(prompt) = queued {
+                entries.push((DialogRole::User, prompt.to_string()));
             }
             continue;
         }
@@ -203,6 +210,18 @@ struct TranscriptEntry {
     #[serde(default, rename = "isSidechain")]
     is_sidechain: bool,
     message: Option<TranscriptMessage>,
+    attachment: Option<TranscriptAttachment>,
+}
+
+/// The `attachment` payload on an `attachment`-type transcript entry. A
+/// mid-turn queued/interrupt prompt arrives as `attachment.type ==
+/// "queued_command"` with the text under `attachment.prompt` — there is no
+/// top-level `prompt` field and no `UserPromptSubmit` hook for it, so the
+/// transcript is the only place this user input appears.
+#[derive(Deserialize)]
+struct TranscriptAttachment {
+    #[serde(rename = "type")]
+    attachment_type: Option<String>,
     prompt: Option<String>,
 }
 
@@ -528,7 +547,7 @@ mod tests {
     // -------- extract_text_entries tests --------
 
     fn attachment(prompt: &str) -> String {
-        json!({ "type": "attachment", "prompt": prompt }).to_string()
+        json!({ "type": "attachment", "attachment": { "type": "queued_command", "prompt": prompt, "commandMode": "prompt" } }).to_string()
     }
 
     #[test]
@@ -594,6 +613,40 @@ mod tests {
     #[test]
     fn extract_skips_empty_attachment() {
         let lines = [attachment("  "), assistant_text("answer")];
+        let entries = extract_text_entries(&refs(&lines));
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].1, "answer");
+    }
+
+    #[test]
+    fn extract_skips_task_notification_attachment() {
+        // queued_command can also carry a system-injected task notification —
+        // not real user input, must not become a dialog boundary.
+        let sysmsg = json!({
+            "type": "attachment",
+            "attachment": {
+                "type": "queued_command",
+                "prompt": "<task-notification>\n<status>completed</status>\n</task-notification>",
+                "commandMode": "task-notification"
+            }
+        })
+        .to_string();
+        let lines = [sysmsg, assistant_text("answer")];
+        let entries = extract_text_entries(&refs(&lines));
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].1, "answer");
+    }
+
+    #[test]
+    fn extract_skips_non_queued_attachment() {
+        // Other attachment kinds (task reminders, edited-file notices, etc.)
+        // have no user prompt and must be ignored.
+        let reminder = json!({
+            "type": "attachment",
+            "attachment": { "type": "task_reminder", "content": [], "itemCount": 0 }
+        })
+        .to_string();
+        let lines = [reminder, assistant_text("answer")];
         let entries = extract_text_entries(&refs(&lines));
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].1, "answer");

@@ -19,7 +19,11 @@ use crate::state::{DialogRole, PendingDialogEntry, SetInput, Status};
 /// PreToolUse hook is the only timely signal.
 const USER_GATING_TOOLS: &[&str] = &["AskUserQuestion", "ExitPlanMode"];
 
-fn is_system_injected(prompt: &str) -> bool {
+/// Claude Code injects synthetic prompts (e.g. background-task completion
+/// notices) as `<task-notification>` blocks. They are not real user input and
+/// must not become dialog entries — filtered on both the hook path and the
+/// transcript-watcher path.
+pub(crate) fn is_system_injected(prompt: &str) -> bool {
     prompt.starts_with("<task-notification>")
 }
 
