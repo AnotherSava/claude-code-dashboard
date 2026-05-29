@@ -77,7 +77,14 @@ pub fn hide_window(window: WebviewWindow) -> Result<(), String> {
 #[tauri::command]
 pub fn show_window(window: WebviewWindow) -> Result<(), String> {
     window.show().map_err(|e| e.to_string())?;
-    window.set_focus().map_err(|e| e.to_string())
+    window.set_focus().map_err(|e| e.to_string())?;
+    // The webview can invoke get_config before setup() finishes managing
+    // ConfigState, in which case it receives Config::default() (auto_resize
+    // None) and stays stuck there forever. The frontend registers its
+    // config_updated listener before calling show_window, so re-pushing the
+    // now-authoritative config here corrects any value lost to that race.
+    emit_config_updated(window.app_handle());
+    Ok(())
 }
 
 #[tauri::command]
@@ -112,13 +119,21 @@ pub fn remove_session(id: String, app: AppHandle) {
     emit_sessions_updated(&app);
 }
 
+/// The history window's OS title bar: the user's custom name for the chat, or
+/// the chat_id when unnamed.
+fn history_title(app: &AppHandle, chat_id: &str) -> String {
+    app.try_state::<CustomNamesStore>()
+        .and_then(|names| names.get(chat_id))
+        .unwrap_or_else(|| chat_id.to_string())
+}
+
 #[tauri::command]
 pub fn open_history(id: String, app: AppHandle) -> Result<(), String> {
     if let Some(target) = app.try_state::<HistoryTarget>() {
         *target.0.lock().unwrap() = Some(id.clone());
     }
     if let Some(window) = app.get_webview_window("history") {
-        let _ = window.set_title(&id);
+        let _ = window.set_title(&history_title(&app, &id));
         let _ = window.emit("history_target", &id);
         if let Some(cfg) = app.try_state::<crate::config::ConfigState>() {
             let snap = cfg.snapshot();
@@ -183,6 +198,14 @@ pub fn set_history_font_size(size: crate::config::HistoryFontSize, app: AppHandl
 pub fn set_chat_name(chat_id: String, name: String, app: AppHandle) {
     if let Some(names) = app.try_state::<CustomNamesStore>() {
         names.set(&chat_id, &name);
+    }
+    let history_targets_chat = app
+        .try_state::<HistoryTarget>()
+        .is_some_and(|target| target.0.lock().unwrap().as_deref() == Some(chat_id.as_str()));
+    if history_targets_chat {
+        if let Some(window) = app.get_webview_window("history") {
+            let _ = window.set_title(&history_title(&app, &chat_id));
+        }
     }
     emit_sessions_updated(&app);
 }
