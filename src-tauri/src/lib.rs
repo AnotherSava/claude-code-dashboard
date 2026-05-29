@@ -21,6 +21,11 @@ use log_watcher::WatcherRegistry;
 use state::AppState;
 use usage_limits::{UsageLimitsPoller, UsageLimitsState};
 
+// Ties this crate's compilation to the frontend dist fingerprint computed in
+// build.rs, so a frontend-only change re-embeds the UI on an incremental local
+// build instead of shipping stale assets. See build.rs for the full rationale.
+const _: &str = env!("FRONTEND_FINGERPRINT");
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
