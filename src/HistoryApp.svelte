@@ -59,16 +59,39 @@
     return segments
   }
 
-  function collapseRange(lines: string[]): [number, number] | null {
+  type Fold = { head: string[]; tail: string[]; label: string }
+
+  const FOLD_HEAD_LINES = 12
+  const FOLD_TAIL_LINES = 6
+  const FOLD_HEAD_CHARS = 900
+  const FOLD_TAIL_CHARS = 300
+  const FOLD_MIN_HIDDEN_LINES = 3
+  const FOLD_MIN_HIDDEN_CHARS = 300
+
+  // Decide whether/how to fold an over-long entry, in priority order. Returns
+  // the lines to show before and after a `<...>` button, or null to show all.
+  function computeFold(lines: string[]): Fold | null {
+    // 1. Collapse the body between an assistant's first and last separator line.
     const hrs: number[] = []
-    for (let i = 0; i < lines.length; i++) {
-      if (SEPARATOR_RE.test(lines[i].trim())) hrs.push(i)
+    for (let i = 0; i < lines.length; i++) if (SEPARATOR_RE.test(lines[i].trim())) hrs.push(i)
+    if (hrs.length >= 2 && hrs[hrs.length - 1] - hrs[0] >= 2) {
+      const first = hrs[0], last = hrs[hrs.length - 1]
+      return { head: lines.slice(0, first), tail: lines.slice(last + 1), label: `${last - first + 1} hidden lines` }
     }
-    if (hrs.length < 2) return null
-    const first = hrs[0]
-    const last = hrs[hrs.length - 1]
-    if (last - first < 2) return null
-    return [first, last]
+
+    // 2. Long entry: keep whole lines at each end within a line- and char-budget.
+    let hi = 0, hc = 0
+    while (hi < lines.length && hi < FOLD_HEAD_LINES && hc + lines[hi].length + 1 <= FOLD_HEAD_CHARS) hc += lines[hi++].length + 1
+    let ti = lines.length, tc = 0
+    while (ti > hi && lines.length - ti < FOLD_TAIL_LINES && tc + lines[ti - 1].length + 1 <= FOLD_TAIL_CHARS) tc += lines[--ti].length + 1
+    if (ti - hi >= FOLD_MIN_HIDDEN_LINES) return { head: lines.slice(0, hi), tail: lines.slice(ti), label: `${ti - hi} hidden lines` }
+
+    // 3. Few lines but unreasonably long: truncate within the text by character budget.
+    const text = lines.join('\n')
+    const hidden = text.length - FOLD_HEAD_CHARS - FOLD_TAIL_CHARS
+    if (hidden >= FOLD_MIN_HIDDEN_CHARS) return { head: [text.slice(0, FOLD_HEAD_CHARS)], tail: [text.slice(text.length - FOLD_TAIL_CHARS)], label: `${hidden} hidden characters` }
+
+    return null
   }
 
   let sessionId = $state<string | null>(null)
@@ -185,8 +208,8 @@
           <div class="separator"><hr /></div>
         {:else}
           {@const lines = entry.text.split('\n')}
-          {@const range = expanded.has(i) ? null : collapseRange(lines)}
-          {@const displayLines = range ? [...lines.slice(0, range[0]), '\x00collapse', ...lines.slice(range[1] + 1)] : lines}
+          {@const fold = expanded.has(i) ? null : computeFold(lines)}
+          {@const displayLines = fold ? [...fold.head, '\x00collapse', ...fold.tail] : lines}
           {@const segments = segmentLines(displayLines)}
           <div class="entry" class:sticky={isTaskBoundary(dialog, i)} class:assistant={entry.role === 'assistant'}>
             <span class="ts">{formatClock(entry.timestamp)}</span>
@@ -200,7 +223,7 @@
                 {:else if seg.kind === 'code'}
                   <pre class="code">{seg.lines.join('\n')}</pre>
                 {:else}
-                  {#each seg.lines as line, j}{#if line === '\x00collapse'}<button type="button" class="ellipsis" onclick={() => expandEntry(i)} title="Expand {range ? range[1] - range[0] + 1 : 0} hidden lines">&lt;...&gt;</button>{:else}{#if j > 0}<br />{/if}{line}{/if}{/each}
+                  {#each seg.lines as line, j}{#if line === '\x00collapse'}{#if j > 0}<br />{/if}<button type="button" class="ellipsis" onclick={() => expandEntry(i)} title="Expand {fold?.label}">&lt;...&gt;</button>{:else}{#if j > 0}<br />{/if}{line}{/if}{/each}
                 {/if}
               {/each}
             </span>
