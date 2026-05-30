@@ -11,7 +11,9 @@ use crate::config::{AutoResize, ConfigState, HistoryFontSize};
 const MENU_SHOW_HIDE: &str = "show_hide";
 const MENU_ALWAYS_ON_TOP: &str = "always_on_top";
 const MENU_SAVE_POSITION: &str = "save_position";
-const MENU_AUTOSTART: &str = "autostart";
+const MENU_AUTOSTART_OFF: &str = "autostart_off";
+const MENU_AUTOSTART_OPEN: &str = "autostart_open";
+const MENU_AUTOSTART_TRAY: &str = "autostart_tray";
 const MENU_AUTO_RESIZE_NONE: &str = "auto_resize_none";
 const MENU_AUTO_RESIZE_UP: &str = "auto_resize_up";
 const MENU_AUTO_RESIZE_DOWN: &str = "auto_resize_down";
@@ -30,7 +32,9 @@ const MENU_QUIT: &str = "quit";
 pub struct TrayHandles {
     pub always_on_top: CheckMenuItem<Wry>,
     pub save_position: CheckMenuItem<Wry>,
-    pub autostart: CheckMenuItem<Wry>,
+    pub autostart_off: CheckMenuItem<Wry>,
+    pub autostart_open: CheckMenuItem<Wry>,
+    pub autostart_tray: CheckMenuItem<Wry>,
     pub auto_resize_none: CheckMenuItem<Wry>,
     pub auto_resize_up: CheckMenuItem<Wry>,
     pub auto_resize_down: CheckMenuItem<Wry>,
@@ -59,10 +63,29 @@ pub fn setup(app: &AppHandle) -> tauri::Result<()> {
         app, MENU_SAVE_POSITION, "Save position on exit", true, save_pos_initial, None::<&str>,
     )?;
 
-    let autostart_initial = app.autolaunch().is_enabled().unwrap_or(false);
-    let autostart = CheckMenuItem::with_id(
-        app, MENU_AUTOSTART, "Open on system start", true, autostart_initial, None::<&str>,
+    // Three-way autostart mode derived from two sources: whether the OS
+    // launch entry is enabled, and (when it is) the persisted `start_minimized`
+    // bit. Off = not enabled; Open window = enabled + show; Open to tray =
+    // enabled + minimized.
+    let autostart_enabled = app.autolaunch().is_enabled().unwrap_or(false);
+    let start_minimized_initial = app
+        .try_state::<ConfigState>()
+        .map(|s| s.snapshot().start_minimized)
+        .unwrap_or(false);
+    let autostart_off = CheckMenuItem::with_id(
+        app, MENU_AUTOSTART_OFF, "Off", true, !autostart_enabled, None::<&str>,
     )?;
+    let autostart_open = CheckMenuItem::with_id(
+        app, MENU_AUTOSTART_OPEN, "Open window", true,
+        autostart_enabled && !start_minimized_initial, None::<&str>,
+    )?;
+    let autostart_tray = CheckMenuItem::with_id(
+        app, MENU_AUTOSTART_TRAY, "Open to tray", true,
+        autostart_enabled && start_minimized_initial, None::<&str>,
+    )?;
+    let autostart_submenu = SubmenuBuilder::new(app, "On system start")
+        .items(&[&autostart_off, &autostart_open, &autostart_tray])
+        .build()?;
 
     let auto_resize_none = CheckMenuItem::with_id(
         app, MENU_AUTO_RESIZE_NONE, "None", true,
@@ -108,7 +131,7 @@ pub fn setup(app: &AppHandle) -> tauri::Result<()> {
             &PredefinedMenuItem::separator(app)?,
             &always_on_top,
             &save_position,
-            &autostart,
+            &autostart_submenu,
             &auto_resize_submenu,
             &hist_font_submenu,
             &PredefinedMenuItem::separator(app)?,
@@ -122,7 +145,9 @@ pub fn setup(app: &AppHandle) -> tauri::Result<()> {
     app.manage(TrayHandles {
         always_on_top: always_on_top.clone(),
         save_position: save_position.clone(),
-        autostart: autostart.clone(),
+        autostart_off: autostart_off.clone(),
+        autostart_open: autostart_open.clone(),
+        autostart_tray: autostart_tray.clone(),
         auto_resize_none: auto_resize_none.clone(),
         auto_resize_up: auto_resize_up.clone(),
         auto_resize_down: auto_resize_down.clone(),
@@ -166,7 +191,9 @@ fn handle_menu_event(app: &AppHandle, id: &str) {
         MENU_SHOW_HIDE => toggle_window(app),
         MENU_ALWAYS_ON_TOP => toggle_always_on_top(app),
         MENU_SAVE_POSITION => toggle_save_position(app),
-        MENU_AUTOSTART => toggle_autostart(app),
+        MENU_AUTOSTART_OFF => select_autostart_mode(app, AutostartMode::Off),
+        MENU_AUTOSTART_OPEN => select_autostart_mode(app, AutostartMode::OpenWindow),
+        MENU_AUTOSTART_TRAY => select_autostart_mode(app, AutostartMode::OpenToTray),
         MENU_AUTO_RESIZE_NONE => select_auto_resize_mode(app, AutoResize::None),
         MENU_AUTO_RESIZE_UP => select_auto_resize_mode(app, AutoResize::Up),
         MENU_AUTO_RESIZE_DOWN => select_auto_resize_mode(app, AutoResize::Down),
@@ -291,17 +318,47 @@ pub fn sync_history_font_checks(app: &AppHandle, size: HistoryFontSize) {
     let _ = handles.hist_font_largest.set_checked(size == HistoryFontSize::Largest);
 }
 
-fn toggle_autostart(app: &AppHandle) {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AutostartMode {
+    Off,
+    OpenWindow,
+    OpenToTray,
+}
+
+/// Apply a chosen autostart mode: flip the OS launch entry on/off and persist
+/// the `start_minimized` bit that distinguishes "Open window" from "Open to
+/// tray". The minimized bit only takes effect at the *next* login launch (it's
+/// read in `lib.rs` startup), so changing the mode while running never moves
+/// the current window.
+fn select_autostart_mode(app: &AppHandle, mode: AutostartMode) {
     let manager = app.autolaunch();
-    let enabled = manager.is_enabled().unwrap_or(false);
-    let new_state = if enabled {
-        manager.disable().is_ok() && false
-    } else {
-        manager.enable().is_ok()
+    let _ = match mode {
+        AutostartMode::Off => manager.disable(),
+        AutostartMode::OpenWindow | AutostartMode::OpenToTray => manager.enable(),
     };
-    if let Some(handles) = app.try_state::<TrayHandles>() {
-        let _ = handles.autostart.set_checked(new_state);
+    if let Some(state) = app.try_state::<ConfigState>() {
+        let minimized = mode == AutostartMode::OpenToTray;
+        if state.snapshot().start_minimized != minimized {
+            state.with_mut(|c| c.start_minimized = minimized);
+            let _ = state.save_to_disk();
+        }
     }
+    // Reconcile the radio checks against the now-authoritative OS state rather
+    // than the requested mode — if enable/disable failed, the marks reflect
+    // reality instead of an optimistic guess.
+    sync_autostart_checks(app);
+}
+
+fn sync_autostart_checks(app: &AppHandle) {
+    let Some(handles) = app.try_state::<TrayHandles>() else { return };
+    let enabled = app.autolaunch().is_enabled().unwrap_or(false);
+    let minimized = app
+        .try_state::<ConfigState>()
+        .map(|s| s.snapshot().start_minimized)
+        .unwrap_or(false);
+    let _ = handles.autostart_off.set_checked(!enabled);
+    let _ = handles.autostart_open.set_checked(enabled && !minimized);
+    let _ = handles.autostart_tray.set_checked(enabled && minimized);
 }
 
 fn open_data_dir(app: &AppHandle) {

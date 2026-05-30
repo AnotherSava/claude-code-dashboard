@@ -83,8 +83,24 @@ pub fn hide_window(window: WebviewWindow, app: AppHandle) -> Result<(), String> 
     Ok(())
 }
 
+/// Set when the app was auto-launched at login in "Open to tray" mode. While
+/// it stays set, the two automatic reveal paths — the frontend's mount-time
+/// `show_window` call and the safety-net timer in `lib.rs` — keep the main
+/// window hidden, so the app lives in the tray. The tray "Show / Hide" entry
+/// and `toggle_window` call `window.show()` directly and are unaffected.
+pub struct SuppressInitialShow(pub std::sync::atomic::AtomicBool);
+
 #[tauri::command]
-pub fn show_window(window: WebviewWindow) -> Result<(), String> {
+pub fn show_window(window: WebviewWindow, app: AppHandle) -> Result<(), String> {
+    if let Some(suppress) = app.try_state::<SuppressInitialShow>() {
+        if suppress.0.load(std::sync::atomic::Ordering::SeqCst) {
+            // Started minimized to tray: swallow the frontend's auto-reveal but
+            // still re-push config (the get_config race fix below applies even
+            // when the window stays hidden — the history window reads it too).
+            emit_config_updated(&app);
+            return Ok(());
+        }
+    }
     window.show().map_err(|e| e.to_string())?;
     window.set_focus().map_err(|e| e.to_string())?;
     // The webview can invoke get_config before setup() finishes managing

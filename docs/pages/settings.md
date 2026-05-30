@@ -20,7 +20,7 @@ Quick toggles that mirror specific `config.json` fields, plus shortcuts:
 - **Show / Hide widget** — left-click toggle on the tray icon.
 - **Always on top** — `always_on_top`.
 - **Save position on exit** — `save_window_position`.
-- **Start with system** — autostart via the OS (no `config.json` field; managed by Tauri's autostart plugin).
+- **On system start** submenu — Off / Open window / Open to tray. Autostart is managed by the OS; **Open to tray** also sets `start_minimized` so a login launch stays in the tray instead of showing the window.
 - **Auto-resize** submenu — Off / Up / Down (`auto_resize`).
 - **History font size** submenu — five sizes (`history_font_size`).
 - **Open config/logs location** — opens the app data directory.
@@ -35,6 +35,7 @@ Quick toggles that mirror specific `config.json` fields, plus shortcuts:
 | `save_window_position` | bool | `true` | Persist `window_position` / `history_window_position` on close (position **and** size). |
 | `window_position` | `{x, y, width?, height?}` | `null` | Last-saved main window position and size. `width`/`height` are optional so older configs keep working. |
 | `history_window_position` | `{x, y, width?, height?}` | `null` | Last-saved history window position and size. |
+| `start_minimized` | bool | `false` | When autostart launches the app at login, keep the main window hidden (tray only). Set via the tray's **On system start → Open to tray**; ignored on a manual launch. |
 | `auto_resize` | enum | `"none"` | `"none"` / `"up"` / `"down"` — auto-fit window height to content; `up` keeps the bottom edge fixed, `down` keeps the top edge fixed. |
 | `history_font_size` | enum | `"regular"` | `"smallest"` / `"small"` / `"regular"` / `"large"` / `"largest"`. |
 | `limit_bar_segments` | int | `16` | Number of segments in the 5h / 7d usage limit bars. |

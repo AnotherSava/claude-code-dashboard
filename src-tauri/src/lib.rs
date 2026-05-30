@@ -56,6 +56,17 @@ fn clear_webview_cache() {
 #[cfg(not(windows))]
 fn clear_webview_cache() {}
 
+/// Appended to the autostart launch command (see the plugin init in `run`).
+/// Its presence in the process args means this launch was triggered by the OS
+/// at login rather than by the user — the gate for honoring "Open to tray".
+pub const AUTOSTART_ARG: &str = "--autostarted";
+
+/// True when this process was started by the OS autostart entry (i.e. the
+/// `AUTOSTART_ARG` marker is present in the launch arguments).
+fn launched_via_autostart() -> bool {
+    std::env::args().any(|a| a == AUTOSTART_ARG)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Must run before the Builder creates the config-defined webviews, which
@@ -66,7 +77,10 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
-            None,
+            // Tag the login-launch command so startup can tell an autostart
+            // launch from a manual one — the "Open to tray" mode only hides
+            // the window when the launch actually came from autostart.
+            Some(vec![AUTOSTART_ARG]),
         ))
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState::new())
@@ -155,6 +169,15 @@ pub fn run() {
             let server_port = current_config.server_port;
             app.manage(config_state);
 
+            // "Open to tray": when the OS launched us at login and the user
+            // picked the minimized mode, keep the main window in the tray by
+            // suppressing both automatic reveal paths (frontend mount-time
+            // `show_window` and the safety-net timer below).
+            let start_minimized = current_config.start_minimized && launched_via_autostart();
+            app.manage(commands::SuppressInitialShow(
+                std::sync::atomic::AtomicBool::new(start_minimized),
+            ));
+
             // Apply config to the window
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.set_always_on_top(current_config.always_on_top);
@@ -183,14 +206,18 @@ pub fn run() {
                 auto_resize::set_dark_window_background(&window);
 
                 // Safety net: if the frontend never calls `show_window`
-                // (broken JS, slow webview), reveal the window anyway.
-                let window_for_timeout = window.clone();
-                tauri::async_runtime::spawn(async move {
-                    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
-                    if matches!(window_for_timeout.is_visible(), Ok(false)) {
-                        let _ = window_for_timeout.show();
-                    }
-                });
+                // (broken JS, slow webview), reveal the window anyway — unless
+                // we started minimized to tray, where staying hidden is the
+                // whole point.
+                if !start_minimized {
+                    let window_for_timeout = window.clone();
+                    tauri::async_runtime::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                        if matches!(window_for_timeout.is_visible(), Ok(false)) {
+                            let _ = window_for_timeout.show();
+                        }
+                    });
+                }
             }
 
             tray::setup(app.handle())?;

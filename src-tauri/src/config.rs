@@ -36,6 +36,13 @@ pub struct Config {
     pub auto_resize: AutoResize,
     pub history_font_size: HistoryFontSize,
     pub history_window_position: Option<WindowPosition>,
+    /// When the app is auto-launched at login (the "Open to tray" mode), keep
+    /// the main window hidden so only the tray icon appears. Read at startup in
+    /// `lib.rs`, but only honored when the launch actually came from autostart
+    /// (signaled by the `--autostarted` arg) — a manual launch always reveals
+    /// the window regardless of this flag. Autostart on/off itself lives in the
+    /// OS (registry / LaunchAgent), so this is the only extra bit we persist.
+    pub start_minimized: bool,
     /// Read by `state::apply_set`: prompts that suppress the `done`/`idle` →
     /// `working` task boundary. When the user types one of these as a fresh
     /// prompt after the agent has finished, treat it as a continuation of
@@ -151,6 +158,7 @@ impl Default for Config {
             auto_resize: AutoResize::None,
             history_font_size: HistoryFontSize::Regular,
             history_window_position: None,
+            start_minimized: false,
             continuation_prompts: vec!["go".into(), "continue".into(), "proceed".into()],
         }
     }
