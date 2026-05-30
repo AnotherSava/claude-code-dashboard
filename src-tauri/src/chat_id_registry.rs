@@ -82,7 +82,19 @@ mod tests {
     use super::*;
 
     fn registry() -> ChatIdRegistry {
-        let path = std::env::temp_dir().join(format!("chat_id_registry_test_{}.json", std::process::id()));
+        // Unique path per call: `cargo test` runs these in parallel and they all
+        // share one process id, so a single pid-keyed path would let one test's
+        // save_to_disk land between another's remove_file and new() (which reads
+        // the file) — a flaky cross-test race. The counter isolates each call;
+        // remove_file still guards against a stale file from a reused pid across
+        // separate test runs.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "chat_id_registry_test_{}_{}.json",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
         let _ = std::fs::remove_file(&path);
         ChatIdRegistry::new(path)
     }

@@ -71,7 +71,17 @@ mod tests {
     use super::*;
 
     fn store() -> CustomNamesStore {
-        let path = std::env::temp_dir().join(format!("custom_names_test_{}.json", std::process::id()));
+        // Unique path per call: these tests run in parallel under one process id,
+        // so a single pid-keyed path lets one test's save_to_disk race another's
+        // remove_file/new() (which reads the file). The counter isolates each
+        // call; remove_file still guards a stale file from a reused pid.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "custom_names_test_{}_{}.json",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
         let _ = std::fs::remove_file(&path);
         CustomNamesStore::new(path)
     }
