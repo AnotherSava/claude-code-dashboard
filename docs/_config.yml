@@ -1,5 +1,5 @@
 title: Claude Code Dashboard
-description: An always-on-top desktop widget that tracks your Claude Code sessions in real time.
+description: A live monitor for your Claude Code sessions.
 remote_theme: just-the-docs/just-the-docs
 baseurl: /claude-code-dashboard
 plugins:

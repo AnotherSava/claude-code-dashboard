@@ -3,13 +3,16 @@ layout: default
 title: Home
 nav_order: 1
 has_children: true
+has_toc: false
 ---
 
-*An always-on-top desktop widget that tracks your Claude Code sessions in real time.*
+*A live monitor for your Claude Code sessions.*
 
 ![Claude Code Dashboard](screenshots/screenshot.png)
 
-Each session appears as a row in a compact window with a state pill (WORK / WAIT / IDLE / DONE / ERROR), a live timer, and a token counter colored by how close the session is to its context limit. A thin Python hook turns each Claude Code lifecycle event into a status update for the widget.
+You can track the agent's current state and task, the model's context usage, and a conversation history. Optional notifications ping you when an agent is blocked on input.
+
+The header tracks your 5-hour and 7-day Anthropic usage limits.
 
 ## Next steps
 

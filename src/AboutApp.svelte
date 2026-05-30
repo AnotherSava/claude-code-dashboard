@@ -91,9 +91,9 @@
   <h1>Claude Code Dashboard</h1>
   <p class="desc">A live monitor for your Claude Code sessions.</p>
   <p class="desc">
-    You can track agent's current state and task, model's context usage, and a
-    conversation history. Optional notifications ping you when an agent is blocked
-    on input.
+    You can track the agent's current state and task, the model's context usage,
+    and a conversation history. Optional notifications ping you when an agent is
+    blocked on input.
   </p>
   <p class="desc">
     The header tracks your 5-hour and 7-day Anthropic usage limits.
