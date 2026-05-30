@@ -76,8 +76,7 @@
     })()
   })
 
-  function onDocsClick(e: Event) {
-    e.preventDefault()
+  function onDocsClick() {
     openDocsHome().catch((err) => console.error(err))
   }
 
@@ -104,7 +103,7 @@
       Version {info.version}{info.release_date ? ` from ${info.release_date}` : ''}
     </p>
     <p class="docs">
-      Documentation: <a href="#" onclick={onDocsClick}>{info.docs_url}</a>
+      Documentation: <button class="link" onclick={onDocsClick}>{info.docs_url}</button>
     </p>
   {/if}
 </div>
@@ -158,12 +157,17 @@
     margin: 0;
     white-space: nowrap;
   }
-  .docs a {
+  .docs .link {
     color: #7aa2f7;
     text-decoration: none;
     font-family: ui-monospace, Consolas, monospace;
+    font-size: inherit;
+    background: none;
+    border: none;
+    padding: 0;
+    cursor: pointer;
   }
-  .docs a:hover {
+  .docs .link:hover {
     text-decoration: underline;
   }
 </style>
