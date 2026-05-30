@@ -1,9 +1,12 @@
 use crate::config::{Config, ConfigState};
 use crate::custom_names::CustomNamesStore;
 use crate::log_watcher::WatcherRegistry;
+use crate::prompt_history::PromptHistoryStore;
+use crate::setup;
 use crate::state::{AgentSession, AppState};
 use crate::telegram::TelegramNotifier;
 use crate::usage_limits::{UsageLimits, UsageLimitsState};
+use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State, WebviewWindow};
 
 /// Snapshot the sessions and fill each `display_name` from the custom-names
@@ -70,8 +73,14 @@ pub fn frontend_log(
 }
 
 #[tauri::command]
-pub fn hide_window(window: WebviewWindow) -> Result<(), String> {
-    window.hide().map_err(|e| e.to_string())
+pub fn hide_window(window: WebviewWindow, app: AppHandle) -> Result<(), String> {
+    window.hide().map_err(|e| e.to_string())?;
+    // The About modal is parented to main; hide it too so it doesn't linger
+    // as an orphan window after the user dismisses the dashboard.
+    if let Some(about) = app.get_webview_window("about") {
+        let _ = about.hide();
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -102,6 +111,171 @@ pub fn toggle_window(window: WebviewWindow) -> Result<(), String> {
 pub fn quit_app(_app: AppHandle) {
     tracing::info!("quit_app invoked");
     std::process::exit(0);
+}
+
+/// Information the onboarding panel needs from Rust: the path to the deployed
+/// hook script, the ready-to-paste settings.json snippet, and whether any
+/// hook event has ever been received (the panel hides as soon as one has).
+#[derive(Serialize)]
+pub struct SetupState {
+    pub hook_script_path: String,
+    pub settings_snippet: String,
+    pub has_history: bool,
+}
+
+#[tauri::command]
+pub fn get_setup_state(app: AppHandle) -> SetupState {
+    let hook_path_display = app
+        .path()
+        .app_data_dir()
+        .map(|d| setup::path_for_snippet(&d.join(setup::HOOK_SCRIPT_FILENAME)))
+        .unwrap_or_default();
+    let settings_snippet = setup::build_settings_snippet(&hook_path_display);
+    let has_history = app
+        .try_state::<PromptHistoryStore>()
+        .map(|s| s.has_any_entries())
+        .unwrap_or(false);
+    SetupState {
+        hook_script_path: hook_path_display,
+        settings_snippet,
+        has_history,
+    }
+}
+
+#[tauri::command]
+pub fn open_hook_script_location(app: AppHandle) -> Result<(), String> {
+    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    open::that(dir).map_err(|e| e.to_string())
+}
+
+/// Open the GitHub Pages install / Claude-Code-setup guide in the user's
+/// default browser. URL is hard-coded so the command can't be abused as a
+/// generic URL opener from the frontend.
+#[tauri::command]
+pub fn open_setup_docs() -> Result<(), String> {
+    open::that("https://anothersava.github.io/claude-code-dashboard/pages/install")
+        .map_err(|e| e.to_string())
+}
+
+/// Open the GitHub Pages documentation home in the user's default browser.
+#[tauri::command]
+pub fn open_docs_home() -> Result<(), String> {
+    open::that("https://anothersava.github.io/claude-code-dashboard/")
+        .map_err(|e| e.to_string())
+}
+
+#[derive(Serialize)]
+pub struct AboutInfo {
+    pub version: String,
+    pub release_date: String,
+    pub docs_url: String,
+}
+
+/// Convert the build-time ISO date `YYYY-MM-DD` (embedded by `build.rs`) into
+/// the human-facing form `Month D, YYYY` (e.g. "May 28, 2026"). Empty input
+/// or a parse failure returns an empty string so the About dialog hides the
+/// line gracefully.
+fn release_date_pretty() -> String {
+    let raw = env!("APP_RELEASE_DATE");
+    if raw.is_empty() {
+        return String::new();
+    }
+    match chrono::NaiveDate::parse_from_str(raw, "%Y-%m-%d") {
+        Ok(d) => {
+            use chrono::Datelike;
+            format!("{} {}, {}", d.format("%B"), d.day(), d.year())
+        }
+        Err(_) => raw.to_string(),
+    }
+}
+
+#[tauri::command]
+pub fn get_about_info(app: AppHandle) -> AboutInfo {
+    AboutInfo {
+        version: app.package_info().version.to_string(),
+        release_date: release_date_pretty(),
+        docs_url: "anothersava.github.io/claude-code-dashboard".to_string(),
+    }
+}
+
+#[tauri::command]
+pub fn open_about(app: AppHandle) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window("about") {
+        window.show().map_err(|e| e.to_string())?;
+        window.set_focus().map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// Right-edge padding (physical pixels) preserved when an anchored window
+/// (e.g. the bottom-right main widget) grows. Mirrors
+/// `config_watcher::apply_default_position`'s margin so the resized window
+/// keeps the same standoff from the work-area edge.
+const RESIZE_RIGHT_MARGIN: i32 = 16;
+
+/// Resize a window to (`logical_width`, `logical_height`) CSS pixels.
+/// `recenter`:
+///   - `false` (e.g. main widget): if the new right edge would intrude into
+///     the reserved right margin, shift left so the standoff is preserved.
+///     Y is left alone.
+///   - `true` (e.g. modal About): re-center the window on its current
+///     monitor along both axes after the resize, so growth doesn't slide it
+///     off-center.
+/// We size first, then read back the *actual* outer size (Tauri's set_size
+/// adds a Windows DWM non-client frame even on `decorations: false` windows
+/// so the post-resize outer is a bit wider/taller than what was asked for)
+/// before computing the final position. Caller is responsible for clamping
+/// the requested dimensions to sensible upper bounds.
+#[tauri::command]
+pub fn set_window_size(
+    label: String,
+    logical_width: f64,
+    logical_height: f64,
+    recenter: bool,
+    app: AppHandle,
+) -> Result<(), String> {
+    let Some(window) = app.get_webview_window(&label) else {
+        return Ok(());
+    };
+    window
+        .set_size(tauri::LogicalSize::new(logical_width, logical_height))
+        .map_err(|e| e.to_string())?;
+
+    let pos = window.outer_position().map_err(|e| e.to_string())?;
+    let actual_size = window.outer_size().map_err(|e| e.to_string())?;
+    let Some(monitor) = window.current_monitor().ok().flatten() else {
+        return Ok(());
+    };
+    let work = monitor.work_area();
+
+    let (new_x, new_y) = if recenter {
+        let work_center_x = work.position.x + (work.size.width as i32) / 2;
+        let work_center_y = work.position.y + (work.size.height as i32) / 2;
+        let half_w = (actual_size.width as i32) / 2;
+        let half_h = (actual_size.height as i32) / 2;
+        let x = (work_center_x - half_w)
+            .max(work.position.x)
+            .min(work.position.x + work.size.width as i32 - actual_size.width as i32);
+        let y = (work_center_y - half_h)
+            .max(work.position.y)
+            .min(work.position.y + work.size.height as i32 - actual_size.height as i32);
+        (x, y)
+    } else {
+        let allowed_right = work.position.x + work.size.width as i32 - RESIZE_RIGHT_MARGIN;
+        let actual_right = pos.x + actual_size.width as i32;
+        let overflow = actual_right - allowed_right;
+        let x = if overflow > 0 {
+            (pos.x - overflow).max(work.position.x)
+        } else {
+            pos.x
+        };
+        (x, pos.y)
+    };
+
+    if new_x != pos.x || new_y != pos.y {
+        let _ = window.set_position(tauri::PhysicalPosition::new(new_x, new_y));
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -140,6 +314,9 @@ pub fn open_history(id: String, app: AppHandle) -> Result<(), String> {
             if snap.save_window_position {
                 if let Some(pos) = snap.history_window_position {
                     let _ = window.set_position(tauri::PhysicalPosition::new(pos.x, pos.y));
+                    if let (Some(w), Some(h)) = (pos.width, pos.height) {
+                        let _ = window.set_size(tauri::PhysicalSize::new(w, h));
+                    }
                 }
             }
         }

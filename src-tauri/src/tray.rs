@@ -4,7 +4,6 @@ use tauri::{
     AppHandle, Manager, Wry,
 };
 use tauri_plugin_autostart::ManagerExt;
-use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
 
 use crate::commands::emit_config_updated;
 use crate::config::{AutoResize, ConfigState, HistoryFontSize};
@@ -22,7 +21,8 @@ const MENU_HIST_FONT_REGULAR: &str = "hist_font_regular";
 const MENU_HIST_FONT_LARGE: &str = "hist_font_large";
 const MENU_HIST_FONT_LARGEST: &str = "hist_font_largest";
 const MENU_OPEN_DATA_DIR: &str = "open_data_dir";
-const MENU_ABOUT: &str = "about";
+const MENU_HELP_ABOUT: &str = "help_about";
+const MENU_HELP_INSTRUCTIONS: &str = "help_instructions";
 const MENU_QUIT: &str = "quit";
 
 /// Tray menu item handles kept in managed state so menu handlers can update
@@ -94,7 +94,11 @@ pub fn setup(app: &AppHandle) -> tauri::Result<()> {
         .build()?;
 
     let open_data_dir = MenuItem::with_id(app, MENU_OPEN_DATA_DIR, "Open config/logs location", true, None::<&str>)?;
-    let about = MenuItem::with_id(app, MENU_ABOUT, "About", true, None::<&str>)?;
+    let help_about = MenuItem::with_id(app, MENU_HELP_ABOUT, "About", true, None::<&str>)?;
+    let help_instructions = MenuItem::with_id(app, MENU_HELP_INSTRUCTIONS, "Connect instructions", true, None::<&str>)?;
+    let help_submenu = SubmenuBuilder::new(app, "Help")
+        .items(&[&help_about, &help_instructions])
+        .build()?;
     let quit = MenuItem::with_id(app, MENU_QUIT, "Quit", true, None::<&str>)?;
 
     let menu = Menu::with_items(
@@ -110,7 +114,7 @@ pub fn setup(app: &AppHandle) -> tauri::Result<()> {
             &PredefinedMenuItem::separator(app)?,
             &open_data_dir,
             &PredefinedMenuItem::separator(app)?,
-            &about,
+            &help_submenu,
             &quit,
         ],
     )?;
@@ -172,7 +176,8 @@ fn handle_menu_event(app: &AppHandle, id: &str) {
         MENU_HIST_FONT_LARGE => select_history_font_size(app, HistoryFontSize::Large),
         MENU_HIST_FONT_LARGEST => select_history_font_size(app, HistoryFontSize::Largest),
         MENU_OPEN_DATA_DIR => open_data_dir(app),
-        MENU_ABOUT => show_about(app),
+        MENU_HELP_ABOUT => show_about(app),
+        MENU_HELP_INSTRUCTIONS => show_setup_instructions(app),
         MENU_QUIT => {
             tracing::info!("tray quit invoked");
             // `app.exit(0)` going through Tauri's exit pipeline can silently
@@ -192,6 +197,11 @@ fn toggle_window(app: &AppHandle) {
     };
     if window.is_visible().unwrap_or(true) {
         let _ = window.hide();
+        // Carry the About modal with the dashboard — leaving it visible
+        // after the tray hides main produces a stray floating window.
+        if let Some(about) = app.get_webview_window("about") {
+            let _ = about.hide();
+        }
     } else {
         let _ = window.show();
         let _ = window.set_focus();
@@ -305,17 +315,21 @@ fn open_data_dir(app: &AppHandle) {
     }
 }
 
+/// Surface the onboarding panel on demand: bring the main window forward and
+/// emit a frontend event so App.svelte forces SetupPanel visible, overriding
+/// the `has_history` auto-hide.
+fn show_setup_instructions(app: &AppHandle) {
+    use tauri::Emitter;
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+    let _ = app.emit("show_setup_instructions", ());
+}
+
 fn show_about(app: &AppHandle) {
-    let version = app.package_info().version.to_string();
-    let body = format!(
-        "Claude Code Dashboard\nv{version}\n\nAlways-on-top widget for tracking AI coding agents."
-    );
-    let handle = app.clone();
-    app.dialog()
-        .message(body)
-        .title("About")
-        .buttons(MessageDialogButtons::Ok)
-        .show(move |_| {
-            drop(handle);
-        });
+    if let Some(window) = app.get_webview_window("about") {
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
 }

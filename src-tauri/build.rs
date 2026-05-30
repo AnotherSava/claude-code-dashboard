@@ -2,8 +2,23 @@ use std::hash::{Hash, Hasher};
 use std::path::Path;
 
 fn main() {
+    // The Python hook script is embedded into the binary via include_str! in
+    // src/setup.rs; tell cargo to recompile when it changes.
+    println!("cargo:rerun-if-changed=../integrations/claude_hook.py");
+    register_release_date();
     register_frontend_fingerprint(Path::new("../dist"));
     tauri_build::build()
+}
+
+/// Embed today's date as the app's "release date". For CI release builds
+/// (which run on the same day as the tag), this equals the tag date. For
+/// dev builds, it's "the date this binary was built" — which matches what
+/// a user expects to see for the binary they just installed. No git
+/// dependency: works for tarball / sparse-checkout / missing-`.git` builds.
+/// Format: YYYY-MM-DD; Rust-side formats it to "Month D, YYYY" at runtime.
+fn register_release_date() {
+    let date = chrono::Local::now().format("%Y-%m-%d").to_string();
+    println!("cargo:rustc-env=APP_RELEASE_DATE={date}");
 }
 
 /// `tauri-build` registers only `tauri.conf.json` and `capabilities/` as

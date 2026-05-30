@@ -33,7 +33,25 @@
         "decorations": true,
         "resizable": true,
         "visible": false,
-        "acceptFirstMouse": true
+        "acceptFirstMouse": true,
+        "theme": "Dark"
+      },
+      {
+        "label": "about",
+        "title": "About",
+        "width": 380,
+        "height": 280,
+        "decorations": true,
+        "resizable": false,
+        "minimizable": false,
+        "maximizable": false,
+        "center": true,
+        "skipTaskbar": true,
+        "visible": false,
+        "acceptFirstMouse": true,
+        "alwaysOnTop": true,
+        "theme": "Dark",
+        "parent": "main"
       }
     ],
     "security": {

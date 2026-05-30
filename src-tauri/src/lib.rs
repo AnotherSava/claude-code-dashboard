@@ -11,6 +11,7 @@ mod log_watcher;
 mod logging;
 mod notifications;
 mod prompt_history;
+mod setup;
 mod state;
 mod telegram;
 mod tray;
@@ -58,6 +59,13 @@ pub fn run() {
             commands::set_history_font_size,
             commands::set_chat_name,
             commands::test_telegram_notification,
+            commands::get_setup_state,
+            commands::open_hook_script_location,
+            commands::open_setup_docs,
+            commands::open_docs_home,
+            commands::get_about_info,
+            commands::open_about,
+            commands::set_window_size,
         ])
         .setup(|app| {
             use tauri::Manager;
@@ -79,6 +87,13 @@ pub fn run() {
             let history_store =
                 prompt_history::PromptHistoryStore::new(app_data.join("prompt_history.json"));
             app.manage(history_store);
+
+            // Drop the embedded Python hook next to config.json so users can
+            // paste its path into ~/.claude/settings.json without cloning the
+            // repo. Overwrites on every launch to track app updates.
+            if let Err(e) = setup::write_hook_script(&app_data) {
+                tracing::warn!(?e, "failed to write claude_hook.py to app data dir");
+            }
 
             app.manage(chat_id_registry::ChatIdRegistry::new(
                 app_data.join("session_chat_ids.json"),
@@ -112,6 +127,12 @@ pub fn run() {
                 match (current_config.save_window_position, current_config.window_position) {
                     (true, Some(pos)) => {
                         let _ = window.set_position(tauri::PhysicalPosition::new(pos.x, pos.y));
+                        // Restore size if a prior run captured it. Old configs
+                        // (or never-resized fresh installs) leave w/h as None
+                        // and we keep the conf-default geometry.
+                        if let (Some(w), Some(h)) = (pos.width, pos.height) {
+                            let _ = window.set_size(tauri::PhysicalSize::new(w, h));
+                        }
                     }
                     _ => {
                         config_watcher::apply_default_position(&window);
@@ -163,6 +184,13 @@ pub fn run() {
                         let _ = window.hide();
                         let _ = window.emit("history_hidden", ());
                     }
+                    "about" => {
+                        // About is informational — keep it alive across opens
+                        // so we don't pay the webview cold-start each time the
+                        // user picks Help → About.
+                        api.prevent_close();
+                        let _ = window.hide();
+                    }
                     _ => {}
                 }
             }
@@ -176,7 +204,15 @@ fn save_history_position_if_enabled(window: &tauri::Window) {
     let Some(state) = window.try_state::<ConfigState>() else { return };
     if !state.snapshot().save_window_position { return }
     let Ok(pos) = window.outer_position() else { return };
-    state.with_mut(|c| { c.history_window_position = Some(config::WindowPosition { x: pos.x, y: pos.y }) });
+    let size = window.outer_size().ok();
+    state.with_mut(|c| {
+        c.history_window_position = Some(config::WindowPosition {
+            x: pos.x,
+            y: pos.y,
+            width: size.map(|s| s.width),
+            height: size.map(|s| s.height),
+        })
+    });
     let _ = state.save_to_disk();
 }
 
@@ -192,8 +228,14 @@ fn save_window_position_if_enabled(window: &tauri::Window) {
     let Ok(pos) = window.outer_position() else {
         return;
     };
+    let size = window.outer_size().ok();
     state.with_mut(|c| {
-        c.window_position = Some(config::WindowPosition { x: pos.x, y: pos.y });
+        c.window_position = Some(config::WindowPosition {
+            x: pos.x,
+            y: pos.y,
+            width: size.map(|s| s.width),
+            height: size.map(|s| s.height),
+        });
     });
     let _ = state.save_to_disk();
 }

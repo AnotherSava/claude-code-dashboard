@@ -1,6 +1,6 @@
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
-import type { AgentSession, Config, UsageLimits } from './types'
+import type { AgentSession, Config, SetupState, UsageLimits } from './types'
 
 export function getSessions(): Promise<AgentSession[]> {
   return invoke<AgentSession[]>('get_sessions')
@@ -74,6 +74,41 @@ export function hideHistory(): Promise<void> {
   return invoke('hide_history')
 }
 
+export function getSetupState(): Promise<SetupState> {
+  return invoke<SetupState>('get_setup_state')
+}
+
+export function openHookScriptLocation(): Promise<void> {
+  return invoke('open_hook_script_location')
+}
+
+export function openSetupDocs(): Promise<void> {
+  return invoke('open_setup_docs')
+}
+
+export function openDocsHome(): Promise<void> {
+  return invoke('open_docs_home')
+}
+
+export interface AboutInfo {
+  version: string
+  release_date: string
+  docs_url: string
+}
+
+export function getAboutInfo(): Promise<AboutInfo> {
+  return invoke<AboutInfo>('get_about_info')
+}
+
+export function setWindowSize(
+  label: string,
+  logicalWidth: number,
+  logicalHeight: number,
+  recenter = false,
+): Promise<void> {
+  return invoke('set_window_size', { label, logicalWidth, logicalHeight, recenter })
+}
+
 export function onSessionsUpdated(
   handler: (sessions: AgentSession[]) => void,
 ): Promise<UnlistenFn> {
@@ -90,4 +125,8 @@ export function onUsageLimitsUpdated(
   handler: (usage: UsageLimits) => void,
 ): Promise<UnlistenFn> {
   return listen<UsageLimits>('usage_limits_updated', (evt) => handler(evt.payload))
+}
+
+export function onShowSetupInstructions(handler: () => void): Promise<UnlistenFn> {
+  return listen('show_setup_instructions', () => handler())
 }

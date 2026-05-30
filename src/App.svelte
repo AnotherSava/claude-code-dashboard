@@ -1,29 +1,54 @@
 <script lang="ts">
   import { onMount, tick } from 'svelte'
   import SessionList from './lib/components/SessionList.svelte'
+  import SetupPanel from './lib/components/SetupPanel.svelte'
   import HistoryApp from './HistoryApp.svelte'
+  import AboutApp from './AboutApp.svelte'
   import LimitBar from './lib/components/LimitBar.svelte'
   import {
     applyAutoResize,
     frontendLog,
     getConfig,
     getSessions,
+    getSetupState,
     getUsageLimits,
     getWindowLabel,
     hideWindow,
     onConfigUpdated,
     onSessionsUpdated,
+    onShowSetupInstructions,
     onUsageLimitsUpdated,
     refreshUsageLimits,
     showWindow,
   } from './lib/api'
-  import type { AgentSession, Config, UsageLimits } from './lib/types'
+  import type { AgentSession, Config, SetupState, UsageLimits } from './lib/types'
 
   let historyMode = $state(false)
+  let aboutMode = $state(false)
   let sessions = $state<AgentSession[]>([])
   let config = $state<Config | null>(null)
   let usage = $state<UsageLimits | null>(null)
+  let setup = $state<SetupState | null>(null)
   let now = $state(Date.now())
+
+  // Once the dashboard has *ever* received a hook event (history persisted to
+  // prompt_history.json), the onboarding panel is permanently retired. We
+  // latch the `has_history` flag from the initial snapshot, then also flip it
+  // on the first sessions_updated that carries any session — so the panel
+  // disappears immediately on the first event without waiting for a restart.
+  let hookEverReceived = $derived(
+    (setup?.has_history ?? false) || sessions.length > 0,
+  )
+
+  // Per-session manual override on top of `hookEverReceived`. Tray menu
+  // "Help → Instructions to connect to Claude" sets `'shown'` and the
+  // panel's hover-to-dismiss × sets `'hidden'`. `null` means follow the auto
+  // behavior. Reset on every app launch — we don't persist the override.
+  let setupOverride = $state<'shown' | 'hidden' | null>(null)
+  let showSetup = $derived(
+    setupOverride === 'shown' ||
+      (setupOverride === null && !hookEverReceived),
+  )
 
   let widgetEl: HTMLDivElement | undefined = $state()
   let lastSentHeight = -1
@@ -46,10 +71,15 @@
     // the intrinsic content size — locking us at whatever height we last set.
     let listH = 0
     const list = widgetEl.querySelector('.list')
+    const panel = widgetEl.querySelector('.panel')
     if (list) {
       for (const child of list.children) {
         listH += (child as HTMLElement).getBoundingClientRect().height
       }
+    } else if (panel) {
+      // SetupPanel renders one block — measure its intrinsic content height
+      // so auto-resize grows to fit the onboarding copy.
+      listH = (panel as HTMLElement).scrollHeight
     } else if (widgetEl.querySelector('.empty')) {
       listH = 36
     }
@@ -83,6 +113,7 @@
     sessions
     usage
     config?.auto_resize
+    showSetup
     scheduleMeasure()
   })
 
@@ -90,6 +121,7 @@
     let unlistenSessions: (() => void) | undefined
     let unlistenConfig: (() => void) | undefined
     let unlistenUsage: (() => void) | undefined
+    let unlistenShowSetup: (() => void) | undefined
 
     ;(async () => {
       try {
@@ -98,9 +130,14 @@
           historyMode = true
           return
         }
+        if (label === 'about') {
+          aboutMode = true
+          return
+        }
         config = await getConfig()
         sessions = await getSessions()
         usage = await getUsageLimits()
+        setup = await getSetupState()
         frontendLog('trace', 'mount snapshot', {
           five_hour_present: usage?.five_hour != null,
           seven_day_present: usage?.seven_day != null,
@@ -111,6 +148,11 @@
           sessions = s
         })
         unlistenConfig = await onConfigUpdated((c) => (config = c))
+        unlistenShowSetup = await onShowSetupInstructions(() => {
+          // Help menu → Instructions: force the panel visible regardless of
+          // history state. Clears any prior dismiss.
+          setupOverride = 'shown'
+        })
         unlistenUsage = await onUsageLimitsUpdated((u) => {
           frontendLog('trace', 'event usage_limits_updated', {
             five_hour_present: u.five_hour != null,
@@ -136,7 +178,10 @@
         await new Promise<void>((resolve) =>
           requestAnimationFrame(() => requestAnimationFrame(() => resolve()))
         )
-        if (!historyMode) {
+        // Only the main widget auto-reveals on mount. History and About
+        // windows are shown on demand (history click / Help → About) — the
+        // initial visibility comes from `visible: false` in tauri.conf.json.
+        if (!historyMode && !aboutMode) {
           try {
             await showWindow()
           } catch (err) {
@@ -172,6 +217,7 @@
       unlistenSessions?.()
       unlistenConfig?.()
       unlistenUsage?.()
+      unlistenShowSetup?.()
       if (measureTimer !== null) clearTimeout(measureTimer)
     }
   })
@@ -183,6 +229,8 @@
 
 {#if historyMode}
   <HistoryApp />
+{:else if aboutMode}
+  <AboutApp />
 {:else}
 <div class="widget" bind:this={widgetEl}>
   <header data-tauri-drag-region>
@@ -208,7 +256,15 @@
     <button class="hide-btn" onclick={onHide} aria-label="Hide to tray" title="Hide to tray">×</button>
   </header>
   {#if config}
-    <SessionList {sessions} {config} {now} />
+    {#if showSetup && setup}
+      <SetupPanel
+        snippet={setup.settings_snippet}
+        hookPath={setup.hook_script_path}
+        onDismiss={() => (setupOverride = 'hidden')}
+      />
+    {:else}
+      <SessionList {sessions} {config} {now} />
+    {/if}
   {/if}
 </div>
 {/if}

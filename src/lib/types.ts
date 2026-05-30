@@ -62,6 +62,12 @@ export interface UsageLimits {
   updated: number
 }
 
+export interface SetupState {
+  hook_script_path: string
+  settings_snippet: string
+  has_history: boolean
+}
+
 export const stateLabel: Record<Status, string> = {
   idle: 'IDLE',
   working: 'WORK',

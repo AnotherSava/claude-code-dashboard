@@ -103,10 +103,19 @@ impl Default for TelegramConfig {
     }
 }
 
+/// Persisted window geometry. `width` / `height` are optional so configs
+/// written by older builds (which only stored x/y) keep deserializing.
+/// Stored in physical pixels; restoration uses `PhysicalPosition` /
+/// `PhysicalSize` so the same monitor reproduces the same window — DPR
+/// differences across monitors are an accepted edge case.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct WindowPosition {
     pub x: i32,
     pub y: i32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

@@ -33,6 +33,14 @@ impl PromptHistoryStore {
         self.data.lock().unwrap().get(session_id).cloned()
     }
 
+    /// True if any session has ever been persisted. Used by the onboarding
+    /// flow as the signal that the dashboard has received at least one hook
+    /// hit from Claude Code — once that has happened, the setup panel hides
+    /// permanently across restarts.
+    pub fn has_any_entries(&self) -> bool {
+        !self.data.lock().unwrap().is_empty()
+    }
+
     pub fn save_session(&self, session: &AgentSession) {
         let mut data = self.data.lock().unwrap();
         data.insert(
@@ -116,6 +124,19 @@ mod tests {
         let path = std::env::temp_dir().join("nonexistent_prompt_history.json");
         let store = PromptHistoryStore::new(path);
         assert!(store.get("any").is_none());
+    }
+
+    #[test]
+    fn has_any_entries_tracks_inserts_and_removals() {
+        let store = PromptHistoryStore::new(PathBuf::new());
+        assert!(!store.has_any_entries());
+        {
+            let mut data = store.data.lock().unwrap();
+            data.insert("s1".into(), PersistedSession::default());
+        }
+        assert!(store.has_any_entries());
+        store.remove("s1");
+        assert!(!store.has_any_entries());
     }
 
     #[test]
