@@ -1,7 +1,7 @@
 ---
 layout: default
 title: Development
-nav_order: 4
+nav_order: 2
 has_children: true
 ---
 
@@ -51,7 +51,8 @@ The source-of-truth `AgentSession` state lives behind a `Mutex` in Rust. Three p
 claude-code-dashboard/
 ├── src/                                Svelte frontend (Vite)
 │   ├── App.svelte                       top-level layout, subscribes to Tauri events
-│   ├── HistoryApp.svelte                root component of the second (history) window
+│   ├── HistoryApp.svelte                root component of the history window
+│   ├── AboutApp.svelte                  root component of the About window (Help → About)
 │   ├── main.ts                          mount entry point
 │   └── lib/
 │       ├── types.ts                     shared TS types and display helpers
@@ -61,6 +62,7 @@ claude-code-dashboard/
 │       └── components/
 │           ├── SessionList.svelte       list container, empty-state
 │           ├── SessionItem.svelte       per-row rendering (pill, timer, tokens, label)
+│           ├── SetupPanel.svelte        onboarding panel: bundled hook snippet, copy-to-clipboard, hide affordance
 │           └── LimitBar.svelte          header 5h / 7d usage bar (segmented fill, percent + timer caps)
 ├── src-tauri/
 │   ├── Cargo.toml                       Rust deps: tauri, axum, notify, tracing, serde, reqwest, chrono, open
@@ -73,6 +75,7 @@ claude-code-dashboard/
 │       ├── config.rs                    Config struct, load/save, ConfigState wrapper
 │       ├── config_watcher.rs            notify watcher for config.json hot-reload
 │       ├── commands.rs                  Tauri commands + event emitters
+│       ├── setup.rs                     embedded Python hook + settings.json snippet builder for onboarding
 │       ├── http_server.rs               axum routes for POST /api/event
 │       ├── log_watcher.rs               per-session transcript tailing + infer_state + assistant text upsert
 │       ├── tray.rs                      TrayIconBuilder, menu handlers, autostart
@@ -103,9 +106,10 @@ claude-code-dashboard/
 
 ## Architecture reference
 
-- [Classification](classification) — how the Claude adapter turns a raw lifecycle payload into the `(chat_id, status, label)` tuple the widget renders.
-- [Sticky labels](sticky-labels) — the state machine that keeps a meaningful caption next to a session row across approval cycles, cancellations, and continuation prompts.
-- [Data flow](data-flow) — end-to-end paths from a Python hook POST or a transcript file change to a rendered pixel.
+- [Classification](development/classification) — how the Claude adapter turns a raw lifecycle payload into the `(chat_id, status, label)` tuple the widget renders.
+- [Sticky labels](development/sticky-labels) — the state machine that keeps a meaningful caption next to a session row across approval cycles, cancellations, and continuation prompts.
+- [Data flow](development/data-flow) — end-to-end paths from a Python hook POST or a transcript file change to a rendered pixel.
+- [HTTP API](development/http-api) — `POST /api/event` envelope shape and how to write a new adapter for a non-Claude agent.
 
 ## Testing
 

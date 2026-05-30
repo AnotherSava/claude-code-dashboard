@@ -37,7 +37,7 @@ The `claude` adapter recognizes five events. Other event names are silently igno
 | `Stop`              | `done`; flips to `awaiting` if the last assistant turn ends with `?` (minus configured benign closers)                        | `"has a question"` when flipped                         |
 | `SessionEnd`        | — (emits a `clear`, removing the row)                                                                                         | —                                                       |
 
-The adapter derives a friendly `chat_id` from `payload.cwd` and the `projects_root` config setting; see the [Claude Code page](claude-code) for chat-id rules.
+The adapter derives a friendly `chat_id` from `payload.cwd` and the `projects_root` config setting; see [Features → session identity](../features#session-identity) for chat-id rules.
 
 ### Sticky label state machine
 
