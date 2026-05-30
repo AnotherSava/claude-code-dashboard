@@ -247,6 +247,25 @@
     color: #d6d6d6;
     display: flex;
     flex-direction: column-reverse;
+    scrollbar-width: thin;
+    scrollbar-color: rgba(255, 255, 255, 0.15) transparent;
+  }
+  .entries::-webkit-scrollbar, .code::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  .entries::-webkit-scrollbar-track, .code::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  .entries::-webkit-scrollbar-thumb, .code::-webkit-scrollbar-thumb {
+    background: rgba(255, 255, 255, 0.12);
+    border-radius: 4px;
+  }
+  .entries::-webkit-scrollbar-thumb:hover, .code::-webkit-scrollbar-thumb:hover {
+    background: rgba(255, 255, 255, 0.22);
+  }
+  .entries::-webkit-scrollbar-corner, .code::-webkit-scrollbar-corner {
+    background: transparent;
   }
   .entries-inner {
     display: flex;
@@ -280,6 +299,8 @@
     margin: 0;
     white-space: pre;
     overflow-x: auto;
+    scrollbar-width: thin;
+    scrollbar-color: rgba(255, 255, 255, 0.15) transparent;
   }
   .box-table {
     border-collapse: collapse;
