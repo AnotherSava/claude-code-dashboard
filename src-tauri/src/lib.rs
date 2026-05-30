@@ -28,41 +28,40 @@ use usage_limits::{UsageLimitsPoller, UsageLimitsState};
 const _: &str = env!("FRONTEND_FINGERPRINT");
 
 /// Tauri serves the frontend from a fixed `index.html` URL, and on Windows
-/// WebView2 caches that response in its user-data folder (`EBWebView`). Because
-/// the filename never changes, an app update or local redeploy that only swaps
-/// the content-hashed JS/CSS bundle can leave the webview loading a *stale*
-/// `index.html` still pointing at the previous bundle — the UI silently runs old
-/// frontend code (e.g. an onboarding panel that predates a fix). WebView2's
-/// `--disable-http-cache` arg does not reliably bypass an already-cached entry,
-/// so instead we wipe the whole WebView2 cache whenever the embedded frontend
-/// fingerprint changes — before the webview is created. Unchanged fingerprint is
-/// a no-op, so a normal restart pays nothing. Windows-only: the macOS WKWebView
-/// custom-scheme handler doesn't exhibit this staleness.
+/// WebView2 caches that response in its user-data folder (`EBWebView`). The
+/// filename never changes, so a redeploy or app update that only swaps the
+/// content-hashed JS/CSS bundle leaves WebView2 serving a *stale* cached
+/// `index.html` that still points at the previous bundle — the UI then silently
+/// runs old frontend code (e.g. an onboarding panel that predates its fix).
+///
+/// The staleness is sticky: it recurs on *every* launch (not just the first
+/// after an update), survives `--disable-http-cache`, and a build-fingerprint
+/// gate doesn't help because it happens *within* a single build. The only thing
+/// that reliably forces a fresh fetch is deleting the cache. Since the frontend
+/// is embedded in the binary (served from memory, no network), the WebView2
+/// cache buys us nothing — so we wipe it on every startup, before the webview is
+/// created. Windows-only: the macOS WKWebView custom-scheme handler doesn't
+/// exhibit this staleness.
 #[cfg(windows)]
-fn clear_stale_webview_cache() {
+fn clear_webview_cache() {
     let Ok(local) = std::env::var("LOCALAPPDATA") else { return };
     // Mirrors `identifier` in tauri.conf.json — Tauri derives the WebView2
     // user-data folder from it.
-    let base = std::path::Path::new(&local).join("com.anothersava.claude-code-dashboard");
-    let fingerprint_file = base.join("frontend_fingerprint");
-    let current = env!("FRONTEND_FINGERPRINT");
-    if std::fs::read_to_string(&fingerprint_file).is_ok_and(|stored| stored == current) {
-        return;
-    }
-    let _ = std::fs::remove_dir_all(base.join("EBWebView"));
-    let _ = std::fs::create_dir_all(&base);
-    let _ = std::fs::write(&fingerprint_file, current);
+    let webview = std::path::Path::new(&local)
+        .join("com.anothersava.claude-code-dashboard")
+        .join("EBWebView");
+    let _ = std::fs::remove_dir_all(webview);
 }
 
 #[cfg(not(windows))]
-fn clear_stale_webview_cache() {}
+fn clear_webview_cache() {}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Must run before the Builder creates the config-defined webviews, which
     // begin loading `index.html` immediately — clearing later (e.g. in setup())
     // would be too late to affect the initial navigation.
-    clear_stale_webview_cache();
+    clear_webview_cache();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_autostart::init(
