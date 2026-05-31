@@ -42,9 +42,8 @@ fn awaiting_label_for(tool_name: &str) -> &'static str {
 /// transcript watcher (and eventually `Stop`) carry the row out of `Awaiting`.
 pub fn dispatch(event: &str, payload: &Value, cfg: &Config) -> AdapterOutput {
     let cwd = payload.get("cwd").and_then(|v| v.as_str());
-    let session_id = payload.get("session_id").and_then(|v| v.as_str()).unwrap_or("");
     let projects_root = cfg.projects_root.as_deref();
-    let chat_id = derive_chat_id(cwd, session_id, projects_root);
+    let chat_id = derive_chat_id(cwd, projects_root);
 
     if event == "SessionEnd" {
         return AdapterOutput::Clear { id: chat_id };
@@ -103,8 +102,8 @@ pub fn dispatch(event: &str, payload: &Value, cfg: &Config) -> AdapterOutput {
 ///
 /// - cwd under projects_root → relative path with `/`, `-`, `_` replaced by spaces
 /// - cwd outside projects_root or no projects_root → basename of cwd
-/// - no cwd → `claude-<session_id[:8]>` (or `claude-unknown`)
-fn derive_chat_id(cwd: Option<&str>, session_id: &str, projects_root: Option<&str>) -> String {
+/// - no cwd → `claude-unknown` (defensive; Claude Code payloads always carry `cwd`)
+fn derive_chat_id(cwd: Option<&str>, projects_root: Option<&str>) -> String {
     if let Some(cwd) = cwd.map(str::trim).filter(|s| !s.is_empty()) {
         let normalized = cwd.replace('\\', "/");
         let normalized = normalized.trim_end_matches('/');
@@ -134,13 +133,7 @@ fn derive_chat_id(cwd: Option<&str>, session_id: &str, projects_root: Option<&st
         }
         return normalized.chars().take(20).collect();
     }
-    let first_8: String = session_id.trim().chars().take(8).collect();
-    let prefix = if first_8.is_empty() {
-        "unknown".to_string()
-    } else {
-        first_8
-    };
-    format!("claude-{}", prefix)
+    "claude-unknown".to_string()
 }
 
 /// Map event + payload to a (status, optional label) pair.
@@ -334,7 +327,8 @@ const PERMISSION_SEEKING: &[&str] = &[
 /// known hand-back phrase (permission-seeking or a direct second-person
 /// question); or the last paragraph issues a `Paste …` request for output.
 fn is_a_question(text: &str, benign_closers: &[String]) -> bool {
-    let effective = strip_trailing_options(text);
+    let plain = strip_markdown(text);
+    let effective = strip_trailing_options(&plain);
     if effective.ends_with('?') {
         let lower = effective.to_lowercase();
         let is_benign = benign_closers.iter().any(|c| {
@@ -344,7 +338,18 @@ fn is_a_question(text: &str, benign_closers: &[String]) -> bool {
             return true;
         }
     }
-    has_permission_seeking_question(text) || has_paste_request(text)
+    has_permission_seeking_question(&plain) || has_paste_request(&plain)
+}
+
+/// Strip inline Markdown formatting so classification sees the underlying text.
+/// Emphasis, code-span, heading and strikethrough markers are dropped — so a
+/// final `**Push?**` reduces to `Push?` and is recognized as a question. Only
+/// formatting characters are removed: newlines (paragraph structure) and every
+/// other character — crucially the terminal `?` — are preserved.
+fn strip_markdown(text: &str) -> String {
+    text.chars()
+        .filter(|c| !matches!(c, '*' | '_' | '`' | '#' | '~'))
+        .collect()
 }
 
 /// Check the last paragraph for a permission-seeking phrase. A phrase ending in
@@ -444,7 +449,7 @@ mod tests {
     #[test]
     fn subfolder_of_projects_root_uses_spaced_relpath() {
         assert_eq!(
-            derive_chat_id(Some("D:/projects/bga/assistant"), "", Some("d:/projects")),
+            derive_chat_id(Some("D:/projects/bga/assistant"), Some("d:/projects")),
             "bga assistant"
         );
     }
@@ -452,11 +457,7 @@ mod tests {
     #[test]
     fn dashes_and_underscores_become_spaces() {
         assert_eq!(
-            derive_chat_id(
-                Some("d:/projects/foo-bar/sub_dir/leaf"),
-                "",
-                Some("d:/projects")
-            ),
+            derive_chat_id(Some("d:/projects/foo-bar/sub_dir/leaf"), Some("d:/projects")),
             "foo bar sub dir leaf"
         );
     }
@@ -464,7 +465,7 @@ mod tests {
     #[test]
     fn root_match_is_case_insensitive() {
         assert_eq!(
-            derive_chat_id(Some("D:/PROJECTS/thing"), "", Some("d:/projects")),
+            derive_chat_id(Some("D:/PROJECTS/thing"), Some("d:/projects")),
             "thing"
         );
     }
@@ -472,7 +473,7 @@ mod tests {
     #[test]
     fn backslash_separators_are_normalized() {
         assert_eq!(
-            derive_chat_id(Some("D:\\projects\\sub\\deep"), "", Some("d:/projects")),
+            derive_chat_id(Some("D:\\projects\\sub\\deep"), Some("d:/projects")),
             "sub deep"
         );
     }
@@ -480,7 +481,7 @@ mod tests {
     #[test]
     fn trailing_slash_on_cwd_is_tolerated() {
         assert_eq!(
-            derive_chat_id(Some("d:/projects/foo-bar/"), "", Some("d:/projects")),
+            derive_chat_id(Some("d:/projects/foo-bar/"), Some("d:/projects")),
             "foo bar"
         );
     }
@@ -488,7 +489,7 @@ mod tests {
     #[test]
     fn exact_root_falls_back_to_basename() {
         assert_eq!(
-            derive_chat_id(Some("d:/projects"), "", Some("d:/projects")),
+            derive_chat_id(Some("d:/projects"), Some("d:/projects")),
             "projects"
         );
     }
@@ -496,7 +497,7 @@ mod tests {
     #[test]
     fn outside_projects_root_uses_basename() {
         assert_eq!(
-            derive_chat_id(Some("c:/Users/foo/bar"), "", Some("d:/projects")),
+            derive_chat_id(Some("c:/Users/foo/bar"), Some("d:/projects")),
             "bar"
         );
     }
@@ -504,32 +505,21 @@ mod tests {
     #[test]
     fn no_projects_root_uses_basename() {
         assert_eq!(
-            derive_chat_id(Some("d:/projects/sub/deep"), "", None),
+            derive_chat_id(Some("d:/projects/sub/deep"), None),
             "deep"
         );
     }
 
     #[test]
-    fn no_cwd_uses_session_id_prefix() {
-        assert_eq!(
-            derive_chat_id(None, "abcdef1234", Some("d:/projects")),
-            "claude-abcdef12"
-        );
-    }
-
-    #[test]
-    fn no_cwd_and_no_session_returns_unknown() {
-        assert_eq!(
-            derive_chat_id(None, "", Some("d:/projects")),
-            "claude-unknown"
-        );
+    fn no_cwd_returns_unknown() {
+        assert_eq!(derive_chat_id(None, Some("d:/projects")), "claude-unknown");
     }
 
     #[test]
     fn whitespace_only_cwd_treated_as_missing() {
         assert_eq!(
-            derive_chat_id(Some("   "), "abcdef1234", Some("d:/projects")),
-            "claude-abcdef12"
+            derive_chat_id(Some("   "), Some("d:/projects")),
+            "claude-unknown"
         );
     }
 
@@ -809,6 +799,34 @@ mod tests {
             "Save these? (all / numbers / none)",
             &[]
         ));
+    }
+
+    #[test]
+    fn is_a_question_bold_wrapped_question_is_detected() {
+        // Regression: a final "**Push?**" must read as a question. The trailing
+        // "**" used to hide the "?" so the row went Done instead of Awaiting.
+        assert!(is_a_question(
+            "Remote was in sync, so this will fast-forward cleanly.\n\n**Push?**",
+            &[]
+        ));
+    }
+
+    #[test]
+    fn is_a_question_other_markdown_emphasis_is_stripped() {
+        assert!(is_a_question("*continue?*", &[]));
+        assert!(is_a_question("`run this?`", &[]));
+        assert!(is_a_question("__ready to deploy?__", &[]));
+        assert!(is_a_question("## Proceed?", &[]));
+    }
+
+    #[test]
+    fn is_a_question_bold_question_with_trailing_options() {
+        assert!(is_a_question("**Save these?** (all / none)", &[]));
+    }
+
+    #[test]
+    fn is_a_question_bold_statement_is_not_a_question() {
+        assert!(!is_a_question("**All done.**", &[]));
     }
 
     #[test]

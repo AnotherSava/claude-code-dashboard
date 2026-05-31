@@ -18,7 +18,7 @@ Each Claude Code session collapses to one row in the widget. The row's `id` (a.k
 | `cwd` is under `projects_root` (case-insensitive) | relative path; `/`, `-`, `_` replaced with spaces|
 | `cwd` is outside `projects_root` (or root unset)  | basename of `cwd`                                |
 | `cwd` exactly equals `projects_root`              | basename of `projects_root`                      |
-| `cwd` is missing or whitespace-only               | `claude-<session_id[:8]>` (or `claude-unknown`)  |
+| `cwd` is missing or whitespace-only               | `claude-unknown` (defensive; payloads always carry `cwd`) |
 
 Backslashes are normalized to forward slashes before matching, so Windows paths work uniformly. Trailing slashes on `cwd` are tolerated. Examples (with `projects_root = "d:/projects"`):
 
@@ -90,7 +90,7 @@ Other Unicode passes through untouched — accents, emoji, CJK, math symbols. Th
    - if it's an array, walk each block and take the trimmed `text` from blocks where `type == "text"`.
 5. Track the last non-empty text seen (so trailing whitespace-only assistant turns don't reset the state) and return it.
 
-**`is_a_question(text, benign_closers)`** — pure check on a string, three detection paths:
+**`is_a_question(text, benign_closers)`** — pure check on a string, three detection paths. Before any path runs, inline Markdown formatting characters (`*`, `_`, `` ` ``, `#`, `~`) are stripped so a final `**Push?**` reduces to `Push?` and is still recognized — only those marker characters are removed; newlines and every other character (crucially the terminal `?`) are preserved.
 
 **Path 1 — trailing `?`:**
 
