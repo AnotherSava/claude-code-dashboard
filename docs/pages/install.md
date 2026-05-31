@@ -30,27 +30,40 @@ After install, the widget lives in the system tray — left-click the tray icon 
 
 ## 2. Wire the Claude Code hook
 
-The dashboard integrates via [Claude Code lifecycle hooks](https://docs.claude.com/en/docs/claude-code/hooks) — Claude Code fires named events at specific moments during a session, and a small Python script (`integrations/claude_hook.py`, distributed with the widget source) turns each event into a status update for the widget.
+The dashboard integrates via [Claude Code lifecycle hooks](https://docs.claude.com/en/docs/claude-code/hooks) — Claude Code fires named events at specific moments during a session, and a small Python script (`claude_hook.py`) turns each event into a status update for the widget. **You don't need to clone this repo:** the widget ships the script inside the binary and writes a fresh copy to its app-data folder on every launch.
 
-Copy that script to a known location and point Claude Code at it from `~/.claude/settings.json`:
+### Copy the snippet from the widget (recommended)
+
+Until it receives its first event, the widget shows an **Instructions to connect Claude Code** panel. It contains the exact `~/.claude/settings.json` snippet with the hook path and Python launcher **already filled in for your setup**.
+
+1. Launch the widget (left-click the tray icon if it's hidden).
+2. In the instructions panel, click **Copy**.
+3. Open `~/.claude/settings.json` (create it if missing) and paste the snippet in. If the file already has a `"hooks"` block, merge the entries rather than overwriting.
+4. Restart Claude Code, then start a session.
+
+The panel disappears automatically once the dashboard receives its first event. Prefer to let Claude Code do the wiring? Ask it to follow the steps in the panel — it can edit `settings.json` for you.
+
+### What the snippet looks like
+
+For reference, the copied snippet has this shape (your copy substitutes the real absolute path to `claude_hook.py` in your app-data folder, and `python` vs `python3` for your platform):
 
 ```json
 {
   "hooks": {
-    "SessionStart":     [{"hooks": [{"type": "command", "command": "python3 <repo>/integrations/claude_hook.py"}]}],
-    "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "python3 <repo>/integrations/claude_hook.py"}]}],
-    "Notification":     [{"hooks": [{"type": "command", "command": "python3 <repo>/integrations/claude_hook.py"}]}],
-    "Stop":             [{"hooks": [{"type": "command", "command": "python3 <repo>/integrations/claude_hook.py"}]}],
-    "SessionEnd":       [{"hooks": [{"type": "command", "command": "python3 <repo>/integrations/claude_hook.py"}]}],
+    "SessionStart":     [{"hooks": [{"type": "command", "command": "python3 \"<app-data>/claude_hook.py\""}]}],
+    "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "python3 \"<app-data>/claude_hook.py\""}]}],
+    "Notification":     [{"hooks": [{"type": "command", "command": "python3 \"<app-data>/claude_hook.py\""}]}],
+    "Stop":             [{"hooks": [{"type": "command", "command": "python3 \"<app-data>/claude_hook.py\""}]}],
+    "SessionEnd":       [{"hooks": [{"type": "command", "command": "python3 \"<app-data>/claude_hook.py\""}]}],
     "PreToolUse": [{
       "matcher": "^(AskUserQuestion|ExitPlanMode)$",
-      "hooks": [{"type": "command", "command": "python3 <repo>/integrations/claude_hook.py"}]
+      "hooks": [{"type": "command", "command": "python3 \"<app-data>/claude_hook.py\""}]
     }]
   }
 }
 ```
 
-Replace `<repo>` with the absolute path to your clone of this repo. Restart Claude Code — new sessions will appear in the widget as soon as you start one.
+The app-data folder is `%APPDATA%\com.anothersava.claude-code-dashboard\` on Windows and `~/Library/Application Support/com.anothersava.claude-code-dashboard/` on macOS. The instructions panel's **Hook script** line links straight to it.
 
 The `PreToolUse` matcher restricts the hook to user-gating tools (`AskUserQuestion`, `ExitPlanMode`). Claude Code buffers their `tool_use` blocks until the user answers, so without this hook the dashboard can't detect those calls in flight. The matcher also avoids per-Bash/Read/Grep fork overhead an unfiltered `PreToolUse` would incur.
 
