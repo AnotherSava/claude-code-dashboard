@@ -3,7 +3,6 @@
   import { invoke } from '@tauri-apps/api/core'
   import { listen, type UnlistenFn } from '@tauri-apps/api/event'
   import { closeWindow, getConfig, getSessions, onConfigUpdated, onSessionsUpdated, setHistoryFontSize } from './lib/api'
-  import { isTaskBoundary } from './lib/dialog'
   import type { AgentSession, HistoryFontSize } from './lib/types'
 
   const SIZE_ORDER: HistoryFontSize[] = ['smallest', 'small', 'regular', 'large', 'largest']
@@ -211,7 +210,7 @@
           {@const fold = expanded.has(i) ? null : computeFold(lines)}
           {@const displayLines = fold ? [...fold.head, '\x00collapse', ...fold.tail] : lines}
           {@const segments = segmentLines(displayLines)}
-          <div class="entry" class:sticky={isTaskBoundary(dialog, i)} class:assistant={entry.role === 'assistant'}>
+          <div class="entry" class:sticky={entry.task_start} class:assistant={entry.role === 'assistant'}>
             <span class="ts">{formatClock(entry.timestamp)}</span>
             <span class="text">
               {#each segments as seg}

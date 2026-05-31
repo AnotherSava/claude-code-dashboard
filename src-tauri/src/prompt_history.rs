@@ -93,6 +93,7 @@ mod tests {
             text: "fix foo".into(),
             timestamp: 1000,
             status: Status::Working,
+            task_start: true,
         };
         {
             let mut data = store.data.lock().unwrap();

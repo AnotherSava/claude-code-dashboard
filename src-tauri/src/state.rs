@@ -25,6 +25,14 @@ pub struct DialogEntry {
     pub text: String,
     pub timestamp: i64,
     pub status: Status,
+    /// True when this entry is a user prompt that started a fresh task — the
+    /// same boundary decision `apply_set` uses for the sticky label. The
+    /// frontend reads this directly for the history highlight and the row
+    /// tooltip, instead of re-deriving boundaries with a divergent heuristic.
+    /// `#[serde(default)]` so dialogs persisted before this field existed load
+    /// as `false` (those pre-flag entries simply aren't highlighted).
+    #[serde(default)]
+    pub task_start: bool,
 }
 
 /// Built by the adapter, converted to a full [`DialogEntry`] by `apply_set`
@@ -190,11 +198,13 @@ impl AppState {
             existing.updated = now_ms;
 
             if let Some(pending) = dialog_entry {
+                let task_start = pending.role == DialogRole::User && task_boundary;
                 existing.dialog.push(DialogEntry {
                     role: pending.role,
                     text: pending.text,
                     timestamp: now_ms,
                     status: existing.status,
+                    task_start,
                 });
                 return true;
             }
@@ -231,15 +241,18 @@ impl AppState {
                     text: String::new(),
                     timestamp: now_ms,
                     status: Status::Idle,
+                    task_start: false,
                 });
             }
 
             let has_new_entry = if let Some(pending) = dialog_entry {
+                let task_start = pending.role == DialogRole::User;
                 dialog.push(DialogEntry {
                     role: pending.role,
                     text: pending.text,
                     timestamp: now_ms,
                     status: input.status,
+                    task_start,
                 });
                 true
             } else {
@@ -294,6 +307,7 @@ impl AppState {
             text: String::new(),
             timestamp: now_ms,
             status: Status::Idle,
+            task_start: false,
         });
         session.updated = now_ms;
         true
@@ -317,7 +331,7 @@ impl AppState {
                     if last_user.is_some_and(|e| e.text == *text) {
                         continue;
                     }
-                    session.dialog.push(DialogEntry { role: *role, text: text.clone(), timestamp: now_ms, status: session.status });
+                    session.dialog.push(DialogEntry { role: *role, text: text.clone(), timestamp: now_ms, status: session.status, task_start: false });
                     changed = true;
                 }
                 DialogRole::Assistant => {
@@ -333,7 +347,7 @@ impl AppState {
                         session.dialog[i].timestamp = now_ms;
                         session.dialog[i].status = session.status;
                     } else {
-                        session.dialog.push(DialogEntry { role: *role, text: text.clone(), timestamp: now_ms, status: session.status });
+                        session.dialog.push(DialogEntry { role: *role, text: text.clone(), timestamp: now_ms, status: session.status, task_start: false });
                     }
                     changed = true;
                 }
@@ -736,6 +750,30 @@ mod tests {
     }
 
     #[test]
+    fn dialog_entry_task_start_marks_only_boundaries() {
+        let state = AppState::new();
+        let cont: Vec<String> = vec!["go".into()];
+        // First prompt creates the session — a task start.
+        state.apply_set(set_with_dialog("a", Status::Working, "fix foo"), 0, &cont, None);
+        // Agent finishes.
+        state.apply_set(stop_with_dialog("a", Status::Done, "done"), 1_000, &cont, None);
+        // Continuation "go" after done — resumes the task, not a new one.
+        state.apply_set(set_with_dialog("a", Status::Working, "go"), 2_000, &cont, None);
+        // A genuinely new top-level prompt — a task start again.
+        state.apply_set(set_with_dialog("a", Status::Working, "next task"), 3_000, &cont, None);
+        let s = get(&state, "a");
+        let users: Vec<&DialogEntry> = s.dialog.iter().filter(|e| e.role == DialogRole::User).collect();
+        assert_eq!(users[0].text, "fix foo");
+        assert!(users[0].task_start, "first prompt is a task start");
+        assert_eq!(users[1].text, "go");
+        assert!(!users[1].task_start, "continuation is not a task start");
+        assert_eq!(users[2].text, "next task");
+        assert!(users[2].task_start, "new prompt after working is a task start");
+        let assistant = s.dialog.iter().find(|e| e.role == DialogRole::Assistant).unwrap();
+        assert!(!assistant.task_start, "assistant entries are never task starts");
+    }
+
+    #[test]
     fn dialog_not_pushed_without_pending_entry() {
         let state = AppState::new();
         state.apply_set(set("a", Status::Working, "fix foo"), 0, NO_CONTINUATIONS, None);
@@ -748,8 +786,8 @@ mod tests {
         let state = AppState::new();
         let restored = PersistedSession {
             dialog: vec![
-                DialogEntry { role: DialogRole::User, text: "old task".into(), timestamp: 100, status: Status::Working },
-                DialogEntry { role: DialogRole::Assistant, text: "Done.".into(), timestamp: 200, status: Status::Done },
+                DialogEntry { role: DialogRole::User, text: "old task".into(), timestamp: 100, status: Status::Working, task_start: true },
+                DialogEntry { role: DialogRole::Assistant, text: "Done.".into(), timestamp: 200, status: Status::Done, task_start: false },
             ],
             original_prompt: Some("old task".into()),
             task_started_at: 100,
@@ -772,13 +810,13 @@ mod tests {
     }
 
     fn user_entry(text: &str, ts: i64) -> DialogEntry {
-        DialogEntry { role: DialogRole::User, text: text.into(), timestamp: ts, status: Status::Working }
+        DialogEntry { role: DialogRole::User, text: text.into(), timestamp: ts, status: Status::Working, task_start: true }
     }
     fn assistant_entry(text: &str, ts: i64) -> DialogEntry {
-        DialogEntry { role: DialogRole::Assistant, text: text.into(), timestamp: ts, status: Status::Done }
+        DialogEntry { role: DialogRole::Assistant, text: text.into(), timestamp: ts, status: Status::Done, task_start: false }
     }
     fn separator_entry(ts: i64) -> DialogEntry {
-        DialogEntry { role: DialogRole::Separator, text: String::new(), timestamp: ts, status: Status::Idle }
+        DialogEntry { role: DialogRole::Separator, text: String::new(), timestamp: ts, status: Status::Idle, task_start: false }
     }
 
     fn seed(state: &AppState, dialog: Vec<DialogEntry>) {

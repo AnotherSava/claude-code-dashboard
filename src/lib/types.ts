@@ -7,6 +7,12 @@ export interface DialogEntry {
   text: string
   timestamp: number
   status: Status
+  // True when this user prompt started a fresh task — stamped by the Rust
+  // state machine (the same decision that drives the sticky label). The
+  // history highlight and row tooltip read it directly. Always false for
+  // assistant/separator entries and for entries persisted before the field
+  // existed.
+  task_start: boolean
 }
 
 export interface AgentSession {
