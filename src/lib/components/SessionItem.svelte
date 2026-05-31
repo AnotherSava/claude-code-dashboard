@@ -54,6 +54,9 @@
   function commitEdit() {
     if (!editing) return
     editing = false
+    // An empty / whitespace-only value is treated as a cancel — keep the
+    // current name rather than clearing the custom name back to the derived id.
+    if (!draft.trim()) return
     setChatName(session.id, draft).catch((err) => console.error('set_chat_name failed', err))
   }
 
