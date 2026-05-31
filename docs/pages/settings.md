@@ -5,78 +5,105 @@ parent: Home
 nav_order: 3
 ---
 
-All settings live in `config.json` under the app data directory:
+Every setting lives in a single `config.json` file. The tray menu is a shortcut for the handful of options you change most often — flipping a toggle there writes the matching `config.json` field — but `config.json` is the full surface, including settings with no tray equivalent.
+
+Location of the `config.json` file under the app data directory:
 
 - **Windows**: `%APPDATA%\com.anothersava.claude-code-dashboard\`
 - **macOS**: `~/Library/Application Support/com.anothersava.claude-code-dashboard/`
-- **Linux**: `$XDG_CONFIG_HOME/com.anothersava.claude-code-dashboard/` (or `~/.config/...`)
 
-The tray menu has an **Open config/logs location** shortcut that opens the folder. The widget hot-reloads `config.json` on save — no restart needed except when changing `server_port`.
+The tray's **Open config/logs location** shortcut opens this folder. The widget hot-reloads `config.json` on save — no restart needed except when changing `server_port`.
 
 ## Tray menu
 
-Quick toggles that mirror specific `config.json` fields, plus shortcuts:
+Right-click the tray icon for the controls you reach for most:
 
-- **Show / Hide widget** — left-click toggle on the tray icon.
-- **Always on top** — `always_on_top`.
-- **Save position on exit** — `save_window_position`.
-- **On system start** submenu — Off / Open window / Open to tray. Autostart is managed by the OS; **Open to tray** also sets `start_minimized` so a login launch stays in the tray instead of showing the window.
-- **Auto-resize** submenu — Off / Up / Down (`auto_resize`).
-- **History font size** submenu — five sizes (`history_font_size`).
-- **Open config/logs location** — opens the app data directory.
-- **Quit** — closes the widget.
+- **Show / Hide widget** — toggle the window (also a left-click on the tray icon).
+- **Always on top** — keep the widget above your other windows.
+- **Save position on exit** — reopen where you left it, at the same size.
+- **On system start** — launch at login: off, open the window, or start hidden in the tray.
+- **Auto-resize** — fit the window height to its content, growing upward or downward.
+- **History font size** — pick one of five sizes for the history window.
+- **Open config/logs location** — open the app data folder.
+- **Quit** — close the widget.
 
-## Top-level fields
+## Config file
 
-| Field | Type | Default | Notes |
-|---|---|---|---|
-| `server_port` | int | `9077` | HTTP server port. **Requires restart** — not hot-reloaded. |
-| `always_on_top` | bool | `true` | Whether the widget stays above other windows. |
-| `save_window_position` | bool | `true` | Persist `window_position` / `history_window_position` on close (position **and** size). |
-| `window_position` | `{x, y, width?, height?}` | `null` | Last-saved main window position and size. `width`/`height` are optional so older configs keep working. |
-| `history_window_position` | `{x, y, width?, height?}` | `null` | Last-saved history window position and size. |
-| `start_minimized` | bool | `false` | When autostart launches the app at login, keep the main window hidden (tray only). Set via the tray's **On system start → Open to tray**; ignored on a manual launch. |
-| `auto_resize` | enum | `"none"` | `"none"` / `"up"` / `"down"` — auto-fit window height to content; `up` keeps the bottom edge fixed, `down` keeps the top edge fixed. |
-| `history_font_size` | enum | `"regular"` | `"smallest"` / `"small"` / `"regular"` / `"large"` / `"largest"`. |
-| `limit_bar_segments` | int | `16` | Number of segments in the 5h / 7d usage limit bars. |
-| `usage_limits_poll_interval_seconds` | int | `600` | How often to poll Anthropic's `/api/oauth/usage`. Clamped to 60s minimum at runtime. |
-| `projects_root` | string | `null` | Folder your projects live under — turns session ids into short folder-relative names instead of bare basenames. |
-
-## Token coloring
-
-| Field | Type | Default |
-|---|---|---|
-| `context_window_tokens` | `{model: tokens}` | `{ "claude-opus-4-7": 1000000, "claude-sonnet-4-6": 200000, "claude-haiku-4-5": 200000 }` |
-| `context_bar_thresholds` | `[{percent, color}]` | green at 0%, amber at 60%, red at 85% |
-
-The widget interpolates the token-counter color from `context_bar_thresholds` based on the live token count as a percentage of the active model's `context_window_tokens` entry.
-
-## Prompt classification
-
-| Field | Type | Default | Notes |
-|---|---|---|---|
-| `benign_closers` | `[string]` | `["What's next?", "Anything else?"]` | Polite trailing questions that end with `?` but shouldn't flip the row to WAIT. Case-insensitive suffix match. |
-| `continuation_prompts` | `[string]` | `["go", "continue", "proceed"]` | Replies that look like new prompts but are really *"keep going"* — suppress the DONE/IDLE → WORK task boundary, preserve the original prompt and timer. Exact match after trim, case-insensitive. |
-
-For the full classification logic see [Classification](development/classification) and [Sticky labels](development/sticky-labels) in the Development section.
-
-## Notifications
+Every field is optional — omit one and the built-in default applies. A complete config with those defaults, roughly ordered from the settings you're most likely to change to the ones you'll rarely touch:
 
 ```json
 {
+  "always_on_top": true,
+  "history_font_size": "regular",
+  "auto_resize": "none",
+  "save_window_position": true,
+  "window_position": null,
+  "history_window_position": null,
+  "start_minimized": false,
+  "projects_root": null,
   "notifications": {
     "telegram": {
-      "bot_token": "<from @BotFather>",
-      "chat_id": "<your chat id>",
-      "state_thresholds_ms": {
-        "awaiting": 60000,
-        "error": 60000
-      }
+      "bot_token": null,
+      "chat_id": null,
+      "state_thresholds_ms": { "awaiting": 120000, "error": 60000 }
     }
-  }
+  },
+  "context_bar_thresholds": [
+    { "percent": 0,  "color": "#3a7c4a" },
+    { "percent": 60, "color": "#c6a03c" },
+    { "percent": 85, "color": "#c64a4a" }
+  ],
+  "context_window_tokens": {
+    "claude-opus-4-7": 1000000,
+    "claude-sonnet-4-6": 200000,
+    "claude-haiku-4-5": 200000
+  },
+  "benign_closers": ["What's next?", "Anything else?"],
+  "continuation_prompts": ["go", "continue", "proceed"],
+  "limit_bar_segments": 16,
+  "usage_limits_poll_interval_seconds": 600,
+  "server_port": 9077
 }
 ```
 
-`state_thresholds_ms` keys: `"idle"`, `"working"`, `"awaiting"`, `"done"`, `"error"`. A missing key (or value `0`) means silent for that state. A session that stays in the named state for the threshold duration triggers a Telegram message.
+### Window and startup
 
-To disable notifications entirely, set `"notifications": null` (or omit the object).
+Whether autostart is enabled isn't a config field — it lives in the OS launch entry (Windows registry / macOS LaunchAgent), so the tray's **On system start** submenu is the way to turn it on or off. `config.json` only persists `start_minimized`, the "open to tray" vs "open window" distinction.
+
+- `always_on_top` — keep the widget above other windows.
+- `history_font_size` — history-window text size, one of `"smallest"`, `"small"`, `"regular"`, `"large"`, `"largest"`.
+- `auto_resize` — fit the window height to its content: `"up"` grows from a fixed bottom edge, `"down"` from a fixed top edge, `"none"` leaves the window manually sized.
+- `save_window_position` — remember each window's position and size on close. The saved geometry lives in `window_position` and `history_window_position`, which the widget manages for you — no need to edit them by hand.
+- `start_minimized` — when launched at login, stay hidden in the tray. Set it through the tray's **On system start → Open to tray**; it's ignored on a manual launch.
+
+### Session identity
+
+- `projects_root` — the folder your projects live under. Sessions beneath it get short, folder-relative names instead of bare folder basenames. See [Features → session identity](features#session-identity).
+
+### Notifications
+
+The `notifications` block controls alerts when a session needs you. Set it to `null` (or omit it) to turn notifications off entirely. Telegram is the only channel today:
+
+- `bot_token` / `chat_id` — your Telegram bot credentials; get `bot_token` from [@BotFather](https://t.me/BotFather).
+- `state_thresholds_ms` — how long a session must sit in a state before it alerts, in milliseconds, keyed by state: `"idle"`, `"working"`, `"awaiting"`, `"done"`, `"error"`. A missing key or `0` keeps that state silent.
+
+### Token coloring
+
+- `context_bar_thresholds` — color stops for the token counter, each a `percent` and a hex `color`. The widget interpolates the color from the live count as a percentage of the active model's window — so it ramps green → amber → red as context fills.
+- `context_window_tokens` — per-model context-window size, used as the denominator for that percentage. Add an entry for any model you use.
+
+### Prompt classification
+
+- `benign_closers` — polite trailing questions that end in `?` but shouldn't flip a finished row to WAIT. Matched case-insensitively as a suffix.
+- `continuation_prompts` — short replies that mean *keep going* rather than a new task, so the original prompt and work timer carry over instead of resetting. Matched exactly, case-insensitively, after trimming.
+
+For the full classification logic see [Classification](development/classification) and [Sticky labels](development/sticky-labels) in the Development section.
+
+### Usage limit bars
+
+- `limit_bar_segments` — number of segments in the 5-hour / 7-day usage bars; higher is finer-grained.
+- `usage_limits_poll_interval_seconds` — how often to poll Anthropic for usage. Clamped to a 60-second minimum.
+
+### Server port
+
+- `server_port` — port the embedded HTTP server listens on for hook events. Most users never touch this. Two caveats if you do: it's the only setting that needs an app restart to take effect (everything else hot-reloads), and the Claude hook must point at the same port — it defaults to `9077`, so set `TAURI_DASHBOARD_URL=http://127.0.0.1:<port>` in the hook's environment to match.

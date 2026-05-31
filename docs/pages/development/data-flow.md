@@ -7,35 +7,31 @@ nav_order: 3
 
 End-to-end: what happens when a Claude Code hook fires, when a transcript file gets a new line, or when you toggle a tray menu item.
 
-## The three input sources
+## Input sources and data flow
 
-```
-┌──────────────────┐    POST /api/event     ┌────────────────┐
-│  Claude Code     │──────────────────────▶ │  axum (Rust)   │
-│  (hook forwards  │                        │  :9077         │
-│   raw payload)   │                        └───────┬────────┘
-└──────────────────┘                                │ adapters::dispatch
-                                                    │ → apply_set
-                                                    │   / apply_clear
-                                                    ▼
-┌──────────────────┐   notify::Event       ┌────────────────┐
-│  transcript      │─────────────────────▶ │  AppState      │     app.emit
-│  <session>.jsonl │                       │  Mutex<Vec<    │───────────────▶ Svelte
-└──────────────────┘                       │    AgentSession│   "sessions_      (listen)
-                                           │  >>            │    updated")
-                                           └────────┬───────┘
-┌──────────────────┐  #[tauri::command]             │
-│  Svelte UI       │────────────────────▶ commands.rs ──apply_clear──▶ AppState
-└──────────────────┘                                │
-                                                    ▼
-                                            Window / TrayIcon
-                                            native APIs
+```mermaid
+flowchart LR
+  CC["Claude Code<br/>hook forwards raw payload"]
+  TR["transcript<br/>&lt;session&gt;.jsonl"]
+  UI["Svelte UI"]
+  CFG["config.json"]
 
-┌──────────────────┐  file change event
-│  config.json     │─────────────────▶ config_watcher reloads ─▶ emit("config_updated")
-└──────────────────┘                                                       │
-                                                                           ▼
-                                                                  Svelte + tray refresh
+  AX["axum (Rust) :9077"]
+  CMD["commands.rs"]
+  CW["config_watcher"]
+  AS[("AppState<br/>Mutex&lt;Vec&lt;AgentSession&gt;&gt;")]
+  NATIVE["Window / TrayIcon<br/>native APIs"]
+  SV["Svelte (listen)"]
+
+  CC -->|"POST /api/event"| AX
+  AX -->|"adapters::dispatch -> apply_set / apply_clear"| AS
+  TR -->|"notify::Event"| AS
+  UI -->|"#[tauri::command]"| CMD
+  CMD -->|"apply_clear"| AS
+  CMD --> NATIVE
+  CFG -->|"file change event"| CW
+  CW -->|"emit(config_updated)"| SV
+  AS -->|"app.emit(sessions_updated)"| SV
 ```
 
 Every mutation to session state funnels through `state::apply_set` or `state::apply_clear` so the sticky-label rules, working-time accumulator, and upgrade-only merge policy are enforced in one place regardless of origin.

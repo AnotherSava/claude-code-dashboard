@@ -1,6 +1,6 @@
 ---
 layout: default
-title: Install
+title: Installation
 parent: Home
 nav_order: 1
 ---

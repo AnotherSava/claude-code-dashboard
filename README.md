@@ -17,7 +17,7 @@ Download the latest installer for your platform from the [Releases page](https:/
 
 See full project documentation at **[anothersava.github.io/claude-code-dashboard](https://anothersava.github.io/claude-code-dashboard/)**:
 
-- [Install](https://anothersava.github.io/claude-code-dashboard/pages/install)
+- [Installation](https://anothersava.github.io/claude-code-dashboard/pages/install)
 - [Features](https://anothersava.github.io/claude-code-dashboard/pages/features)
 - [Settings](https://anothersava.github.io/claude-code-dashboard/pages/settings)
 - [Development](https://anothersava.github.io/claude-code-dashboard/pages/development)

@@ -8,5 +8,9 @@ color_scheme: light
 search_enabled: true
 heading_anchors: true
 
+# Render ```mermaid code blocks client-side (just-the-docs built-in support).
+mermaid:
+  version: "11.4.1"
+
 exclude:
   - plans/

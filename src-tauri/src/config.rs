@@ -101,7 +101,7 @@ impl Default for TelegramConfig {
             bot_token: None,
             chat_id: None,
             state_thresholds_ms: [
-                ("awaiting".to_string(), 60_000),
+                ("awaiting".to_string(), 120_000),
                 ("error".to_string(), 60_000),
             ]
             .into_iter()
@@ -249,7 +249,7 @@ mod tests {
         assert_eq!(tg.chat_id.as_deref(), Some("c"));
         assert_eq!(
             tg.state_thresholds_ms.get("awaiting"),
-            Some(&60_000),
+            Some(&120_000),
             "default thresholds survive when caller only supplies creds"
         );
         assert_eq!(tg.state_thresholds_ms.get("error"), Some(&60_000));
@@ -260,7 +260,7 @@ mod tests {
         let cfg: Config = serde_json::from_str("{}").unwrap();
         let tg = cfg.notifications.unwrap().telegram.unwrap();
         assert!(tg.bot_token.is_none());
-        assert_eq!(tg.state_thresholds_ms.get("awaiting"), Some(&60_000));
+        assert_eq!(tg.state_thresholds_ms.get("awaiting"), Some(&120_000));
     }
 
     #[test]

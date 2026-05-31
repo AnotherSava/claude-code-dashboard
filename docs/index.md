@@ -8,15 +8,15 @@ has_toc: false
 
 *A live monitor for your Claude Code sessions.*
 
-![Claude Code Dashboard](screenshots/screenshot.png)
-
 You can track the agent's current state and task, the model's context usage, and a conversation history. Optional notifications ping you when an agent is blocked on input.
 
 The header tracks your 5-hour and 7-day Anthropic usage limits.
 
-## Next steps
+![Claude Code Dashboard](screenshots/screenshot.png)
 
-- **[Install](pages/install)** — download the installer and wire the Claude Code lifecycle hook.
-- **[Features](pages/features)** — what each row shows: status pills, sticky prompts, live tokens, renaming.
-- **[Settings](pages/settings)** — all `config.json` options and the tray menu.
-- **[Development](pages/development)** — building from source, architecture, and internals.
+## What's next?
+
+- **[Installation](pages/install)** — download the widget and connect it to your Claude Code sessions.
+- **[Features](pages/features)** — explore the session list: status badges, sticky task labels, live token counts, history, and notifications.
+- **[Settings](pages/settings)** — tune every option in the config file, with tray shortcuts for the ones you change most.
+- **[Development](pages/development)** — build from source and dig into the architecture and internals.

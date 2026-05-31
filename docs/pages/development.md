@@ -36,7 +36,7 @@ Compiles the Rust backend, starts Vite on `localhost:1420`, and launches the nat
 - `npm run tauri dev` — dev build with HMR.
 - `npm run tauri build` — release build; bundles land in `src-tauri/target/release/bundle/` (`nsis/` on Windows, `dmg/` on macOS).
 - `npm run check` — TypeScript + Svelte check (no build).
-- `npm run tauri icon <path/to/1024.png>` — regenerate the Windows / Linux / macOS icon set from a source PNG.
+- `npm run tauri icon <path/to/1024.png>` — regenerate the Windows / macOS icon set from a source PNG.
 - `cargo test --manifest-path src-tauri/Cargo.toml --lib` — Rust unit tests (state machine, transcript parser, merge policy, Claude adapter, label policy).
 
 ## Architecture
@@ -47,54 +47,51 @@ The source-of-truth `AgentSession` state lives behind a `Mutex` in Rust. Three p
 
 ## Project structure
 
-```
-claude-code-dashboard/
-├── src/                                Svelte frontend (Vite)
-│   ├── App.svelte                       top-level layout, subscribes to Tauri events
-│   ├── HistoryApp.svelte                root component of the history window
-│   ├── AboutApp.svelte                  root component of the About window (Help → About)
-│   ├── main.ts                          mount entry point
-│   └── lib/
-│       ├── types.ts                     shared TS types and display helpers
-│       ├── mockSessions.ts              dev-only fixtures (unused in release)
-│       ├── api.ts                       invoke / listen wrappers
-│       ├── dialog.ts                    shared isTaskBoundary + isAQuestion helpers used by history view and tooltip
-│       └── components/
-│           ├── SessionList.svelte       list container, empty-state
-│           ├── SessionItem.svelte       per-row rendering (pill, timer, tokens, label)
-│           ├── SetupPanel.svelte        onboarding panel: bundled hook snippet, copy-to-clipboard, hide affordance
-│           └── LimitBar.svelte          header 5h / 7d usage bar (segmented fill, percent + timer caps)
-├── src-tauri/
-│   ├── Cargo.toml                       Rust deps: tauri, axum, notify, tracing, serde, reqwest, chrono, open
-│   ├── tauri.conf.json                  NSIS + DMG bundle targets, WebView2 bootstrapper, window config
-│   ├── capabilities/default.json        capability-based permissions for the main window
-│   └── src/
-│       ├── main.rs                      entry; calls lib::run()
-│       ├── lib.rs                       Builder: plugins, state, commands, setup hook
-│       ├── state.rs                     AgentSession struct, apply_set sticky-label machine
-│       ├── config.rs                    Config struct, load/save, ConfigState wrapper
-│       ├── config_watcher.rs            notify watcher for config.json hot-reload
-│       ├── commands.rs                  Tauri commands + event emitters
-│       ├── setup.rs                     embedded Python hook + settings.json snippet builder for onboarding
-│       ├── http_server.rs               axum routes for POST /api/event
-│       ├── log_watcher.rs               per-session transcript tailing + infer_state + assistant text upsert
-│       ├── tray.rs                      TrayIconBuilder, menu handlers, autostart
-│       ├── notifications.rs             1s-tick reconciler + Notifier trait
-│       ├── telegram.rs                  reqwest-based Telegram Bot API client
-│       ├── usage_limits.rs              Anthropic OAuth usage poller + refresh (5h / 7d buckets)
-│       ├── auto_resize.rs               Up/Down content-fit window + Win32 resize lock + dark class brush
-│       ├── label_policy.rs              shared (label, original_prompt) decision used by adapters
-│       ├── adapters.rs                  adapter dispatch for /api/event payloads
-│       ├── adapters/
-│       │   └── claude.rs                Claude Code lifecycle classifier + chat-id derivation
-│       └── logging.rs                   tracing subscriber → widget.jsonl + FrontendLogger for IPC log lines
-├── integrations/
-│   └── claude_hook.py                   thin Claude Code hook — forwards stdin payload to /api/event
-├── docs/                                this site
-└── .github/workflows/
-    ├── build.yml                        CI: check + cargo test + frontend build on push/PR (Windows + macOS matrix)
-    └── release.yml                      CI: build NSIS + DMG installers on tag push (Windows + macOS matrix)
-```
+Under the repo root `claude-code-dashboard/`:
+
+- `src/` — Svelte frontend (Vite)
+  - `App.svelte` — top-level layout, subscribes to Tauri events
+  - `HistoryApp.svelte` — root component of the history window
+  - `AboutApp.svelte` — root component of the About window (Help → About)
+  - `main.ts` — mount entry point
+  - `lib/`
+    - `types.ts` — shared TS types and display helpers
+    - `mockSessions.ts` — dev-only fixtures (unused in release)
+    - `api.ts` — invoke / listen wrappers
+    - `dialog.ts` — shared isTaskBoundary + isAQuestion helpers used by history view and tooltip
+    - `components/`
+      - `SessionList.svelte` — list container, empty-state
+      - `SessionItem.svelte` — per-row rendering (status badge, timer, tokens, label)
+      - `SetupPanel.svelte` — onboarding panel: bundled hook snippet, copy-to-clipboard, hide affordance
+      - `LimitBar.svelte` — header 5h / 7d usage bar (segmented fill, percent + timer caps)
+- `src-tauri/`
+  - `Cargo.toml` — Rust deps: tauri, axum, notify, tracing, serde, reqwest, chrono, open
+  - `tauri.conf.json` — NSIS + DMG bundle targets, WebView2 bootstrapper, window config
+  - `capabilities/default.json` — capability-based permissions for the main window
+  - `src/`
+    - `main.rs` — entry; calls lib::run()
+    - `lib.rs` — Builder: plugins, state, commands, setup hook
+    - `state.rs` — AgentSession struct, apply_set sticky-label machine
+    - `config.rs` — Config struct, load/save, ConfigState wrapper
+    - `config_watcher.rs` — notify watcher for config.json hot-reload
+    - `commands.rs` — Tauri commands + event emitters
+    - `setup.rs` — embedded Python hook + settings.json snippet builder for onboarding
+    - `http_server.rs` — axum routes for POST /api/event
+    - `log_watcher.rs` — per-session transcript tailing + infer_state + assistant text upsert
+    - `tray.rs` — TrayIconBuilder, menu handlers, autostart
+    - `notifications.rs` — 1s-tick reconciler + Notifier trait
+    - `telegram.rs` — reqwest-based Telegram Bot API client
+    - `usage_limits.rs` — Anthropic OAuth usage poller + refresh (5h / 7d buckets)
+    - `auto_resize.rs` — Up/Down content-fit window + Win32 resize lock + dark class brush
+    - `label_policy.rs` — shared (label, original_prompt) decision used by adapters
+    - `adapters.rs` — adapter dispatch for /api/event payloads
+    - `adapters/claude.rs` — Claude Code lifecycle classifier + chat-id derivation
+    - `logging.rs` — tracing subscriber → widget.jsonl + FrontendLogger for IPC log lines
+- `integrations/claude_hook.py` — thin Claude Code hook that forwards the stdin payload to /api/event
+- `docs/` — this site
+- `.github/workflows/`
+  - `build.yml` — CI: check + cargo test + frontend build on push/PR (Windows + macOS matrix)
+  - `release.yml` — CI: build NSIS + DMG installers on tag push (Windows + macOS matrix)
 
 ### Where state lives at runtime
 
@@ -102,7 +99,6 @@ claude-code-dashboard/
 - **On disk** — `config.json` and `widget.jsonl` under `app_data_dir()`:
   - Windows: `%APPDATA%\com.anothersava.claude-code-dashboard\`
   - macOS: `~/Library/Application Support/com.anothersava.claude-code-dashboard/`
-  - Linux: `$XDG_CONFIG_HOME/com.anothersava.claude-code-dashboard/` (or `~/.config/...`)
 
 ## Architecture reference
 

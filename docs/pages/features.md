@@ -5,7 +5,7 @@ parent: Home
 nav_order: 2
 ---
 
-The dashboard is an always-on-top, tray-only window — no taskbar entry — that you drag by its header strip; a hover-revealed × in the header tucks it back into the tray. Here's what it shows and how it behaves once Claude Code sessions start firing events at it.
+A compact desktop widget that helps you keep an eye on your Claude Code sessions.
 
 ## Session identity
 
@@ -15,7 +15,7 @@ Each Claude Code session becomes one row. The row's `id` is *initially* derived 
 
 ## Live status
 
-The row's state pill tracks the agent in real time:
+The row's status badge tracks the agent in real time:
 
 - **WORK** — Claude is working on your task. Timer accumulates total time spent working on the same prompt across approval cycles.
 - **WAIT** — Claude is blocked on you. The row shows the agent's current question or permission request.
@@ -23,7 +23,7 @@ The row's state pill tracks the agent in real time:
 - **DONE** — Claude finished the task and isn't waiting on you. Timer shows time since it finished.
 - **ERROR** — the hook reported an error; the row shows the error text.
 
-Each pill is color-coded, and WAIT and ERROR pulse to draw your eye when a session needs attention.
+Each badge is color-coded, and WAIT and ERROR pulse to draw your eye when a session needs attention.
 
 ## Your task stays in view
 
@@ -49,7 +49,7 @@ Ctrl+`+` and Ctrl+`-` cycle through five font sizes; Esc closes the window. The 
 
 ## Notifications
 
-Get pinged when a session needs you — for example, when it sits in WAIT longer than a threshold you set. Notifications are delivered via Telegram and stay off until you configure them. See [Settings](settings) for setup and per-state thresholds.
+Get pinged when a session needs you — for example, when it sits in WAIT longer than a threshold you set. Once the agent moves on — you answer the prompt and it resumes work — the message is deleted automatically, so your Telegram chat shows only the sessions still waiting on you. Notifications are delivered via Telegram and stay off until you configure them. See [Settings](settings) for setup and per-state thresholds.
 
 ## Usage limits
 
