@@ -116,9 +116,9 @@ This catches questions embedded mid-paragraph like `"Want me to add that? The pl
 
 Only round brackets `()` are recognized for the option-list strip; `[]` and `{}` aren't peeled.
 
-**Path 3 — `Paste …` request in last paragraph:**
+**Path 3 — hand-back request in last paragraph:**
 
-If neither path above matches, check whether any sentence in the last paragraph (split on `.!?` and newlines) starts with `"paste "` (case-insensitive). This catches the imperative hand-back where the agent waits for the user to paste output but never ends on a `?` — `"Paste the tableinfos output and I'll finish arena."`, `"Paste whatever it prints."`. Only a **sentence-initial** `Paste` counts, so a mid-sentence mention like `"you can paste this"` or `"I'll paste the result"` doesn't trigger.
+If neither path above matches, check whether any sentence in the last paragraph (split on `.!?` and newlines) starts with one of the hand-back openers `"paste "` or `"please provide "` (case-insensitive). This catches the imperative hand-back where the agent waits for the user to supply something but never ends on a `?` — `"Paste the tableinfos output and I'll finish arena."`, `"Please provide the model group and the model name."`. Only a **sentence-initial** opener counts, so a mid-sentence mention like `"you can paste this"` or `"I'll paste the result"` doesn't trigger. The list is kept narrow and phrase-matched — a blanket `"please "` would misfire on informational openers like *"Please note …"* / *"Please see …"*.
 
 Failure modes are silent: a missing transcript file returns `None` from `last_assistant_text` (treated as "no question"), and malformed JSONL lines are individually skipped. The adapter never crashes a status update because of a transcript read error.
 

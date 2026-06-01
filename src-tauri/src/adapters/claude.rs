@@ -325,7 +325,8 @@ const PERMISSION_SEEKING: &[&str] = &[
 /// True when `text` reads as a hand-back to the user: the whole text ends with
 /// `?` (possibly after a trailing option list); the last paragraph contains a
 /// known hand-back phrase (permission-seeking or a direct second-person
-/// question); or the last paragraph issues a `Paste …` request for output.
+/// question); or the last paragraph issues a hand-back request for input
+/// (`Paste …` / `Please provide …`).
 fn is_a_question(text: &str, benign_closers: &[String]) -> bool {
     let plain = strip_markdown(text);
     let effective = strip_trailing_options(&plain);
@@ -338,7 +339,7 @@ fn is_a_question(text: &str, benign_closers: &[String]) -> bool {
             return true;
         }
     }
-    has_permission_seeking_question(&plain) || has_paste_request(&plain)
+    has_permission_seeking_question(&plain) || has_handback_request(&plain)
 }
 
 /// Strip inline Markdown formatting so classification sees the underlying text.
@@ -369,15 +370,25 @@ fn has_permission_seeking_question(text: &str) -> bool {
     })
 }
 
-/// True when the last paragraph issues a sentence-initial `Paste …` request —
-/// the agent is waiting for the user to paste output back. Only a
-/// sentence-initial imperative counts; a mid-sentence mention like
-/// "you can paste this" or "I'll paste the result" does not.
-fn has_paste_request(text: &str) -> bool {
+/// Sentence-initial imperative openers that hand control back to the user — the
+/// agent is waiting for them to supply something. Kept narrow and phrase-matched
+/// (not a blanket `"please "`) so informational openers like "Please note …" /
+/// "Please see …" don't register as questions.
+const HANDBACK_OPENERS: &[&str] = &["paste ", "please provide "];
+
+/// True when the last paragraph issues a sentence-initial hand-back request —
+/// "Paste the output …", "Please provide the model name …" — meaning the agent
+/// is waiting on the user. Only a sentence-initial imperative counts; a
+/// mid-sentence mention like "you can paste this" or "I'll paste the result"
+/// does not.
+fn has_handback_request(text: &str) -> bool {
     last_paragraph(text)
         .to_lowercase()
         .split(|c| matches!(c, '.' | '!' | '?' | '\n'))
-        .any(|sentence| sentence.trim_start().starts_with("paste "))
+        .any(|sentence| {
+            let s = sentence.trim_start();
+            HANDBACK_OPENERS.iter().any(|opener| s.starts_with(opener))
+        })
 }
 
 fn last_paragraph(text: &str) -> &str {
@@ -953,6 +964,23 @@ mod tests {
         // Only a sentence-initial imperative counts — a mention does not.
         assert!(!is_a_question("You can paste this into the terminal later. All set.", &[]));
         assert!(!is_a_question("I'll paste the result here once it's done.", &[]));
+    }
+
+    #[test]
+    fn please_provide_request_is_awaiting() {
+        // A sentence-initial "Please provide ..." imperative hands back to the user.
+        assert!(is_a_question(
+            "Please provide the model group (e.g. `other`, `inserts`) and the model name.",
+            &[]
+        ));
+        assert!(is_a_question("Looks good. Please provide your API key.", &[]));
+    }
+
+    #[test]
+    fn please_note_is_not_awaiting() {
+        // Informational "Please ..." openers must not register as hand-backs.
+        assert!(!is_a_question("Please note the migration runs on next launch.", &[]));
+        assert!(!is_a_question("Done. Please see the updated README for details.", &[]));
     }
 
     #[test]
