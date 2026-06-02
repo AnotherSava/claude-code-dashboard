@@ -2,7 +2,7 @@
 
 *A live monitor for your Claude Code sessions.*
 
-You can track the agent's current state and task, the model's context usage, and a conversation history. Optional notifications ping you when an agent is blocked on input.
+You can track the agent's current state and task, the model's context usage, and a conversation history. Optional notifications ping you when an agent needs your attention.
 
 The header tracks your 5-hour and 7-day Anthropic usage limits.
 

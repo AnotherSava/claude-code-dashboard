@@ -209,6 +209,7 @@ mod tests {
                 .iter()
                 .map(|(k, v)| (k.to_string(), *v))
                 .collect(),
+            context_alert_percent: None,
         }
     }
 

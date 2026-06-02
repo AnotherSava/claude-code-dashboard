@@ -93,6 +93,12 @@ pub struct TelegramConfig {
     /// "idle" | "working" | "awaiting" | "done" | "error". Missing key or
     /// value 0 = silent for that state.
     pub state_thresholds_ms: HashMap<String, u64>,
+    /// Context-usage alert: fire a one-shot message when a session's
+    /// `input_tokens / context_window_tokens[model]` crosses this percent.
+    /// `null` or `0` disables it. Edge-triggered — it fires once on crossing
+    /// and re-arms only after usage drops back below the threshold (a new
+    /// task or `/clear` resets the token count).
+    pub context_alert_percent: Option<f32>,
 }
 
 impl Default for TelegramConfig {
@@ -106,6 +112,7 @@ impl Default for TelegramConfig {
             ]
             .into_iter()
             .collect(),
+            context_alert_percent: Some(80.0),
         }
     }
 }
@@ -253,6 +260,28 @@ mod tests {
             "default thresholds survive when caller only supplies creds"
         );
         assert_eq!(tg.state_thresholds_ms.get("error"), Some(&60_000));
+        assert_eq!(
+            tg.context_alert_percent,
+            Some(80.0),
+            "default context_alert_percent survives when caller only supplies creds"
+        );
+    }
+
+    #[test]
+    fn context_alert_percent_can_be_overridden_and_disabled() {
+        let set: Config = serde_json::from_str(
+            r#"{ "notifications": { "telegram": { "context_alert_percent": 70 } } }"#,
+        )
+        .unwrap();
+        let tg = set.notifications.unwrap().telegram.unwrap();
+        assert_eq!(tg.context_alert_percent, Some(70.0));
+
+        let off: Config = serde_json::from_str(
+            r#"{ "notifications": { "telegram": { "context_alert_percent": null } } }"#,
+        )
+        .unwrap();
+        let tg = off.notifications.unwrap().telegram.unwrap();
+        assert_eq!(tg.context_alert_percent, None);
     }
 
     #[test]

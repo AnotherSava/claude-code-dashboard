@@ -45,7 +45,8 @@ Every field is optional — omit one and the built-in default applies. A complet
     "telegram": {
       "bot_token": null,
       "chat_id": null,
-      "state_thresholds_ms": { "awaiting": 120000, "error": 60000 }
+      "state_thresholds_ms": { "awaiting": 120000, "error": 60000 },
+      "context_alert_percent": 80
     }
   },
   "context_bar_thresholds": [
@@ -86,6 +87,7 @@ The `notifications` block controls alerts when a session needs you. Set it to `n
 
 - `bot_token` / `chat_id` — your Telegram bot credentials; get `bot_token` from [@BotFather](https://t.me/BotFather).
 - `state_thresholds_ms` — how long a session must sit in a state before it alerts, in milliseconds, keyed by state: `"idle"`, `"working"`, `"awaiting"`, `"done"`, `"error"`. A missing key or `0` keeps that state silent.
+- `context_alert_percent` — send a one-off message when a session's context usage crosses this percent of the active model's window (the same percentage that colors the token counter). It fires once on crossing and re-arms only after usage drops back below — so a new task or `/clear` lets it alert again. `null` or `0` turns it off.
 
 ### Token coloring
 
