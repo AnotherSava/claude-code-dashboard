@@ -309,6 +309,9 @@ fn last_assistant_text(path: &Path) -> Option<String> {
 /// `"save this config"` from matching. `can you` / `could you` / `did you` /
 /// `want to` catch directed questions whose paragraph continues past the `?`
 /// (`"Did you try the admin launch? That's the most likely fix."`).
+/// `confirm ` (trailing space, so `confirmed` / `confirmation` don't match)
+/// catches approval prompts whose `?` isn't last —
+/// (`"Confirm v0.5.0 and these notes? On approval I'll …"`).
 const PERMISSION_SEEKING: &[&str] = &[
     "want me to",
     "shall i",
@@ -320,6 +323,7 @@ const PERMISSION_SEEKING: &[&str] = &[
     "could you",
     "did you",
     "want to",
+    "confirm ",
 ];
 
 /// True when `text` reads as a hand-back to the user: the whole text ends with
@@ -950,6 +954,24 @@ mod tests {
         ] {
             assert!(is_a_question(text, &[]), "text: {}", text);
         }
+    }
+
+    #[test]
+    fn confirm_prompt_with_question_not_last_is_awaiting() {
+        // Approval prompt whose "?" is followed by a plan/tail — the exact
+        // shape of the release skill's "Confirm vX? On approval I'll …".
+        assert!(is_a_question(
+            "Confirm v0.5.0 and these notes? On approval I'll tag and push.",
+            &[]
+        ));
+        // Trailing space guards against `confirmed` / `confirmation` matching
+        // a declarative sentence that happens to share a paragraph with a "?".
+        // (Bare "confirm" would false-positive here; "confirm " does not, and
+        // the text doesn't end with "?" so the trailing-? path stays quiet.)
+        assert!(!is_a_question(
+            "The change is confirmed working. Does that match? Shipping it now.",
+            &[]
+        ));
     }
 
     #[test]
