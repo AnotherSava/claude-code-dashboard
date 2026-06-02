@@ -309,9 +309,11 @@ fn last_assistant_text(path: &Path) -> Option<String> {
 /// `"save this config"` from matching. `can you` / `could you` / `did you` /
 /// `want to` catch directed questions whose paragraph continues past the `?`
 /// (`"Did you try the admin launch? That's the most likely fix."`).
-/// `confirm ` (trailing space, so `confirmed` / `confirmation` don't match)
-/// catches approval prompts whose `?` isn't last —
-/// (`"Confirm v0.5.0 and these notes? On approval I'll …"`).
+/// `confirm ` and `ready to ` (trailing space, so `confirmed` /
+/// `confirmation` don't match, and `ready` alone with no follow-up doesn't)
+/// catch approval prompts whose `?` isn't last —
+/// (`"Confirm v0.5.0 and these notes? On approval I'll …"`,
+///  `"Ready to tag v0.5.1 and push it? Reply with y …"`).
 const PERMISSION_SEEKING: &[&str] = &[
     "want me to",
     "shall i",
@@ -324,6 +326,7 @@ const PERMISSION_SEEKING: &[&str] = &[
     "did you",
     "want to",
     "confirm ",
+    "ready to ",
 ];
 
 /// True when `text` reads as a hand-back to the user: the whole text ends with
@@ -914,6 +917,16 @@ mod tests {
     fn permission_seeking_do_you_want_mid_paragraph() {
         assert!(is_a_question(
             "Deployed. Do you want me to run the tests? I can also check coverage.",
+            &[]
+        ));
+    }
+
+    #[test]
+    fn permission_seeking_ready_to_mid_paragraph() {
+        // "Ready to <action>?" approval prompts whose "?" isn't last —
+        // ("Ready to tag v0.5.1 and push it? Reply with y …").
+        assert!(is_a_question(
+            "Ready to tag v0.5.1 and push it? Reply with y to tag + push, or tell me what to tweak in the notes first.",
             &[]
         ));
     }
