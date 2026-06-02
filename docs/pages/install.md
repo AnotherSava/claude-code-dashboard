@@ -11,8 +11,6 @@ Two steps: install the widget, then point Claude Code at the lifecycle hook.
 
 Download the latest installer for your platform from the [Releases page](https://github.com/AnotherSava/claude-code-dashboard/releases) and run it.
 
-The build is not yet code-signed on either platform, so you might see an OS warning on first launch.
-
 ### Windows
 
 - File: `Claude Code Dashboard_<version>_x64-setup.exe`
@@ -24,7 +22,7 @@ The build is not yet code-signed on either platform, so you might see an OS warn
 
 - File: `Claude Code Dashboard_<version>_aarch64.dmg`
 - Requirements: macOS 11+ on Apple Silicon.
-- On first launch right-click the app → **Open** to bypass Gatekeeper.
+- The build is ad-hoc signed but not Apple-notarized, so on first launch macOS will say *"damaged and can't be opened"*. Open **System Settings → Privacy & Security**, scroll to the blocked-app notice, and click **Open Anyway**. Power users can instead run `xattr -cr "/Applications/Claude Code Dashboard.app"` in Terminal once after install.
 
 After install, the widget lives in the system tray — left-click the tray icon to show or hide it. Until you wire the hook in step 2, no sessions will appear.
 

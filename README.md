@@ -13,7 +13,7 @@ The header tracks your 5-hour and 7-day Anthropic usage limits.
 Download the latest installer for your platform from the [Releases page](https://github.com/AnotherSava/claude-code-dashboard/releases):
 
 - **Windows**: `Claude Code Dashboard_<version>_x64-setup.exe` — Windows 10 version 1803 or newer; WebView2 is fetched during install if missing.
-- **macOS**: `Claude Code Dashboard_<version>_aarch64.dmg` — macOS 11+ on Apple Silicon.
+- **macOS**: `Claude Code Dashboard_<version>_aarch64.dmg` — macOS 11+ on Apple Silicon. On first launch macOS will say *"damaged and can't be opened"* — the app is ad-hoc signed, not notarized. Open **System Settings → Privacy & Security**, scroll to the blocked-app notice, and click **Open Anyway**. Power users can instead run `xattr -cr "/Applications/Claude Code Dashboard.app"` in Terminal once after install.
 
 See full project documentation at **[anothersava.github.io/claude-code-dashboard](https://anothersava.github.io/claude-code-dashboard/)**:
 

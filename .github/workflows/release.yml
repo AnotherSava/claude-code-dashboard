@@ -45,6 +45,8 @@ jobs:
         with:
           tagName: ${{ github.ref_type == 'tag' && github.ref_name || format('v-{0}', github.sha) }}
           releaseName: 'Claude Code Dashboard ${{ github.ref_name }}'
+          releaseBody: |
+            See the [installation guide](https://anothersava.github.io/claude-code-dashboard/pages/install) for downloads, system requirements, and the macOS first-launch workaround.
           releaseDraft: true
           prerelease: false
           includeUpdaterJson: false
