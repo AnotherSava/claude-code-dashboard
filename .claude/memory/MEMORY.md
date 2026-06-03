@@ -1,0 +1,4 @@
+- [Hook env var setup](hook_env_var_setup.md) — Claude Code hooks in ~/.claude/settings.json need $CLAUDE_AI_AGENT_DASHBOARD set to the repo root; silent failure when unset
+- [Frontend question detector is lenient](feedback_frontend_question_detector_lenient.md) — src/lib/dialog.ts intentionally diverges from Rust is_a_question; don't unify
+- [macOS ad-hoc signing strategy](macos_signing_strategy.md) — DMG uses signingIdentity="-" + documented user workaround; don't push for $99/yr Apple notarization unprompted
+- [Test SetupPanel via port override](dashboard_test_port_override.md) — `config/local.json {"server_port": 9078}` keeps prompt_history empty so the onboarding panel stays visible
