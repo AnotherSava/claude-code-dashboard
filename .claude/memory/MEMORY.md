@@ -2,3 +2,13 @@
 - [Frontend question detector is lenient](feedback_frontend_question_detector_lenient.md) — src/lib/dialog.ts intentionally diverges from Rust is_a_question; don't unify
 - [macOS ad-hoc signing strategy](macos_signing_strategy.md) — DMG uses signingIdentity="-" + documented user workaround; don't push for $99/yr Apple notarization unprompted
 - [Test SetupPanel via port override](dashboard_test_port_override.md) — `config/local.json {"server_port": 9078}` keeps prompt_history empty so the onboarding panel stays visible
+- [Run deploy directly, don't hand it back](feedback_run_deploy_directly.md) — after code changes that need visual verification, call `Bash deploy` instead of asking the user
+- [Frontend log bypasses tracing intentionally](feedback_frontend_log_bypasses_tracing.md) — FrontendLogger writes JSONL directly; don't "fix" by routing through tracing::*! macros
+- [Favor clean design over compat](feedback_favor_clean_design.md) — don't keep legacy fields alongside replacements; break and update consumers
+- [No redundant flags](feedback_no_redundant_flags.md) — don't add booleans when existing data values already distinguish all cases (exception: cross-layer info gap)
+- [Frontend reads backend state decisions](feedback_frontend_reads_state_decisions.md) — stamp Rust state-machine decisions (task boundaries) onto data fields; don't re-derive in TS, they drift
+- [Config wiped on deploy](project_config_wiped_on_deploy.md) — deploy overwrites config.json; persist runtime state in its own app-data JSON file
+- [Validate detection against history](feedback_validate_detection_against_history.md) — test is_a_question changes vs prompt_history.json; prefer phrase-matching over broad structural rules
+- [App.svelte multi-window finally-block trap](feedback_app_svelte_multi_window_routing.md) — finally{showWindow} runs even for non-main labels; guard with !historyMode && !aboutMode or hidden secondaries auto-reveal
+- [User docs stay high-level](feedback_user_docs_high_level.md) — high-level intros, no UI jargon, omit edge cases; users skim for the gist
+- [Doc features in both pages](feedback_doc_both_features_and_settings.md) — a config-driven feature needs a features.md mention, not just a settings.md entry
