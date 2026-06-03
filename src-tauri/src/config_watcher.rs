@@ -101,6 +101,14 @@ pub fn apply_config_to_window(app: &AppHandle, cfg: &Config, prior: Option<&Conf
     }
 }
 
+/// Logical dimensions of the main widget — must match tauri.conf.json's
+/// `windows[main]` entry. Read at setup() time, where `outer_size()` /
+/// `inner_size()` on macOS aren't reliable before the NSWindow has been
+/// realized (returning zero, or logical units in a physical-pixel slot,
+/// either of which silently breaks the bottom-right anchor math).
+const CONF_LOGICAL_WIDTH: f64 = 420.0;
+const CONF_LOGICAL_HEIGHT: f64 = 320.0;
+
 /// Position the window in the bottom-right of the primary monitor's work area
 /// (i.e. inside the region not covered by the macOS Dock/menu bar or Windows
 /// taskbar) with a small margin. Called at startup when `save_window_position`
@@ -110,11 +118,29 @@ pub fn apply_default_position(window: &tauri::WebviewWindow) {
         Ok(Some(m)) => m,
         _ => return,
     };
+    // Use the monitor's baked scale factor rather than `window.scale_factor()`
+    // — the latter on macOS reads NSWindow.backingScaleFactor, which can lag
+    // before the window is realized on its screen and lead to a half-DPI
+    // computation on retina.
+    let scale = monitor.scale_factor();
+    let width = (CONF_LOGICAL_WIDTH * scale).round() as i32;
+    let height = (CONF_LOGICAL_HEIGHT * scale).round() as i32;
+    let margin_x = (16.0 * scale).round() as i32;
+    let margin_y = (4.0 * scale).round() as i32;
     let work = monitor.work_area();
-    let size = window.outer_size().unwrap_or_default();
-    let margin_x: i32 = 16;
-    let margin_y: i32 = 4;
-    let x = work.position.x + work.size.width as i32 - size.width as i32 - margin_x;
-    let y = work.position.y + work.size.height as i32 - size.height as i32 - margin_y;
+    let raw_x = work.position.x + work.size.width as i32 - width - margin_x;
+    let raw_y = work.position.y + work.size.height as i32 - height - margin_y;
+    let bounds = crate::auto_resize::WorkAreaBounds::from_monitor(&monitor);
+    let (x, y) = bounds.clamp(raw_x, raw_y, width, height);
+    tracing::debug!(
+        scale,
+        width,
+        height,
+        work_pos = ?(work.position.x, work.position.y),
+        work_size = ?(work.size.width, work.size.height),
+        raw = ?(raw_x, raw_y),
+        clamped = ?(x, y),
+        "apply_default_position",
+    );
     let _ = window.set_position(tauri::PhysicalPosition::new(x, y));
 }

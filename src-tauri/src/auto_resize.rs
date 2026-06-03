@@ -32,29 +32,75 @@ pub fn apply(
         AutoResize::None => unreachable!(),
     };
 
-    // Clamp y to the current monitor's top edge (multi-monitor safe —
-    // a non-primary monitor can have a non-zero origin).
-    let monitor_top = window
+    // Clamp to the current monitor's work area (the region not covered by
+    // the macOS Dock/menu bar or the Windows taskbar) on all four sides, so
+    // the resize can never leave the window partially off-screen. Without
+    // the bottom/right clamps, a window placed near a screen edge on first
+    // launch — or one whose saved position was on a now-disconnected
+    // monitor — would resize and stay where it was, with content cut off.
+    let bounds = window
         .current_monitor()?
-        .map(|m| m.position().y)
-        .unwrap_or(0);
-    let new_y = raw_y.max(monitor_top);
+        .as_ref()
+        .map(WorkAreaBounds::from_monitor)
+        .unwrap_or_else(WorkAreaBounds::unbounded);
+    let width_phys = size.width as i32;
+    let (new_x, new_y) = bounds.clamp(pos.x, raw_y, width_phys, new_height_phys);
 
     let current_width_logical = size.width as f64 / scale;
     window.set_size(LogicalSize::new(
         current_width_logical,
         desired_logical_height,
     ))?;
-    window.set_position(PhysicalPosition::new(pos.x, new_y))?;
+    window.set_position(PhysicalPosition::new(new_x, new_y))?;
     nchittest::set_active(true);
     tracing::debug!(
         ?mode,
         desired_logical_height,
         new_height_phys,
+        new_x,
         new_y,
         "auto_resize::apply"
     );
     Ok(())
+}
+
+/// Physical-pixel bounds of a monitor's work area, with a clamp helper that
+/// keeps a (x, y, w, h) rect inside it. Extracted so the clamping logic is
+/// testable without a real `Monitor` and reusable across `auto_resize::apply`,
+/// `config_watcher::apply_default_position`, and `commands::set_window_size`.
+pub(crate) struct WorkAreaBounds {
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+}
+
+impl WorkAreaBounds {
+    pub(crate) fn from_monitor(m: &tauri::Monitor) -> Self {
+        let w = m.work_area();
+        Self {
+            left: w.position.x,
+            top: w.position.y,
+            right: w.position.x + w.size.width as i32,
+            bottom: w.position.y + w.size.height as i32,
+        }
+    }
+
+    fn unbounded() -> Self {
+        Self { left: i32::MIN / 2, top: i32::MIN / 2, right: i32::MAX / 2, bottom: i32::MAX / 2 }
+    }
+
+    /// Clamp a top-left position so the rect `(x, y, w, h)` lies within the
+    /// work area. If the rect is bigger than the work area on an axis, the
+    /// top-left wins (better to show the top of an overlong widget than to
+    /// leave it floating below the bottom edge).
+    pub(crate) fn clamp(&self, x: i32, y: i32, w: i32, h: i32) -> (i32, i32) {
+        let max_x = (self.right - w).max(self.left);
+        let max_y = (self.bottom - h).max(self.top);
+        let cx = x.clamp(self.left, max_x);
+        let cy = y.clamp(self.top, max_y);
+        (cx, cy)
+    }
 }
 
 /// Install the WM_NCHITTEST subclass on the main window. Called once at
@@ -251,5 +297,62 @@ mod win_chrome {
         // that to DeleteObject is unsafe. The one-time leak is acceptable.
         unsafe { SetClassLongPtrW(hwnd_raw, GCLP_HBRBACKGROUND, brush) };
         tracing::debug!("class background brush set to dark theme");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::WorkAreaBounds;
+
+    fn screen_1440_900() -> WorkAreaBounds {
+        // 1440x900 logical at scale 2 with a 25 pt macOS menu bar (50 physical).
+        WorkAreaBounds { left: 0, top: 50, right: 2880, bottom: 1800 }
+    }
+
+    #[test]
+    fn clamp_keeps_in_bounds_rect_untouched() {
+        let b = screen_1440_900();
+        assert_eq!(b.clamp(500, 500, 840, 1200), (500, 500));
+    }
+
+    #[test]
+    fn clamp_pulls_bottom_overflow_back_onto_screen() {
+        // Simulates Up-mode resize where the window's bottom was already
+        // off-screen because the first-launch position was placed below the
+        // work area — the resize must move the window up so the bottom sits
+        // on the work-area floor.
+        let b = screen_1440_900();
+        let (x, y) = b.clamp(2024, 1500, 840, 600);
+        assert_eq!(y, 1200, "y clamped to bottom - height");
+        assert_eq!(x, 2024, "x left alone when in bounds");
+    }
+
+    #[test]
+    fn clamp_pulls_right_overflow_back_onto_screen() {
+        let b = screen_1440_900();
+        let (x, _) = b.clamp(2500, 500, 840, 600);
+        assert_eq!(x, 2040, "x clamped to right - width");
+    }
+
+    #[test]
+    fn clamp_respects_macos_menu_bar_top() {
+        let b = screen_1440_900();
+        let (_, y) = b.clamp(500, 10, 840, 600);
+        assert_eq!(y, 50, "y clamped to work-area top, not monitor top");
+    }
+
+    #[test]
+    fn clamp_oversized_rect_pins_to_top_left() {
+        // When the rect is bigger than the work area, the .max() in the
+        // bound clamp keeps the top-left anchored — showing the top of the
+        // widget is more useful than showing nothing.
+        let b = screen_1440_900();
+        assert_eq!(b.clamp(100, 100, 4000, 4000), (0, 50));
+    }
+
+    #[test]
+    fn clamp_unbounded_is_a_noop() {
+        let b = WorkAreaBounds::unbounded();
+        assert_eq!(b.clamp(12_345, -678, 840, 600), (12_345, -678));
     }
 }

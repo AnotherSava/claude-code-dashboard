@@ -32,30 +32,65 @@
     openSetupDocs().catch((err) => console.error(err))
   }
 
-  // Grow the widget wide enough that the reference lines (hook script path,
-  // setup-guide URL) fit on a single row each. We measure the natural width
-  // each .meta paragraph wants by temporarily forcing nowrap, then ask the
-  // backend to setSize. Capped at 2/3 of the screen's available width so the
-  // widget can't overflow the desktop on tiny screens. Never shrinks below
-  // the current viewport — manual user resizes upward stick.
+  // Grow the widget to fit the onboarding instructions in one resize. Two
+  // dimensions to fit:
+  //   - Width: the hook-script path and setup-guide URL are forced onto one
+  //     line each, so we widen the window to the longest .meta line.
+  //   - Height: `.panel` is `flex: 1; overflow-y: auto;`, so a too-short
+  //     window just scrolls the instructions instead of growing — we read
+  //     the panel's natural `scrollHeight` and grow to fit.
+  // We measure BOTH dimensions before issuing a single `setWindowSize` call.
+  // The height read at the current (narrow) width slightly overshoots — text
+  // wraps more on a narrow line, making each paragraph one or two rows
+  // taller than it'll be after the widen — but a single resize with a few
+  // pixels of dead bottom space is far better than the visible flicker of
+  // two separate resizes 1.5s apart. Both axes capped at 2/3 of the screen.
+  // `set_window_size`'s WorkAreaBounds clamp moves the window up/left if the
+  // new bottom/right would fall off-screen. Never shrinks below the current
+  // viewport — manual user resizes stick, and the panel disappears as soon
+  // as the first hook event arrives.
   onMount(() => {
     if (!referenceEl) return
+    // Measure widening need. `scrollWidth` returns max(content, clientWidth)
+    // per MDN, so once a line fits, scrollWidth === clientWidth and adding a
+    // safety pad would request `innerWidth + pad` — making the window grow
+    // a few pixels every hide/show cycle. So treat a line as "needs widening"
+    // ONLY when it actually overflows (scrollWidth > clientWidth). When no
+    // line overflows, widthTarget is left at the current viewport width, so
+    // the Math.max idempotency check below short-circuits with no resize.
     const metas = referenceEl.querySelectorAll<HTMLElement>('.meta')
-    let contentWidth = 0
+    let overflowingContent = 0
     for (const el of metas) {
       const prior = el.style.whiteSpace
       el.style.whiteSpace = 'nowrap'
-      contentWidth = Math.max(contentWidth, el.scrollWidth)
+      if (el.scrollWidth > el.clientWidth) {
+        overflowingContent = Math.max(overflowingContent, el.scrollWidth)
+      }
       el.style.whiteSpace = prior
     }
-    if (contentWidth === 0) return
-    // Panel padding (16 each side) + a few px for scrollbar / margin safety.
-    const needed = Math.ceil(contentWidth + 32 + 4)
-    const cap = Math.floor((window.screen.availWidth * 2) / 3)
-    const target = Math.min(needed, cap)
-    if (target > window.innerWidth) {
-      // Height stays at whatever the user (or auto_resize) had it at.
-      setWindowSize('main', target, window.innerHeight, false).catch((err) =>
+    const widthCap = Math.floor((window.screen.availWidth * 2) / 3)
+    const widthTarget =
+      overflowingContent > 0
+        ? Math.min(Math.ceil(overflowingContent + 32 + 4), widthCap)
+        : window.innerWidth
+
+    const panelEl = document.querySelector('.panel') as HTMLElement | null
+    const headerEl = document.querySelector('header') as HTMLElement | null
+    let heightTarget = window.innerHeight
+    if (panelEl && headerEl) {
+      const naturalHeight =
+        headerEl.getBoundingClientRect().height + panelEl.scrollHeight
+      const heightCap = Math.floor((window.screen.availHeight * 2) / 3)
+      heightTarget = Math.min(Math.ceil(naturalHeight), heightCap)
+    }
+
+    const finalWidth = Math.max(widthTarget, window.innerWidth)
+    const finalHeight = Math.max(heightTarget, window.innerHeight)
+    if (
+      finalWidth !== window.innerWidth ||
+      finalHeight !== window.innerHeight
+    ) {
+      setWindowSize('main', finalWidth, finalHeight, false).catch((err) =>
         console.error('setSize failed', err),
       )
     }

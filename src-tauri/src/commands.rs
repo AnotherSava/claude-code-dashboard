@@ -233,15 +233,25 @@ const RESIZE_RIGHT_MARGIN: i32 = 16;
 /// `recenter`:
 ///   - `false` (e.g. main widget): if the new right edge would intrude into
 ///     the reserved right margin, shift left so the standoff is preserved.
-///     Y is left alone.
+///     Y is left alone except by the work-area clamp.
 ///   - `true` (e.g. modal About): re-center the window on its current
-///     monitor along both axes after the resize, so growth doesn't slide it
-///     off-center.
-/// We size first, then read back the *actual* outer size (Tauri's set_size
-/// adds a Windows DWM non-client frame even on `decorations: false` windows
-/// so the post-resize outer is a bit wider/taller than what was asked for)
-/// before computing the final position. Caller is responsible for clamping
-/// the requested dimensions to sensible upper bounds.
+///     monitor along both axes, so growth doesn't slide it off-center.
+///
+/// Ordering: we call `set_position` BEFORE `set_size`. The reverse causes a
+/// visible flicker on macOS — `set_size` grows the window past the work-area
+/// floor/edge, then `set_position` shifts it back into view a frame or two
+/// later. Moving first means the intermediate state (new position, old size)
+/// is always on-screen.
+///
+/// Sizing: we compute the new outer rect from `requested × scale` instead of
+/// reading `outer_size()` — pre-resize that gives the *old* size (wrong for
+/// growth), and post-resize on macOS it can lag by several frames (the bug
+/// that left the window off-screen before this rewrite). On Windows the DWM
+/// non-client frame adds ~7px even on `decorations: false`, so the actual
+/// right edge after `set_size` may land that far past where we computed —
+/// well within `RESIZE_RIGHT_MARGIN` (16px), so still inside the work area.
+/// Caller is responsible for clamping the requested dimensions to sensible
+/// upper bounds.
 #[tauri::command]
 pub fn set_window_size(
     label: String,
@@ -253,44 +263,50 @@ pub fn set_window_size(
     let Some(window) = app.get_webview_window(&label) else {
         return Ok(());
     };
-    window
-        .set_size(tauri::LogicalSize::new(logical_width, logical_height))
-        .map_err(|e| e.to_string())?;
-
+    let scale = window.scale_factor().map_err(|e| e.to_string())?;
     let pos = window.outer_position().map_err(|e| e.to_string())?;
-    let actual_size = window.outer_size().map_err(|e| e.to_string())?;
     let Some(monitor) = window.current_monitor().ok().flatten() else {
+        // No monitor — just size and bail (can't compute work area).
+        window
+            .set_size(tauri::LogicalSize::new(logical_width, logical_height))
+            .map_err(|e| e.to_string())?;
         return Ok(());
     };
     let work = monitor.work_area();
+    let bounds = crate::auto_resize::WorkAreaBounds::from_monitor(&monitor);
+    let new_w = (logical_width * scale).round() as i32;
+    let new_h = (logical_height * scale).round() as i32;
 
-    let (new_x, new_y) = if recenter {
+    let (raw_x, raw_y) = if recenter {
         let work_center_x = work.position.x + (work.size.width as i32) / 2;
         let work_center_y = work.position.y + (work.size.height as i32) / 2;
-        let half_w = (actual_size.width as i32) / 2;
-        let half_h = (actual_size.height as i32) / 2;
-        let x = (work_center_x - half_w)
-            .max(work.position.x)
-            .min(work.position.x + work.size.width as i32 - actual_size.width as i32);
-        let y = (work_center_y - half_h)
-            .max(work.position.y)
-            .min(work.position.y + work.size.height as i32 - actual_size.height as i32);
-        (x, y)
+        (work_center_x - new_w / 2, work_center_y - new_h / 2)
     } else {
         let allowed_right = work.position.x + work.size.width as i32 - RESIZE_RIGHT_MARGIN;
-        let actual_right = pos.x + actual_size.width as i32;
+        let actual_right = pos.x + new_w;
         let overflow = actual_right - allowed_right;
-        let x = if overflow > 0 {
-            (pos.x - overflow).max(work.position.x)
-        } else {
-            pos.x
-        };
+        let x = if overflow > 0 { pos.x - overflow } else { pos.x };
         (x, pos.y)
     };
+    let (new_x, new_y) = bounds.clamp(raw_x, raw_y, new_w, new_h);
+    tracing::debug!(
+        label = %label,
+        logical = ?(logical_width, logical_height),
+        scale,
+        new_size = ?(new_w, new_h),
+        pos = ?(pos.x, pos.y),
+        target = ?(new_x, new_y),
+        moved = new_x != pos.x || new_y != pos.y,
+        "set_window_size",
+    );
 
+    // Position first (always on-screen intermediate state), then resize.
     if new_x != pos.x || new_y != pos.y {
         let _ = window.set_position(tauri::PhysicalPosition::new(new_x, new_y));
     }
+    window
+        .set_size(tauri::LogicalSize::new(logical_width, logical_height))
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 
