@@ -50,8 +50,7 @@
         "visible": false,
         "acceptFirstMouse": true,
         "alwaysOnTop": true,
-        "theme": "Dark",
-        "parent": "main"
+        "theme": "Dark"
       }
     ],
     "security": {
