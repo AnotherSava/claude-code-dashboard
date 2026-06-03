@@ -1,6 +1,6 @@
 [package]
 name = "claude-code-dashboard"
-version = "0.5.1"
+version = "0.5.2"
 description = "Claude Code Dashboard - always-on-top widget for tracking AI coding agents"
 authors = ["Oleg Savelyev"]
 edition = "2021"
