@@ -341,16 +341,19 @@ pub fn open_history(id: String, app: AppHandle) -> Result<(), String> {
     if let Some(window) = app.get_webview_window("history") {
         let _ = window.set_title(&history_title(&app, &id));
         let _ = window.emit("history_target", &id);
-        if let Some(cfg) = app.try_state::<crate::config::ConfigState>() {
-            let snap = cfg.snapshot();
-            if snap.save_window_position {
-                if let Some(pos) = snap.history_window_position {
-                    let _ = window.set_position(tauri::PhysicalPosition::new(pos.x, pos.y));
-                    if let (Some(w), Some(h)) = (pos.width, pos.height) {
-                        let _ = window.set_size(tauri::PhysicalSize::new(w, h));
-                    }
-                }
+        let saved = app.try_state::<crate::config::ConfigState>().map(|cfg| cfg.snapshot()).filter(|snap| snap.save_window_position).and_then(|snap| snap.history_window_position);
+        if let Some(pos) = saved {
+            let _ = window.unmaximize();
+            let _ = window.set_position(tauri::PhysicalPosition::new(pos.x, pos.y));
+            if let (Some(w), Some(h)) = (pos.width, pos.height) {
+                let _ = window.set_size(tauri::PhysicalSize::new(w, h));
             }
+        } else {
+            // No saved position: open maximized on the dashboard's monitor.
+            if let Some(monitor) = app.get_webview_window("main").and_then(|m| m.current_monitor().ok().flatten()) {
+                let _ = window.set_position(*monitor.position());
+            }
+            let _ = window.maximize();
         }
         window.show().map_err(|e| e.to_string())?;
         window.set_focus().map_err(|e| e.to_string())?;
