@@ -11,6 +11,7 @@ use crate::config::{AutoResize, ConfigState, HistoryFontSize};
 const MENU_SHOW_HIDE: &str = "show_hide";
 const MENU_ALWAYS_ON_TOP: &str = "always_on_top";
 const MENU_SAVE_POSITION: &str = "save_position";
+const MENU_TERMINAL_TITLES: &str = "terminal_titles";
 const MENU_AUTOSTART_OFF: &str = "autostart_off";
 const MENU_AUTOSTART_OPEN: &str = "autostart_open";
 const MENU_AUTOSTART_TRAY: &str = "autostart_tray";
@@ -32,6 +33,7 @@ const MENU_QUIT: &str = "quit";
 pub struct TrayHandles {
     pub always_on_top: CheckMenuItem<Wry>,
     pub save_position: CheckMenuItem<Wry>,
+    pub terminal_titles: CheckMenuItem<Wry>,
     pub autostart_off: CheckMenuItem<Wry>,
     pub autostart_open: CheckMenuItem<Wry>,
     pub autostart_tray: CheckMenuItem<Wry>,
@@ -48,19 +50,23 @@ pub struct TrayHandles {
 pub fn setup(app: &AppHandle) -> tauri::Result<()> {
     let show_hide = MenuItem::with_id(app, MENU_SHOW_HIDE, "Show / Hide", true, None::<&str>)?;
 
-    let (aot_initial, save_pos_initial, auto_resize_initial) = app
+    let (aot_initial, save_pos_initial, auto_resize_initial, term_titles_initial) = app
         .try_state::<ConfigState>()
         .map(|s| {
             let c = s.snapshot();
-            (c.always_on_top, c.save_window_position, c.auto_resize)
+            (c.always_on_top, c.save_window_position, c.auto_resize, c.terminal_titles)
         })
-        .unwrap_or((true, false, AutoResize::None));
+        .unwrap_or((true, false, AutoResize::None, true));
     let always_on_top = CheckMenuItem::with_id(
         app, MENU_ALWAYS_ON_TOP, "Always on top", true, aot_initial, None::<&str>,
     )?;
 
     let save_position = CheckMenuItem::with_id(
         app, MENU_SAVE_POSITION, "Save position on exit", true, save_pos_initial, None::<&str>,
+    )?;
+
+    let terminal_titles = CheckMenuItem::with_id(
+        app, MENU_TERMINAL_TITLES, "Terminal tab titles", true, term_titles_initial, None::<&str>,
     )?;
 
     // Three-way autostart mode derived from two sources: whether the OS
@@ -131,6 +137,7 @@ pub fn setup(app: &AppHandle) -> tauri::Result<()> {
             &PredefinedMenuItem::separator(app)?,
             &always_on_top,
             &save_position,
+            &terminal_titles,
             &autostart_submenu,
             &auto_resize_submenu,
             &hist_font_submenu,
@@ -145,6 +152,7 @@ pub fn setup(app: &AppHandle) -> tauri::Result<()> {
     app.manage(TrayHandles {
         always_on_top: always_on_top.clone(),
         save_position: save_position.clone(),
+        terminal_titles: terminal_titles.clone(),
         autostart_off: autostart_off.clone(),
         autostart_open: autostart_open.clone(),
         autostart_tray: autostart_tray.clone(),
@@ -191,6 +199,7 @@ fn handle_menu_event(app: &AppHandle, id: &str) {
         MENU_SHOW_HIDE => toggle_window(app),
         MENU_ALWAYS_ON_TOP => toggle_always_on_top(app),
         MENU_SAVE_POSITION => toggle_save_position(app),
+        MENU_TERMINAL_TITLES => toggle_terminal_titles(app),
         MENU_AUTOSTART_OFF => select_autostart_mode(app, AutostartMode::Off),
         MENU_AUTOSTART_OPEN => select_autostart_mode(app, AutostartMode::OpenWindow),
         MENU_AUTOSTART_TRAY => select_autostart_mode(app, AutostartMode::OpenToTray),
@@ -262,6 +271,22 @@ fn toggle_save_position(app: &AppHandle) {
         let _ = handles.save_position.set_checked(new_state);
     }
     emit_config_updated(app);
+}
+
+fn toggle_terminal_titles(app: &AppHandle) {
+    let Some(state) = app.try_state::<ConfigState>() else {
+        return;
+    };
+    let new_state = !state.snapshot().terminal_titles;
+    state.with_mut(|c| c.terminal_titles = new_state);
+    let _ = state.save_to_disk();
+    if let Some(handles) = app.try_state::<TrayHandles>() {
+        let _ = handles.terminal_titles.set_checked(new_state);
+    }
+    emit_config_updated(app);
+    // Apply immediately: the sync inside re-pushes titles on enable and
+    // blanks them on disable, instead of waiting for the next state change.
+    crate::commands::emit_sessions_updated(app);
 }
 
 fn select_auto_resize_mode(app: &AppHandle, mode: AutoResize) {

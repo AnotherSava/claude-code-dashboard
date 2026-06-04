@@ -431,7 +431,13 @@ pub fn now_ms() -> i64 {
 }
 
 pub fn emit_sessions_updated(app: &AppHandle) {
-    let _ = app.emit("sessions_updated", resolved_snapshot(app));
+    let sessions = resolved_snapshot(app);
+    // Every state transition flows through this emit, so it doubles as the
+    // single trigger for terminal tab-title reconciliation — the tab tracks
+    // exactly what the row shows (watcher promotions, renames, removals)
+    // without a second state machine.
+    crate::terminal_title::sync(app, &sessions);
+    let _ = app.emit("sessions_updated", sessions);
 }
 
 pub fn emit_config_updated(app: &AppHandle) {

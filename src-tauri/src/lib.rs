@@ -14,6 +14,7 @@ mod prompt_history;
 mod setup;
 mod state;
 mod telegram;
+mod terminal_title;
 mod tray;
 mod usage_limits;
 
@@ -87,6 +88,7 @@ pub fn run() {
         .manage(WatcherRegistry::new())
         .manage(UsageLimitsState::new())
         .manage(commands::HistoryTarget(std::sync::Mutex::new(None)))
+        .manage(terminal_title::TerminalTitles::new())
         .invoke_handler(tauri::generate_handler![
             commands::get_sessions,
             commands::get_config,

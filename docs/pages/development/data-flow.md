@@ -22,6 +22,7 @@ flowchart LR
   AS[("AppState<br/>Mutex&lt;Vec&lt;AgentSession&gt;&gt;")]
   NATIVE["Window / TrayIcon<br/>native APIs"]
   SV["Svelte (listen)"]
+  TT["terminal tab title<br/>(Win32 console)"]
 
   CC -->|"POST /api/event"| AX
   AX -->|"adapters::dispatch -> apply_set / apply_clear"| AS
@@ -32,6 +33,7 @@ flowchart LR
   CFG -->|"file change event"| CW
   CW -->|"emit(config_updated)"| SV
   AS -->|"app.emit(sessions_updated)"| SV
+  AS -->|"terminal_title::sync"| TT
 ```
 
 Every mutation to session state funnels through `state::apply_set` or `state::apply_clear` so the sticky-label rules, working-time accumulator, and upgrade-only merge policy are enforced in one place regardless of origin.
@@ -39,14 +41,14 @@ Every mutation to session state funnels through `state::apply_set` or `state::ap
 ## Path 1 — Hook POSTs event
 
 1. Claude Code fires a lifecycle event (`UserPromptSubmit`, `Stop`, etc.). The hook command spawns `python claude_hook.py` and pipes the event payload to stdin.
-2. `claude_hook.py` reads the payload, extracts `hook_event_name`, and POSTs `{client: "claude", event: <name>, payload: <verbatim>}` to `$TAURI_DASHBOARD_URL/api/event` (default `http://127.0.0.1:9077/api/event`). The hook does no classification or config reading.
+2. `claude_hook.py` reads the payload, extracts `hook_event_name`, and POSTs `{client: "claude", event: <name>, payload: <verbatim>, console_pids: [...]}` to `$TAURI_DASHBOARD_URL/api/event` (default `http://127.0.0.1:9077/api/event`). The hook does no classification or config reading — `console_pids` (Windows) is pure environment gathering: the processes attached to its console plus its ancestor pid chain, used later for terminal tab titles.
 3. `POST /api/event` hits the axum handler. Origin guard rejects non-null cross-origin requests.
 4. `adapters::dispatch` routes by `client`; `adapters::claude::dispatch` matches on `event` and produces an `AdapterOutput::Set { input, transcript_path } | Clear { id } | Ignore`. All chat-id derivation, prompt cleaning, and transcript question-detection happen here.
 5. For `Set`, `label_policy::select` decides the `(label, original_prompt)` pair.
 6. Session-boundary marking. Claude `/clear` fires `SessionEnd` → `SessionStart`; the chat_id (derived from cwd) is unchanged but the JSONL is a new file. The handler covers this in two places: (a) on `Clear`, `AppState::mark_session_boundary` appends a `Separator` to the in-memory dialog and `PromptHistoryStore` persists it before `apply_clear` destroys the session — the following `SessionStart` then takes the "new" branch in `apply_set` and restores a dialog that already ends with the separator, so the upcoming user entry lands after it. (b) On `Set`, a defensive `transcript_path`-rotation check still calls `mark_session_boundary` if the new path differs from what `WatcherRegistry` is already watching — covers any rotation that happens without a preceding `SessionEnd`.
 7. `AppState::apply_set` runs: if status transitions out of `working`, it accumulates elapsed time into `working_accumulated_ms`; if the transition is a task boundary (`done` / `idle` → `working`), it zeroes the accumulator; otherwise existing timers are preserved.
 8. If `transcript_path` is present, `WatcherRegistry::start` spawns a per-session tokio task with a `notify::RecommendedWatcher` on the transcript's parent directory.
-9. `emit_sessions_updated` broadcasts the fresh snapshot on the `sessions_updated` event.
+9. `emit_sessions_updated` broadcasts the fresh snapshot on the `sessions_updated` event. The same emit reconciles terminal tab titles (`terminal_title::sync`): every session whose status or display name changed gets its circle re-pushed onto the console the hook's `console_pids` identified.
 10. The Svelte frontend's `listen` callback replaces its `$state` sessions array, Svelte's reactivity re-renders the list, the row updates within a frame.
 
 ## Path 2 — Transcript-driven updates

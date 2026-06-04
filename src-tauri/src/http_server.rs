@@ -45,6 +45,11 @@ struct EventRequest {
     event: String,
     #[serde(default)]
     payload: serde_json::Value,
+    /// Windows: pids attached to the hook's console (includes the long-lived
+    /// Claude Code process) — `terminal_title` uses them to set the terminal
+    /// tab title. Absent on macOS and from pre-field hooks.
+    #[serde(default)]
+    console_pids: Vec<u32>,
 }
 
 async fn post_event(
@@ -97,9 +102,17 @@ async fn post_event(
                 chat_id = %input.id,
                 status = ?input.status,
                 label = ?input.label,
+                console_pids = ?req.console_pids,
                 "event -> set"
             );
             let chat_id = input.id.clone();
+            // Remember which console hosts this session so terminal_title can
+            // push tab-title updates. Cleanup is centralized in
+            // `terminal_title::sync` — when the session row disappears (Clear,
+            // manual removal) the title is blanked and the pids forgotten.
+            if let Some(titles) = app.try_state::<crate::terminal_title::TerminalTitles>() {
+                titles.register(&chat_id, &req.console_pids);
+            }
             let history = app.try_state::<PromptHistoryStore>();
             let restored = history.as_ref().and_then(|h| h.get(&chat_id));
             let now = now_ms();

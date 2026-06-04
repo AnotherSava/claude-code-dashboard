@@ -17,13 +17,15 @@ The widget listens on `http://127.0.0.1:9077` (default) for lifecycle events fro
 {
   "client": "claude",
   "event": "UserPromptSubmit",
-  "payload": { ... raw agent payload ... }
+  "payload": { ... raw agent payload ... },
+  "console_pids": [1234, 5678]
 }
 ```
 
 - `client` — identifies which adapter should handle this event. Today: `"claude"`. New clients are new server-side adapter modules; the envelope shape never grows a per-client variant.
 - `event` — the agent's own event name (for Claude Code this is the `hook_event_name` field from its hook payload: `SessionStart` / `UserPromptSubmit` / `Notification` / `Stop` / `SessionEnd`).
 - `payload` — opaque to the HTTP layer; forwarded verbatim to the adapter. The adapter knows what fields it cares about.
+- `console_pids` — optional, Windows only. Candidate pids the hook gathered from its console and ancestor chain; the widget attaches to one of them to set the terminal tab title (see [Features → terminal tab titles](../features#terminal-tab-titles)). Plays no part in classification; absent or empty on macOS.
 
 ## Payload interpretation
 

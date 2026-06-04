@@ -25,6 +25,10 @@ The row's status badge tracks the agent in real time:
 
 Each badge is color-coded, and WAIT and ERROR pulse to draw your eye when a session needs attention.
 
+## Terminal tab titles
+
+Each session's status is mirrored onto the terminal tab it runs in, as a colored circle next to the session name — 🔵 working, 🟠 waiting on you, 🟢 done, 🔴 error. A glance at your terminal tabs shows which session needs attention, even without the widget on screen. The title updates the moment the status changes and clears when the session ends. On by default; the tray's **Terminal tab titles** toggle turns it off. Windows only for now.
+
 ## Your task stays in view
 
 While Claude is blocked on you (WAIT), the row shows the question or approval request, so you know what it needs. Once you answer and Claude resumes (WORK), the row goes back to showing your **original request** rather than the *yes* you typed — so a quick approval or a *continue* never replaces your task on screen. The work timer pauses during WAIT — replaced by a timer counting how long Claude has been blocked on you — and resumes once the agent continues working on the task. A new top-level prompt after DONE / IDLE starts a fresh task.

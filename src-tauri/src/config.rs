@@ -50,6 +50,10 @@ pub struct Config {
     /// and the working timer instead of resetting them. Match is exact,
     /// case-insensitive, after trimming whitespace.
     pub continuation_prompts: Vec<String>,
+    /// Mirror each session's status onto its terminal tab title as
+    /// "<colored circle> <name>" (e.g. "🔵 ai-dashboard"). Read by
+    /// `terminal_title::sync`; Windows-only today.
+    pub terminal_titles: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -167,6 +171,7 @@ impl Default for Config {
             history_window_position: None,
             start_minimized: false,
             continuation_prompts: vec!["go".into(), "continue".into(), "proceed".into()],
+            terminal_titles: true,
         }
     }
 }
@@ -311,6 +316,14 @@ mod tests {
         let with_extra = r#"{ "this_key_does_not_exist_on_config": 42 }"#;
         let cfg: Config = serde_json::from_str(with_extra).unwrap();
         assert_eq!(cfg.server_port, 9077);
+    }
+
+    #[test]
+    fn terminal_titles_defaults_on_when_field_missing() {
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert!(cfg.terminal_titles);
+        let off: Config = serde_json::from_str(r#"{ "terminal_titles": false }"#).unwrap();
+        assert!(!off.terminal_titles);
     }
 
     #[test]
