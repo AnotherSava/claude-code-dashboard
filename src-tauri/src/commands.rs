@@ -223,6 +223,16 @@ pub fn open_about(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+/// Move a window to a persisted `WindowPosition`, and resize to it when the
+/// saved geometry included a size (older configs stored only x/y). Best-effort
+/// — restoration errors are swallowed.
+pub fn apply_window_position(window: &WebviewWindow, pos: &crate::config::WindowPosition) {
+    let _ = window.set_position(tauri::PhysicalPosition::new(pos.x, pos.y));
+    if let (Some(w), Some(h)) = (pos.width, pos.height) {
+        let _ = window.set_size(tauri::PhysicalSize::new(w, h));
+    }
+}
+
 /// Right-edge padding (physical pixels) preserved when an anchored window
 /// (e.g. the bottom-right main widget) grows. Mirrors
 /// `config_watcher::apply_default_position`'s margin so the resized window
@@ -341,19 +351,34 @@ pub fn open_history(id: String, app: AppHandle) -> Result<(), String> {
     if let Some(window) = app.get_webview_window("history") {
         let _ = window.set_title(&history_title(&app, &id));
         let _ = window.emit("history_target", &id);
-        let saved = app.try_state::<crate::config::ConfigState>().map(|cfg| cfg.snapshot()).filter(|snap| snap.save_window_position).and_then(|snap| snap.history_window_position);
-        if let Some(pos) = saved {
-            let _ = window.unmaximize();
-            let _ = window.set_position(tauri::PhysicalPosition::new(pos.x, pos.y));
-            if let (Some(w), Some(h)) = (pos.width, pos.height) {
-                let _ = window.set_size(tauri::PhysicalSize::new(w, h));
+        let snap = app.try_state::<crate::config::ConfigState>().map(|cfg| cfg.snapshot()).filter(|snap| snap.save_window_position);
+        let saved = snap.as_ref().and_then(|s| s.history_window_position);
+        let want_maximized = snap.as_ref().is_some_and(|s| s.history_window_maximized);
+        // Closing the window only hides it — a maximized window stays maximized
+        // while hidden. So on reopen it's usually already in the right state;
+        // touching geometry only when it differs avoids flashing a normal-size
+        // frame before re-maximizing (unmaximize → resize → maximize).
+        let already_maximized = window.is_maximized().unwrap_or(false);
+        match (saved, want_maximized) {
+            (Some(pos), false) => {
+                let _ = window.unmaximize();
+                apply_window_position(&window, &pos);
             }
-        } else {
-            // No saved position: open maximized on the dashboard's monitor.
-            if let Some(monitor) = app.get_webview_window("main").and_then(|m| m.current_monitor().ok().flatten()) {
-                let _ = window.set_position(*monitor.position());
+            (Some(pos), true) if !already_maximized => {
+                // Set the unmaximized bounds first so they become the
+                // restore-rect for a later un-maximize, then maximize.
+                apply_window_position(&window, &pos);
+                let _ = window.maximize();
             }
-            let _ = window.maximize();
+            (Some(_), true) => {} // already maximized — leave it, no flash
+            (None, _) if !already_maximized => {
+                // No saved bounds: open maximized on the dashboard's monitor.
+                if let Some(monitor) = app.get_webview_window("main").and_then(|m| m.current_monitor().ok().flatten()) {
+                    let _ = window.set_position(*monitor.position());
+                }
+                let _ = window.maximize();
+            }
+            (None, _) => {} // no saved bounds, already maximized
         }
         window.show().map_err(|e| e.to_string())?;
         window.set_focus().map_err(|e| e.to_string())?;

@@ -36,6 +36,13 @@ pub struct Config {
     pub auto_resize: AutoResize,
     pub history_font_size: HistoryFontSize,
     pub history_window_position: Option<WindowPosition>,
+    /// Whether the history window was maximized when last closed. Persisted
+    /// separately from `history_window_position` because a maximized window's
+    /// outer rect is inflated by the frame (it sits ~8px past each work-area
+    /// edge), so capturing it as the restore bounds would grow the window on
+    /// every reopen. Instead we keep the last *unmaximized* bounds in
+    /// `history_window_position` and re-maximize on open when this is set.
+    pub history_window_maximized: bool,
     /// When the app is auto-launched at login (the "Open to tray" mode), keep
     /// the main window hidden so only the tray icon appears. Read at startup in
     /// `lib.rs`, but only honored when the launch actually came from autostart
@@ -169,6 +176,7 @@ impl Default for Config {
             auto_resize: AutoResize::None,
             history_font_size: HistoryFontSize::Regular,
             history_window_position: None,
+            history_window_maximized: false,
             start_minimized: false,
             continuation_prompts: vec!["go".into(), "continue".into(), "proceed".into()],
             terminal_titles: true,
@@ -316,6 +324,14 @@ mod tests {
         let with_extra = r#"{ "this_key_does_not_exist_on_config": 42 }"#;
         let cfg: Config = serde_json::from_str(with_extra).unwrap();
         assert_eq!(cfg.server_port, 9077);
+    }
+
+    #[test]
+    fn history_window_maximized_defaults_false_and_parses() {
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert!(!cfg.history_window_maximized);
+        let on: Config = serde_json::from_str(r#"{ "history_window_maximized": true }"#).unwrap();
+        assert!(on.history_window_maximized);
     }
 
     #[test]

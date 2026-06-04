@@ -185,13 +185,10 @@ pub fn run() {
                 let _ = window.set_always_on_top(current_config.always_on_top);
                 match (current_config.save_window_position, current_config.window_position) {
                     (true, Some(pos)) => {
-                        let _ = window.set_position(tauri::PhysicalPosition::new(pos.x, pos.y));
-                        // Restore size if a prior run captured it. Old configs
-                        // (or never-resized fresh installs) leave w/h as None
-                        // and we keep the conf-default geometry.
-                        if let (Some(w), Some(h)) = (pos.width, pos.height) {
-                            let _ = window.set_size(tauri::PhysicalSize::new(w, h));
-                        }
+                        // Restore size too if a prior run captured it. Old
+                        // configs (or never-resized fresh installs) leave w/h
+                        // as None and we keep the conf-default geometry.
+                        commands::apply_window_position(&window, &pos);
                     }
                     _ => {
                         config_watcher::apply_default_position(&window);
@@ -219,6 +216,20 @@ pub fn run() {
                             let _ = window_for_timeout.show();
                         }
                     });
+                }
+            }
+
+            // Pre-apply the history window's saved maximized state while it's
+            // still hidden, so its first open this run reveals it already
+            // maximized instead of flashing a normal-size frame then growing.
+            // Subsequent reopens are handled in `open_history` (the window
+            // keeps its maximized state across hide/show).
+            if current_config.save_window_position && current_config.history_window_maximized {
+                if let Some(history) = app.get_webview_window("history") {
+                    if let Some(pos) = current_config.history_window_position {
+                        commands::apply_window_position(&history, &pos);
+                    }
+                    let _ = history.maximize();
                 }
             }
 
@@ -266,16 +277,24 @@ fn save_history_position_if_enabled(window: &tauri::Window) {
     use tauri::Manager;
     let Some(state) = window.try_state::<ConfigState>() else { return };
     if !state.snapshot().save_window_position { return }
-    let Ok(pos) = window.outer_position() else { return };
-    let size = window.outer_size().ok();
-    state.with_mut(|c| {
-        c.history_window_position = Some(config::WindowPosition {
-            x: pos.x,
-            y: pos.y,
-            width: size.map(|s| s.width),
-            height: size.map(|s| s.height),
-        })
-    });
+    let maximized = window.is_maximized().unwrap_or(false);
+    state.with_mut(|c| c.history_window_maximized = maximized);
+    // Only capture bounds while unmaximized. A maximized window's outer rect
+    // is inflated by the frame, so saving it would grow the window on reopen;
+    // keep the last unmaximized geometry as the restore bounds instead.
+    if !maximized {
+        if let Ok(pos) = window.outer_position() {
+            let size = window.outer_size().ok();
+            state.with_mut(|c| {
+                c.history_window_position = Some(config::WindowPosition {
+                    x: pos.x,
+                    y: pos.y,
+                    width: size.map(|s| s.width),
+                    height: size.map(|s| s.height),
+                })
+            });
+        }
+    }
     let _ = state.save_to_disk();
 }
 
