@@ -49,7 +49,9 @@
       }
       if (inCode) {
         codeLines.push(line)
-      } else {
+      } else if (line.trim() !== '') {
+        // Blank lines are dropped: each line renders as its own block, so
+        // paragraphs stay visually separated without empty-line gaps.
         const last = segments[segments.length - 1]
         if (last && last.kind === 'text') last.lines.push(line)
         else segments.push({ kind: 'text', lines: [line] })
@@ -67,28 +69,39 @@
   const FOLD_MIN_HIDDEN_LINES = 3
   const FOLD_MIN_HIDDEN_CHARS = 300
 
+  // Blank lines adjacent to the `<...>` button add no information — fold them
+  // into the hidden region so the "hidden lines" label counts them.
+  function lineFold(lines: string[], head: string[], tail: string[]): Fold {
+    let h = head.length
+    while (h > 0 && head[h - 1].trim() === '') h--
+    let t = 0
+    while (t < tail.length && tail[t].trim() === '') t++
+    head = head.slice(0, h)
+    tail = tail.slice(t)
+    return { head, tail, label: `${lines.length - head.length - tail.length} hidden lines` }
+  }
+
   // Decide whether/how to fold an over-long entry, in priority order. Returns
   // the lines to show before and after a `<...>` button, or null to show all.
   function computeFold(lines: string[]): Fold | null {
     // 1. Collapse the body between an assistant's first and last separator line.
     const hrs: number[] = []
     for (let i = 0; i < lines.length; i++) if (SEPARATOR_RE.test(lines[i].trim())) hrs.push(i)
-    if (hrs.length >= 2 && hrs[hrs.length - 1] - hrs[0] >= 2) {
-      const first = hrs[0], last = hrs[hrs.length - 1]
-      return { head: lines.slice(0, first), tail: lines.slice(last + 1), label: `${last - first + 1} hidden lines` }
-    }
+    if (hrs.length >= 2 && hrs[hrs.length - 1] - hrs[0] >= 2) return lineFold(lines, lines.slice(0, hrs[0]), lines.slice(hrs[hrs.length - 1] + 1))
 
     // 2. Long entry: keep whole lines at each end within a line- and char-budget.
     let hi = 0, hc = 0
     while (hi < lines.length && hi < FOLD_HEAD_LINES && hc + lines[hi].length + 1 <= FOLD_HEAD_CHARS) hc += lines[hi++].length + 1
     let ti = lines.length, tc = 0
     while (ti > hi && lines.length - ti < FOLD_TAIL_LINES && tc + lines[ti - 1].length + 1 <= FOLD_TAIL_CHARS) tc += lines[--ti].length + 1
-    if (ti - hi >= FOLD_MIN_HIDDEN_LINES) return { head: lines.slice(0, hi), tail: lines.slice(ti), label: `${ti - hi} hidden lines` }
+    if (ti - hi >= FOLD_MIN_HIDDEN_LINES) return lineFold(lines, lines.slice(0, hi), lines.slice(ti))
 
-    // 3. Few lines but unreasonably long: truncate within the text by character budget.
+    // 3. Few lines but unreasonably long: truncate within the text by character
+    // budget. Split the slices back into lines so they render per-line like
+    // everything else (blank-line dropping, block layout).
     const text = lines.join('\n')
     const hidden = text.length - FOLD_HEAD_CHARS - FOLD_TAIL_CHARS
-    if (hidden >= FOLD_MIN_HIDDEN_CHARS) return { head: [text.slice(0, FOLD_HEAD_CHARS)], tail: [text.slice(text.length - FOLD_TAIL_CHARS)], label: `${hidden} hidden characters` }
+    if (hidden >= FOLD_MIN_HIDDEN_CHARS) return { head: text.slice(0, FOLD_HEAD_CHARS).split('\n'), tail: text.slice(text.length - FOLD_TAIL_CHARS).split('\n'), label: `${hidden} hidden characters` }
 
     return null
   }
@@ -222,7 +235,7 @@
                 {:else if seg.kind === 'code'}
                   <pre class="code">{seg.lines.join('\n')}</pre>
                 {:else}
-                  {#each seg.lines as line, j}{#if line === '\x00collapse'}{#if j > 0}<br />{/if}<button type="button" class="ellipsis" onclick={() => expandEntry(i)} title="Expand {fold?.label}">&lt;...&gt;</button>{:else}{#if j > 0}<br />{/if}{line}{/if}{/each}
+                  {#each seg.lines as line}{#if line === '\x00collapse'}<button type="button" class="ellipsis" onclick={() => expandEntry(i)} title="Expand {fold?.label}">&lt;...&gt;</button>{:else}<span class="line">{line}</span>{/if}{/each}
                 {/if}
               {/each}
             </span>
@@ -322,7 +335,11 @@
     font-style: italic;
     color: #6b7280;
   }
+  .line {
+    display: block;
+  }
   .ellipsis {
+    display: block;
     background: none;
     border: none;
     padding: 0;
