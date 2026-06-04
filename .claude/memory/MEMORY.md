@@ -14,3 +14,5 @@
 - [Doc features in both pages](feedback_doc_both_features_and_settings.md) — a config-driven feature needs a features.md mention, not just a settings.md entry
 - [History window: no blank lines](feedback_history_compact_blank_lines.md) — blank lines inside messages are dropped entirely; user rejected even reduced-height gaps
 - [Debug history rendering via prompt_history.json](debug_history_rendering_via_prompt_history.md) — dump raw stored dialog lines/char codes to split data bugs from render-path bugs
+- [Console-title checks: Bash tool has its own hidden console](debug_console_titles_tool_consoles.md) — verify titles via the PowerShell tool, which shares the real terminal console
+- [Terminal title follow-ups](terminal_title_followups.md) — deferred: macOS tty/OSC variant, yes-button via WriteConsoleInputW, Claude OSC title clobbering options
