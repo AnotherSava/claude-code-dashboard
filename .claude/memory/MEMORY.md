@@ -12,3 +12,5 @@
 - [App.svelte multi-window finally-block trap](feedback_app_svelte_multi_window_routing.md) — finally{showWindow} runs even for non-main labels; guard with !historyMode && !aboutMode or hidden secondaries auto-reveal
 - [User docs stay high-level](feedback_user_docs_high_level.md) — high-level intros, no UI jargon, omit edge cases; users skim for the gist
 - [Doc features in both pages](feedback_doc_both_features_and_settings.md) — a config-driven feature needs a features.md mention, not just a settings.md entry
+- [History window: no blank lines](feedback_history_compact_blank_lines.md) — blank lines inside messages are dropped entirely; user rejected even reduced-height gaps
+- [Debug history rendering via prompt_history.json](debug_history_rendering_via_prompt_history.md) — dump raw stored dialog lines/char codes to split data bugs from render-path bugs
