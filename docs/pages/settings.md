@@ -66,6 +66,13 @@ Every field is optional — omit one and the built-in default applies. A complet
   "continuation_prompts": ["go", "continue", "proceed"],
   "limit_bar_segments": 16,
   "usage_limits_poll_interval_seconds": 600,
+  "sync": {
+    "device_name": "",
+    "listen": false,
+    "listen_port": 9078,
+    "peers": [],
+    "token": null
+  },
   "server_port": 9077
 }
 ```
@@ -113,6 +120,18 @@ For the full classification logic see [Classification](development/classificatio
 - `limit_bar_segments` — number of segments in the 5-hour / 7-day usage bars; higher is finer-grained.
 - `usage_limits_poll_interval_seconds` — how often to poll Anthropic for usage. Clamped to a 60-second minimum.
 
+### Multi-device sync
+
+The `sync` block shows sessions from your other computers — see [Features → multi-device sync](features#multi-device-sync). The devices must be able to reach each other by address; across different networks the simplest way is a VPN like [Tailscale](https://tailscale.com/). On each device, point `peers` at the other devices, turn `listen` on, and set the same `token` everywhere:
+
+- `device_name` — the name other dashboards show on this device's session badges. Filled in from the computer's hostname on first launch; edit it if you'd like a friendlier label.
+- `listen` — accept session pushes from peers. Needs an app restart to change, like `server_port`.
+- `listen_port` — port the sync listener uses (peers connect here). Also restart-required.
+- `peers` — addresses of the other devices' sync listeners, e.g. `["http://my-laptop:9078"]`.
+- `token` — a shared secret, the same string on every device; pushes without it are rejected. Sync stays fully off while it's `null`.
+
+A typical two-device setup — desktop: `"listen": true, "peers": ["http://laptop:9078"], "token": "pick-a-long-random-string"`; laptop: the same with `"peers": ["http://desktop:9078"]`.
+
 ### Server port
 
-- `server_port` — port the embedded HTTP server listens on for hook events. Most users never touch this. Two caveats if you do: it's the only setting that needs an app restart to take effect (everything else hot-reloads), and the Claude hook must point at the same port — it defaults to `9077`, so set `TAURI_DASHBOARD_URL=http://127.0.0.1:<port>` in the hook's environment to match.
+- `server_port` — port the embedded HTTP server listens on for hook events. Most users never touch this. Two caveats if you do: it needs an app restart to take effect (like the `sync` listener settings, while everything else hot-reloads), and the Claude hook must point at the same port — it defaults to `9077`, so set `TAURI_DASHBOARD_URL=http://127.0.0.1:<port>` in the hook's environment to match.

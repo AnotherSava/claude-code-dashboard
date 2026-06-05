@@ -297,6 +297,7 @@ mod tests {
             state_entered_at,
             working_accumulated_ms: 0,
             display_name: None,
+            origin: None,
         }
     }
 

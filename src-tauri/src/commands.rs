@@ -8,14 +8,18 @@ use crate::usage_limits::{UsageLimits, UsageLimitsState};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State, WebviewWindow};
 
-/// Snapshot the sessions and fill each `display_name` from the custom-names
-/// store. The name rides on the session so the frontend renders it without a
-/// separate lookup channel.
+/// Snapshot local + remote sessions and fill each `display_name` from the
+/// custom-names store. The name rides on the session so the frontend renders
+/// it without a separate lookup channel. This is the single point where the
+/// local and synced-from-peers worlds combine — remote rows get the overlay
+/// too (keyed by their namespaced "{device}/{id}"), so renaming a remote row
+/// works and stays a local-only decoration.
 fn resolved_snapshot(app: &AppHandle) -> Vec<AgentSession> {
     let Some(state) = app.try_state::<AppState>() else {
         return Vec::new();
     };
     let mut sessions = state.snapshot();
+    sessions.extend(state.remote_snapshot());
     if let Some(names) = app.try_state::<CustomNamesStore>() {
         for s in &mut sessions {
             s.display_name = names.get(&s.id);
@@ -332,6 +336,11 @@ pub fn open_history(id: String, app: AppHandle) -> Result<(), String> {
     if let Some(target) = app.try_state::<HistoryTarget>() {
         *target.0.lock().unwrap() = Some(id.clone());
     }
+    // Remote sessions accumulate dialog from push deltas, which a dashboard
+    // restart discards — catch up from the origin device now so the window
+    // fills in once the fetch lands (it re-emits and the window re-renders).
+    // No-op for local ids: no remote device prefix matches.
+    crate::sync::fetch_remote_dialog(app.clone(), id.clone());
     if let Some(window) = app.get_webview_window("history") {
         let _ = window.set_title(&history_title(&app, &id));
         let _ = window.emit("history_target", &id);
@@ -444,9 +453,18 @@ pub fn emit_sessions_updated(app: &AppHandle) {
     // Every state transition flows through this emit, so it doubles as the
     // single trigger for terminal tab-title reconciliation — the tab tracks
     // exactly what the row shows (watcher promotions, renames, removals)
-    // without a second state machine.
-    crate::terminal_title::sync(app, &sessions);
+    // without a second state machine. Titles are a local-machine concern:
+    // hand over only the local subset so remote rows can't even reach the
+    // pid bookkeeping.
+    let local: Vec<AgentSession> = sessions.iter().filter(|s| s.origin.is_none()).cloned().collect();
+    crate::terminal_title::sync(app, &local);
     let _ = app.emit("sessions_updated", sessions);
+    // ...and it doubles again as the sync-push trigger: the pusher debounces
+    // pokes and ships *local* sessions to peers (received remote sessions are
+    // never re-broadcast, so a peer's push poking this emit can't echo).
+    if let Some(dirty) = app.try_state::<crate::sync::SyncDirty>() {
+        dirty.inner().0.notify_one();
+    }
 }
 
 pub fn emit_config_updated(app: &AppHandle) {

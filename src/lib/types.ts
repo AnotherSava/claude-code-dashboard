@@ -29,6 +29,9 @@ export interface AgentSession {
   state_entered_at: number
   working_accumulated_ms: number
   display_name?: string | null
+  // Device name of the peer dashboard this session was synced from; null for
+  // sessions on this machine. Remote ids are namespaced "{origin}/{raw_id}".
+  origin?: string | null
 }
 
 export interface ContextBarThreshold {

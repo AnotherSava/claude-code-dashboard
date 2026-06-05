@@ -35,7 +35,11 @@
 
   const HISTORY_VISIBLE = 4
 
-  const displayName = $derived(session.display_name ?? session.id)
+  // Remote ids arrive namespaced as "{origin}/{raw_id}"; the badge already
+  // carries the device, so an unnamed remote row shows just the raw id.
+  const displayName = $derived(
+    session.display_name ?? (session.origin ? session.id.slice(session.origin.length + 1) : session.id),
+  )
 
   let editing = $state(false)
   let draft = $state('')
@@ -129,6 +133,9 @@
       {:else}
         <span class="id" title="{displayName} — double-click to rename" ondblclick={startEdit} role="textbox" tabindex="-1">{displayName}</span>
       {/if}
+      {#if session.origin}
+        <span class="device" title="Session on {session.origin}">{session.origin}</span>
+      {/if}
       <span class="pill state-{session.status}" class:pulse={shouldPulse}>{stateLabel[session.status]}</span>
       <span class="time">{time}</span>
       <span class="tokens" style:color={tokColor}>{#if tokensText}{tokensText}<span class="k">k</span>{/if}</span>
@@ -192,6 +199,20 @@
     padding: 0 4px;
     outline: none;
     font-family: inherit;
+  }
+  .device {
+    font-size: 9px;
+    font-weight: 600;
+    letter-spacing: 0.3px;
+    color: #a78bfa;
+    background: #2e2a3f;
+    padding: 2px 6px;
+    border-radius: 9px;
+    flex-shrink: 0;
+    max-width: 80px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
   .pill {
     font-size: 9px;

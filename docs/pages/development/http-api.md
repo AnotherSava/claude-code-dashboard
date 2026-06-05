@@ -7,6 +7,8 @@ nav_order: 4
 
 The widget listens on `http://127.0.0.1:9077` (default) for lifecycle events from external agents. One endpoint, one envelope shape, adapter-dispatched on the server side.
 
+A second, separate listener serves the [multi-device sync](#sync-api) API when enabled — the hook API below stays loopback-only and unauthenticated regardless.
+
 ## Endpoint
 
 `POST /api/event` with `Content-Type: application/json`. Returns `204 No Content` on success, `403` if the `Origin` header is a real web origin (blocks browser XHR), `400` on malformed JSON.
@@ -38,4 +40,28 @@ The widget listens on `server_port` from `config.json` (default 9077). The Claud
 ## Adding a new client
 
 Writing a new adapter is a ~100 LOC pure Rust function: `src-tauri/src/adapters/<your_client>.rs` exposing `dispatch(event, payload, cfg) -> AdapterOutput`, plus a match arm in `adapters::dispatch`. See `src-tauri/src/adapters/claude.rs` for the reference implementation. No HTTP layer changes — the envelope already carries `client` as the discriminator.
+
+## Sync API
+
+When `sync.listen` is on (and `sync.token` set), a second listener binds **all interfaces** on `sync.listen_port` (default 9078) for dashboard-to-dashboard session sync. Every route requires `Authorization: Bearer <sync.token>`; requests without it get `401`. Implementation: `src-tauri/src/sync.rs`.
+
+### `POST /api/sync`
+
+A peer pushes its local sessions. The body is a full snapshot of the sender's session *metadata* (a session absent from the snapshot is removed on the receiver) plus per-session `dialog_delta` — only the dialog entries changed since that peer's last acknowledged push, since full dialogs run to hundreds of KB:
+
+```json
+{
+  "device_name": "my-laptop",
+  "listen_port": 9078,
+  "sessions": [
+    { "session": { ...AgentSession, "dialog": [] }, "dialog_delta": [ ...DialogEntry ] }
+  ]
+}
+```
+
+Returns `204` on ingest, `400` when `device_name` is empty or equals the receiver's own. The receiver namespaces ids to `{device_name}/{id}`, stamps `origin`, and accumulates deltas; `listen_port` plus the connection's source IP becomes the address for catch-up fetches. A device unheard from for 90 s is dropped.
+
+### `GET /api/sync/dialog?id=<raw_id>&since=<epoch_ms>`
+
+Catch-up: returns the *local* session's dialog entries with `timestamp > since` (the full dialog for `since=0`). A peer calls this when its history window opens a remote session it holds incomplete dialog for — remote dialogs live in memory only, so a restarted dashboard refills them on demand. `404` for unknown ids.
 

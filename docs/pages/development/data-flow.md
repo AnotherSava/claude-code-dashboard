@@ -15,11 +15,13 @@ flowchart LR
   TR["transcript<br/>&lt;session&gt;.jsonl"]
   UI["Svelte UI"]
   CFG["config.json"]
+  PEER["peer dashboard<br/>(another device)"]
 
   AX["axum (Rust) :9077"]
+  SYNC["axum (Rust) :9078<br/>bearer-gated sync"]
   CMD["commands.rs"]
   CW["config_watcher"]
-  AS[("AppState<br/>Mutex&lt;Vec&lt;AgentSession&gt;&gt;")]
+  AS[("AppState<br/>sessions: Mutex&lt;Vec&lt;AgentSession&gt;&gt;<br/>remote: Mutex&lt;BTreeMap&lt;device, RemoteDevice&gt;&gt;")]
   NATIVE["Window / TrayIcon<br/>native APIs"]
   SV["Svelte (listen)"]
   TT["terminal tab title<br/>(Win32 console / tty)"]
@@ -27,16 +29,19 @@ flowchart LR
   CC -->|"POST /api/event"| AX
   AX -->|"adapters::dispatch -> apply_set / apply_clear"| AS
   TR -->|"notify::Event"| AS
+  PEER -->|"POST /api/sync"| SYNC
+  SYNC -->|"sync::ingest -> remote map"| AS
+  AS -->|"pusher: local sessions"| PEER
   UI -->|"#[tauri::command]"| CMD
   CMD -->|"apply_clear"| AS
   CMD --> NATIVE
   CFG -->|"file change event"| CW
   CW -->|"emit(config_updated)"| SV
   AS -->|"app.emit(sessions_updated)"| SV
-  AS -->|"terminal_title::sync"| TT
+  AS -->|"terminal_title::sync (local only)"| TT
 ```
 
-Every mutation to session state funnels through `state::apply_set` or `state::apply_clear` so the sticky-label rules, working-time accumulator, and upgrade-only merge policy are enforced in one place regardless of origin.
+Every mutation to **local** session state funnels through `state::apply_set` or `state::apply_clear` so the sticky-label rules, working-time accumulator, and upgrade-only merge policy are enforced in one place regardless of origin. Remote sessions arrive pre-enriched from the device that ran them (its own `apply_set` already applied those rules) and live in the separate `remote` map — `commands::resolved_snapshot` is the single point where the two sets combine on the way to the frontend.
 
 ## Path 1 — Hook POSTs event
 
@@ -63,7 +68,7 @@ Every mutation to session state funnels through `state::apply_set` or `state::ap
 
 The initial drain on watcher startup suppresses the inferred **state** AND the **latest assistant text** — a resume would otherwise snap to a stale "done" from the prior turn and duplicate the last assistant entry already in the restored dialog. Model and token counts still surface.
 
-Tauri commands target native window/tray APIs (`hide_window`, `show_window`, `toggle_window`, `quit_app`); session state is only read from the frontend (`get_sessions`) — every mutation arrives through the HTTP event path above.
+Tauri commands target native window/tray APIs (`hide_window`, `show_window`, `toggle_window`, `quit_app`); session state is only read from the frontend (`get_sessions`) — every local-session mutation arrives through the HTTP event path above, and remote sessions only through the sync path below.
 
 ## Path 3 — Tray toggles
 
@@ -81,6 +86,16 @@ Tauri commands target native window/tray APIs (`hide_window`, `show_window`, `to
 4. `Config::load_or_default` re-reads the file. Serde serializes both the new and current in-memory configs to JSON strings; if they're byte-identical, the reload is skipped — this is how our own tray writes avoid re-triggering the reload path.
 5. `apply_config_to_window` applies runtime-safe changes (always-on-top, saved window position). Port changes are intentionally ignored on hot-reload and require a restart.
 6. `config_updated` is emitted and the tray check marks re-sync.
+
+## Path 5 — Peer sync (multi-device)
+
+Dashboards on other devices push their sessions here, and this dashboard pushes its own to them — see [Features → multi-device sync](../features#multi-device-sync) for the user-facing behavior and [HTTP API → sync API](http-api#sync-api) for the wire contract.
+
+**Outbound:** every `emit_sessions_updated` pokes the `SyncDirty` notify; the pusher task debounces 300ms (a 30s heartbeat fires regardless) and POSTs to each `config.sync.peers` entry: a full metadata snapshot of the **local** sessions plus per-session dialog entries newer than that peer's watermark. The watermark advances only on a 2xx, so a failed push (peer offline) re-sends the missed entries next time. Received remote sessions are never re-broadcast, so a peer's push poking the emit can't echo.
+
+**Inbound:** `POST /api/sync` (bearer-gated, port `sync.listen_port`) namespaces incoming ids to `{device}/{raw_id}`, stamps `origin`, wholesale-replaces that device's metadata (absence = removal), and merges dialog deltas via `state::merge_dialog_entries` — the same turn-aware, replay-safe merge the transcript watcher uses. Then `emit_sessions_updated` fires as in Path 1. A reaper drops devices silent for 90s.
+
+Remote dialogs are memory-only; when the history window opens a remote session, `open_history` fires a catch-up `GET /api/sync/dialog?id=&since=<max held timestamp>` against the origin device and merges the response. Notifications, persistence, terminal titles, and the watcher never see remote sessions — they read `AppState::sessions` directly, and remote rows live only in the `remote` map.
 
 ## Sticky-label state machine
 

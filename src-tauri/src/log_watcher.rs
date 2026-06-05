@@ -795,6 +795,7 @@ mod tests {
             state_entered_at: 0,
             working_accumulated_ms: 0,
             display_name: None,
+            origin: None,
         }
     }
 

@@ -61,6 +61,44 @@ pub struct Config {
     /// "<colored circle> <name>" (e.g. "🔵 ai-dashboard"). Read by
     /// `terminal_title::sync`; Windows-only today.
     pub terminal_titles: bool,
+    /// Multi-device session sync (see `sync.rs`). Disabled by default:
+    /// `listen=false` and empty `peers` make every sync task a no-op.
+    pub sync: SyncConfig,
+}
+
+/// Settings for syncing sessions between dashboards on different devices
+/// (reachable over a VPN such as Tailscale). `peers`/`token`/`device_name`
+/// hot-reload (the pusher re-reads config each cycle); `listen`/`listen_port`
+/// need a restart, like `server_port`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SyncConfig {
+    /// Name other dashboards show on this device's session badges. Empty =
+    /// resolved once at startup from the hostname and written back.
+    pub device_name: String,
+    /// Accept session pushes from peers on `listen_port`. Off by default —
+    /// the sync listener binds all interfaces (the bearer `token` gates it).
+    pub listen: bool,
+    pub listen_port: u16,
+    /// Peer sync listeners to push local sessions to, e.g.
+    /// "http://my-laptop:9078". Empty = push nothing.
+    pub peers: Vec<String>,
+    /// Shared secret across all of the user's devices. With `None`, sync is
+    /// fully disabled (no listener, no pushes) even if `listen`/`peers` are
+    /// set — never run unauthenticated.
+    pub token: Option<String>,
+}
+
+impl Default for SyncConfig {
+    fn default() -> Self {
+        Self {
+            device_name: String::new(),
+            listen: false,
+            listen_port: 9078,
+            peers: Vec::new(),
+            token: None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -180,6 +218,7 @@ impl Default for Config {
             start_minimized: false,
             continuation_prompts: vec!["go".into(), "continue".into(), "proceed".into()],
             terminal_titles: true,
+            sync: SyncConfig::default(),
         }
     }
 }
@@ -340,6 +379,28 @@ mod tests {
         assert!(cfg.terminal_titles);
         let off: Config = serde_json::from_str(r#"{ "terminal_titles": false }"#).unwrap();
         assert!(!off.terminal_titles);
+    }
+
+    #[test]
+    fn sync_defaults_to_disabled() {
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert!(!cfg.sync.listen);
+        assert!(cfg.sync.peers.is_empty());
+        assert!(cfg.sync.token.is_none());
+        assert_eq!(cfg.sync.listen_port, 9078);
+        assert_eq!(cfg.sync.device_name, "", "resolved at startup, not here");
+    }
+
+    #[test]
+    fn partial_sync_block_backfills_the_rest() {
+        let partial = r#"{ "sync": { "peers": ["http://laptop:9078"], "token": "s3cret" } }"#;
+        let cfg: Config = serde_json::from_str(partial).unwrap();
+        assert_eq!(cfg.sync.peers, vec!["http://laptop:9078".to_string()]);
+        assert_eq!(cfg.sync.token.as_deref(), Some("s3cret"));
+        assert!(!cfg.sync.listen, "default listen survives");
+        assert_eq!(cfg.sync.listen_port, 9078, "default port survives");
+        // unrelated defaults still survive
+        assert_eq!(cfg.server_port, 9077);
     }
 
     #[test]

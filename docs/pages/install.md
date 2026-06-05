@@ -70,6 +70,26 @@ The `PreToolUse` matcher restricts the hook to user-gating tools (`AskUserQuesti
 - **`projects_root`** in `config.json` — set to the folder your projects live under, so session ids become short folder-relative names instead of bare folder basenames. See [Features → session identity](features#session-identity).
 - **`TAURI_DASHBOARD_URL`** environment variable — to use a non-default port or host, export e.g. `TAURI_DASHBOARD_URL=http://127.0.0.1:9100` before launching Claude Code. The hook resolves its URL from this variable, falling back to `http://127.0.0.1:9077`.
 
+## Optional: multi-device sync
+
+To see sessions from your other computers in every dashboard (see [Features → multi-device sync](features#multi-device-sync)):
+
+1. Repeat steps 1–2 on each computer.
+2. Make the computers reachable from each other by address. On the same home network the machine names usually work as-is; across different networks the simplest option is a VPN like [Tailscale](https://tailscale.com/) — install it on each computer and use the names it assigns.
+3. In each computer's `config.json`, fill in the `sync` block: set `"listen": true`, list the other computers in `peers`, and put the **same** `token` (any long random string) on every device:
+
+   ```json
+   "sync": {
+     "listen": true,
+     "peers": ["http://my-laptop:9078"],
+     "token": "pick-a-long-random-string"
+   }
+   ```
+
+4. Restart the widget on each computer (the `listen` setting needs a restart, like `server_port`).
+
+Each device's sessions now appear on the others, tagged with a badge showing the device's name. See [Settings → multi-device sync](settings#multi-device-sync) for all fields.
+
 ## Next
 
 See [Features](features) for what each row shows once sessions start flowing in, and [Settings](settings) for the full `config.json` reference.

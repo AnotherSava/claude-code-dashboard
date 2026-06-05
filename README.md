@@ -2,7 +2,7 @@
 
 *A live monitor for your Claude Code sessions.*
 
-You can track the agent's current state and task, the model's context usage, and a conversation history. Optional notifications ping you when an agent needs your attention. Each session's status is also mirrored as a colored circle in its terminal tab title.
+You can track the agent's current state and task, the model's context usage, and a conversation history. Optional notifications ping you when an agent needs your attention. Each session's status is also mirrored as a colored circle in its terminal tab title. Run the dashboard on several computers and each one can show the sessions from all of them.
 
 The header tracks your 5-hour and 7-day Anthropic usage limits.
 

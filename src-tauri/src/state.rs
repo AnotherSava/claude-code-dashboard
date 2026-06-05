@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -78,6 +79,12 @@ pub struct AgentSession {
     /// to the frontend. Not persisted in `prompt_history`.
     #[serde(default)]
     pub display_name: Option<String>,
+    /// Device name of the peer dashboard this session was synced from; `None`
+    /// for sessions running on this machine. Stamped by `sync::ingest` (which
+    /// also namespaces `id` to "{device}/{raw_id}"); the frontend renders the
+    /// device badge from it. Always `None` in `AppState.sessions`.
+    #[serde(default)]
+    pub origin: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -105,9 +112,30 @@ fn is_continuation_prompt(label: &str, continuation_prompts: &[String]) -> bool 
         .any(|p| p.trim().eq_ignore_ascii_case(trimmed))
 }
 
+/// Sessions pushed by one peer dashboard. Held in memory only — repopulated
+/// by the peer's next push after a restart, never persisted. Kept separate
+/// from `AppState::sessions` so every local-session consumer (`apply_set`,
+/// `prompt_history`, `notifications`, `terminal_title`, `log_watcher`) stays
+/// remote-blind by construction instead of by per-call filtering.
+#[derive(Clone, Debug)]
+pub struct RemoteDevice {
+    /// Already namespaced ("{device}/{raw_id}") and origin-stamped.
+    pub sessions: Vec<AgentSession>,
+    /// Receiver-clock ms of the last push from this device — TTL reaping.
+    pub last_seen: i64,
+    /// Base URL for catch-up dialog fetches, derived from the push's socket
+    /// peer IP + advertised listen_port (e.g. "http://100.1.2.3:9078").
+    pub origin_addr: String,
+}
+
 #[derive(Default)]
 pub struct AppState {
+    /// Sessions running on this machine — the only set the hook/watcher
+    /// pipeline, persistence, and notifications ever touch.
     pub sessions: Mutex<Vec<AgentSession>>,
+    /// Sessions synced from peer dashboards, keyed by device name. BTreeMap
+    /// so the emit-time merge produces a stable row order across emits.
+    pub remote: Mutex<BTreeMap<String, RemoteDevice>>,
 }
 
 impl AppState {
@@ -117,6 +145,21 @@ impl AppState {
 
     pub fn snapshot(&self) -> Vec<AgentSession> {
         self.sessions.lock().unwrap().clone()
+    }
+
+    /// Flattened snapshot of all remote-device sessions, for the emit-time
+    /// merge in `commands::resolved_snapshot`.
+    pub fn remote_snapshot(&self) -> Vec<AgentSession> {
+        self.remote.lock().unwrap().values().flat_map(|d| d.sessions.iter().cloned()).collect()
+    }
+
+    /// Drop remote devices not heard from within `ttl_ms`. Returns `true`
+    /// when anything was dropped (caller re-emits).
+    pub fn reap_remote(&self, now_ms: i64, ttl_ms: i64) -> bool {
+        let mut remote = self.remote.lock().unwrap();
+        let before = remote.len();
+        remote.retain(|_, d| now_ms - d.last_seen <= ttl_ms);
+        remote.len() != before
     }
 
     /// Returns `true` when the session's dialog was modified (caller should
@@ -274,6 +317,7 @@ impl AppState {
                 state_entered_at: now_ms,
                 working_accumulated_ms: 0,
                 display_name: None,
+                origin: None,
             });
             has_new_entry || dialog_restored
         }
@@ -323,42 +367,80 @@ impl AppState {
         let Some(session) = sessions.iter_mut().find(|s| s.id == id) else {
             return false;
         };
-        let mut changed = false;
-        for (role, text) in entries {
-            match role {
-                DialogRole::User => {
-                    let last_user = session.dialog.iter().rev().find(|e| e.role == DialogRole::User);
-                    if last_user.is_some_and(|e| e.text == *text) {
-                        continue;
-                    }
-                    session.dialog.push(DialogEntry { role: *role, text: text.clone(), timestamp: now_ms, status: session.status, task_start: false });
-                    changed = true;
-                }
-                DialogRole::Assistant => {
-                    let tail_idx = session.dialog.iter().enumerate().rev()
-                        .take_while(|(_, e)| e.role != DialogRole::User)
-                        .find(|(_, e)| e.role == DialogRole::Assistant)
-                        .map(|(i, _)| i);
-                    if let Some(i) = tail_idx {
-                        if session.dialog[i].text == *text {
-                            continue;
-                        }
-                        session.dialog[i].text = text.clone();
-                        session.dialog[i].timestamp = now_ms;
-                        session.dialog[i].status = session.status;
-                    } else {
-                        session.dialog.push(DialogEntry { role: *role, text: text.clone(), timestamp: now_ms, status: session.status, task_start: false });
-                    }
-                    changed = true;
-                }
-                _ => {}
-            }
-        }
+        // The watcher only ever yields User/Assistant; separators enter a
+        // dialog via mark_session_boundary, not the transcript.
+        let incoming: Vec<DialogEntry> = entries
+            .iter()
+            .filter(|(role, _)| matches!(role, DialogRole::User | DialogRole::Assistant))
+            .map(|(role, text)| DialogEntry { role: *role, text: text.clone(), timestamp: now_ms, status: session.status, task_start: false })
+            .collect();
+        let changed = merge_dialog_entries(&mut session.dialog, &incoming);
         if changed {
             session.updated = now_ms;
         }
         changed
     }
+}
+
+/// Merge `incoming` dialog entries (chronological order) into `dialog` with
+/// the turn-aware semantics of the transcript watcher, made replay-safe so
+/// the sync receive path can apply overlapping deltas idempotently (a failed
+/// push leaves the sender's watermark in place, so the next push re-sends
+/// the same entries):
+/// - User: append, unless the last user entry has the same text (watcher
+///   dedup of re-read transcripts) or an identical entry — same timestamp
+///   and text — already exists (replayed delta).
+/// - Assistant: replace the tail assistant of the current turn in place
+///   (same-turn streaming update — also how a replayed newer version of the
+///   same turn lands), skip when its text already matches, append when a
+///   user entry intervened.
+/// - Separator: append, unless the dialog already ends with one (mirrors the
+///   mark_session_boundary guard) or the same separator (by timestamp) was
+///   already merged.
+/// Returns `true` when the dialog was modified.
+pub fn merge_dialog_entries(dialog: &mut Vec<DialogEntry>, incoming: &[DialogEntry]) -> bool {
+    let mut changed = false;
+    for entry in incoming {
+        match entry.role {
+            DialogRole::User => {
+                let last_user = dialog.iter().rev().find(|e| e.role == DialogRole::User);
+                if last_user.is_some_and(|e| e.text == entry.text) {
+                    continue;
+                }
+                if dialog.iter().any(|e| e.role == DialogRole::User && e.timestamp == entry.timestamp && e.text == entry.text) {
+                    continue;
+                }
+                dialog.push(entry.clone());
+                changed = true;
+            }
+            DialogRole::Assistant => {
+                let tail_idx = dialog.iter().enumerate().rev()
+                    .take_while(|(_, e)| e.role != DialogRole::User)
+                    .find(|(_, e)| e.role == DialogRole::Assistant)
+                    .map(|(i, _)| i);
+                if let Some(i) = tail_idx {
+                    if dialog[i].text == entry.text {
+                        continue;
+                    }
+                    dialog[i] = entry.clone();
+                } else {
+                    dialog.push(entry.clone());
+                }
+                changed = true;
+            }
+            DialogRole::Separator => {
+                if dialog.last().is_some_and(|e| e.role == DialogRole::Separator) {
+                    continue;
+                }
+                if dialog.iter().any(|e| e.role == DialogRole::Separator && e.timestamp == entry.timestamp) {
+                    continue;
+                }
+                dialog.push(entry.clone());
+                changed = true;
+            }
+        }
+    }
+    changed
 }
 
 #[cfg(test)]
@@ -834,6 +916,7 @@ mod tests {
             state_entered_at: 0,
             working_accumulated_ms: 0,
             display_name: None,
+            origin: None,
         });
     }
 
@@ -962,5 +1045,111 @@ mod tests {
         state.apply_set(set("a", Status::Working, "go"), 2000, &cont, None);
         let s = get(&state, "a");
         assert_eq!(s.original_prompt.as_deref(), Some("fix foo.py"));
+    }
+
+    // -------- merge_dialog_entries (sync delta path) tests --------
+
+    #[test]
+    fn merge_replay_of_same_delta_is_noop() {
+        let mut dialog = Vec::new();
+        let delta = vec![user_entry("u1", 10), assistant_entry("a1", 20), separator_entry(30)];
+        assert!(merge_dialog_entries(&mut dialog, &delta));
+        assert_eq!(dialog.len(), 3);
+        // A failed push re-sends the same window — must not duplicate.
+        assert!(!merge_dialog_entries(&mut dialog, &delta));
+        assert_eq!(dialog.len(), 3);
+    }
+
+    #[test]
+    fn merge_replaces_streamed_assistant_in_place() {
+        let mut dialog = vec![user_entry("u1", 10), assistant_entry("partial", 20)];
+        // The origin's watcher rewrote the same-turn assistant text and
+        // bumped its timestamp; the delta carries the newer version.
+        let delta = vec![assistant_entry("final", 25)];
+        assert!(merge_dialog_entries(&mut dialog, &delta));
+        assert_eq!(dialog.len(), 2);
+        assert_eq!(dialog[1].text, "final");
+        assert_eq!(dialog[1].timestamp, 25);
+    }
+
+    #[test]
+    fn merge_appends_assistant_after_user_boundary() {
+        let mut dialog = vec![user_entry("u1", 10), assistant_entry("a1", 20)];
+        let delta = vec![user_entry("u2", 30), assistant_entry("a2", 40)];
+        assert!(merge_dialog_entries(&mut dialog, &delta));
+        assert_eq!(dialog.len(), 4);
+        assert_eq!(dialog[3].text, "a2");
+    }
+
+    #[test]
+    fn merge_separator_skips_when_dialog_ends_with_one() {
+        let mut dialog = vec![user_entry("u1", 10), separator_entry(20)];
+        assert!(!merge_dialog_entries(&mut dialog, &[separator_entry(50)]));
+        assert_eq!(dialog.len(), 2);
+    }
+
+    #[test]
+    fn merge_user_dedups_against_last_user() {
+        let mut dialog = vec![user_entry("fix bug", 10), assistant_entry("done", 20)];
+        // Same prompt re-read with a different timestamp (transcript re-read
+        // on the origin) — text dedup against the last user entry catches it.
+        assert!(!merge_dialog_entries(&mut dialog, &[user_entry("fix bug", 30)]));
+        assert_eq!(dialog.len(), 2);
+    }
+
+    #[test]
+    fn merge_preserves_incoming_metadata() {
+        let mut dialog = Vec::new();
+        let mut entry = user_entry("u1", 42);
+        entry.task_start = true;
+        assert!(merge_dialog_entries(&mut dialog, &[entry]));
+        assert_eq!(dialog[0].timestamp, 42, "sender timestamps survive");
+        assert!(dialog[0].task_start, "task boundary flag survives");
+    }
+
+    // -------- remote-device storage tests --------
+
+    fn remote_session(id: &str, origin: &str) -> AgentSession {
+        AgentSession {
+            id: id.to_string(),
+            status: Status::Working,
+            label: String::new(),
+            original_prompt: None,
+            task_started_at: 0,
+            dialog: Vec::new(),
+            source: "claude".into(),
+            model: None,
+            input_tokens: None,
+            updated: 0,
+            state_entered_at: 0,
+            working_accumulated_ms: 0,
+            display_name: None,
+            origin: Some(origin.to_string()),
+        }
+    }
+
+    #[test]
+    fn remote_snapshot_is_ordered_by_device_name() {
+        let state = AppState::new();
+        let mut remote = state.remote.lock().unwrap();
+        remote.insert("zeta".into(), RemoteDevice { sessions: vec![remote_session("zeta/p", "zeta")], last_seen: 0, origin_addr: String::new() });
+        remote.insert("alpha".into(), RemoteDevice { sessions: vec![remote_session("alpha/p", "alpha")], last_seen: 0, origin_addr: String::new() });
+        drop(remote);
+        let snap = state.remote_snapshot();
+        let ids: Vec<&str> = snap.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, vec!["alpha/p", "zeta/p"], "stable order across emits");
+    }
+
+    #[test]
+    fn reap_remote_drops_only_silent_devices() {
+        let state = AppState::new();
+        let mut remote = state.remote.lock().unwrap();
+        remote.insert("fresh".into(), RemoteDevice { sessions: Vec::new(), last_seen: 1000, origin_addr: String::new() });
+        remote.insert("stale".into(), RemoteDevice { sessions: Vec::new(), last_seen: 0, origin_addr: String::new() });
+        drop(remote);
+        assert!(state.reap_remote(1500, 1000), "stale device dropped");
+        assert!(state.remote.lock().unwrap().contains_key("fresh"));
+        assert!(!state.remote.lock().unwrap().contains_key("stale"));
+        assert!(!state.reap_remote(1500, 1000), "second reap is a no-op");
     }
 }

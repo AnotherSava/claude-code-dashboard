@@ -13,6 +13,7 @@ mod notifications;
 mod prompt_history;
 mod setup;
 mod state;
+mod sync;
 mod telegram;
 mod terminal_title;
 mod tray;
@@ -69,6 +70,26 @@ fn launched_via_autostart() -> bool {
     std::env::args().any(|a| a == AUTOSTART_ARG)
 }
 
+/// Hostname for `sync.device_name` bootstrapping. Windows always sets
+/// COMPUTERNAME; on macOS GUI apps get no HOSTNAME env var, so ask the
+/// `hostname` binary instead of pulling in a crate for one call.
+fn default_device_name() -> String {
+    #[cfg(windows)]
+    {
+        std::env::var("COMPUTERNAME").unwrap_or_else(|_| "device".into())
+    }
+    #[cfg(not(windows))]
+    {
+        std::process::Command::new("hostname")
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "device".into())
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Must run before the Builder creates the config-defined webviews, which
@@ -90,6 +111,7 @@ pub fn run() {
         .manage(UsageLimitsState::new())
         .manage(commands::HistoryTarget(std::sync::Mutex::new(None)))
         .manage(terminal_title::TerminalTitles::new())
+        .manage(sync::SyncDirty(std::sync::Arc::new(tokio::sync::Notify::new())))
         .invoke_handler(tauri::generate_handler![
             commands::get_sessions,
             commands::get_config,
@@ -171,6 +193,13 @@ pub fn run() {
                 use tauri_plugin_autostart::ManagerExt;
                 let _ = app.autolaunch().enable();
             }
+            // Resolve an empty sync.device_name once from the hostname so
+            // peers have a stable badge label; written back so the user can
+            // see and edit it in config.json.
+            if config_state.snapshot().sync.device_name.is_empty() {
+                config_state.with_mut(|c| c.sync.device_name = default_device_name());
+                let _ = config_state.save_to_disk();
+            }
             let current_config = config_state.snapshot();
             let server_port = current_config.server_port;
             app.manage(config_state);
@@ -246,6 +275,26 @@ pub fn run() {
             tauri::async_runtime::spawn(async move {
                 http_server::run(handle, server_port).await;
             });
+
+            // Multi-device sync. Pusher + reaper always run — they no-op
+            // without peers/token. The listener needs the opt-in *and* a
+            // token (never accept pushes unauthenticated). Like server_port,
+            // changing sync.listen/listen_port needs a restart; peers, token
+            // and device_name hot-reload via the pusher's per-cycle re-read.
+            let dirty = app.state::<sync::SyncDirty>().inner().0.clone();
+            sync::spawn_pusher(app.handle().clone(), dirty);
+            sync::spawn_reaper(app.handle().clone());
+            if current_config.sync.listen {
+                if current_config.sync.token.as_deref().is_some_and(|t| !t.is_empty()) {
+                    let handle = app.handle().clone();
+                    let port = current_config.sync.listen_port;
+                    tauri::async_runtime::spawn(async move {
+                        sync::run_listener(handle, port).await;
+                    });
+                } else {
+                    tracing::warn!("sync.listen is on but sync.token is unset — listener not started");
+                }
+            }
 
             #[cfg(debug_assertions)]
             seed_dev_sessions(&app.handle());
@@ -329,7 +378,7 @@ fn save_window_position_if_enabled(window: &tauri::Window) {
 #[cfg(debug_assertions)]
 fn seed_dev_sessions(app: &tauri::AppHandle) {
     use crate::commands::{emit_sessions_updated, now_ms};
-    use crate::state::{SetInput, Status};
+    use crate::state::{AgentSession, DialogEntry, DialogRole, RemoteDevice, SetInput, Status};
     use tauri::Manager;
 
     let Some(state) = app.try_state::<AppState>() else {
@@ -381,6 +430,35 @@ fn seed_dev_sessions(app: &tauri::AppHandle) {
         now - 45 * s,
         &[],
         None,
+    );
+
+    // A fake remote device so the badge + prefix-stripped name render in
+    // `cargo tauri dev` without running a second instance.
+    state.remote.lock().unwrap().insert(
+        "macbook".into(),
+        RemoteDevice {
+            sessions: vec![AgentSession {
+                id: "macbook/bga-assistant".into(),
+                status: Status::Done,
+                label: "Refactor the move validator".into(),
+                original_prompt: Some("Refactor the move validator".into()),
+                task_started_at: now - 10 * min,
+                dialog: vec![
+                    DialogEntry { role: DialogRole::User, text: "Refactor the move validator".into(), timestamp: now - 10 * min, status: Status::Working, task_start: true },
+                    DialogEntry { role: DialogRole::Assistant, text: "Done — extracted the rules table.".into(), timestamp: now - 2 * min, status: Status::Done, task_start: false },
+                ],
+                source: "claude-code".into(),
+                model: Some("claude-sonnet-4-6".into()),
+                input_tokens: Some(48_000),
+                updated: now - 2 * min,
+                state_entered_at: now - 2 * min,
+                working_accumulated_ms: 8 * min as u64,
+                display_name: None,
+                origin: Some("macbook".into()),
+            }],
+            last_seen: now,
+            origin_addr: "http://127.0.0.1:9078".into(),
+        },
     );
 
     emit_sessions_updated(app);
