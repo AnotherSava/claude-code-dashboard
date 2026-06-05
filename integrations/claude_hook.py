@@ -30,6 +30,7 @@ Server URL resolution: `$TAURI_DASHBOARD_URL` if set, else `http://127.0.0.1:907
 """
 import json
 import os
+import subprocess
 import sys
 import urllib.request
 
@@ -37,12 +38,15 @@ DEFAULT_URL = "http://127.0.0.1:9077"
 
 
 def console_pids() -> list:
-    """Windows: candidate pids for the widget's terminal-tab-title writes.
+    """Candidate pids for the widget's terminal-tab-title writes.
 
-    The widget sets a session's tab title by attaching to the console of one
-    of these pids (AttachConsole + SetConsoleTitleW — see its
-    `terminal_title` module). Two sources, because Claude Code spawns hooks
-    with CREATE_NO_WINDOW, which gives the hook a fresh *invisible* console
+    The widget sets a session's tab title through one of these pids — on
+    Windows by attaching to its console (AttachConsole + SetConsoleTitleW),
+    on macOS by resolving its controlling tty and writing an OSC escape —
+    see the widget's `terminal_title` module.
+
+    Windows gathers two sources, because Claude Code spawns hooks with
+    CREATE_NO_WINDOW, which gives the hook a fresh *invisible* console
     rather than the terminal's:
 
     - processes attached to this hook's own console — only useful in setups
@@ -50,13 +54,34 @@ def console_pids() -> list:
     - this process's ancestor chain — the long-lived Claude Code process an
       ancestor or two up holds the visible terminal console.
 
-    Order matters: nearest first. The widget attaches far-to-near so the
-    transient hook-side processes (whose console is the invisible one) are
-    tried last. Pure environment gathering, no state logic. Returns [] on
-    macOS/Linux or when nothing is reachable.
+    macOS gathers only the ancestor chain (one `ps` snapshot): the hook's
+    own pid is transient, but Claude Code an ancestor or two up shares the
+    controlling tty of the visible tab.
+
+    Order matters: nearest first. The widget walks far-to-near on Windows
+    (transient hook-side pids hold the invisible console, so they go last)
+    and near-to-far on macOS (dead transients and tty-less GUI ancestors
+    are skipped). Pure environment gathering, no state logic.
     """
     if os.name != "nt":
-        return []
+        # macOS/Linux: ancestor pid chain, nearest first.
+        try:
+            out = subprocess.run(["ps", "-axo", "pid=,ppid="], capture_output=True, text=True, timeout=2).stdout
+            parents = {}
+            for line in out.splitlines():
+                parts = line.split()
+                if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+                    parents[int(parts[0])] = int(parts[1])
+            pids = []
+            pid = os.getpid()
+            for _ in range(6):
+                pid = parents.get(pid)
+                if not pid or pid <= 1:
+                    break
+                pids.append(pid)
+            return pids
+        except Exception:
+            return []
     try:
         import ctypes
         from ctypes import wintypes

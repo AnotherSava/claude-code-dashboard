@@ -27,7 +27,7 @@ Each badge is color-coded, and WAIT and ERROR pulse to draw your eye when a sess
 
 ## Terminal tab titles
 
-Each session's status is mirrored onto the terminal tab it runs in, as a colored circle next to the session name — 🔵 working, 🟠 waiting on you, 🟢 done, 🔴 error. A glance at your terminal tabs shows which session needs attention, even without the widget on screen. The title updates the moment the status changes and clears when the session ends. On by default; the tray's **Terminal tab titles** toggle turns it off. Windows only for now.
+Each session's status is mirrored onto the terminal tab it runs in, as a colored circle next to the session name — 🔵 working, 🟠 waiting on you, 🟢 done, 🔴 error. A glance at your terminal tabs shows which session needs attention, even without the widget on screen. The title updates the moment the status changes and clears when the session ends. On by default; the tray's **Terminal tab titles** toggle turns it off.
 
 ## Your task stays in view
 

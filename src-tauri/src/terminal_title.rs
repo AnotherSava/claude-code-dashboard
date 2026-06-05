@@ -2,17 +2,17 @@
 //! "<colored circle> <name>" (e.g. "🔵 ai-dashboard").
 //!
 //! The dashboard is a GUI process with no handle into any terminal, so it
-//! borrows the console of the session's Claude Code process: the hook reports
-//! the pids attached to its console (`console_pids` on `/api/event`), and on
-//! every state change we `AttachConsole` to one of them and call
-//! `SetConsoleTitleW`. Windows Terminal / VS Code / conhost all map the
-//! console title onto the tab, and the write needs no window focus.
+//! reaches the session's terminal through the pid candidates the hook
+//! reports (`console_pids` on `/api/event`). On Windows we `AttachConsole`
+//! to one of them and call `SetConsoleTitleW` — Windows Terminal / VS Code /
+//! conhost all map the console title onto the tab, and the write needs no
+//! window focus. On macOS we resolve a candidate's controlling tty
+//! (`ps -o tty=`) and write an OSC 0 escape to the device — Terminal.app,
+//! iTerm2, and kitty all map it onto the tab.
 //!
-//! Windows-only today: the attach dance is `#[cfg(windows)]`-gated and the
-//! macOS variant (resolve the controlling tty, write an OSC 0 escape) is a
-//! later addition. Everything is best-effort — a dead pid, a closed terminal,
-//! or a disabled config flag degrade to "title doesn't change", never to an
-//! error the caller sees.
+//! Everything is best-effort — a dead pid, a closed terminal, or a disabled
+//! config flag degrade to "title doesn't change", never to an error the
+//! caller sees.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
@@ -185,10 +185,29 @@ fn push_title(candidates: &[u32], title: &str) -> bool {
     }
 }
 
-/// macOS/Linux variant lands later (controlling-tty OSC write); report
-/// "nothing written" so the cache never claims a push that didn't happen.
+/// macOS/Linux: resolve the candidate's controlling tty via `ps -o tty=` and
+/// write an OSC 0 (icon + window title) escape to the device. Near-to-far,
+/// unlike Windows: there is no attach dance whose first success must be the
+/// real console — transient per-hook pids are usually dead by now (`ps`
+/// prints nothing) and GUI ancestors (the terminal emulator itself) report
+/// `??`, so both fall through to the long-lived Claude Code / shell pids,
+/// which share the controlling tty of the visible tab.
 #[cfg(not(windows))]
-fn push_title(_candidates: &[u32], _title: &str) -> bool {
+fn push_title(candidates: &[u32], title: &str) -> bool {
+    use std::io::Write;
+    for &pid in candidates {
+        let Ok(out) = std::process::Command::new("ps").args(["-o", "tty=", "-p", &pid.to_string()]).output() else { continue };
+        let tty_raw = String::from_utf8_lossy(&out.stdout);
+        let tty = tty_raw.trim();
+        if tty.is_empty() || tty.starts_with('?') {
+            continue;
+        }
+        let Ok(mut dev) = std::fs::OpenOptions::new().write(true).open(format!("/dev/{tty}")) else { continue };
+        if dev.write_all(format!("\x1b]0;{title}\x07").as_bytes()).is_ok() {
+            tracing::debug!(pid, tty, title, "terminal title written");
+            return true;
+        }
+    }
     false
 }
 

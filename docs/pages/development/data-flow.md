@@ -22,7 +22,7 @@ flowchart LR
   AS[("AppState<br/>Mutex&lt;Vec&lt;AgentSession&gt;&gt;")]
   NATIVE["Window / TrayIcon<br/>native APIs"]
   SV["Svelte (listen)"]
-  TT["terminal tab title<br/>(Win32 console)"]
+  TT["terminal tab title<br/>(Win32 console / tty)"]
 
   CC -->|"POST /api/event"| AX
   AX -->|"adapters::dispatch -> apply_set / apply_clear"| AS
@@ -41,7 +41,7 @@ Every mutation to session state funnels through `state::apply_set` or `state::ap
 ## Path 1 — Hook POSTs event
 
 1. Claude Code fires a lifecycle event (`UserPromptSubmit`, `Stop`, etc.). The hook command spawns `python claude_hook.py` and pipes the event payload to stdin.
-2. `claude_hook.py` reads the payload, extracts `hook_event_name`, and POSTs `{client: "claude", event: <name>, payload: <verbatim>, console_pids: [...]}` to `$TAURI_DASHBOARD_URL/api/event` (default `http://127.0.0.1:9077/api/event`). The hook does no classification or config reading — `console_pids` (Windows) is pure environment gathering: the processes attached to its console plus its ancestor pid chain, used later for terminal tab titles.
+2. `claude_hook.py` reads the payload, extracts `hook_event_name`, and POSTs `{client: "claude", event: <name>, payload: <verbatim>, console_pids: [...]}` to `$TAURI_DASHBOARD_URL/api/event` (default `http://127.0.0.1:9077/api/event`). The hook does no classification or config reading — `console_pids` is pure environment gathering: the processes attached to its console plus its ancestor pid chain (Windows) or the ancestor chain alone (macOS), used later for terminal tab titles.
 3. `POST /api/event` hits the axum handler. Origin guard rejects non-null cross-origin requests.
 4. `adapters::dispatch` routes by `client`; `adapters::claude::dispatch` matches on `event` and produces an `AdapterOutput::Set { input, transcript_path } | Clear { id } | Ignore`. All chat-id derivation, prompt cleaning, and transcript question-detection happen here.
 5. For `Set`, `label_policy::select` decides the `(label, original_prompt)` pair.

@@ -86,7 +86,7 @@ Whether autostart is enabled isn't a config field — it lives in the OS launch 
 
 ### Terminal tab titles
 
-- `terminal_titles` — mirror each session's status onto its terminal tab as a colored circle next to the session name (🔵 working, 🟠 waiting, 🟢 done, 🔴 error, ⚪ idle). Windows only for now. See [Features → terminal tab titles](features#terminal-tab-titles).
+- `terminal_titles` — mirror each session's status onto its terminal tab as a colored circle next to the session name (🔵 working, 🟠 waiting, 🟢 done, 🔴 error, ⚪ idle). See [Features → terminal tab titles](features#terminal-tab-titles).
 
 ### Notifications
 
