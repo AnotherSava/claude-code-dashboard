@@ -81,6 +81,11 @@ Under the repo root `claude-code-dashboard/`:
     - `notifications.rs` — 1s-tick reconciler + Notifier trait
     - `telegram.rs` — reqwest-based Telegram Bot API client
     - `usage_limits.rs` — Anthropic OAuth usage poller + refresh (5h / 7d buckets)
+    - `usage_history.rs` — appends each successful usage poll to `usage_history.jsonl`
+    - `prompt_history.rs` — per-session dialog persistence to `prompt_history.json`
+    - `chat_id_registry.rs` — persisted `session_id → chat_id` lock in `session_chat_ids.json`
+    - `custom_names.rs` — user-assigned display names persisted to `custom_names.json`
+    - `terminal_title.rs` — mirrors session status onto terminal tab titles
     - `auto_resize.rs` — Up/Down content-fit window + Win32 resize lock + dark class brush
     - `label_policy.rs` — shared (label, original_prompt) decision used by adapters
     - `adapters.rs` — adapter dispatch for /api/event payloads
@@ -95,7 +100,7 @@ Under the repo root `claude-code-dashboard/`:
 ### Where state lives at runtime
 
 - **In-memory** — `AppState` (sessions) and `ConfigState` (config) via `tauri::State`.
-- **On disk** — `config.json` and `widget.jsonl` under `app_data_dir()`:
+- **On disk** — `config.json`, `widget.jsonl`, `prompt_history.json`, `session_chat_ids.json`, `custom_names.json`, and `usage_history.jsonl` under `app_data_dir()`:
   - Windows: `%APPDATA%\com.anothersava.claude-code-dashboard\`
   - macOS: `~/Library/Application Support/com.anothersava.claude-code-dashboard/`
 

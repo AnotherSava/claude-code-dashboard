@@ -16,6 +16,7 @@ mod state;
 mod telegram;
 mod terminal_title;
 mod tray;
+mod usage_history;
 mod usage_limits;
 
 use config::ConfigState;
@@ -100,7 +101,6 @@ pub fn run() {
             commands::show_window,
             commands::toggle_window,
             commands::quit_app,
-            commands::remove_session,
             commands::open_history,
             commands::get_window_label,
             commands::get_history_target,
@@ -151,6 +151,10 @@ pub fn run() {
 
             app.manage(custom_names::CustomNamesStore::new(
                 app_data.join("custom_names.json"),
+            ));
+
+            app.manage(usage_history::UsageHistoryStore::new(
+                app_data.join("usage_history.jsonl"),
             ));
 
             let config_path = app_data.join("config.json");

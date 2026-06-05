@@ -10,6 +10,7 @@ use tokio::sync::Notify;
 
 use crate::commands::{emit_usage_limits_updated, now_ms};
 use crate::config::ConfigState;
+use crate::usage_history::{UsageHistoryRecord, UsageHistoryStore};
 
 #[derive(Clone, Debug, Serialize)]
 pub struct LimitBucket {
@@ -374,6 +375,25 @@ fn to_bucket(wire: UsageBucketWire) -> LimitBucket {
     }
 }
 
+/// Flatten a wire response into a history sample, keeping the raw API
+/// percentages (0..100, unclamped) rather than the display-normalized
+/// 0..1 values that `to_bucket` produces.
+fn to_history_record(usage: &UsageResponse, ts: i64) -> UsageHistoryRecord {
+    UsageHistoryRecord {
+        ts,
+        five_hour_pct: usage.five_hour.as_ref().map(|b| b.utilization),
+        five_hour_resets_at: usage
+            .five_hour
+            .as_ref()
+            .and_then(|b| b.resets_at.map(|t| t.timestamp_millis())),
+        seven_day_pct: usage.seven_day.as_ref().map(|b| b.utilization),
+        seven_day_resets_at: usage
+            .seven_day
+            .as_ref()
+            .and_then(|b| b.resets_at.map(|t| t.timestamp_millis())),
+    }
+}
+
 pub struct UsageLimitsPoller;
 
 impl UsageLimitsPoller {
@@ -579,6 +599,9 @@ async fn poll_once(app: &AppHandle, client: &reqwest::Client) {
                 seven_day_raw = ?usage.seven_day.as_ref().map(|b| b.utilization),
                 "usage poll success"
             );
+            if let Some(history) = app.try_state::<UsageHistoryStore>() {
+                history.append(&to_history_record(&usage, now));
+            }
             state.replace(UsageLimits {
                 five_hour: usage.five_hour.map(to_bucket),
                 seven_day: usage.seven_day.map(to_bucket),
@@ -780,6 +803,26 @@ mod tests {
         let wire = UsageBucketWire { utilization: 1.0, resets_at: None };
         let b = to_bucket(wire);
         assert!((b.utilization - 0.01).abs() < 1e-6);
+    }
+
+    #[test]
+    fn to_history_record_keeps_raw_percentages() {
+        let resets = DateTime::parse_from_rfc3339("2026-04-20T22:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let usage = UsageResponse {
+            five_hour: Some(UsageBucketWire {
+                utilization: 42.5,
+                resets_at: Some(resets),
+            }),
+            seven_day: None,
+        };
+        let rec = to_history_record(&usage, 1234);
+        assert_eq!(rec.ts, 1234);
+        assert_eq!(rec.five_hour_pct, Some(42.5));
+        assert_eq!(rec.five_hour_resets_at, Some(resets.timestamp_millis()));
+        assert_eq!(rec.seven_day_pct, None);
+        assert_eq!(rec.seven_day_resets_at, None);
     }
 
     #[test]
