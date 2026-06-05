@@ -23,7 +23,7 @@
     stateLabel,
     tokenColor,
   } from '../types'
-  import { hideHistory, openHistory, removeSession, setChatName } from '../api'
+  import { hideHistory, openHistory, setChatName } from '../api'
 
   interface Props {
     session: AgentSession
@@ -113,11 +113,6 @@
     historyClosedAt.set(0)
     openHistory(session.id).catch((err) => console.error('open_history failed', err))
   }
-
-  function onRemove(e: MouseEvent) {
-    e.stopPropagation()
-    removeSession(session.id).catch((err) => console.error('remove failed', err))
-  }
 </script>
 
 <div class="row">
@@ -135,10 +130,7 @@
         <span class="id" title="{displayName} — double-click to rename" ondblclick={startEdit} role="textbox" tabindex="-1">{displayName}</span>
       {/if}
       <span class="pill state-{session.status}" class:pulse={shouldPulse}>{stateLabel[session.status]}</span>
-      <span class="time-slot">
-        <span class="time">{time}</span>
-        <button class="remove" onclick={onRemove} aria-label="Remove session" tabindex="-1">×</button>
-      </span>
+      <span class="time">{time}</span>
       <span class="tokens" style:color={tokColor}>{#if tokensText}{tokensText}<span class="k">k</span>{/if}</span>
     </div>
     {#if label}
@@ -232,48 +224,14 @@
     background: #b91c1c;
     color: #fecaca;
   }
-  .time-slot {
-    position: relative;
-    display: inline-flex;
-    justify-content: flex-end;
-    flex-shrink: 0;
-    min-width: 36px;
-  }
   .time {
     font-size: 11px;
     color: #8a8a8e;
     font-family: ui-monospace, Consolas, monospace;
     font-variant-numeric: tabular-nums;
     text-align: right;
-    transition: opacity 120ms ease;
-  }
-  .remove {
-    position: absolute;
-    inset: 0;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    opacity: 0;
-    pointer-events: none;
-    background: transparent;
-    border: 0;
-    padding: 0;
-    color: #b91c1c;
-    font-size: 16px;
-    font-weight: 700;
-    line-height: 1;
-    cursor: pointer;
-    transition: opacity 120ms ease, color 120ms ease;
-  }
-  .remove:hover {
-    color: #ef4444;
-  }
-  .row:hover .remove {
-    opacity: 1;
-    pointer-events: auto;
-  }
-  .row:hover .time {
-    opacity: 0;
+    flex-shrink: 0;
+    min-width: 36px;
   }
   .tokens {
     font-size: 12px;

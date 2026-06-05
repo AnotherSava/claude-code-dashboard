@@ -63,7 +63,7 @@ Every mutation to session state funnels through `state::apply_set` or `state::ap
 
 The initial drain on watcher startup suppresses the inferred **state** AND the **latest assistant text** — a resume would otherwise snap to a stale "done" from the prior turn and duplicate the last assistant entry already in the restored dialog. Model and token counts still surface.
 
-Tauri commands have two possible targets: native window/tray APIs (`hide_window`, `show_window`, `toggle_window`, `quit_app`) or `AppState` itself — `remove_session` calls `apply_clear` to dismiss a row the user no longer cares about, then re-emits the snapshot on the same `sessions_updated` channel.
+Tauri commands target native window/tray APIs (`hide_window`, `show_window`, `toggle_window`, `quit_app`); session state is only read from the frontend (`get_sessions`) — every mutation arrives through the HTTP event path above.
 
 ## Path 3 — Tray toggles
 

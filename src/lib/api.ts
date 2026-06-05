@@ -46,10 +46,6 @@ export function quitApp(): Promise<void> {
   return invoke('quit_app')
 }
 
-export function removeSession(id: string): Promise<void> {
-  return invoke('remove_session', { id })
-}
-
 export function openHistory(id: string): Promise<void> {
   return invoke('open_history', { id })
 }

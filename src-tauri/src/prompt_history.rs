@@ -54,10 +54,6 @@ impl PromptHistoryStore {
         );
     }
 
-    pub fn remove(&self, session_id: &str) {
-        self.data.lock().unwrap().remove(session_id);
-    }
-
     pub fn save_to_disk(&self) {
         let data = self.data.lock().unwrap();
         match serde_json::to_string_pretty(&*data) {
@@ -128,7 +124,7 @@ mod tests {
     }
 
     #[test]
-    fn has_any_entries_tracks_inserts_and_removals() {
+    fn has_any_entries_tracks_inserts() {
         let store = PromptHistoryStore::new(PathBuf::new());
         assert!(!store.has_any_entries());
         {
@@ -136,20 +132,5 @@ mod tests {
             data.insert("s1".into(), PersistedSession::default());
         }
         assert!(store.has_any_entries());
-        store.remove("s1");
-        assert!(!store.has_any_entries());
-    }
-
-    #[test]
-    fn remove_deletes_session() {
-        let store = PromptHistoryStore::new(PathBuf::new());
-        {
-            let mut data = store.data.lock().unwrap();
-            data.insert("s1".into(), PersistedSession::default());
-            data.insert("s2".into(), PersistedSession::default());
-        }
-        store.remove("s1");
-        assert!(store.get("s1").is_none());
-        assert!(store.get("s2").is_some());
     }
 }

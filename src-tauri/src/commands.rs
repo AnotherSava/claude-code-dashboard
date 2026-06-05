@@ -1,6 +1,5 @@
 use crate::config::{Config, ConfigState};
 use crate::custom_names::CustomNamesStore;
-use crate::log_watcher::WatcherRegistry;
 use crate::prompt_history::PromptHistoryStore;
 use crate::setup;
 use crate::state::{AgentSession, AppState};
@@ -318,21 +317,6 @@ pub fn set_window_size(
         .set_size(tauri::LogicalSize::new(logical_width, logical_height))
         .map_err(|e| e.to_string())?;
     Ok(())
-}
-
-#[tauri::command]
-pub fn remove_session(id: String, app: AppHandle) {
-    if let Some(state) = app.try_state::<AppState>() {
-        state.apply_clear(&id);
-    }
-    if let Some(reg) = app.try_state::<WatcherRegistry>() {
-        reg.stop(&id);
-    }
-    if let Some(store) = app.try_state::<crate::prompt_history::PromptHistoryStore>() {
-        store.remove(&id);
-        store.save_to_disk();
-    }
-    emit_sessions_updated(&app);
 }
 
 /// The history window's OS title bar: the user's custom name for the chat, or
