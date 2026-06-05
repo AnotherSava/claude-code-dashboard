@@ -1,7 +1,7 @@
 - [Hook env var setup](hook_env_var_setup.md) — Claude Code hooks in ~/.claude/settings.json need $CLAUDE_AI_AGENT_DASHBOARD set to the repo root; silent failure when unset
 - [Frontend question detector is lenient](feedback_frontend_question_detector_lenient.md) — src/lib/dialog.ts intentionally diverges from Rust is_a_question; don't unify
 - [macOS ad-hoc signing strategy](macos_signing_strategy.md) — DMG uses signingIdentity="-" + documented user workaround; don't push for $99/yr Apple notarization unprompted
-- [Test SetupPanel via port override](dashboard_test_port_override.md) — `config/local.json {"server_port": 9078}` keeps prompt_history empty so the onboarding panel stays visible
+- [Test SetupPanel via port override](dashboard_test_port_override.md) — `config/local.json {"server_port": 9078}` keeps prompt_history empty; revert to 9077 after or the dashboard goes deaf
 - [Run deploy directly, don't hand it back](feedback_run_deploy_directly.md) — after code changes that need visual verification, call `Bash deploy` instead of asking the user
 - [Frontend log bypasses tracing intentionally](feedback_frontend_log_bypasses_tracing.md) — FrontendLogger writes JSONL directly; don't "fix" by routing through tracing::*! macros
 - [Favor clean design over compat](feedback_favor_clean_design.md) — don't keep legacy fields alongside replacements; break and update consumers
@@ -15,4 +15,5 @@
 - [History window: no blank lines](feedback_history_compact_blank_lines.md) — blank lines inside messages are dropped entirely; user rejected even reduced-height gaps
 - [Debug history rendering via prompt_history.json](debug_history_rendering_via_prompt_history.md) — dump raw stored dialog lines/char codes to split data bugs from render-path bugs
 - [Console-title checks: Bash tool has its own hidden console](debug_console_titles_tool_consoles.md) — verify titles via the PowerShell tool, which shares the real terminal console
-- [Terminal title follow-ups](terminal_title_followups.md) — deferred: macOS tty/OSC variant, yes-button via WriteConsoleInputW, Claude OSC title clobbering options
+- [Terminal title follow-ups](terminal_title_followups.md) — deferred: yes-button via WriteConsoleInputW, Claude OSC title clobbering options
+- [Synthetic hook events for e2e tests](debug_synthetic_hook_events.md) — pipe fake-cwd payloads through claude_hook.py; SessionEnd cleans up; check widget.jsonl

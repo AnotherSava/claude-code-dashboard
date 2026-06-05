@@ -16,7 +16,7 @@ runtime `config.json`), so the dashboard starts on 9078 while the hook in
 refused), `prompt_history.json` stays empty, `has_history` stays false, and
 SetupPanel keeps rendering across hide/show cycles.
 
-To revert: delete `config/local.json` and redeploy.
+To revert: set `config/local.json` back to `{ "server_port": 9077 }` (or delete it AND fix the live `config.json` — deleting alone leaves the stale 9078 deployed) and restart the app. **Don't forget this step**: deploy re-applies `local.json` on every run and the hook posts to the default 9077, so a forgotten 9078 override leaves the dashboard running but silently receiving nothing (bit us 2026-06-04 — a fresh deploy after testing shipped a deaf dashboard).
 
 **Why:** any active Claude Code conversation (including the one querying
 about SetupPanel) fires hook events that get persisted to
