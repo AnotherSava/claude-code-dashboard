@@ -17,3 +17,4 @@
 - [Console-title checks: Bash tool has its own hidden console](debug_console_titles_tool_consoles.md) — verify titles via the PowerShell tool, which shares the real terminal console
 - [Terminal title follow-ups](terminal_title_followups.md) — deferred: yes-button via WriteConsoleInputW, Claude OSC title clobbering options
 - [Synthetic hook events for e2e tests](debug_synthetic_hook_events.md) — pipe fake-cwd payloads through claude_hook.py; SessionEnd cleans up; check widget.jsonl
+- [Sync e2e via fake peer](debug_sync_fake_peer.md) — don't run two app instances (shared %APPDATA%); Python peer on :9080 + temp sync block in config/local.json; PrintWindow flag 3 for occluded-widget screenshots
