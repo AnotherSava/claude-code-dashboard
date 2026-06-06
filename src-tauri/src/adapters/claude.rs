@@ -333,7 +333,7 @@ const PERMISSION_SEEKING: &[&str] = &[
 /// `?` (possibly after a trailing option list); the last paragraph contains a
 /// known hand-back phrase (permission-seeking or a direct second-person
 /// question); or the last paragraph issues a hand-back request for input
-/// (`Paste …` / `Please provide …`).
+/// (`Paste …` / `Please provide …` / `Confirm …`).
 fn is_a_question(text: &str, benign_closers: &[String]) -> bool {
     let plain = strip_markdown(text);
     let effective = strip_trailing_options(&plain);
@@ -380,8 +380,11 @@ fn has_permission_seeking_question(text: &str) -> bool {
 /// Sentence-initial imperative openers that hand control back to the user — the
 /// agent is waiting for them to supply something. Kept narrow and phrase-matched
 /// (not a blanket `"please "`) so informational openers like "Please note …" /
-/// "Please see …" don't register as questions.
-const HANDBACK_OPENERS: &[&str] = &["paste ", "please provide "];
+/// "Please see …" don't register as questions. `confirm ` (trailing space, so
+/// `confirmed` doesn't match) catches approval prompts phrased without a `?` —
+/// "Confirm to tag v1.2.0, or request edits." — which the `?`-gated
+/// `PERMISSION_SEEKING` entry can't see.
+const HANDBACK_OPENERS: &[&str] = &["paste ", "please provide ", "confirm "];
 
 /// True when the last paragraph issues a sentence-initial hand-back request —
 /// "Paste the output …", "Please provide the model name …" — meaning the agent
@@ -1009,6 +1012,18 @@ mod tests {
             &[]
         ));
         assert!(is_a_question("Looks good. Please provide your API key.", &[]));
+    }
+
+    #[test]
+    fn confirm_request_without_question_mark_is_awaiting() {
+        // A sentence-initial "Confirm ..." imperative hands back even without a `?`.
+        assert!(is_a_question("Confirm to tag v1.2.0, or request edits.", &[]));
+        assert!(is_a_question(
+            "Skipped as internal: docs and the memory chore. Confirm to tag v1.2.0, or request edits.",
+            &[]
+        ));
+        // "Confirmed ..." is a statement, not a hand-back — trailing space keeps it out.
+        assert!(!is_a_question("Confirmed: the fix works on both platforms.", &[]));
     }
 
     #[test]
