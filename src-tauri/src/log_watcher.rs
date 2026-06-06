@@ -1,4 +1,5 @@
 use crate::commands::{emit_sessions_updated, now_ms};
+use crate::config::ConfigState;
 use crate::prompt_history::PromptHistoryStore;
 use crate::state::{AgentSession, AppState, Status};
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
@@ -10,6 +11,13 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Manager};
 
+/// Claude Code writes this as a `user` transcript entry when a turn is
+/// cancelled with Esc (it has variants like "… for tool use", so we match the
+/// prefix). An Esc-cancel fires no lifecycle hook, so this marker is the only
+/// signal that the turn ended — `infer_state` flags it so the watcher can
+/// demote the row out of `Working` instead of re-reading it as user input.
+const INTERRUPT_MARKER_PREFIX: &str = "[Request interrupted by user";
+
 /// Block-level output of one inference pass over transcript lines. Fields are
 /// `None` when the scan found nothing conclusive for that dimension — callers
 /// are expected to preserve prior values rather than clobber to None.
@@ -18,6 +26,9 @@ pub struct InferredState {
     pub state: Option<Status>,
     pub model: Option<String>,
     pub input_tokens: Option<u64>,
+    /// The newest state-bearing entry is an Esc-cancel interrupt marker — the
+    /// turn ended with no hook. Drives a `Working`→`Idle` demotion.
+    pub ended: bool,
 }
 
 /// Walk JSONL lines newest-first and derive current state, last-known model,
@@ -81,7 +92,19 @@ pub fn infer_state(lines: &[&str]) -> Option<InferredState> {
             if has_tool_use || has_tool_result {
                 result.state = Some(Status::Working);
             } else if entry.entry_type == "user" && has_text {
-                result.state = Some(Status::Working);
+                // An interrupt marker is the newest user entry only when the
+                // turn was just cancelled (a fresh prompt afterwards would be
+                // newer). Flag the end and stop here so an older entry can't
+                // re-resolve the state to Working.
+                if content.iter().any(|b| {
+                    b.block_type == "text"
+                        && b.text.as_deref().map(|t| t.trim().starts_with(INTERRUPT_MARKER_PREFIX)).unwrap_or(false)
+                }) {
+                    result.ended = true;
+                    result.state = Some(Status::Idle); // sentinel: stop resolution; apply_watcher_update ignores non-Working
+                } else {
+                    result.state = Some(Status::Working);
+                }
             } else if entry.entry_type == "assistant" && has_text {
                 result.state = Some(Status::Done);
             }
@@ -401,6 +424,9 @@ async fn drain(app: &AppHandle, chat_id: &str, path: &Path, state: &Arc<Mutex<Dr
     let text_entries = if initial_read {
         state.lock().unwrap().initial_read = false;
         update.state = None;
+        // A stale interrupt marker at the tail of a pre-existing transcript
+        // must not demote a session being restored on app start.
+        update.ended = false;
         let all = extract_text_entries(&borrowed);
         all.into_iter().rev().find(|(r, _)| *r == DialogRole::Assistant).into_iter().collect()
     } else {
@@ -422,6 +448,18 @@ fn apply_and_emit(app: &AppHandle, chat_id: &str, update: &InferredState, text_e
             None => false,
         }
     };
+    // The turn was cancelled with Esc (no lifecycle hook). Settle the row back
+    // to Idle — unless the user opted out. Gated here rather than in
+    // `infer_state` so detection stays pure and testable.
+    let demoted = update.ended
+        && app
+            .try_state::<ConfigState>()
+            .map(|c| c.snapshot().detect_cancelled_turns)
+            .unwrap_or(true)
+        && app_state.demote_working_to_idle(chat_id, now);
+    if demoted {
+        tracing::debug!(chat_id, "turn cancelled (interrupt marker); demoted to idle");
+    }
     let dialog_changed = if !text_entries.is_empty() {
         app_state.apply_text_entries(chat_id, &text_entries, now)
     } else {
@@ -437,7 +475,7 @@ fn apply_and_emit(app: &AppHandle, chat_id: &str, update: &InferredState, text_e
             h.save_to_disk();
         }
     }
-    if metric_changed || dialog_changed {
+    if metric_changed || dialog_changed || demoted {
         emit_sessions_updated(app);
     }
 }
@@ -542,6 +580,37 @@ mod tests {
             meta("last-prompt"),
         ];
         assert_eq!(infer_state(&refs(&lines)).unwrap().state, Some(Status::Done));
+    }
+
+    #[test]
+    fn interrupt_marker_flags_ended_not_working() {
+        // The newest entry is an Esc-cancel marker following a working turn.
+        let lines = [
+            user_text("do the thing"),
+            assistant_tool_use(),
+            user_text("[Request interrupted by user]"),
+        ];
+        let r = infer_state(&refs(&lines)).unwrap();
+        assert!(r.ended, "interrupt marker sets ended");
+        assert_ne!(r.state, Some(Status::Working), "must not re-promote to working");
+    }
+
+    #[test]
+    fn interrupt_marker_variant_for_tool_use_flags_ended() {
+        let lines = [user_text("[Request interrupted by user for tool use]")];
+        assert!(infer_state(&refs(&lines)).unwrap().ended);
+    }
+
+    #[test]
+    fn prompt_after_interrupt_is_working_again() {
+        // A fresh prompt newer than the interrupt marker is a new turn.
+        let lines = [
+            user_text("[Request interrupted by user]"),
+            user_text("ok now do this instead"),
+        ];
+        let r = infer_state(&refs(&lines)).unwrap();
+        assert!(!r.ended, "the newer entry is a real prompt, not a cancel");
+        assert_eq!(r.state, Some(Status::Working));
     }
 
     // -------- extract_text_entries tests --------
@@ -857,6 +926,7 @@ mod tests {
                 state: Some(Status::Working),
                 model: Some("claude-opus-4-7".into()),
                 input_tokens: Some(42_100),
+                ended: false,
             },
             500,
         );
@@ -876,6 +946,7 @@ mod tests {
                 state: Some(Status::Working),
                 model: Some("claude-opus-4-7".into()),
                 input_tokens: Some(100),
+                ended: false,
             },
             500,
         );

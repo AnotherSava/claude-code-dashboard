@@ -6,6 +6,7 @@ mod config;
 mod config_watcher;
 mod custom_names;
 mod http_server;
+mod idle_probe;
 mod label_policy;
 mod log_watcher;
 mod logging;
@@ -270,6 +271,7 @@ pub fn run() {
             config_watcher::spawn(app.handle().clone(), config_path);
             notifications::NotificationManager::spawn(app.handle().clone());
             UsageLimitsPoller::spawn(app.handle().clone());
+            idle_probe::spawn(app.handle().clone());
 
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {

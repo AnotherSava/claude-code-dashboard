@@ -328,6 +328,30 @@ impl AppState {
         sessions.retain(|s| s.id != id);
     }
 
+    /// Demote a `Working` session to `Idle`. Called by the transcript watcher
+    /// when it sees the "[Request interrupted by user]" marker — an Esc-cancel
+    /// emits no lifecycle hook, so without this the row would stay `Working`
+    /// forever (and the watcher's own `infer_state` would otherwise re-promote
+    /// the marker as user input). No-op unless the row is still `Working`, so a
+    /// turn that already moved on is left alone. Mirrors `apply_set`'s
+    /// Working→non-Working accounting (banks the elapsed run into
+    /// `working_accumulated_ms`, resets the timer). Returns true if it acted.
+    pub fn demote_working_to_idle(&self, id: &str, now_ms: i64) -> bool {
+        let mut sessions = self.sessions.lock().unwrap();
+        let Some(s) = sessions.iter_mut().find(|s| s.id == id) else {
+            return false;
+        };
+        if s.status != Status::Working {
+            return false;
+        }
+        let delta = (now_ms - s.state_entered_at).max(0) as u64;
+        s.working_accumulated_ms = s.working_accumulated_ms.saturating_add(delta);
+        s.status = Status::Idle;
+        s.state_entered_at = now_ms;
+        s.updated = now_ms;
+        true
+    }
+
     /// Mark a session-boundary in the in-memory dialog. Called when the
     /// hook reports a transcript_path different from the one we're already
     /// watching for this chat_id — Claude Code's `/clear` keeps the cwd
@@ -480,6 +504,27 @@ mod tests {
     }
 
     const NO_CONTINUATIONS: &[String] = &[];
+
+    #[test]
+    fn demote_banks_elapsed_and_sets_idle() {
+        let state = AppState::new();
+        state.apply_set(set("a", Status::Working, "fix foo.py"), 0, NO_CONTINUATIONS, None);
+
+        assert!(state.demote_working_to_idle("a", 20_000));
+        let s = get(&state, "a");
+        assert_eq!(s.status, Status::Idle);
+        assert_eq!(s.working_accumulated_ms, 20_000, "elapsed run banked");
+        assert_eq!(s.state_entered_at, 20_000);
+        assert_eq!(s.updated, 20_000);
+    }
+
+    #[test]
+    fn demote_is_noop_when_not_working() {
+        let state = AppState::new();
+        state.apply_set(set("a", Status::Awaiting, "run bash?"), 0, NO_CONTINUATIONS, None);
+        assert!(!state.demote_working_to_idle("a", 20_000));
+        assert_eq!(get(&state, "a").status, Status::Awaiting);
+    }
 
     #[test]
     fn new_working_session_captures_original_prompt() {

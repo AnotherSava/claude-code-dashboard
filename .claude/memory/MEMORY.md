@@ -18,3 +18,4 @@
 - [Terminal title follow-ups](terminal_title_followups.md) — deferred: yes-button via WriteConsoleInputW, Claude OSC title clobbering options
 - [Synthetic hook events for e2e tests](debug_synthetic_hook_events.md) — pipe fake-cwd payloads through claude_hook.py; SessionEnd cleans up; check widget.jsonl
 - [Sync e2e via fake peer](debug_sync_fake_peer.md) — don't run two app instances (shared %APPDATA%); Python peer on :9080 + temp sync block in config/local.json; PrintWindow flag 3 for occluded-widget screenshots
+- [Terminal-reading e2e](debug_terminal_reading_e2e.md) — bind synthetic Working session to real console pids (GetConsoleProcessList in PowerShell tool), POST direct to /api/event, end turn, bg-watch widget.jsonl
