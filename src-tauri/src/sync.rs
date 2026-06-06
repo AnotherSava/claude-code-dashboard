@@ -29,7 +29,7 @@ use std::time::Duration;
 use tauri::{AppHandle, Manager};
 use tokio::sync::Notify;
 
-use crate::commands::{emit_sessions_updated, now_ms};
+use crate::commands::{emit_sessions_updated_remote, now_ms};
 use crate::config::ConfigState;
 use crate::state::{merge_dialog_entries, AgentSession, AppState, DialogEntry, RemoteDevice};
 
@@ -138,7 +138,7 @@ async fn post_sync(
         let device = ingest(&push.device_name, push.sessions, prev, now, origin_addr);
         remote.insert(push.device_name.clone(), device);
     }
-    emit_sessions_updated(&app);
+    emit_sessions_updated_remote(&app);
     StatusCode::NO_CONTENT
 }
 
@@ -281,7 +281,7 @@ pub fn spawn_reaper(app: AppHandle) {
                 continue;
             };
             if state.reap_remote(now_ms(), REMOTE_TTL_MS) {
-                emit_sessions_updated(&app);
+                emit_sessions_updated_remote(&app);
             }
         }
     });
@@ -371,7 +371,7 @@ pub fn fetch_remote_dialog(app: AppHandle, session_id: String) {
                 merge_dialog_entries(&mut s.dialog, &entries);
             }
         }
-        emit_sessions_updated(&app);
+        emit_sessions_updated_remote(&app);
     });
 }
 

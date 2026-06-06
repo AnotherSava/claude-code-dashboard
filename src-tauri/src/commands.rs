@@ -460,11 +460,25 @@ pub fn emit_sessions_updated(app: &AppHandle) {
     crate::terminal_title::sync(app, &local);
     let _ = app.emit("sessions_updated", sessions);
     // ...and it doubles again as the sync-push trigger: the pusher debounces
-    // pokes and ships *local* sessions to peers (received remote sessions are
-    // never re-broadcast, so a peer's push poking this emit can't echo).
+    // pokes and ships *local* sessions to peers. Remote-driven changes must go
+    // through `emit_sessions_updated_remote` instead — the *content* of a
+    // received push can't echo (remote sessions are never re-broadcast), but
+    // the poke itself would: receive → poke → push our locals back → the peer
+    // receives and pokes its own pusher, ping-ponging full snapshots at the
+    // debounce period forever.
     if let Some(dirty) = app.try_state::<crate::sync::SyncDirty>() {
         dirty.inner().0.notify_one();
     }
+}
+
+/// UI-only refresh for remote-driven changes (received sync push, remote TTL
+/// reap, dialog catch-up). Skips the `SyncDirty` poke — those paths mutate
+/// only `AppState::remote`, which the pusher never ships, and poking it back
+/// would ping-pong pushes between two devices (see `emit_sessions_updated`).
+/// Also skips terminal-title reconciliation: remote rows never own a local
+/// terminal, and the local subset is untouched by definition.
+pub fn emit_sessions_updated_remote(app: &AppHandle) {
+    let _ = app.emit("sessions_updated", resolved_snapshot(app));
 }
 
 pub fn emit_config_updated(app: &AppHandle) {
