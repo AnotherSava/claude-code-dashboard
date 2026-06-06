@@ -61,6 +61,15 @@ pub struct Config {
     /// "<colored circle> <name>" (e.g. "🔵 ai-dashboard"). Read by
     /// `terminal_title::sync`; Windows-only today.
     pub terminal_titles: bool,
+    /// Demote a `Working` row to `Idle` when its turn was cancelled with Esc —
+    /// which emits no lifecycle hook. Two cooperating detectors, both gated by
+    /// this flag: `log_watcher` catches cancels of *active* work via the
+    /// "[Request interrupted by user]" transcript marker (cross-platform,
+    /// instant); `idle_probe` catches an *instant* cancel that wrote nothing to
+    /// the transcript by reading the terminal for Claude's idle prompt
+    /// (Windows-only backstop). Off keeps the row `Working` until the next
+    /// prompt.
+    pub detect_cancelled_turns: bool,
     /// Multi-device session sync (see `sync.rs`). Disabled by default:
     /// `listen=false` and empty `peers` make every sync task a no-op.
     pub sync: SyncConfig,
@@ -143,7 +152,8 @@ pub struct TelegramConfig {
     /// value 0 = silent for that state.
     pub state_thresholds_ms: HashMap<String, u64>,
     /// Context-usage alert: fire a one-shot message when a session's
-    /// `input_tokens / context_window_tokens[model]` crosses this percent.
+    /// `input_tokens` over its model's window (longest-prefix lookup in
+    /// `context_window_tokens`) crosses this percent.
     /// `null` or `0` disables it. Edge-triggered — it fires once on crossing
     /// and re-arms only after usage drops back below the threshold (a new
     /// task or `/clear` resets the token count).
@@ -194,10 +204,12 @@ impl Default for Config {
             always_on_top: true,
             save_window_position: true,
             window_position: None,
+            // Keys are matched by longest prefix (see notifications::window_for),
+            // so two family-level entries cover every model without per-release
+            // updates; exact model ids can still be added to override a family.
             context_window_tokens: [
-                ("claude-opus-4-7".to_string(), 1_000_000),
-                ("claude-sonnet-4-6".to_string(), 200_000),
-                ("claude-haiku-4-5".to_string(), 200_000),
+                ("claude-opus".to_string(), 1_000_000),
+                ("claude".to_string(), 200_000),
             ]
             .into_iter()
             .collect(),
@@ -218,6 +230,7 @@ impl Default for Config {
             start_minimized: false,
             continuation_prompts: vec!["go".into(), "continue".into(), "proceed".into()],
             terminal_titles: true,
+            detect_cancelled_turns: true,
             sync: SyncConfig::default(),
         }
     }
@@ -299,6 +312,7 @@ mod tests {
             !cfg.context_window_tokens.is_empty(),
             "default context_window_tokens survives"
         );
+        assert!(cfg.detect_cancelled_turns, "default detect_cancelled_turns survives");
         let tg = cfg
             .notifications
             .as_ref()

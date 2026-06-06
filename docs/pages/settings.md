@@ -38,6 +38,7 @@ Every field is optional — omit one and the built-in default applies. A complet
   "history_font_size": "regular",
   "auto_resize": "none",
   "terminal_titles": true,
+  "detect_cancelled_turns": true,
   "save_window_position": true,
   "window_position": null,
   "history_window_position": null,
@@ -58,9 +59,8 @@ Every field is optional — omit one and the built-in default applies. A complet
     { "percent": 85, "color": "#c64a4a" }
   ],
   "context_window_tokens": {
-    "claude-opus-4-7": 1000000,
-    "claude-sonnet-4-6": 200000,
-    "claude-haiku-4-5": 200000
+    "claude-opus": 1000000,
+    "claude": 200000
   },
   "benign_closers": ["What's next?", "Anything else?"],
   "continuation_prompts": ["go", "continue", "proceed"],
@@ -95,6 +95,10 @@ Whether autostart is enabled isn't a config field — it lives in the OS launch 
 
 - `terminal_titles` — mirror each session's status onto its terminal tab as a colored circle next to the session name (🔵 working, 🟠 waiting, 🟢 done, 🔴 error, ⚪ idle). See [Features → terminal tab titles](features#terminal-tab-titles).
 
+### Behavior
+
+- `detect_cancelled_turns` — settle a working row back to idle when its turn was cancelled with Esc. Cancelling emits no event; the dashboard recognizes it from the conversation transcript, and on Windows also by noticing the terminal returned to its idle prompt (which catches an instant cancel that left nothing in the transcript). On by default. Turn it off to leave a cancelled row showing as working until the next prompt.
+
 ### Notifications
 
 The `notifications` block controls alerts when a session needs you. Set it to `null` (or omit it) to turn notifications off entirely. Telegram is the only channel today:
@@ -106,7 +110,7 @@ The `notifications` block controls alerts when a session needs you. Set it to `n
 ### Token coloring
 
 - `context_bar_thresholds` — color stops for the token counter, each a `percent` and a hex `color`. The widget interpolates the color from the live count as a percentage of the active model's window — so it ramps green → amber → red as context fills.
-- `context_window_tokens` — per-model context-window size, used as the denominator for that percentage. Add an entry for any model you use.
+- `context_window_tokens` — context-window size per model, used as the denominator for that percentage. Keys match by longest prefix, so the two defaults above cover every Claude model — add an exact model id (e.g. `"claude-sonnet-4-6": 1000000`) to override its family.
 
 ### Prompt classification
 

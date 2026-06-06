@@ -42,12 +42,23 @@ pub fn build_message_text(session: &AgentSession) -> String {
     }
 }
 
+/// Resolve a model's context window: exact key first, then the longest key
+/// that is a prefix of the model name — so "claude-opus" covers every future
+/// opus release without a config update. Mirrored by the frontend `windowFor`
+/// in types.ts; keep the two in sync.
+pub fn window_for(model: &str, window_tokens: &HashMap<String, u64>) -> Option<u64> {
+    if let Some(max) = window_tokens.get(model).copied().filter(|m| *m > 0) {
+        return Some(max);
+    }
+    window_tokens.iter().filter(|(k, v)| model.starts_with(k.as_str()) && **v > 0).max_by_key(|(k, _)| k.len()).map(|(_, v)| *v)
+}
+
 /// A session's context usage as a percent of its model's window, mirroring
 /// the frontend's `tokenColor` math. `None` when the session has no token
 /// count, no model, or no configured window for that model.
 pub fn context_percent(session: &AgentSession, window_tokens: &HashMap<String, u64>) -> Option<f32> {
     let tokens = session.input_tokens?;
-    let max = window_tokens.get(session.model.as_ref()?).copied().filter(|m| *m > 0)?;
+    let max = window_for(session.model.as_ref()?, window_tokens)?;
     Some(tokens as f32 / max as f32 * 100.0)
 }
 
@@ -60,7 +71,7 @@ fn tokens_k(n: u64) -> String {
 pub fn build_context_message(session: &AgentSession, window_tokens: &HashMap<String, u64>) -> Option<String> {
     let pct = context_percent(session, window_tokens)?;
     let tokens = session.input_tokens?;
-    let max = window_tokens.get(session.model.as_ref()?).copied()?;
+    let max = window_for(session.model.as_ref()?, window_tokens)?;
     Some(format!("[{}] context {}% ({}/{})", session.id, pct.round() as u32, tokens_k(tokens), tokens_k(max)))
 }
 
@@ -458,6 +469,27 @@ mod tests {
         // No tokens, unknown model, or unknown window all yield None.
         assert_eq!(context_percent(&session("s", Status::Working, 0), &w), None);
         assert_eq!(context_percent(&ctx_session("s", "other", 100_000), &w), None);
+    }
+
+    #[test]
+    fn window_for_matches_longest_prefix() {
+        let w: HashMap<String, u64> = [
+            ("claude-opus".to_string(), 1_000_000u64),
+            ("claude".to_string(), 200_000),
+            ("claude-sonnet-4-6".to_string(), 500_000),
+        ]
+        .into_iter()
+        .collect();
+        // Family prefixes cover unlisted releases.
+        assert_eq!(window_for("claude-opus-4-8", &w), Some(1_000_000));
+        assert_eq!(window_for("claude-haiku-4-5", &w), Some(200_000));
+        // Exact id beats its family prefix.
+        assert_eq!(window_for("claude-sonnet-4-6", &w), Some(500_000));
+        // No prefix match at all.
+        assert_eq!(window_for("gpt-5", &w), None);
+        // Zero-valued entries are skipped, falling through to shorter prefixes.
+        let z: HashMap<String, u64> = [("claude-opus".to_string(), 0u64), ("claude".to_string(), 200_000)].into_iter().collect();
+        assert_eq!(window_for("claude-opus-4-8", &z), Some(200_000));
     }
 
     #[test]

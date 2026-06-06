@@ -125,9 +125,23 @@ export function formatCompactRemaining(ms: number | null, mode: 'hm' | 'dhm'): s
   return `${pad(h)}:${pad(m)}`
 }
 
+// Resolve a model's context window: exact key first, then the longest key
+// that is a prefix of the model name — so "claude-opus" covers every future
+// opus release without a config update. Mirrored by Rust `window_for` in
+// notifications.rs; keep the two in sync.
+export function windowFor(model: string, map: Record<string, number>): number | null {
+  const exact = map[model]
+  if (exact) return exact
+  let best: string | null = null
+  for (const key of Object.keys(map)) {
+    if (model.startsWith(key) && map[key] > 0 && (best === null || key.length > best.length)) best = key
+  }
+  return best === null ? null : map[best]
+}
+
 export function tokenColor(session: AgentSession, config: Config): string {
   if (session.input_tokens === null || session.model === null) return '#8a8a8e'
-  const max = config.context_window_tokens[session.model]
+  const max = windowFor(session.model, config.context_window_tokens)
   if (!max) return '#8a8a8e'
   const pct = Math.min(100, (session.input_tokens / max) * 100)
   return colorAtPercent(pct, config.context_bar_thresholds)

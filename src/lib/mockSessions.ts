@@ -124,9 +124,8 @@ export const mockConfig: Config = {
   save_window_position: false,
   window_position: null,
   context_window_tokens: {
-    'claude-opus-4-7': 200_000,
-    'claude-sonnet-4-6': 200_000,
-    'claude-haiku-4-5': 200_000,
+    'claude-opus': 200_000,
+    claude: 200_000,
   },
   context_bar_thresholds: [
     { percent: 0, color: '#3a7c4a' },
