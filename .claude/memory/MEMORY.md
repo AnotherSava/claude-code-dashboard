@@ -20,3 +20,4 @@
 - [Sync e2e via fake peer](debug_sync_fake_peer.md) — don't run two app instances (shared %APPDATA%); Python peer on :9080 + temp sync block in config/local.json; PrintWindow flag 3 for occluded-widget screenshots
 - [Terminal-reading e2e](debug_terminal_reading_e2e.md) — bind synthetic Working session to real console pids (GetConsoleProcessList in PowerShell tool), POST direct to /api/event, end turn, bg-watch widget.jsonl
 - [Real-device sync pair](sync_device_pair.md) — CHROME ↔ Olegs-MacBook-Air.local:9078, token in each config/local.json; pingable-but-port-timeout Mac = asleep, not firewalled
+- [Sync pusher silence anomaly](sync_pusher_silence_anomaly.md) — ~5-min total pusher log-silence seen once; grep widget.jsonl for `sync push cycle` gaps on recurrence
