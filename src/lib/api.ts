@@ -126,3 +126,9 @@ export function onUsageLimitsUpdated(
 export function onShowSetupInstructions(handler: () => void): Promise<UnlistenFn> {
   return listen('show_setup_instructions', () => handler())
 }
+
+export function onHistoryLoading(
+  handler: (payload: { id: string; loading: boolean }) => void,
+): Promise<UnlistenFn> {
+  return listen<{ id: string; loading: boolean }>('history_loading', (evt) => handler(evt.payload))
+}

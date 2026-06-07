@@ -2,7 +2,7 @@
   import { onMount } from 'svelte'
   import { invoke } from '@tauri-apps/api/core'
   import { listen, type UnlistenFn } from '@tauri-apps/api/event'
-  import { closeWindow, getConfig, getSessions, onConfigUpdated, onSessionsUpdated, setHistoryFontSize } from './lib/api'
+  import { closeWindow, getConfig, getSessions, onConfigUpdated, onHistoryLoading, onSessionsUpdated, setHistoryFontSize } from './lib/api'
   import type { AgentSession, HistoryFontSize } from './lib/types'
 
   const SIZE_ORDER: HistoryFontSize[] = ['smallest', 'small', 'regular', 'large', 'largest']
@@ -32,12 +32,38 @@
     return { headers: parse(dataLines[0]), rows: dataLines.slice(1).map(parse) }
   }
 
+  // A box-drawing table line: a border (┌─┐ / ├─┤ / └─┘) or a │-delimited row.
+  // Used to detect box tables that arrive *without* a ``` fence (e.g. CLI tool
+  // output pasted or emitted inline) — fenced ones are handled separately.
+  function isBoxLine(line: string): boolean {
+    const t = line.trim()
+    return t !== '' && (t.startsWith('│') || BORDER_RE.test(t))
+  }
+
   function segmentLines(lines: string[]): Segment[] {
     const segments: Segment[] = []
     let inCode = false
     let codeLines: string[] = []
+    let boxLines: string[] = []
+
+    const pushText = (line: string) => {
+      const last = segments[segments.length - 1]
+      if (last && last.kind === 'text') last.lines.push(line)
+      else segments.push({ kind: 'text', lines: [line] })
+    }
+    // Flush an accumulated run of box lines: a real table if it parses, else
+    // fall back to plain text so nothing is lost.
+    const flushBox = () => {
+      if (boxLines.length === 0) return
+      const tbl = parseBoxTable(boxLines)
+      if (tbl) segments.push({ kind: 'table', lines: boxLines, table: tbl })
+      else boxLines.forEach(pushText)
+      boxLines = []
+    }
+
     for (const line of lines) {
       if (line.trimEnd().startsWith('```')) {
+        flushBox()
         if (inCode) {
           const tbl = parseBoxTable(codeLines)
           if (tbl) segments.push({ kind: 'table', lines: codeLines, table: tbl })
@@ -49,14 +75,20 @@
       }
       if (inCode) {
         codeLines.push(line)
-      } else if (line.trim() !== '') {
+        continue
+      }
+      if (isBoxLine(line)) {
+        boxLines.push(line)
+        continue
+      }
+      flushBox()
+      if (line.trim() !== '') {
         // Blank lines are dropped: each line renders as its own block, so
         // paragraphs stay visually separated without empty-line gaps.
-        const last = segments[segments.length - 1]
-        if (last && last.kind === 'text') last.lines.push(line)
-        else segments.push({ kind: 'text', lines: [line] })
+        pushText(line)
       }
     }
+    flushBox()
     return segments
   }
 
@@ -110,11 +142,16 @@
   let session = $state<AgentSession | null>(null)
   let fontSize = $state<HistoryFontSize>('regular')
   let error = $state<string | null>(null)
+  // Session id whose remote-dialog catch-up fetch is in flight (see
+  // sync::fetch_remote_dialog). Tracked independently of sessionId because
+  // the backend may emit loading=true before the target event lands.
+  let loadingId = $state<string | null>(null)
   let entriesEl: HTMLDivElement | undefined = $state()
   let expanded = $state<Set<number>>(new Set())
   let unlistenSessions: (() => void) | undefined
   let unlistenConfig: (() => void) | undefined
   let unlistenTarget: UnlistenFn | undefined
+  let unlistenLoading: UnlistenFn | undefined
 
   async function loadSession(id: string) {
     sessionId = id
@@ -149,12 +186,18 @@
       })
 
       unlistenConfig = await onConfigUpdated((c) => { fontSize = c.history_font_size })
+
+      unlistenLoading = await onHistoryLoading(({ id, loading }) => {
+        if (loading) loadingId = id
+        else if (loadingId === id) loadingId = null
+      })
     })()
 
     return () => {
       unlistenTarget?.()
       unlistenSessions?.()
       unlistenConfig?.()
+      unlistenLoading?.()
     }
   })
 
@@ -178,6 +221,7 @@
   }
 
   let dialog = $derived(deduplicatedDialog())
+  let catchingUp = $derived(loadingId !== null && loadingId === sessionId)
 
   function expandEntry(idx: number) {
     expanded.add(idx)
@@ -213,6 +257,9 @@
 {#if error}
   <div class="msg">{error}</div>
 {:else if session}
+  {#if catchingUp && dialog.length > 0}
+    <div class="loading-banner">Loading full history...</div>
+  {/if}
   <div class="entries" bind:this={entriesEl} onscroll={onEntriesScroll} style:font-size="{SIZE_PX[fontSize]}px">
     <div class="entries-inner">
       {#each dialog as entry, i}
@@ -243,7 +290,7 @@
         {/if}
       {/each}
       {#if dialog.length === 0}
-        <div class="msg">No history</div>
+        <div class="msg">{catchingUp ? 'Loading history...' : 'No history'}</div>
       {/if}
     </div>
   </div>
@@ -367,5 +414,17 @@
     height: 100vh;
     font-size: 12px;
     color: #6b7280;
+  }
+  .loading-banner {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    z-index: 1;
+    padding: 2px 12px;
+    text-align: center;
+    font-size: 11px;
+    color: #6b7280;
+    background: rgba(20, 20, 22, 0.85);
   }
 </style>
