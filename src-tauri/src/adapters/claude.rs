@@ -60,7 +60,7 @@ pub fn dispatch(event: &str, payload: &Value, cfg: &Config) -> AdapterOutput {
         .map(PathBuf::from);
 
     // Assistant text capture is owned by the transcript watcher
-    // (`log_watcher::apply_and_emit` → `AppState::upsert_assistant_text`).
+    // (`log_watcher::apply_and_emit` → `AppState::apply_text_entries`).
     // Stop's hook payload reaches the widget before Claude Code flushes the
     // final assistant turn to disk, so reading the transcript here would
     // record the previous turn's text. The watcher catches the post-Stop

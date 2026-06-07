@@ -12,6 +12,7 @@ mod log_watcher;
 mod logging;
 mod notifications;
 mod prompt_history;
+mod remote_history;
 mod setup;
 mod state;
 mod sync;
@@ -160,6 +161,10 @@ pub fn run() {
             let history_store =
                 prompt_history::PromptHistoryStore::new(app_data.join("prompt_history.json"));
             app.manage(history_store);
+
+            app.manage(remote_history::RemoteHistoryStore::new(
+                app_data.join("remote_history"),
+            ));
 
             // Drop the embedded Python hook next to config.json so users can
             // paste its path into ~/.claude/settings.json without cloning the

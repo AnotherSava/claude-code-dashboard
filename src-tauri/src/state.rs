@@ -112,9 +112,10 @@ fn is_continuation_prompt(label: &str, continuation_prompts: &[String]) -> bool 
         .any(|p| p.trim().eq_ignore_ascii_case(trimmed))
 }
 
-/// Sessions pushed by one peer dashboard. Held in memory only — repopulated
-/// by the peer's next push after a restart, never persisted. Kept separate
-/// from `AppState::sessions` so every local-session consumer (`apply_set`,
+/// Sessions pushed by one peer dashboard. The in-memory set is repopulated
+/// by the peer's next push after a restart; accumulated dialogs are backed
+/// by `remote_history` on disk and re-seeded at ingest. Kept separate from
+/// `AppState::sessions` so every local-session consumer (`apply_set`,
 /// `prompt_history`, `notifications`, `terminal_title`, `log_watcher`) stays
 /// remote-blind by construction instead of by per-call filtering.
 #[derive(Clone, Debug)]

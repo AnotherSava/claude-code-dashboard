@@ -53,15 +53,16 @@ A peer pushes its local sessions. The body is a full snapshot of the sender's se
 {
   "device_name": "my-laptop",
   "listen_port": 9078,
+  "delta_from": 1780789975389,
   "sessions": [
     { "session": { ...AgentSession, "dialog": [] }, "dialog_delta": [ ...DialogEntry ] }
   ]
 }
 ```
 
-Returns `204` on ingest, `400` when `device_name` is empty or equals the receiver's own. The receiver namespaces ids to `{device_name}/{id}`, stamps `origin`, and accumulates deltas; `listen_port` plus the connection's source IP becomes the address for catch-up fetches. A device unheard from for 90 s is dropped.
+The `delta_from` field carries the watermark the deltas were selected against (`0` = the deltas start from the beginning of each dialog; also the default when absent). A push may carry only the oldest bounded chunk of a large backlog — the sender drains the rest in immediately following pushes, each contiguous with the last acknowledged one. Returns `204` on ingest, `400` when `device_name` is empty or equals the receiver's own. The receiver namespaces ids to `{device_name}/{id}`, stamps `origin`, and accumulates deltas — but only contiguous ones: a delta whose `delta_from` lies above everything the receiver holds for that session would leave an invisible gap below it, so it's discarded and the held dialog stays gap-free by construction (the history-window catch-up fetches the full dialog at the only moment it's read). `listen_port` plus the connection's source IP becomes the address for catch-up fetches. A device unheard from for 90 s is dropped.
 
 ### `GET /api/sync/dialog?id=<raw_id>&since=<epoch_ms>`
 
-Catch-up: returns the *local* session's dialog entries with `timestamp > since` (the full dialog for `since=0`). A peer calls this when its history window opens a remote session it holds incomplete dialog for — remote dialogs live in memory only, so a restarted dashboard refills them on demand. `404` for unknown ids.
+Catch-up: returns the *local* session's dialog entries with `timestamp > since` (the full dialog when `since` is omitted or `0`). A peer calls this when its history window opens a remote session, always for the full dialog — what it holds accumulates from push deltas (persisted per device, re-seeded after a restart) and can still have a gap *below* its newest entry, e.g. on a fresh install; the dedup merge absorbs the overlap. `404` for unknown ids.
 

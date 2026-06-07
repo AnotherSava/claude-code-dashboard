@@ -76,6 +76,7 @@ Under the repo root `claude-code-dashboard/`:
     - `commands.rs` — Tauri commands + event emitters
     - `setup.rs` — embedded Python hook + settings.json snippet builder for onboarding
     - `http_server.rs` — axum routes for POST /api/event
+    - `sync.rs` — multi-device session sync: bearer-gated listener + chunked delta push
     - `log_watcher.rs` — per-session transcript tailing + infer_state + assistant text upsert
     - `tray.rs` — TrayIconBuilder, menu handlers, autostart
     - `notifications.rs` — 1s-tick reconciler + Notifier trait
@@ -83,6 +84,7 @@ Under the repo root `claude-code-dashboard/`:
     - `usage_limits.rs` — Anthropic OAuth usage poller + refresh (5h / 7d buckets)
     - `usage_history.rs` — appends each successful usage poll to `usage_history.jsonl`
     - `prompt_history.rs` — per-session dialog persistence to `prompt_history.json`
+    - `remote_history.rs` — per-device remote-session dialog persistence under `remote_history/`
     - `chat_id_registry.rs` — persisted `session_id → chat_id` lock in `session_chat_ids.json`
     - `custom_names.rs` — user-assigned display names persisted to `custom_names.json`
     - `terminal_title.rs` — mirrors session status onto terminal tab titles
@@ -100,7 +102,7 @@ Under the repo root `claude-code-dashboard/`:
 ### Where state lives at runtime
 
 - **In-memory** — `AppState` (sessions) and `ConfigState` (config) via `tauri::State`.
-- **On disk** — `config.json`, `widget.jsonl`, `prompt_history.json`, `session_chat_ids.json`, `custom_names.json`, and `usage_history.jsonl` under `app_data_dir()`:
+- **On disk** — `config.json`, `widget.jsonl`, `prompt_history.json`, `session_chat_ids.json`, `custom_names.json`, `usage_history.jsonl`, and the `remote_history/` directory under `app_data_dir()`:
   - Windows: `%APPDATA%\com.anothersava.claude-code-dashboard\`
   - macOS: `~/Library/Application Support/com.anothersava.claude-code-dashboard/`
 
@@ -118,6 +120,7 @@ Rust tests live inline in `#[cfg(test)]` modules next to the code they cover:
 - `state::tests` — sticky-label machine, working-time accumulator, error transitions.
 - `label_policy::tests` — the `(label, original_prompt)` decision extracted from `apply_set`.
 - `log_watcher::tests` — the transcript parser (`infer_state`, `split_complete`) and the upgrade-only merge policy.
+- `sync::tests` — the receive-side `ingest` (namespacing, dialog seeding, contiguity guard) and the oldest-first chunked `build_push_chunk`.
 - `adapters::claude::tests` — `classify`, `derive_chat_id`, `clean_prompt`, `last_assistant_text`, `is_a_question`, and the outer `dispatch`.
 
 CI runs Rust tests on every push and PR (`build.yml`) and again before bundling on every tag push (`release.yml`), so a broken state machine can't ship a release.
