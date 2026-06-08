@@ -25,11 +25,11 @@ The row's status badge tracks the agent in real time:
 
 Each badge is color-coded, and WAIT and ERROR pulse to draw your eye when a session needs attention.
 
-## Terminal tab titles
+## Color terminal tabs
 
-Each session's status is mirrored onto the terminal tab it runs in, as a colored circle next to the session name — 🔵 working, 🟠 waiting on you, 🟢 done, 🔴 error. A glance at your terminal tabs shows which session needs attention, even without the widget on screen. The title updates the moment the status changes and clears when the session ends. On by default; the tray's **Terminal tab titles** toggle turns it off.
+Each session's status is mirrored onto the terminal tab it runs in, as a colored circle next to the session name — 🔵 working, 🟠 waiting on you, 🟢 done, 🔴 error. A glance at your terminal tabs shows which session needs attention, even without the widget on screen. The title updates the moment the status changes and clears when the session ends. On by default; the tray's **Color terminal tabs** toggle turns it off.
 
-## Your task stays in view
+## Focus on the task
 
 While Claude is blocked on you (WAIT), the row shows the question or approval request, so you know what it needs. Once you answer and Claude resumes (WORK), the row goes back to showing your **original request** rather than the *yes* you typed — so a quick approval or a *continue* never replaces your task on screen. The work timer pauses during WAIT — replaced by a timer counting how long Claude has been blocked on you — and resumes once the agent continues working on the task. A new top-level prompt after DONE / IDLE starts a fresh task.
 
@@ -41,13 +41,13 @@ The dashboard doesn't just relay raw events — it reads the conversation to kee
 
 Several of these rules are tunable — see [Settings](settings) — and the full ruleset is documented under [Classification](development/classification).
 
-## Live token count
+## Context usage
 
 The row shows the session's live context usage, updated as Claude works. The count is colored green → amber → red as it climbs toward the model's context window, so you can tell at a glance whether `/compact` is due.
 
 ## History window
 
-Hover a session row for a quick tooltip listing its task prompts so far — one per line, with the current task marked. For the full conversation, click the text below a session's name to open a History window — a chronological view of every user prompt, assistant reply, and a separator marking the start of a new session. Useful for scrolling back through a long-running conversation without leaving the dashboard. The window opens maximized on the dashboard's screen; with **Save window position** enabled it reopens where you last left it.
+Hover a session row for a quick tooltip listing its task prompts so far — one per line, with the current task marked. For the whole story, click the text below a session's name to open a History window — a chronological recap of your prompts and Claude's reply to each, with a separator marking the start of a new session. Useful for scrolling back through a long-running conversation without leaving the dashboard. The window opens maximized on the dashboard's screen; with **Save window position** enabled it reopens where you last left it.
 
 Ctrl+`+` and Ctrl+`-` cycle through five font sizes; Esc closes the window. The choice persists to `config.json`.
 
@@ -61,7 +61,7 @@ The header shows two bars tracking your Anthropic usage against the rolling 5-ho
 
 ## Multi-device sync
 
-Run the dashboard on more than one computer and each one can show the sessions from all of them. Sessions from another device appear in the same list with a small badge carrying that device's name, with everything a local row has — live status, the task in view, the token count, and the full conversation in the History window. Renaming a remote row changes the name on the device where you renamed it, while alerts for a session fire only on the device it runs on, so you never get the same ping twice. When a device goes offline, its rows disappear from the other dashboards shortly after.
+Run the dashboard on more than one computer and each one can show the sessions from all of them. Sessions from another device appear in the same list with a small badge carrying that device's name, with everything a local row has — live status, the task in view, the context usage, and the History window recap. Renaming a remote row changes the name on the device where you renamed it, while alerts for a session fire only on the device it runs on, so you never get the same ping twice. When a device goes offline, its rows disappear from the other dashboards shortly after.
 
 The devices need to reach each other over the network — the simplest way across different networks is a VPN like [Tailscale](https://tailscale.com/). Sync stays off until you configure it; see [Settings → multi-device sync](settings#multi-device-sync).
 

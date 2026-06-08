@@ -66,7 +66,7 @@ pub fn setup(app: &AppHandle) -> tauri::Result<()> {
     )?;
 
     let terminal_titles = CheckMenuItem::with_id(
-        app, MENU_TERMINAL_TITLES, "Terminal tab titles", true, term_titles_initial, None::<&str>,
+        app, MENU_TERMINAL_TITLES, "Color terminal tabs", true, term_titles_initial, None::<&str>,
     )?;
 
     // Three-way autostart mode derived from two sources: whether the OS

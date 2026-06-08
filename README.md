@@ -2,18 +2,20 @@
 
 *A live monitor for your Claude Code sessions.*
 
-You can track the agent's current state and task, the model's context usage, and a conversation history. Optional notifications ping you when an agent needs your attention. Each session's status is also mirrored as a colored circle in its terminal tab title. Run the dashboard on several computers and each one can show the sessions from all of them.
-
-The header tracks your 5-hour and 7-day Anthropic usage limits.
+A desktop app for Windows and macOS — a compact always-on-top widget that lists your agents with each one's current status and the task it's working on. The header tracks your 5-hour and 7-day Anthropic usage limits.
 
 ![Claude Code Dashboard](docs/screenshots/screenshot.png)
 
+## Features
+
+- **Notifications** — Telegram pings you when an agent is stuck waiting for your input, or when a session's context fills past a threshold.
+- **Color terminal tabs** — each session's status appears as a colored circle in its terminal tab, so you see who needs you even without the widget on screen.
+- **Multi-device sync** — track sessions running on your other devices the same way as local ones.
+- **Focus on the task** — once Claude resumes after a question, the row shows your original request, not the *yes* you typed.
+- **Context usage** — each row shows how full the model's context is, colored green → amber → red as it fills, so you can tell at a glance whether `/compact` is due.
+- **History window** — a recap of the work so far: your prompts and Claude's reply to each, with session boundaries marked.
+
 ---
-
-Download the latest installer for your platform from the [Releases page](https://github.com/AnotherSava/claude-code-dashboard/releases):
-
-- **Windows**: `Claude Code Dashboard_<version>_x64-setup.exe` — Windows 10 version 1803 or newer; WebView2 is fetched during install if missing.
-- **macOS**: `Claude Code Dashboard_<version>_aarch64.dmg` — macOS 11+ on Apple Silicon. On first launch macOS will say *"damaged and can't be opened"* — the app is ad-hoc signed, not notarized. Open **System Settings → Privacy & Security**, scroll to the blocked-app notice, and click **Open Anyway**. Power users can instead run `xattr -cr "/Applications/Claude Code Dashboard.app"` in Terminal once after install.
 
 See full project documentation at **[anothersava.github.io/claude-code-dashboard](https://anothersava.github.io/claude-code-dashboard/)**:
 
