@@ -54,9 +54,9 @@
   let lastSentHeight = -1
   let measureTimer: ReturnType<typeof setTimeout> | null = null
   // Timestamp until which `window` 'resize' events are treated as the echo of
-  // our own applyAutoResize and ignored. Without this, a resize that lands the
-  // window on a different-DPI monitor leaves `innerHeight` != `desired`, so the
-  // overflow re-trigger fires forever and drifts the window across screens.
+  // our own applyAutoResize and ignored — so we don't re-measure on a resize we
+  // just caused. (The DPI-mismatch loop itself is prevented by sizing in
+  // physical px; see measureAndSend.)
   let suppressResizeUntil = 0
 
   function scheduleMeasure() {
@@ -107,15 +107,25 @@
     // dedup pins this at one fire per measurement.
     if (!overflowing && Math.abs(desired - lastSentHeight) < 1) return
     lastSentHeight = desired
-    // Cover the IPC + OS-resize round-trip so the resulting 'resize' event is
-    // recognized as our own echo, not an external change worth re-measuring.
+    // Send PHYSICAL pixels computed from the webview's own devicePixelRatio,
+    // not a logical height for Rust to scale. Near a mixed-DPI monitor boundary
+    // Rust's window.scale_factor() and the webview's devicePixelRatio disagree,
+    // so a logical request lands at the wrong physical size and the viewport
+    // never matches `desired` — permanent false-overflow, scrollbar, and drift.
+    const dpr = window.devicePixelRatio
     suppressResizeUntil = Date.now() + 150
-    applyAutoResize(desired).catch((err) => console.error('apply_auto_resize failed', err))
+    frontendLog('trace', 'auto_resize measure', {
+      desired,
+      dpr,
+      inner_height: window.innerHeight,
+      physical: Math.round(desired * dpr),
+    }).catch(() => {})
+    applyAutoResize(Math.round(desired * dpr)).catch((err) => console.error('apply_auto_resize failed', err))
   }
 
   // Re-measure on external viewport changes (manual drag, monitor move, DPI
-  // shift) — but skip the echo of our own applyAutoResize, which would
-  // otherwise re-arm a feedback loop across a DPI boundary.
+  // shift) — but skip the 'resize' event our own applyAutoResize triggers, so
+  // we don't spend a measure pass reacting to a resize we just caused.
   function onWindowResize() {
     if (Date.now() < suppressResizeUntil) return
     scheduleMeasure()
@@ -222,9 +232,10 @@
     // Re-measure when the viewport itself changes — DPI shifts from a monitor
     // move, manual horizontal drag, anything the OS does to the window outside
     // our own `apply_auto_resize` call. `onWindowResize` skips the echo of our
-    // own resize via the `suppressResizeUntil` cooldown: the measureAndSend
-    // dedup alone can't catch it, because across a DPI boundary the post-resize
-    // `innerHeight` stops matching `desired` and the overflow path re-fires.
+    // own resize via the `suppressResizeUntil` cooldown — cheap hygiene so a
+    // self-induced resize doesn't trigger a redundant measure pass. (Sizing in
+    // physical px is what actually keeps `innerHeight` matching `desired`, so
+    // the overflow path settles instead of looping.)
     window.addEventListener('resize', onWindowResize)
 
     return () => {

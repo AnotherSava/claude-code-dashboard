@@ -1,29 +1,33 @@
-use tauri::{LogicalSize, PhysicalPosition, WebviewWindow};
+use tauri::{PhysicalPosition, PhysicalSize, WebviewWindow};
 
 use crate::config::AutoResize;
 
-/// Resize the window to fit `desired_logical_height` while preserving the
-/// edge anchored by `mode`. Vertical drag is prevented by the WM_NCHITTEST
-/// subclass installed at startup (Windows-only) — when the lock is active,
-/// the OS treats the top, bottom, and corner resize handles as client area
-/// so the cursor never even shows the resize affordance there.
+/// Resize the window to a physical inner height of `desired_height_phys` while
+/// preserving the edge anchored by `mode`. The height arrives already in
+/// physical pixels (the frontend multiplies its CSS-pixel measurement by the
+/// webview's own `devicePixelRatio`) so we never route it through
+/// `window.scale_factor()`: near a mixed-DPI monitor boundary Rust's
+/// scale_factor and the webview's devicePixelRatio disagree, and applying a
+/// logical height under Rust's scale lands the viewport at the wrong size —
+/// permanent false-overflow, a content scrollbar, and a re-triggering measure
+/// loop that drifts the window across monitors. Vertical drag is prevented by
+/// the WM_NCHITTEST subclass installed at startup (Windows-only).
 pub fn apply(
     window: &WebviewWindow,
     mode: AutoResize,
-    desired_logical_height: f64,
+    desired_height_phys: f64,
 ) -> tauri::Result<()> {
     if matches!(mode, AutoResize::None) {
         nchittest::set_active(false);
         return Ok(());
     }
 
-    let scale = window.scale_factor()?;
     let pos = window.outer_position()?;
     // Use inner_size: set_size writes to the inner (client) area; reading
     // outer would give an inflated value on frameless Windows windows
     // because of the invisible resize border.
     let size = window.inner_size()?;
-    let new_height_phys = (desired_logical_height * scale).round() as i32;
+    let new_height_phys = desired_height_phys.round() as i32;
     let current_height_phys = size.height as i32;
 
     let raw_y = match mode {
@@ -46,11 +50,7 @@ pub fn apply(
     let width_phys = size.width as i32;
     let (new_x, new_y) = bounds.clamp(pos.x, raw_y, width_phys, new_height_phys);
 
-    let current_width_logical = size.width as f64 / scale;
-    window.set_size(LogicalSize::new(
-        current_width_logical,
-        desired_logical_height,
-    ))?;
+    window.set_size(PhysicalSize::new(size.width, new_height_phys.max(1) as u32))?;
     // Only reposition when the target actually differs from where the window
     // already sits. `set_size` keeps the top-left fixed, so an in-bounds
     // Down-mode resize (and any resize the clamp doesn't touch) needs no move.
@@ -62,10 +62,15 @@ pub fn apply(
         window.set_position(PhysicalPosition::new(new_x, new_y))?;
     }
     nchittest::set_active(true);
+    // `scale` is logged, not used for sizing — it's the value that disagrees
+    // with the webview's devicePixelRatio across a DPI boundary, so capturing
+    // both sides confirms the mismatch from the trace.
+    let scale = window.scale_factor().unwrap_or(0.0);
     tracing::debug!(
         ?mode,
-        desired_logical_height,
+        desired_height_phys,
         new_height_phys,
+        scale,
         new_x,
         new_y,
         "auto_resize::apply"

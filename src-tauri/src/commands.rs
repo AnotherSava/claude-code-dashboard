@@ -49,7 +49,7 @@ pub fn refresh_usage_limits(state: State<UsageLimitsState>) -> bool {
 }
 
 #[tauri::command]
-pub fn apply_auto_resize(height: f64, app: AppHandle) {
+pub fn apply_auto_resize(physical_height: f64, app: AppHandle) {
     let Some(window) = app.get_webview_window("main") else {
         return;
     };
@@ -57,8 +57,8 @@ pub fn apply_auto_resize(height: f64, app: AppHandle) {
         .try_state::<ConfigState>()
         .map(|s| s.snapshot().auto_resize)
         .unwrap_or_default();
-    if let Err(e) = crate::auto_resize::apply(&window, mode, height) {
-        tracing::warn!(?e, height, "apply_auto_resize failed");
+    if let Err(e) = crate::auto_resize::apply(&window, mode, physical_height) {
+        tracing::warn!(?e, physical_height, "apply_auto_resize failed");
     }
 }
 

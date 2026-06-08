@@ -18,8 +18,8 @@ export function refreshUsageLimits(): Promise<boolean> {
   return invoke<boolean>('refresh_usage_limits')
 }
 
-export function applyAutoResize(height: number): Promise<void> {
-  return invoke('apply_auto_resize', { height })
+export function applyAutoResize(physicalHeight: number): Promise<void> {
+  return invoke('apply_auto_resize', { physicalHeight })
 }
 
 export function frontendLog(
