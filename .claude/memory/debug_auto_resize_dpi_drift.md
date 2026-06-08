@@ -1,16 +1,17 @@
 ---
 name: debug_auto_resize_dpi_drift
-description: Auto-resize window drift on mixed-DPI multi-monitor; diagnose via widget.jsonl scale-flip + xy march
+description: Auto-resize drift on mixed-DPI multi-monitor; diagnose via widget.jsonl dpr-vs-scale mismatch + xy march
 metadata:
   type: project
 ---
 
-The dev machine runs **mixed-DPI multi-monitor** (2560×1440 @1.0× primary + a ~1.5× laptop panel). Window-positioning bugs in `auto_resize.rs` only reproduce when the widget sits on or crosses onto the second monitor — a single-monitor session can't trigger them.
+The dev machine runs **mixed-DPI multi-monitor**: 2560×1440 @1.0× primary with a ~1.5× laptop panel positioned **below** it (its y-coords exceed 1440). Auto-resize bugs only reproduce when the widget grows into the second monitor — a single-monitor session can't trigger them. **Down** mode grows the window downward *into* the lower 1.5× panel (Up grows away), which is why Down was affected and Up wasn't.
 
-**Diagnostic signature of the resize feedback loop** (grep `widget.jsonl` for `auto_resize::apply`):
-- `new_height_phys` differs for the *same* `desired_logical_height` (e.g. 145 → 218) → the window read a different `scale_factor`, i.e. it crossed a DPI boundary mid-loop.
-- `new_x`/`new_y` march monotonically across many calls within seconds, converging geometrically toward a screen corner → runaway resize↔reposition loop.
+**Diagnostic signature** (grep `widget.jsonl`):
+- `auto_resize::apply` (Rust) logs `scale` (= `window.scale_factor()`), `new_height_phys`, `new_x`/`new_y`.
+- `auto_resize measure` (frontend) logs `desired` (CSS px), `dpr` (`devicePixelRatio`), `inner_height`, `physical` (sent).
+- **The tell:** `dpr` ≠ `scale` near the boundary, and `inner_height` stays short of `desired` → permanent false-overflow. The old failure also showed `new_x`/`new_y` marching monotonically across rapid calls, converging toward a screen corner.
 
-**Root cause** (fixed 2026-06-08): across a DPI boundary the frontend overflow re-trigger (`desired > innerHeight+1`) never clears because `innerHeight` stops matching the `desired` measured on the other monitor, and `apply()` called `set_position` every time — on a frameless window the `outer_position` round-trip is inconsistent across DPI, nudging the window each call. Fix: suppress the self-resize echo (`App.svelte` `suppressResizeUntil`) + skip `set_position` when target == current pos (`auto_resize.rs`).
+**Root cause + fix** (fixed 2026-06-08): Rust's `window.scale_factor()` and the webview's `devicePixelRatio` disagree near a mixed-DPI boundary, so applying a *logical* height under Rust's scale lands the viewport at the wrong size. Fix: frontend sends **physical** px (`desired * devicePixelRatio`); `auto_resize::apply` sets `PhysicalSize` directly, never using `scale_factor` for sizing. Plus: skip `set_position` when target == current pos, and a `suppressResizeUntil` cooldown ignores our own resize echo. Full framework writeup in the `tauri-mixed-dpi-window-sizing` learning.
 
 Related: [[debug_sync_fake_peer]] for the widget.jsonl-grep debugging style.
