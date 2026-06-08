@@ -21,3 +21,4 @@
 - [Terminal-reading e2e](debug_terminal_reading_e2e.md) — bind synthetic Working session to real console pids (GetConsoleProcessList in PowerShell tool), POST direct to /api/event, end turn, bg-watch widget.jsonl
 - [Real-device sync pair](sync_device_pair.md) — CHROME ↔ Olegs-MacBook-Air.local:9078, token in each config/local.json; pingable-but-port-timeout Mac = asleep, not firewalled
 - [Sync pusher silence anomaly](sync_pusher_silence_anomaly.md) — ~5-min total pusher log-silence seen once; grep widget.jsonl for `sync push cycle` gaps on recurrence
+- [Auto-resize DPI drift](debug_auto_resize_dpi_drift.md) — mixed-DPI multi-monitor needed to repro; widget.jsonl scale-flip + xy march = resize feedback loop
