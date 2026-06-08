@@ -51,7 +51,16 @@ pub fn apply(
         current_width_logical,
         desired_logical_height,
     ))?;
-    window.set_position(PhysicalPosition::new(new_x, new_y))?;
+    // Only reposition when the target actually differs from where the window
+    // already sits. `set_size` keeps the top-left fixed, so an in-bounds
+    // Down-mode resize (and any resize the clamp doesn't touch) needs no move.
+    // Calling set_position unconditionally re-introduced a per-call drift: on a
+    // frameless window the outer_position round-trip is inconsistent across a
+    // DPI boundary, so each call nudged the window and a re-triggering measure
+    // loop marched it across monitors.
+    if new_x != pos.x || new_y != pos.y {
+        window.set_position(PhysicalPosition::new(new_x, new_y))?;
+    }
     nchittest::set_active(true);
     tracing::debug!(
         ?mode,

@@ -53,6 +53,11 @@
   let widgetEl: HTMLDivElement | undefined = $state()
   let lastSentHeight = -1
   let measureTimer: ReturnType<typeof setTimeout> | null = null
+  // Timestamp until which `window` 'resize' events are treated as the echo of
+  // our own applyAutoResize and ignored. Without this, a resize that lands the
+  // window on a different-DPI monitor leaves `innerHeight` != `desired`, so the
+  // overflow re-trigger fires forever and drifts the window across screens.
+  let suppressResizeUntil = 0
 
   function scheduleMeasure() {
     if (measureTimer !== null) clearTimeout(measureTimer)
@@ -102,7 +107,18 @@
     // dedup pins this at one fire per measurement.
     if (!overflowing && Math.abs(desired - lastSentHeight) < 1) return
     lastSentHeight = desired
+    // Cover the IPC + OS-resize round-trip so the resulting 'resize' event is
+    // recognized as our own echo, not an external change worth re-measuring.
+    suppressResizeUntil = Date.now() + 150
     applyAutoResize(desired).catch((err) => console.error('apply_auto_resize failed', err))
+  }
+
+  // Re-measure on external viewport changes (manual drag, monitor move, DPI
+  // shift) — but skip the echo of our own applyAutoResize, which would
+  // otherwise re-arm a feedback loop across a DPI boundary.
+  function onWindowResize() {
+    if (Date.now() < suppressResizeUntil) return
+    scheduleMeasure()
   }
 
   // Re-measure whenever something that affects content height could have
@@ -205,15 +221,16 @@
 
     // Re-measure when the viewport itself changes — DPI shifts from a monitor
     // move, manual horizontal drag, anything the OS does to the window outside
-    // our own `apply_auto_resize` call. The dedup inside measureAndSend
-    // short-circuits when the viewport already matches `desired`, so our own
-    // resize calls don't recurse.
-    window.addEventListener('resize', scheduleMeasure)
+    // our own `apply_auto_resize` call. `onWindowResize` skips the echo of our
+    // own resize via the `suppressResizeUntil` cooldown: the measureAndSend
+    // dedup alone can't catch it, because across a DPI boundary the post-resize
+    // `innerHeight` stops matching `desired` and the overflow path re-fires.
+    window.addEventListener('resize', onWindowResize)
 
     return () => {
       clearInterval(tickId)
       document.removeEventListener('visibilitychange', onVisibility)
-      window.removeEventListener('resize', scheduleMeasure)
+      window.removeEventListener('resize', onWindowResize)
       unlistenSessions?.()
       unlistenConfig?.()
       unlistenUsage?.()
