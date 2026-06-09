@@ -23,3 +23,4 @@
 - [Sync pusher silence anomaly](sync_pusher_silence_anomaly.md) — ~5-min total pusher log-silence seen once; grep widget.jsonl for `sync push cycle` gaps on recurrence
 - [Auto-resize DPI drift](debug_auto_resize_dpi_drift.md) — mixed-DPI multi-monitor needed to repro; widget.jsonl dpr≠scale + xy march = resize loop; fix = send physical px
 - [Terminal promote-to-Working unsafe](terminal_promote_to_working_unsafe.md) — reverted; esc-to-interrupt strands rows; use UserPromptExpansion hook; idle_probe stays demote-only
+- [Diagnose state via widget.jsonl apply_set](debug_state_transitions_via_widget_jsonl.md) — grep apply_set lines (prior_status/task_boundary/continuation_suppressed) for the chat_id; read the decision log, don't theorize
