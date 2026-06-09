@@ -2,9 +2,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Status {
+    #[default]
     Idle,
     Working,
     Awaiting,
@@ -62,6 +63,15 @@ pub struct PersistedSession {
 pub struct AgentSession {
     pub id: String,
     pub status: Status,
+    /// The status the row held immediately before its current `Working` turn
+    /// began — captured by `apply_set` on every non-Working → Working
+    /// transition. A turn cancelled with Esc (no `Stop` hook) reverts here
+    /// rather than collapsing to `Idle`, so an aborted reply to a pending
+    /// question leaves the row in the `Awaiting` state the question put it in
+    /// (the next real answer is then an approval-cycle reply, not a new task).
+    /// Internal bookkeeping — never serialized to the frontend / sync / disk.
+    #[serde(skip)]
+    pub status_before_working: Status,
     pub label: String,
     pub original_prompt: Option<String>,
     #[serde(default)]
@@ -195,6 +205,14 @@ impl AppState {
                 existing.working_accumulated_ms = existing.working_accumulated_ms.saturating_add(delta);
             }
 
+            // Remember where to revert if this turn is cancelled with Esc. Only
+            // capture on a real entry into Working (not Working → Working), so
+            // the snapshot is always a genuine pre-prompt status — typically the
+            // `Awaiting` of a question the user is mid-answer to.
+            if input.status == Status::Working && prior != Status::Working {
+                existing.status_before_working = prior;
+            }
+
             let (new_label, new_original_prompt) =
                 crate::label_policy::select(Some(&*existing), &input, task_boundary);
 
@@ -318,6 +336,7 @@ impl AppState {
             sessions.push(AgentSession {
                 id: input.id,
                 status: input.status,
+                status_before_working: Status::Idle,
                 label,
                 original_prompt,
                 task_started_at,
@@ -340,15 +359,21 @@ impl AppState {
         sessions.retain(|s| s.id != id);
     }
 
-    /// Demote a `Working` session to `Idle`. Called by the transcript watcher
-    /// when it sees the "[Request interrupted by user]" marker — an Esc-cancel
-    /// emits no lifecycle hook, so without this the row would stay `Working`
-    /// forever (and the watcher's own `infer_state` would otherwise re-promote
-    /// the marker as user input). No-op unless the row is still `Working`, so a
+    /// Revert a `Working` session whose turn was cancelled with Esc back to the
+    /// status it held *before* the turn started (`status_before_working`),
+    /// rather than blanket-`Idle`. Called by the transcript watcher on the
+    /// "[Request interrupted by user]" marker and by `idle_probe` on the
+    /// instant-cancel — an Esc emits no lifecycle hook, so without this the row
+    /// would stay `Working` forever (and the watcher's own `infer_state` would
+    /// otherwise re-promote the marker as user input). The cancelled turn
+    /// produced nothing, so the row should look as if the prompt never landed:
+    /// a reply aborted mid-question reverts to `Awaiting`, so the user's real
+    /// answer is an approval-cycle reply (no task boundary) instead of a fresh
+    /// task that clobbers `original_prompt`. No-op unless still `Working`, so a
     /// turn that already moved on is left alone. Mirrors `apply_set`'s
-    /// Working→non-Working accounting (banks the elapsed run into
-    /// `working_accumulated_ms`, resets the timer). Returns true if it acted.
-    pub fn demote_working_to_idle(&self, id: &str, now_ms: i64) -> bool {
+    /// Working→non-Working accounting (banks the elapsed run, resets the timer).
+    /// Returns true if it acted.
+    pub fn revert_cancelled_turn(&self, id: &str, now_ms: i64) -> bool {
         let mut sessions = self.sessions.lock().unwrap();
         let Some(s) = sessions.iter_mut().find(|s| s.id == id) else {
             return false;
@@ -358,7 +383,7 @@ impl AppState {
         }
         let delta = (now_ms - s.state_entered_at).max(0) as u64;
         s.working_accumulated_ms = s.working_accumulated_ms.saturating_add(delta);
-        s.status = Status::Idle;
+        s.status = s.status_before_working;
         s.state_entered_at = now_ms;
         s.updated = now_ms;
         true
@@ -518,11 +543,13 @@ mod tests {
     const NO_CONTINUATIONS: &[String] = &[];
 
     #[test]
-    fn demote_banks_elapsed_and_sets_idle() {
+    fn revert_cancelled_turn_banks_elapsed_and_falls_back_to_idle() {
+        // A fresh session's first turn has no prior status, so a cancel reverts
+        // to Idle (status_before_working defaults to Idle).
         let state = AppState::new();
         state.apply_set(set("a", Status::Working, "fix foo.py"), 0, NO_CONTINUATIONS, None);
 
-        assert!(state.demote_working_to_idle("a", 20_000));
+        assert!(state.revert_cancelled_turn("a", 20_000));
         let s = get(&state, "a");
         assert_eq!(s.status, Status::Idle);
         assert_eq!(s.working_accumulated_ms, 20_000, "elapsed run banked");
@@ -531,10 +558,34 @@ mod tests {
     }
 
     #[test]
-    fn demote_is_noop_when_not_working() {
+    fn revert_cancelled_turn_restores_awaiting_after_aborted_reply() {
+        // The reported bug: agent asks a question (Awaiting), the user submits a
+        // reply (Working) then cancels it with Esc. The row must revert to
+        // Awaiting — not Idle — so the user's *real* answer is an approval-cycle
+        // reply (Awaiting → Working, no boundary) and original_prompt survives.
+        let state = AppState::new();
+        state.apply_set(set("a", Status::Working, "fix the parser"), 0, NO_CONTINUATIONS, None);
+        state.apply_set(set("a", Status::Awaiting, "Push?"), 10_000, NO_CONTINUATIONS, None);
+        // User submits a typo'd reply, which enters Working from Awaiting...
+        state.apply_set(set("a", Status::Working, "ny"), 12_000, NO_CONTINUATIONS, None);
+        // ...then cancels it with Esc (no Stop hook) — idle_probe / the watcher
+        // calls revert_cancelled_turn.
+        assert!(state.revert_cancelled_turn("a", 13_000));
+        let reverted = get(&state, "a");
+        assert_eq!(reverted.status, Status::Awaiting, "cancelled reply reverts to the pending question");
+
+        // The real answer now lands from Awaiting — an approval cycle, not a task
+        // boundary — so the task is preserved even without a continuation match.
+        state.apply_set(set("a", Status::Working, "y"), 14_000, NO_CONTINUATIONS, None);
+        let answered = get(&state, "a");
+        assert_eq!(answered.original_prompt.as_deref(), Some("fix the parser"), "answer must not clobber the task");
+    }
+
+    #[test]
+    fn revert_cancelled_turn_is_noop_when_not_working() {
         let state = AppState::new();
         state.apply_set(set("a", Status::Awaiting, "run bash?"), 0, NO_CONTINUATIONS, None);
-        assert!(!state.demote_working_to_idle("a", 20_000));
+        assert!(!state.revert_cancelled_turn("a", 20_000));
         assert_eq!(get(&state, "a").status, Status::Awaiting);
     }
 
@@ -749,6 +800,26 @@ mod tests {
             "continuation prompt must NOT reset the working timer"
         );
         assert_eq!(resumed.label, "go");
+    }
+
+    #[test]
+    fn default_affirmations_do_not_clobber_task_after_done() {
+        // End-to-end guard against the recurring "row shows 'y' as the task"
+        // bug: an approval reply can arrive when the row is Done or Idle rather
+        // than Awaiting — e.g. the user cancelled a mis-typed reply with Esc
+        // (idle_probe correctly demotes to Idle), then typed the real "y". From
+        // Done/Idle that "y" would be a task boundary; with the default
+        // continuation list it must preserve original_prompt instead.
+        let cont = crate::config::Config::default().continuation_prompts;
+        for reply in ["y", "yes", "yeah", "yep", "yup", "ok", "okay", "sure", "Yes", " y "] {
+            let state = AppState::new();
+            state.apply_set(set("a", Status::Working, "fix the parser"), 0, &cont, None);
+            state.apply_set(set_no_label("a", Status::Done), 10_000, &cont, None);
+            state.apply_set(set("a", Status::Working, reply), 20_000, &cont, None);
+            let s = get(&state, "a");
+            assert_eq!(s.original_prompt.as_deref(), Some("fix the parser"), "reply {reply:?} clobbered the task");
+            assert_eq!(s.working_accumulated_ms, 10_000, "reply {reply:?} reset the timer");
+        }
     }
 
     #[test]
@@ -1007,6 +1078,7 @@ mod tests {
         state.sessions.lock().unwrap().push(AgentSession {
             id: "a".into(),
             status: Status::Done,
+            status_before_working: Status::Idle,
             label: String::new(),
             original_prompt: None,
             task_started_at: 0,
@@ -1215,6 +1287,7 @@ mod tests {
         AgentSession {
             id: id.to_string(),
             status: Status::Working,
+            status_before_working: Status::Idle,
             label: String::new(),
             original_prompt: None,
             task_started_at: 0,

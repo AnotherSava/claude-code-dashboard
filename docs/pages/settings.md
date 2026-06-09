@@ -63,7 +63,7 @@ Every field is optional — omit one and the built-in default applies. A complet
     "claude": 200000
   },
   "benign_closers": ["What's next?", "Anything else?"],
-  "continuation_prompts": ["go", "continue", "proceed"],
+  "continuation_prompts": ["go", "continue", "proceed", "yes", "y", "yeah", "yep", "yup", "ok", "okay", "sure", "go ahead", "do it"],
   "limit_bar_segments": 16,
   "usage_limits_poll_interval_seconds": 600,
   "sync": {
@@ -97,7 +97,7 @@ Whether autostart is enabled isn't a config field — it lives in the OS launch 
 
 ### Behavior
 
-- `detect_cancelled_turns` — settle a working row back to idle when its turn was cancelled with Esc. Cancelling emits no event; the dashboard recognizes it from the conversation transcript, and on Windows also by noticing the terminal returned to its idle prompt (which catches an instant cancel that left nothing in the transcript). On by default. Turn it off to leave a cancelled row showing as working until the next prompt.
+- `detect_cancelled_turns` — settle a working row back out of the working state when its turn was cancelled with Esc, returning it to wherever it was before that turn — a question it was waiting on, otherwise idle — so a cancelled reply doesn't get mistaken for a new task. Cancelling emits no event; the dashboard recognizes it from the conversation transcript, and on Windows also by noticing the terminal returned to its idle prompt (which catches an instant cancel that left nothing in the transcript). On by default. Turn it off to leave a cancelled row showing as working until the next prompt.
 
 ### Notifications
 
@@ -115,7 +115,7 @@ The `notifications` block controls alerts when a session needs you. Set it to `n
 ### Prompt classification
 
 - `benign_closers` — polite trailing questions that end in `?` but shouldn't flip a finished row to WAIT. Matched case-insensitively as a suffix.
-- `continuation_prompts` — short replies that mean *keep going* rather than a new task, so the original prompt and work timer carry over instead of resetting. Matched exactly, case-insensitively, after trimming.
+- `continuation_prompts` — short replies that mean *keep going* or *yes, go ahead* rather than a new task (the defaults cover `go` / `continue` / `proceed` plus approvals like `yes` / `y` / `ok` / `sure`), so the original prompt and work timer carry over instead of resetting. Matched exactly, case-insensitively, after trimming.
 
 For the full classification logic see [Classification](development/classification) and [Sticky labels](development/sticky-labels) in the Development section.
 

@@ -121,9 +121,9 @@ pub fn spawn(app: AppHandle) {
                         let streak = idle_streak.entry(s.id.clone()).or_insert(0);
                         *streak += 1;
                         if *streak >= IDLE_STREAK_TO_DEMOTE
-                            && app_state.demote_working_to_idle(&s.id, now_ms())
+                            && app_state.revert_cancelled_turn(&s.id, now_ms())
                         {
-                            tracing::debug!(id = %s.id, "idle prompt with no in-flight turn; demoted to idle");
+                            tracing::debug!(id = %s.id, "idle prompt with no in-flight turn; reverted to pre-prompt state");
                             idle_streak.remove(&s.id);
                             emit_sessions_updated(&app);
                         }

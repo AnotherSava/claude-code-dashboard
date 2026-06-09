@@ -81,6 +81,7 @@ mod tests {
         AgentSession {
             id: "a".into(),
             status: Status::Idle,
+            status_before_working: Status::Idle,
             label: label.into(),
             original_prompt: original_prompt.map(str::to_string),
             task_started_at: 0,

@@ -449,16 +449,16 @@ fn apply_and_emit(app: &AppHandle, chat_id: &str, update: &InferredState, text_e
         }
     };
     // The turn was cancelled with Esc (no lifecycle hook). Settle the row back
-    // to Idle — unless the user opted out. Gated here rather than in
-    // `infer_state` so detection stays pure and testable.
+    // to its pre-prompt status — unless the user opted out. Gated here rather
+    // than in `infer_state` so detection stays pure and testable.
     let demoted = update.ended
         && app
             .try_state::<ConfigState>()
             .map(|c| c.snapshot().detect_cancelled_turns)
             .unwrap_or(true)
-        && app_state.demote_working_to_idle(chat_id, now);
+        && app_state.revert_cancelled_turn(chat_id, now);
     if demoted {
-        tracing::debug!(chat_id, "turn cancelled (interrupt marker); demoted to idle");
+        tracing::debug!(chat_id, "turn cancelled (interrupt marker); reverted to pre-prompt state");
     }
     let dialog_changed = if !text_entries.is_empty() {
         app_state.apply_text_entries(chat_id, &text_entries, now)
@@ -853,6 +853,7 @@ mod tests {
         AgentSession {
             id: "s".into(),
             status,
+            status_before_working: Status::Idle,
             label: String::new(),
             original_prompt: None,
             task_started_at: 0,

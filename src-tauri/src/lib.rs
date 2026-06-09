@@ -447,6 +447,7 @@ fn seed_dev_sessions(app: &tauri::AppHandle) {
             sessions: vec![AgentSession {
                 id: "macbook/bga-assistant".into(),
                 status: Status::Done,
+                status_before_working: Status::Idle,
                 label: "Refactor the move validator".into(),
                 original_prompt: Some("Refactor the move validator".into()),
                 task_started_at: now - 10 * min,

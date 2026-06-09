@@ -19,7 +19,7 @@ The row's status badge tracks the agent in real time:
 
 - **WORK** — Claude is working on your task. Timer accumulates total time spent working on the same prompt across approval cycles.
 - **WAIT** — Claude is blocked on you. The row shows the agent's current question or permission request.
-- **IDLE** — the session is alive but not actively working. A task you cancel with Esc lands here too: cancelling sends no event of its own, but the dashboard notices the turn ended and settles the row back to idle on its own (on by default, see [Settings](settings#behavior)).
+- **IDLE** — the session is alive but not actively working. A task you cancel with Esc usually settles here too: cancelling sends no event of its own, but the dashboard notices the turn ended and settles the row back on its own — to idle, or back to a question it was waiting on (on by default, see [Settings](settings#behavior)).
 - **DONE** — Claude finished the task and isn't waiting on you. Timer shows time since it finished.
 - **ERROR** — the hook reported an error; the row shows the error text.
 

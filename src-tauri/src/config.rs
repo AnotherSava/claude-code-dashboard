@@ -228,7 +228,7 @@ impl Default for Config {
             history_window_position: None,
             history_window_maximized: false,
             start_minimized: false,
-            continuation_prompts: vec!["go".into(), "continue".into(), "proceed".into()],
+            continuation_prompts: ["go", "continue", "proceed", "yes", "y", "yeah", "yep", "yup", "ok", "okay", "sure", "go ahead", "do it"].iter().map(|s| s.to_string()).collect(),
             terminal_titles: true,
             detect_cancelled_turns: true,
             sync: SyncConfig::default(),
@@ -423,6 +423,21 @@ mod tests {
         assert!(cfg.continuation_prompts.iter().any(|s| s == "go"));
         assert!(cfg.continuation_prompts.iter().any(|s| s == "continue"));
         assert!(cfg.continuation_prompts.iter().any(|s| s == "proceed"));
+    }
+
+    #[test]
+    fn continuation_prompts_default_includes_short_affirmations() {
+        // Approval replies like "y"/"yes" arrive when the agent's closing
+        // question wasn't detected (row sits at Done, not Awaiting); without
+        // these in the default list they'd clobber original_prompt and the row
+        // would show "y" as the task. Regression guard for that recurring bug.
+        let cfg = Config::default();
+        for phrase in ["y", "yes", "yeah", "yep", "yup", "ok", "okay", "sure"] {
+            assert!(
+                cfg.continuation_prompts.iter().any(|s| s == phrase),
+                "default continuation_prompts must include the affirmation {phrase:?}"
+            );
+        }
     }
 
     #[test]

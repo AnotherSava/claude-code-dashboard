@@ -297,6 +297,7 @@ mod tests {
         AgentSession {
             id: id.to_string(),
             status,
+            status_before_working: Status::Idle,
             label: String::new(),
             original_prompt: None,
             task_started_at: 0,
