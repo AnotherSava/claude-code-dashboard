@@ -266,11 +266,22 @@ impl AppState {
             );
 
             let r = restored.unwrap_or_default();
-            let original_prompt = event_prompt.or(r.original_prompt);
-            let task_started_at = if original_prompt.is_some() && r.task_started_at == 0 {
+            // A restored dialog ending in a separator means the conversation was
+            // cleared or compacted — the boundary marker is the last thing on the
+            // row, so no task is in flight. Don't resurrect the pre-boundary
+            // task's prompt/timer onto the fresh row (that's what made a `/clear`
+            // recreate the row as Idle still showing the previous task). Keep the
+            // dialog for history continuity but start the row's active-task state
+            // clean. An incoming `event_prompt` (a Working prompt arriving with
+            // this same event) still takes precedence and starts a real task.
+            let cleared = r.dialog.last().is_some_and(|e| e.role == DialogRole::Separator);
+            let restored_prompt = if cleared { None } else { r.original_prompt };
+            let restored_task_started_at = if cleared { 0 } else { r.task_started_at };
+            let original_prompt = event_prompt.or(restored_prompt);
+            let task_started_at = if original_prompt.is_some() && restored_task_started_at == 0 {
                 now_ms
             } else {
-                r.task_started_at
+                restored_task_started_at
             };
             let mut dialog = r.dialog;
 
@@ -926,6 +937,51 @@ mod tests {
         assert_eq!(s.dialog.len(), 2);
         assert_eq!(s.original_prompt.as_deref(), Some("old task"));
         assert_eq!(s.task_started_at, 100);
+    }
+
+    #[test]
+    fn cleared_session_restore_keeps_dialog_but_drops_task() {
+        // After `/clear`: SessionEnd marks a boundary separator + persists, then
+        // SessionStart recreates the row from prompt_history with an Idle, no-label
+        // Set. The restored dialog ends with the separator, so the row must come
+        // back clean — no resurrected original_prompt — while keeping the history.
+        let state = AppState::new();
+        let restored = PersistedSession {
+            dialog: vec![
+                DialogEntry { role: DialogRole::User, text: "old task".into(), timestamp: 100, status: Status::Working, task_start: true },
+                DialogEntry { role: DialogRole::Assistant, text: "Done.".into(), timestamp: 200, status: Status::Done, task_start: false },
+                DialogEntry { role: DialogRole::Separator, text: String::new(), timestamp: 300, status: Status::Idle, task_start: false },
+            ],
+            original_prompt: Some("old task".into()),
+            task_started_at: 100,
+            last_input_tokens: None,
+        };
+        state.apply_set(set_no_label("a", Status::Idle), 1_000, NO_CONTINUATIONS, Some(restored));
+        let s = get(&state, "a");
+        assert_eq!(s.status, Status::Idle);
+        assert_eq!(s.original_prompt, None, "cleared row must not show the previous task");
+        assert_eq!(s.task_started_at, 0, "cleared row starts with no task timer");
+        assert_eq!(s.dialog.len(), 3, "dialog history is preserved for the history window");
+    }
+
+    #[test]
+    fn cleared_session_restore_still_honors_incoming_prompt() {
+        // If a Working prompt arrives on the same event that recreates a cleared
+        // session, that's a genuine new task — it must win over the cleared state.
+        let state = AppState::new();
+        let restored = PersistedSession {
+            dialog: vec![
+                DialogEntry { role: DialogRole::User, text: "old task".into(), timestamp: 100, status: Status::Working, task_start: true },
+                DialogEntry { role: DialogRole::Separator, text: String::new(), timestamp: 300, status: Status::Idle, task_start: false },
+            ],
+            original_prompt: Some("old task".into()),
+            task_started_at: 100,
+            last_input_tokens: None,
+        };
+        state.apply_set(set("a", Status::Working, "new task"), 2_000, NO_CONTINUATIONS, Some(restored));
+        let s = get(&state, "a");
+        assert_eq!(s.original_prompt.as_deref(), Some("new task"));
+        assert_eq!(s.task_started_at, 2_000);
     }
 
     #[test]

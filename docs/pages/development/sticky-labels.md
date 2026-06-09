@@ -46,6 +46,10 @@ The third row is the **task boundary**: a transition into `working` from any sta
 
 If the new event has `label: None` on a task boundary, the prior `original_prompt` survives unchanged.
 
+### Restore from disk
+
+When a session is re-created from `prompt_history.json` — after an app restart, or when `/clear` ends and immediately re-starts the session under the same cwd-derived id — `apply_set` seeds `original_prompt` from the persisted value, so an in-flight task survives a restart. The exception: if the restored dialog ends in a **separator** (the boundary marker `/clear` and `/compact` leave behind), the conversation has been cleared, so the row starts clean — `original_prompt` and `task_started_at` are dropped while the dialog history is kept for the History window. A `working` prompt arriving on the same event still takes precedence and starts a real task.
+
 ### Continuation prompts
 
 Some replies look like new prompts but are really *"keep going with what you were doing"* — `"go"`, `"continue"`, `"proceed"`, etc. The agent often hits `Done` rather than `Awaiting` when its draft doesn't end in `?` (no `Notification` of type `permission_prompt` / `plan_approval` / `idle_prompt` either), and so a one-word follow-up would otherwise look like a fresh task and clobber `original_prompt` plus reset the working timer.
