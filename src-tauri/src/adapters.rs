@@ -24,6 +24,10 @@ pub enum AdapterOutput {
     },
     /// Remove a session.
     Clear { id: String },
+    /// Mark a context boundary in the session's dialog (a history separator)
+    /// without changing its status — e.g. on context compaction, the session
+    /// continues but its prior dialog belongs to a different context window.
+    Boundary { id: String },
     /// Adapter does not handle this event — drop silently. Useful for
     /// lifecycle events we subscribe to but don't need (future-proofing).
     Ignore,

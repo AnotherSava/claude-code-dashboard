@@ -90,6 +90,9 @@ async fn post_event(
                 *id = registry.resolve(session_id, id);
                 registry.forget(session_id);
             }
+            AdapterOutput::Boundary { id } => {
+                *id = registry.resolve(session_id, id);
+            }
             AdapterOutput::Ignore => {}
         }
     }
@@ -177,6 +180,29 @@ async fn post_event(
                 reg.stop(&id);
             }
             emit_sessions_updated(&app);
+        }
+        AdapterOutput::Boundary { id } => {
+            tracing::debug!(
+                client = %req.client,
+                event = %req.event,
+                chat_id = %id,
+                "event -> boundary"
+            );
+            // The session continues (no status change) — just append a history
+            // separator marking the context boundary. Idempotent, so a parallel
+            // transcript-rotation marking the same boundary is harmless.
+            let now = now_ms();
+            if state.mark_session_boundary(&id, now) {
+                if let Some(h) = app.try_state::<PromptHistoryStore>() {
+                    let sessions = state.sessions.lock().unwrap();
+                    if let Some(s) = sessions.iter().find(|s| s.id == id) {
+                        h.save_session(s);
+                    }
+                    drop(sessions);
+                    h.save_to_disk();
+                }
+                emit_sessions_updated(&app);
+            }
         }
         AdapterOutput::Ignore => {
             tracing::debug!(

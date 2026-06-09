@@ -11,20 +11,34 @@ Install in `~/.claude/settings.json`:
 
     {
       "hooks": {
-        "SessionStart":     [{"hooks": [{"type": "command", "command": "python <repo>/integrations/claude_hook.py"}]}],
-        "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "python <repo>/integrations/claude_hook.py"}]}],
-        "Notification":     [{"hooks": [{"type": "command", "command": "python <repo>/integrations/claude_hook.py"}]}],
-        "Stop":             [{"hooks": [{"type": "command", "command": "python <repo>/integrations/claude_hook.py"}]}],
-        "SessionEnd":       [{"hooks": [{"type": "command", "command": "python <repo>/integrations/claude_hook.py"}]}],
-        "PreToolUse":       [{"matcher": "^(AskUserQuestion|ExitPlanMode)$", "hooks": [{"type": "command", "command": "python <repo>/integrations/claude_hook.py"}]}]
+        "SessionStart":        [{"hooks": [{"type": "command", "command": "python <repo>/integrations/claude_hook.py"}]}],
+        "UserPromptSubmit":    [{"hooks": [{"type": "command", "command": "python <repo>/integrations/claude_hook.py"}]}],
+        "UserPromptExpansion": [{"hooks": [{"type": "command", "command": "python <repo>/integrations/claude_hook.py"}]}],
+        "Notification":        [{"hooks": [{"type": "command", "command": "python <repo>/integrations/claude_hook.py"}]}],
+        "Stop":                [{"hooks": [{"type": "command", "command": "python <repo>/integrations/claude_hook.py"}]}],
+        "StopFailure":         [{"hooks": [{"type": "command", "command": "python <repo>/integrations/claude_hook.py"}]}],
+        "PermissionRequest":   [{"hooks": [{"type": "command", "command": "python <repo>/integrations/claude_hook.py"}]}],
+        "Elicitation":         [{"hooks": [{"type": "command", "command": "python <repo>/integrations/claude_hook.py"}]}],
+        "PreCompact":          [{"hooks": [{"type": "command", "command": "python <repo>/integrations/claude_hook.py"}]}],
+        "SessionEnd":          [{"hooks": [{"type": "command", "command": "python <repo>/integrations/claude_hook.py"}]}],
+        "PreToolUse":          [{"matcher": "^(AskUserQuestion|ExitPlanMode)$", "hooks": [{"type": "command", "command": "python <repo>/integrations/claude_hook.py"}]}]
       }
     }
+
+`StopFailure` (turn ended on an API error → ERROR), `PermissionRequest` and
+`Elicitation` (blocked on the user → WAIT), and `PreCompact` (context
+compaction → a history separator) cover gaps the core lifecycle events leave.
 
 The `PreToolUse` matcher restricts the hook to user-gating tools whose
 `tool_use` blocks aren't flushed to the JSONL transcript until the user
 responds — without this hook, the dashboard cannot detect those calls in
 flight. The matcher avoids the per-Bash/Read/Grep fork overhead of an
 unfiltered hook.
+
+`UserPromptExpansion` fires the instant a slash command is invoked — seconds
+before `UserPromptSubmit`, which Claude Code only emits after the command's
+context-gathering completes — so a skill launch flips the row to Working at
+once instead of lingering on the prior state.
 
 Server URL resolution: `$TAURI_DASHBOARD_URL` if set, else `http://127.0.0.1:9077`.
 """

@@ -44,11 +44,16 @@ pub fn build_settings_snippet(hook_path_for_command: &str) -> String {
     format!(
         r#"{{
   "hooks": {{
-    "SessionStart":     [{{"hooks": [{{"type": "command", "command": "{cmd}"}}]}}],
-    "UserPromptSubmit": [{{"hooks": [{{"type": "command", "command": "{cmd}"}}]}}],
-    "Notification":     [{{"hooks": [{{"type": "command", "command": "{cmd}"}}]}}],
-    "Stop":             [{{"hooks": [{{"type": "command", "command": "{cmd}"}}]}}],
-    "SessionEnd":       [{{"hooks": [{{"type": "command", "command": "{cmd}"}}]}}],
+    "SessionStart":        [{{"hooks": [{{"type": "command", "command": "{cmd}"}}]}}],
+    "UserPromptSubmit":    [{{"hooks": [{{"type": "command", "command": "{cmd}"}}]}}],
+    "UserPromptExpansion": [{{"hooks": [{{"type": "command", "command": "{cmd}"}}]}}],
+    "Notification":        [{{"hooks": [{{"type": "command", "command": "{cmd}"}}]}}],
+    "Stop":                [{{"hooks": [{{"type": "command", "command": "{cmd}"}}]}}],
+    "StopFailure":         [{{"hooks": [{{"type": "command", "command": "{cmd}"}}]}}],
+    "PermissionRequest":   [{{"hooks": [{{"type": "command", "command": "{cmd}"}}]}}],
+    "Elicitation":         [{{"hooks": [{{"type": "command", "command": "{cmd}"}}]}}],
+    "PreCompact":          [{{"hooks": [{{"type": "command", "command": "{cmd}"}}]}}],
+    "SessionEnd":          [{{"hooks": [{{"type": "command", "command": "{cmd}"}}]}}],
     "PreToolUse": [{{
       "matcher": "^(AskUserQuestion|ExitPlanMode)$",
       "hooks": [{{"type": "command", "command": "{cmd}"}}]

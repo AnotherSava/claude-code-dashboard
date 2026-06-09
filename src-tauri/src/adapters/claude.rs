@@ -36,8 +36,15 @@ fn awaiting_label_for(tool_name: &str) -> &'static str {
 
 /// Translate a Claude Code hook event + payload into an [`AdapterOutput`].
 ///
-/// Known events: `UserPromptSubmit`, `Stop`, `SessionStart`, `Notification`,
-/// `PreToolUse`, `SessionEnd`. Unknown events → [`AdapterOutput::Ignore`].
+/// Known events: `UserPromptSubmit`, `UserPromptExpansion`, `Stop`,
+/// `StopFailure`, `SessionStart`, `Notification`, `PreToolUse`,
+/// `PermissionRequest`, `Elicitation`, `PreCompact`, `SessionEnd`. Unknown
+/// events → [`AdapterOutput::Ignore`]. `UserPromptExpansion` is the early signal
+/// a slash command fires before its context-gathering, so a skill launch shows
+/// Working at once instead of after the gathering when `UserPromptSubmit` lands.
+/// `StopFailure` (API error), `PermissionRequest`/`Elicitation` (blocked on the
+/// user), and `PreCompact` (context boundary → history separator) fill gaps the
+/// lifecycle events leave.
 /// `PostToolUse` is intentionally ignored — once the user answers, the
 /// transcript watcher (and eventually `Stop`) carry the row out of `Awaiting`.
 pub fn dispatch(event: &str, payload: &Value, cfg: &Config) -> AdapterOutput {
@@ -47,6 +54,14 @@ pub fn dispatch(event: &str, payload: &Value, cfg: &Config) -> AdapterOutput {
 
     if event == "SessionEnd" {
         return AdapterOutput::Clear { id: chat_id };
+    }
+
+    // Context compaction (manual `/compact` or auto): the session continues but
+    // its prior dialog belongs to the pre-compaction context — drop a history
+    // separator. Idempotent in the state layer, so it's safe even if a
+    // transcript-path rotation also marks the same boundary.
+    if event == "PreCompact" {
+        return AdapterOutput::Boundary { id: chat_id };
     }
 
     let Some((status, label)) = classify(event, payload, &cfg.benign_closers) else {
@@ -160,6 +175,25 @@ fn classify(
                 Some((Status::Working, Some(clean_prompt(prompt))))
             }
         }
+        "UserPromptExpansion" => {
+            // Fires the instant a slash command is invoked — seconds before
+            // `UserPromptSubmit`, which Claude Code only emits *after* the
+            // command's `!` context-gathering finishes. Flip to Working now with
+            // the command (e.g. "/commit") as the label so a skill launch
+            // doesn't sit on the prior DONE/IDLE state for the gathering window;
+            // the later `UserPromptSubmit` reaffirms the same task. Only handle
+            // slash-command expansions — other expansion types are left for
+            // `UserPromptSubmit`. No dialog entry here (UserPromptSubmit owns it).
+            if payload.get("expansion_type").and_then(|v| v.as_str()) != Some("slash_command") {
+                return None;
+            }
+            let prompt = payload.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
+            if prompt.trim().is_empty() {
+                Some((Status::Working, None))
+            } else {
+                Some((Status::Working, Some(clean_prompt(prompt))))
+            }
+        }
         "Stop" => {
             if let Some(path) = transcript_path {
                 if let Some(text) = last_assistant_text(Path::new(path)) {
@@ -206,6 +240,47 @@ fn classify(
                 let truncated: String = cleaned.chars().take(60).collect();
                 Some((Status::Awaiting, Some(truncated)))
             }
+        }
+        "StopFailure" => {
+            // The turn ended on an API error — rate limit, overload, billing,
+            // auth, server error, max output tokens, … — which fires no `Stop`,
+            // so without this the row would sit on WORK until something else
+            // settles it. Surface ERROR with the kind. The exact payload field
+            // is read defensively (confirmed empirically) with a generic
+            // fallback so the state is always correct even if the kind is absent.
+            let reason = ["reason", "error_type", "error", "type", "failure_reason", "message"]
+                .iter()
+                .find_map(|k| payload.get(k).and_then(|v| v.as_str()))
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(clean_prompt)
+                .filter(|s| !s.is_empty());
+            Some((Status::Error, Some(reason.unwrap_or_else(|| "turn failed".into()))))
+        }
+        "PermissionRequest" => {
+            // A tool-permission dialog appeared — blocked on the user. Carries a
+            // real `tool_name`, unlike the `Notification` permission_prompt whose
+            // tool name is parsed out of a message string.
+            let tool = payload
+                .get("tool_name")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("tool");
+            Some((Status::Awaiting, Some(format!("needs approval: {}", tool))))
+        }
+        "Elicitation" => {
+            // An MCP tool is requesting input — blocked on the user. The message
+            // field is read defensively (confirmed empirically) with a fallback.
+            let msg = ["message", "prompt", "title", "text", "elicitation"]
+                .iter()
+                .find_map(|k| payload.get(k).and_then(|v| v.as_str()))
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(clean_prompt)
+                .map(|s| s.chars().take(60).collect::<String>())
+                .filter(|s| !s.is_empty());
+            Some((Status::Awaiting, Some(msg.unwrap_or_else(|| "needs your input".into()))))
         }
         _ => None,
     }
@@ -1090,6 +1165,68 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_stop_failure_sets_error_with_reason() {
+        let cfg = cfg_with(Some("d:/projects"), &[]);
+        let p = json!({ "cwd": "d:/projects/demo", "reason": "overloaded" });
+        match dispatch("StopFailure", &p, &cfg) {
+            AdapterOutput::Set { input, .. } => {
+                assert_eq!(input.status, Status::Error);
+                assert_eq!(input.label.as_deref(), Some("overloaded"));
+            }
+            _ => panic!("expected Set"),
+        }
+    }
+
+    #[test]
+    fn dispatch_stop_failure_without_reason_falls_back() {
+        let cfg = cfg_with(Some("d:/projects"), &[]);
+        let p = json!({ "cwd": "d:/projects/demo" });
+        match dispatch("StopFailure", &p, &cfg) {
+            AdapterOutput::Set { input, .. } => {
+                assert_eq!(input.status, Status::Error);
+                assert_eq!(input.label.as_deref(), Some("turn failed"));
+            }
+            _ => panic!("expected Set"),
+        }
+    }
+
+    #[test]
+    fn dispatch_permission_request_awaits_with_tool() {
+        let cfg = cfg_with(Some("d:/projects"), &[]);
+        let p = json!({ "cwd": "d:/projects/demo", "tool_name": "Bash" });
+        match dispatch("PermissionRequest", &p, &cfg) {
+            AdapterOutput::Set { input, .. } => {
+                assert_eq!(input.status, Status::Awaiting);
+                assert_eq!(input.label.as_deref(), Some("needs approval: Bash"));
+            }
+            _ => panic!("expected Set"),
+        }
+    }
+
+    #[test]
+    fn dispatch_elicitation_awaits() {
+        let cfg = cfg_with(Some("d:/projects"), &[]);
+        let p = json!({ "cwd": "d:/projects/demo", "message": "Pick a branch" });
+        match dispatch("Elicitation", &p, &cfg) {
+            AdapterOutput::Set { input, .. } => {
+                assert_eq!(input.status, Status::Awaiting);
+                assert_eq!(input.label.as_deref(), Some("Pick a branch"));
+            }
+            _ => panic!("expected Set"),
+        }
+    }
+
+    #[test]
+    fn dispatch_precompact_marks_boundary() {
+        let cfg = cfg_with(Some("d:/projects"), &[]);
+        let p = json!({ "cwd": "d:/projects/demo", "trigger": "manual" });
+        match dispatch("PreCompact", &p, &cfg) {
+            AdapterOutput::Boundary { id } => assert_eq!(id, "demo"),
+            _ => panic!("expected Boundary"),
+        }
+    }
+
+    #[test]
     fn dispatch_user_prompt_submit_produces_set_with_transcript() {
         let cfg = cfg_with(Some("d:/projects"), &[]);
         let p = json!({
@@ -1108,6 +1245,43 @@ mod tests {
             }
             _ => panic!("expected Set"),
         }
+    }
+
+    #[test]
+    fn dispatch_slash_command_expansion_sets_working_no_dialog() {
+        let cfg = cfg_with(Some("d:/projects"), &[]);
+        let p = json!({
+            "cwd": "d:/projects/demo",
+            "session_id": "s",
+            "expansion_type": "slash_command",
+            "command_name": "commit",
+            "command_args": "",
+            "prompt": "/commit",
+        });
+        match dispatch("UserPromptExpansion", &p, &cfg) {
+            AdapterOutput::Set { input, .. } => {
+                assert_eq!(input.id, "demo");
+                assert_eq!(input.status, Status::Working);
+                assert_eq!(input.label.as_deref(), Some("/commit"));
+                // UserPromptSubmit owns the dialog entry; expansion adds none.
+                assert!(input.dialog_entry.is_none());
+            }
+            _ => panic!("expected Set"),
+        }
+    }
+
+    #[test]
+    fn dispatch_non_slash_expansion_is_ignored() {
+        let cfg = cfg_with(Some("d:/projects"), &[]);
+        let p = json!({
+            "cwd": "d:/projects/demo",
+            "expansion_type": "file_reference",
+            "prompt": "@foo.rs",
+        });
+        assert!(matches!(
+            dispatch("UserPromptExpansion", &p, &cfg),
+            AdapterOutput::Ignore
+        ));
     }
 
     #[test]
