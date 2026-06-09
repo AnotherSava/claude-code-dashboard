@@ -73,6 +73,16 @@
   }
 
   const label = $derived(displayLabel(session))
+  // When there's no active task to show (e.g. an idle row after `/clear`), fall
+  // back to the most recent task prompt so the history tooltip + click-to-open
+  // stay reachable. Rendered muted/italic via `isPastTask` so it reads clearly
+  // as a past task, not the current one.
+  const lastTask = $derived.by(() => {
+    const tasks = session.dialog.filter((e) => e.task_start)
+    return tasks.length ? tasks[tasks.length - 1].text : ''
+  })
+  const labelText = $derived(label || lastTask)
+  const isPastTask = $derived(!label && !!lastTask)
   const time = $derived(formatTime(displayTimeMs(session, now)))
   const tokensText = $derived(
     session.input_tokens !== null ? formatTokens(session.input_tokens) : '',
@@ -140,8 +150,8 @@
       <span class="time">{time}</span>
       <span class="tokens" style:color={tokColor}>{#if tokensText}{tokensText}<span class="k">k</span>{/if}</span>
     </div>
-    {#if label}
-      <div class="label" title={effectiveTitle} onclick={onLabelClick} onkeydown={(e) => { if (e.key === 'Enter') onLabelClick() }} role="button" tabindex="-1">{label}</div>
+    {#if labelText}
+      <div class="label" class:past={isPastTask} title={effectiveTitle} onclick={onLabelClick} onkeydown={(e) => { if (e.key === 'Enter') onLabelClick() }} role="button" tabindex="-1">{labelText}</div>
     {/if}
   </div>
 </div>
@@ -279,5 +289,12 @@
   }
   .label:hover {
     color: #b0b0b4;
+  }
+  .label.past {
+    font-style: italic;
+    color: #6a6a6e;
+  }
+  .label.past:hover {
+    color: #9a9a9e;
   }
 </style>
