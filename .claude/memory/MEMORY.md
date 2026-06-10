@@ -22,5 +22,7 @@
 - [Real-device sync pair](sync_device_pair.md) — CHROME ↔ Olegs-MacBook-Air.local:9078, token in each config/local.json; pingable-but-port-timeout Mac = asleep, not firewalled
 - [Sync pusher silence anomaly](sync_pusher_silence_anomaly.md) — ~5-min total pusher log-silence seen once; grep widget.jsonl for `sync push cycle` gaps on recurrence
 - [Auto-resize DPI drift](debug_auto_resize_dpi_drift.md) — mixed-DPI multi-monitor needed to repro; widget.jsonl dpr≠scale + xy march = resize loop; fix = send physical px
+- [Auto-resize children-sum race](debug_auto_resize_children_race.md) — stuck scrollbar (window < content); summing .list children raced Svelte reconciliation, desired one row short; fix = measure non-stretching .list-inner + ResizeObserver
 - [Terminal promote-to-Working unsafe](terminal_promote_to_working_unsafe.md) — reverted; esc-to-interrupt strands rows; use UserPromptExpansion hook; idle_probe stays demote-only
 - [Diagnose state via widget.jsonl apply_set](debug_state_transitions_via_widget_jsonl.md) — grep apply_set lines (prior_status/task_boundary/continuation_suppressed) for the chat_id; read the decision log, don't theorize
+- [Tray badge deferred work](tray_badge_deferred.md) — macOS light/dark contrast (colored non-template icon) and live DPI re-render not done; config.tray_badge wiped on deploy
