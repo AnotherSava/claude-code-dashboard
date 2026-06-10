@@ -25,6 +25,7 @@ Right-click the tray icon for the controls you reach for most:
 - **On system start** — launch at login: off, open the window, or start hidden in the tray.
 - **Auto-resize** — fit the window height to its content, growing upward or downward.
 - **History font size** — pick one of five sizes for the history window.
+- **Tray usage badge** — show the 5-hour or 7-day usage percentage as a number on the tray icon (or none).
 - **Open config/logs location** — open the app data folder.
 - **Quit** — close the widget.
 
@@ -37,6 +38,7 @@ Every field is optional — omit one and the built-in default applies. A complet
   "always_on_top": true,
   "history_font_size": "regular",
   "auto_resize": "none",
+  "tray_badge": "none",
   "terminal_titles": true,
   "detect_cancelled_turns": true,
   "save_window_position": true,
@@ -123,6 +125,7 @@ For the full classification logic see [Classification](development/classificatio
 
 - `limit_bar_segments` — number of segments in the 5-hour / 7-day usage bars; higher is finer-grained.
 - `usage_limits_poll_interval_seconds` — how often to poll Anthropic for usage. Clamped to a 60-second minimum.
+- `tray_badge` — draw a usage percentage on the tray icon: `"five_hour"`, `"seven_day"`, or `"none"`. Colored green → amber → red by severity; the icon's hover tooltip always shows both figures. Set it from the tray's **Tray usage badge** submenu.
 
 ### Multi-device sync
 

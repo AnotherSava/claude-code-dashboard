@@ -59,6 +59,8 @@ Get pinged when a session needs you — for example, when it sits in WAIT longer
 
 The header shows two bars tracking your Anthropic usage against the rolling 5-hour and 7-day rate limits, so you can see how much headroom is left before you hit a cap.
 
+You can also surface one of those figures right on the tray icon — the tray's **Tray usage badge** submenu draws the 5-hour or 7-day percentage over the icon, colored green → amber → red by how close you are to the cap, with both figures always in the icon's hover tooltip. Off by default.
+
 ## Multi-device sync
 
 Run the dashboard on more than one computer and each one can show the sessions from all of them. Sessions from another device appear in the same list with a small badge carrying that device's name, with everything a local row has — live status, the task in view, the context usage, and the History window recap. Renaming a remote row changes the name on the device where you renamed it, while alerts for a session fire only on the device it runs on, so you never get the same ping twice. When a device goes offline, its rows disappear from the other dashboards shortly after.

@@ -30,3 +30,4 @@ async-trait = "0.1"
 anyhow = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 open = "5"
+fontdue = "0.9"

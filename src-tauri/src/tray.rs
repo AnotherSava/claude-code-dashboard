@@ -6,7 +6,7 @@ use tauri::{
 use tauri_plugin_autostart::ManagerExt;
 
 use crate::commands::emit_config_updated;
-use crate::config::{AutoResize, ConfigState, HistoryFontSize};
+use crate::config::{AutoResize, ConfigState, HistoryFontSize, TrayBadge};
 
 const MENU_SHOW_HIDE: &str = "show_hide";
 const MENU_ALWAYS_ON_TOP: &str = "always_on_top";
@@ -23,6 +23,9 @@ const MENU_HIST_FONT_SMALL: &str = "hist_font_small";
 const MENU_HIST_FONT_REGULAR: &str = "hist_font_regular";
 const MENU_HIST_FONT_LARGE: &str = "hist_font_large";
 const MENU_HIST_FONT_LARGEST: &str = "hist_font_largest";
+const MENU_TRAY_BADGE_NONE: &str = "tray_badge_none";
+const MENU_TRAY_BADGE_5H: &str = "tray_badge_5h";
+const MENU_TRAY_BADGE_7D: &str = "tray_badge_7d";
 const MENU_OPEN_DATA_DIR: &str = "open_data_dir";
 const MENU_HELP_ABOUT: &str = "help_about";
 const MENU_HELP_INSTRUCTIONS: &str = "help_instructions";
@@ -45,6 +48,9 @@ pub struct TrayHandles {
     pub hist_font_regular: CheckMenuItem<Wry>,
     pub hist_font_large: CheckMenuItem<Wry>,
     pub hist_font_largest: CheckMenuItem<Wry>,
+    pub tray_badge_none: CheckMenuItem<Wry>,
+    pub tray_badge_5h: CheckMenuItem<Wry>,
+    pub tray_badge_7d: CheckMenuItem<Wry>,
 }
 
 pub fn setup(app: &AppHandle) -> tauri::Result<()> {
@@ -122,6 +128,17 @@ pub fn setup(app: &AppHandle) -> tauri::Result<()> {
         .items(&[&hist_font_smallest, &hist_font_small, &hist_font_regular, &hist_font_large, &hist_font_largest])
         .build()?;
 
+    let tray_badge_initial = app
+        .try_state::<ConfigState>()
+        .map(|s| s.snapshot().tray_badge)
+        .unwrap_or_default();
+    let tray_badge_none = CheckMenuItem::with_id(app, MENU_TRAY_BADGE_NONE, "None", true, tray_badge_initial == TrayBadge::None, None::<&str>)?;
+    let tray_badge_5h = CheckMenuItem::with_id(app, MENU_TRAY_BADGE_5H, "5-hour limit", true, tray_badge_initial == TrayBadge::FiveHour, None::<&str>)?;
+    let tray_badge_7d = CheckMenuItem::with_id(app, MENU_TRAY_BADGE_7D, "7-day limit", true, tray_badge_initial == TrayBadge::SevenDay, None::<&str>)?;
+    let tray_badge_submenu = SubmenuBuilder::new(app, "Tray usage badge")
+        .items(&[&tray_badge_none, &tray_badge_5h, &tray_badge_7d])
+        .build()?;
+
     let open_data_dir = MenuItem::with_id(app, MENU_OPEN_DATA_DIR, "Open config/logs location", true, None::<&str>)?;
     let help_about = MenuItem::with_id(app, MENU_HELP_ABOUT, "About", true, None::<&str>)?;
     let help_instructions = MenuItem::with_id(app, MENU_HELP_INSTRUCTIONS, "Connect instructions", true, None::<&str>)?;
@@ -141,6 +158,7 @@ pub fn setup(app: &AppHandle) -> tauri::Result<()> {
             &autostart_submenu,
             &auto_resize_submenu,
             &hist_font_submenu,
+            &tray_badge_submenu,
             &PredefinedMenuItem::separator(app)?,
             &open_data_dir,
             &PredefinedMenuItem::separator(app)?,
@@ -164,6 +182,9 @@ pub fn setup(app: &AppHandle) -> tauri::Result<()> {
         hist_font_regular: hist_font_regular.clone(),
         hist_font_large: hist_font_large.clone(),
         hist_font_largest: hist_font_largest.clone(),
+        tray_badge_none: tray_badge_none.clone(),
+        tray_badge_5h: tray_badge_5h.clone(),
+        tray_badge_7d: tray_badge_7d.clone(),
     });
 
     let icon = app
@@ -211,6 +232,9 @@ fn handle_menu_event(app: &AppHandle, id: &str) {
         MENU_HIST_FONT_REGULAR => select_history_font_size(app, HistoryFontSize::Regular),
         MENU_HIST_FONT_LARGE => select_history_font_size(app, HistoryFontSize::Large),
         MENU_HIST_FONT_LARGEST => select_history_font_size(app, HistoryFontSize::Largest),
+        MENU_TRAY_BADGE_NONE => select_tray_badge(app, TrayBadge::None),
+        MENU_TRAY_BADGE_5H => select_tray_badge(app, TrayBadge::FiveHour),
+        MENU_TRAY_BADGE_7D => select_tray_badge(app, TrayBadge::SevenDay),
         MENU_OPEN_DATA_DIR => open_data_dir(app),
         MENU_HELP_ABOUT => show_about(app),
         MENU_HELP_INSTRUCTIONS => show_setup_instructions(app),
@@ -341,6 +365,26 @@ pub fn sync_history_font_checks(app: &AppHandle, size: HistoryFontSize) {
     let _ = handles.hist_font_regular.set_checked(size == HistoryFontSize::Regular);
     let _ = handles.hist_font_large.set_checked(size == HistoryFontSize::Large);
     let _ = handles.hist_font_largest.set_checked(size == HistoryFontSize::Largest);
+}
+
+fn select_tray_badge(app: &AppHandle, mode: TrayBadge) {
+    let Some(state) = app.try_state::<ConfigState>() else { return };
+    if state.snapshot().tray_badge != mode {
+        state.with_mut(|c| c.tray_badge = mode);
+        let _ = state.save_to_disk();
+        emit_config_updated(app);
+    }
+    sync_tray_badge_checks(app, mode);
+    // Repaint the icon/tooltip immediately rather than waiting for the next
+    // usage poll.
+    crate::tray_badge::refresh(app);
+}
+
+fn sync_tray_badge_checks(app: &AppHandle, mode: TrayBadge) {
+    let Some(handles) = app.try_state::<TrayHandles>() else { return };
+    let _ = handles.tray_badge_none.set_checked(mode == TrayBadge::None);
+    let _ = handles.tray_badge_5h.set_checked(mode == TrayBadge::FiveHour);
+    let _ = handles.tray_badge_7d.set_checked(mode == TrayBadge::SevenDay);
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

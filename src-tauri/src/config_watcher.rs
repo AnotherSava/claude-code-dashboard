@@ -75,6 +75,8 @@ pub fn spawn(app: AppHandle, path: PathBuf) {
             }
             state.with_mut(|c| *c = new_cfg.clone());
             apply_config_to_window(&app, &new_cfg, Some(&prior));
+            // Re-render the tray badge in case `tray_badge` changed externally.
+            crate::tray_badge::refresh(&app);
             let _ = app.emit("config_updated", &new_cfg);
         }
     });

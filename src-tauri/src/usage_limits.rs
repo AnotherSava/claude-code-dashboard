@@ -36,7 +36,7 @@ pub struct UsageLimits {
 }
 
 impl UsageLimits {
-    fn empty() -> Self {
+    pub fn empty() -> Self {
         Self {
             five_hour: None,
             seven_day: None,

@@ -73,6 +73,20 @@ pub struct Config {
     /// Multi-device session sync (see `sync.rs`). Disabled by default:
     /// `listen=false` and empty `peers` make every sync task a no-op.
     pub sync: SyncConfig,
+    /// Which usage-limit percentage to render as a number on the tray icon.
+    /// `None` keeps the plain app icon. Read by `tray_badge::refresh`; the
+    /// tray's "Tray usage badge" submenu writes it. The hover tooltip always
+    /// shows both buckets regardless of this setting.
+    pub tray_badge: TrayBadge,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrayBadge {
+    #[default]
+    None,
+    FiveHour,
+    SevenDay,
 }
 
 /// Settings for syncing sessions between dashboards on different devices
@@ -232,6 +246,7 @@ impl Default for Config {
             terminal_titles: true,
             detect_cancelled_turns: true,
             sync: SyncConfig::default(),
+            tray_badge: TrayBadge::None,
         }
     }
 }
@@ -438,6 +453,16 @@ mod tests {
                 "default continuation_prompts must include the affirmation {phrase:?}"
             );
         }
+    }
+
+    #[test]
+    fn tray_badge_defaults_to_none_and_parses_snake_case() {
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(cfg.tray_badge, TrayBadge::None);
+        let five: Config = serde_json::from_str(r#"{ "tray_badge": "five_hour" }"#).unwrap();
+        assert_eq!(five.tray_badge, TrayBadge::FiveHour);
+        let seven: Config = serde_json::from_str(r#"{ "tray_badge": "seven_day" }"#).unwrap();
+        assert_eq!(seven.tray_badge, TrayBadge::SevenDay);
     }
 
     #[test]

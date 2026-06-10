@@ -19,6 +19,7 @@ mod sync;
 mod telegram;
 mod terminal_title;
 mod tray;
+mod tray_badge;
 mod usage_history;
 mod usage_limits;
 

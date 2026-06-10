@@ -491,6 +491,8 @@ pub fn emit_usage_limits_updated(app: &AppHandle) {
     if let Some(state) = app.try_state::<UsageLimitsState>() {
         let _ = app.emit("usage_limits_updated", state.snapshot());
     }
+    // Keep the tray badge/tooltip in step with every usage update.
+    crate::tray_badge::refresh(app);
 }
 
 #[tauri::command]
