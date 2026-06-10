@@ -257,13 +257,14 @@ fn render_badge(base: &Image, text: &str, color: [u8; 3], size: usize) -> Image<
     Image::new_owned(buf, w as u32, h as u32)
 }
 
-/// Badge text for a percentage: digits 0..=99, or "XX" for a maxed (>=100%)
-/// bucket — kept to two characters so the number never shrinks to fit a third.
+/// Badge text for a percentage: always two characters — zero-padded for 0..=9
+/// ("09"), the value for 10..=99, or "XX" for a maxed (>=100%) bucket. Fixing
+/// the width keeps the digit size and position stable across every value.
 fn badge_text(pct: u32) -> String {
     if pct >= 100 {
         "XX".to_string()
     } else {
-        pct.to_string()
+        format!("{pct:02}")
     }
 }
 
@@ -396,8 +397,9 @@ mod tests {
     }
 
     #[test]
-    fn badge_text_caps_at_two_chars() {
-        assert_eq!(badge_text(7), "7");
+    fn badge_text_is_always_two_chars() {
+        assert_eq!(badge_text(0), "00");
+        assert_eq!(badge_text(7), "07");
         assert_eq!(badge_text(85), "85");
         assert_eq!(badge_text(99), "99");
         assert_eq!(badge_text(100), "XX");
