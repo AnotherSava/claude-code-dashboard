@@ -15,9 +15,15 @@
   <div class="empty">No active agents</div>
 {:else}
   <div class="list">
-    {#each sessions as session (session.id)}
-      <SessionItem {session} {config} {now} />
-    {/each}
+    <!-- Inner wrapper shrink-wraps the rows so its measured height is the true
+         content height regardless of how tall the scroll viewport (.list) is
+         stretched by flex. App.svelte's auto-resize measures this element; a
+         single rect read is race-free where summing .list children was not. -->
+    <div class="list-inner">
+      {#each sessions as session (session.id)}
+        <SessionItem {session} {config} {now} />
+      {/each}
+    </div>
   </div>
 {/if}
 

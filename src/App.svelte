@@ -64,35 +64,52 @@
     measureTimer = setTimeout(measureAndSend, 50)
   }
 
+  // Re-measure whenever the rendered content height changes, even when no
+  // Svelte-tracked dep ($effect below) fired — e.g. the layout settling a frame
+  // after a session row was added/removed. This is the backstop that keeps the
+  // window from getting stuck shorter than its content after a flapping session
+  // count. The observed element shrink-wraps its content (.list-inner / .panel),
+  // so a window resize doesn't change its height and can't feed back a loop.
+  let contentObserver: ResizeObserver | null = null
+  let observedEl: Element | null = null
+  function observeContent(el: Element | null) {
+    if (el === observedEl) return
+    if (!contentObserver) contentObserver = new ResizeObserver(() => scheduleMeasure())
+    if (observedEl) contentObserver.unobserve(observedEl)
+    observedEl = el
+    if (el) contentObserver.observe(el)
+  }
+
   function measureAndSend() {
     measureTimer = null
     if (!widgetEl || !config || config.auto_resize === 'none') return
     const headerEl = widgetEl.querySelector('header') as HTMLElement | null
     if (!headerEl) return
-    // Walk the SessionList's natural content height ourselves rather than
-    // reading `.list.scrollHeight`: the list has `flex: 1; min-height: 0`, so
-    // when the window is currently larger than its content, it stretches to
-    // fill the viewport and `scrollHeight` reports the stretched size, not
-    // the intrinsic content size — locking us at whatever height we last set.
+    // Measure a single non-stretching content element rather than summing the
+    // scroll viewport's children. The list viewport (`.list`) has
+    // `flex: 1; min-height: 0`, so its own `scrollHeight` reports the stretched
+    // height when the window exceeds its content; and iterating its live
+    // children races with Svelte's keyed-each reconciliation (observed: a
+    // child count that disagreed with the laid-out scrollHeight, yielding a
+    // `desired` one row too small and a stuck scrollbar). `.list-inner`
+    // shrink-wraps the rows, so one `getBoundingClientRect()` read gives the
+    // true, internally-consistent content height.
     let listH = 0
-    const list = widgetEl.querySelector('.list')
-    const panel = widgetEl.querySelector('.panel')
-    if (list) {
-      for (const child of list.children) {
-        listH += (child as HTMLElement).getBoundingClientRect().height
-      }
+    const content = widgetEl.querySelector('.list-inner') as HTMLElement | null
+    const panel = widgetEl.querySelector('.panel') as HTMLElement | null
+    if (content) {
+      listH = content.getBoundingClientRect().height
     } else if (panel) {
       // SetupPanel renders one block — measure its intrinsic content height
       // so auto-resize grows to fit the onboarding copy.
-      listH = (panel as HTMLElement).scrollHeight
+      listH = panel.scrollHeight
     } else if (widgetEl.querySelector('.empty')) {
       listH = 36
     }
-    // Use subpixel-accurate getBoundingClientRect() heights, then ceil the
-    // total. `offsetHeight` rounds each child down to an integer, and the
-    // accumulated fractional loss across rows would leave us asking for ~3-6
-    // px less than the content needs — the OS resizes to exactly what we
-    // asked, and a scrollbar appears.
+    observeContent(content ?? panel ?? widgetEl.querySelector('.empty'))
+    // Subpixel-accurate getBoundingClientRect(), then ceil the total: rounding
+    // down would leave us asking for a hair less than the content needs and the
+    // OS would resize to exactly that, surfacing a scrollbar.
     const desired = Math.ceil(headerEl.getBoundingClientRect().height + listH)
     // Always fire when content actually exceeds the viewport — that's the
     // overflow case we're guarding against. Drift sources (DPI shift, OS
@@ -247,6 +264,7 @@
       unlistenUsage?.()
       unlistenShowSetup?.()
       if (measureTimer !== null) clearTimeout(measureTimer)
+      contentObserver?.disconnect()
     }
   })
 
