@@ -79,7 +79,20 @@
   // as a past task, not the current one.
   const lastTask = $derived.by(() => {
     const tasks = session.dialog.filter((e) => e.task_start)
-    return tasks.length ? tasks[tasks.length - 1].text : ''
+    if (tasks.length) return tasks[tasks.length - 1].text
+    // No flagged task starts — a dialog synced from a peer, persisted before
+    // backend task-start marking, or made of only continuations/approvals.
+    // Fall back to a user prompt so a row with restorable history never goes
+    // blank (the click target stays alive and history stays reachable).
+    // Prefer the most recent non-trivial prompt over single-token approvals
+    // like "y"/"ok" so the hint reads as a task, not a confirmation; fall back
+    // to any user prompt, then any non-separator entry.
+    const users = session.dialog.filter((e) => e.role === 'user' && e.text.trim() !== '')
+    const substantive = users.filter((e) => e.text.trim().length > 4)
+    if (substantive.length) return substantive[substantive.length - 1].text
+    if (users.length) return users[users.length - 1].text
+    const any = session.dialog.filter((e) => e.role !== 'separator' && e.text.trim() !== '')
+    return any.length ? any[any.length - 1].text : ''
   })
   const labelText = $derived(label || lastTask)
   const isPastTask = $derived(!label && !!lastTask)
