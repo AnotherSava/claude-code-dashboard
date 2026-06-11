@@ -25,4 +25,4 @@
 - [Auto-resize children-sum race](debug_auto_resize_children_race.md) — stuck scrollbar (window < content); summing .list children raced Svelte reconciliation, desired one row short; fix = measure non-stretching .list-inner + ResizeObserver
 - [Terminal promote-to-Working unsafe](terminal_promote_to_working_unsafe.md) — reverted; esc-to-interrupt strands rows; use UserPromptExpansion hook; idle_probe stays demote-only
 - [Diagnose state via widget.jsonl apply_set](debug_state_transitions_via_widget_jsonl.md) — grep apply_set lines (prior_status/task_boundary/continuation_suppressed) for the chat_id; read the decision log, don't theorize
-- [Tray badge deferred work](tray_badge_deferred.md) — macOS light/dark contrast (colored non-template icon) and live DPI re-render not done; config.tray_badge wiped on deploy
+- [Tray badge deferred work](tray_badge_deferred.md) — macOS contrast on number modes + live DPI re-render not done; config.tray_badge set in config/local.json
