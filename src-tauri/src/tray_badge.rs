@@ -151,50 +151,20 @@ fn over(dst: &mut [u8], rgb: [u8; 3], a: u8) {
     dst[3] = (out_a * 255.0).round().clamp(0.0, 255.0) as u8;
 }
 
-/// Composite a coverage mask (0..255 per pixel, `size`x`size`) onto a dimmed,
-/// tray-sized copy of `base`, in `color` with a 1px black outline for contrast.
-/// The badge is built directly at `size` (the OS tray pixel size) so it
+/// Rasterize a coverage mask (0..255 per pixel, `size`x`size`) into a `color`ed
+/// badge on a fully transparent background — only the digits show, the menu bar
+/// fills everything else, and the anti-aliased edges fade to transparent
+/// (alpha = coverage). Built directly at `size` (the OS tray pixel size) so it
 /// displays ~1:1 instead of being resampled by the OS.
-fn compose_badge(base: &Image, cov: &[u8], color: [u8; 3], size: usize) -> Image<'static> {
+fn compose_badge(cov: &[u8], color: [u8; 3], size: usize) -> Image<'static> {
     let w = size;
     let h = size;
 
-    // Background: fit the source icon to the tray size with an area filter,
-    // dimmed so the mark reads regardless of icon brightness.
-    let mut buf = area_downscale(base.rgba(), base.width() as usize, base.height() as usize, w, h);
-    for px in buf.chunks_exact_mut(4) {
-        px[0] = (px[0] as u32 * 35 / 100) as u8;
-        px[1] = (px[1] as u32 * 35 / 100) as u8;
-        px[2] = (px[2] as u32 * 35 / 100) as u8;
-    }
-
-    // Outline coverage: a 1px dilation of the mark coverage. Drawing it in black
-    // under the colored mark leaves a dark rim everywhere the mark doesn't fully
-    // cover — contrast against any background.
-    let mut outline = vec![0u8; w * h];
-    for y in 0..h {
-        for x in 0..w {
-            let mut mx = 0u8;
-            for dy in -1i32..=1 {
-                for dx in -1i32..=1 {
-                    let nx = x as i32 + dx;
-                    let ny = y as i32 + dy;
-                    if nx >= 0 && ny >= 0 && (nx as usize) < w && (ny as usize) < h {
-                        let v = cov[ny as usize * w + nx as usize];
-                        if v > mx {
-                            mx = v;
-                        }
-                    }
-                }
-            }
-            outline[y * w + x] = mx;
-        }
-    }
-
-    // Composite: dimmed background -> black outline -> colored mark.
+    // Transparent background — no plate. The colored mark is drawn straight onto
+    // empty pixels, so only the digits carry alpha.
+    let mut buf = vec![0u8; w * h * 4];
     for i in 0..w * h {
         let p = i * 4;
-        over(&mut buf[p..p + 4], [0, 0, 0], outline[i]);
         over(&mut buf[p..p + 4], color, cov[i]);
     }
 
@@ -265,9 +235,9 @@ fn text_coverage(text: &str, size: usize) -> Vec<u8> {
     cov
 }
 
-/// Render a 1-2 digit number badge over the app icon.
-fn render_badge(base: &Image, text: &str, color: [u8; 3], size: usize) -> Image<'static> {
-    compose_badge(base, &text_coverage(text, size), color, size)
+/// Render a 1-2 digit number badge on a black plate.
+fn render_badge(text: &str, color: [u8; 3], size: usize) -> Image<'static> {
+    compose_badge(&text_coverage(text, size), color, size)
 }
 
 /// Traffic-light colors. Green and red are sampled from the app icon's lights;
@@ -403,7 +373,7 @@ pub fn refresh(app: &AppHandle) {
             let img = if badge.is_light() || pct >= 100 {
                 render_light_badge(&base, pct, size)
             } else {
-                render_badge(&base, &badge_text(pct), urgency_color(pct), size)
+                render_badge(&badge_text(pct), urgency_color(pct), size)
             };
             let _ = tray.set_icon(Some(img));
         }
@@ -487,19 +457,16 @@ mod tests {
     #[test]
     fn render_badge_renders_at_requested_size_and_draws_pixels() {
         // Renders at the requested tray size (24px = 150% DPI here), with the
-        // urgency color and outline present. Source can be any size.
-        let base = Image::new_owned(vec![255u8; 128 * 128 * 4], 128, 128);
-        let out = render_badge(&base, "85", urgency_color(85), 24);
+        // urgency color on a transparent background.
+        let out = render_badge("85", urgency_color(85), 24);
         assert_eq!((out.width(), out.height()), (24, 24));
         let rgba = out.rgba();
         let has_red = rgba
             .chunks_exact(4)
             .any(|p| p[0] == 255 && p[1] == 90 && p[2] == 90);
         assert!(has_red, "the number color should appear in the output");
-        let has_black = rgba
-            .chunks_exact(4)
-            .any(|p| p[0] == 0 && p[1] == 0 && p[2] == 0 && p[3] == 255);
-        assert!(has_black, "the outline should appear in the output");
+        let has_transparent = rgba.chunks_exact(4).any(|p| p[3] == 0);
+        assert!(has_transparent, "the background should be transparent");
     }
 
     #[test]
