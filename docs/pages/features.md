@@ -59,7 +59,7 @@ Get pinged when a session needs you — for example, when it sits in WAIT longer
 
 The header shows two bars tracking your Anthropic usage against the rolling 5-hour and 7-day rate limits, so you can see how much headroom is left before you hit a cap.
 
-You can also surface one of those figures right on the tray icon — the tray's **Tray usage badge** submenu draws the 5-hour or 7-day percentage over the icon, colored green → amber → red by how close you are to the cap, with both figures always in the icon's hover tooltip. Off by default.
+You can also surface a limit right on the tray icon, via the tray's **Tray usage badge** submenu — for the 5-hour or 7-day bucket, in one of two styles: **lights** recolor the dashboard's traffic-light icon, its three lamps stepping from green through amber to red as the bucket fills; or **number** shows the percentage itself, switching to the all-red light at 100%. Either way the icon's hover tooltip shows both figures. Off by default.
 
 ## Multi-device sync
 

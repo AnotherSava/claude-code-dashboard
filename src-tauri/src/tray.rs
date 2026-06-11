@@ -24,8 +24,10 @@ const MENU_HIST_FONT_REGULAR: &str = "hist_font_regular";
 const MENU_HIST_FONT_LARGE: &str = "hist_font_large";
 const MENU_HIST_FONT_LARGEST: &str = "hist_font_largest";
 const MENU_TRAY_BADGE_NONE: &str = "tray_badge_none";
-const MENU_TRAY_BADGE_5H: &str = "tray_badge_5h";
-const MENU_TRAY_BADGE_7D: &str = "tray_badge_7d";
+const MENU_TRAY_BADGE_5H_LIGHT: &str = "tray_badge_5h_light";
+const MENU_TRAY_BADGE_7D_LIGHT: &str = "tray_badge_7d_light";
+const MENU_TRAY_BADGE_5H_NUM: &str = "tray_badge_5h_num";
+const MENU_TRAY_BADGE_7D_NUM: &str = "tray_badge_7d_num";
 const MENU_OPEN_DATA_DIR: &str = "open_data_dir";
 const MENU_HELP_ABOUT: &str = "help_about";
 const MENU_HELP_INSTRUCTIONS: &str = "help_instructions";
@@ -49,8 +51,10 @@ pub struct TrayHandles {
     pub hist_font_large: CheckMenuItem<Wry>,
     pub hist_font_largest: CheckMenuItem<Wry>,
     pub tray_badge_none: CheckMenuItem<Wry>,
-    pub tray_badge_5h: CheckMenuItem<Wry>,
-    pub tray_badge_7d: CheckMenuItem<Wry>,
+    pub tray_badge_5h_light: CheckMenuItem<Wry>,
+    pub tray_badge_7d_light: CheckMenuItem<Wry>,
+    pub tray_badge_5h_num: CheckMenuItem<Wry>,
+    pub tray_badge_7d_num: CheckMenuItem<Wry>,
 }
 
 pub fn setup(app: &AppHandle) -> tauri::Result<()> {
@@ -133,10 +137,12 @@ pub fn setup(app: &AppHandle) -> tauri::Result<()> {
         .map(|s| s.snapshot().tray_badge)
         .unwrap_or_default();
     let tray_badge_none = CheckMenuItem::with_id(app, MENU_TRAY_BADGE_NONE, "None", true, tray_badge_initial == TrayBadge::None, None::<&str>)?;
-    let tray_badge_5h = CheckMenuItem::with_id(app, MENU_TRAY_BADGE_5H, "5-hour limit", true, tray_badge_initial == TrayBadge::FiveHour, None::<&str>)?;
-    let tray_badge_7d = CheckMenuItem::with_id(app, MENU_TRAY_BADGE_7D, "7-day limit", true, tray_badge_initial == TrayBadge::SevenDay, None::<&str>)?;
+    let tray_badge_5h_light = CheckMenuItem::with_id(app, MENU_TRAY_BADGE_5H_LIGHT, "5-hour limit (lights)", true, tray_badge_initial == TrayBadge::FiveHourLight, None::<&str>)?;
+    let tray_badge_7d_light = CheckMenuItem::with_id(app, MENU_TRAY_BADGE_7D_LIGHT, "7-day limit (lights)", true, tray_badge_initial == TrayBadge::SevenDayLight, None::<&str>)?;
+    let tray_badge_5h_num = CheckMenuItem::with_id(app, MENU_TRAY_BADGE_5H_NUM, "5-hour limit (number)", true, tray_badge_initial == TrayBadge::FiveHourNumber, None::<&str>)?;
+    let tray_badge_7d_num = CheckMenuItem::with_id(app, MENU_TRAY_BADGE_7D_NUM, "7-day limit (number)", true, tray_badge_initial == TrayBadge::SevenDayNumber, None::<&str>)?;
     let tray_badge_submenu = SubmenuBuilder::new(app, "Tray usage badge")
-        .items(&[&tray_badge_none, &tray_badge_5h, &tray_badge_7d])
+        .items(&[&tray_badge_none, &tray_badge_5h_light, &tray_badge_7d_light, &tray_badge_5h_num, &tray_badge_7d_num])
         .build()?;
 
     let open_data_dir = MenuItem::with_id(app, MENU_OPEN_DATA_DIR, "Open config/logs location", true, None::<&str>)?;
@@ -183,8 +189,10 @@ pub fn setup(app: &AppHandle) -> tauri::Result<()> {
         hist_font_large: hist_font_large.clone(),
         hist_font_largest: hist_font_largest.clone(),
         tray_badge_none: tray_badge_none.clone(),
-        tray_badge_5h: tray_badge_5h.clone(),
-        tray_badge_7d: tray_badge_7d.clone(),
+        tray_badge_5h_light: tray_badge_5h_light.clone(),
+        tray_badge_7d_light: tray_badge_7d_light.clone(),
+        tray_badge_5h_num: tray_badge_5h_num.clone(),
+        tray_badge_7d_num: tray_badge_7d_num.clone(),
     });
 
     let icon = app
@@ -233,8 +241,10 @@ fn handle_menu_event(app: &AppHandle, id: &str) {
         MENU_HIST_FONT_LARGE => select_history_font_size(app, HistoryFontSize::Large),
         MENU_HIST_FONT_LARGEST => select_history_font_size(app, HistoryFontSize::Largest),
         MENU_TRAY_BADGE_NONE => select_tray_badge(app, TrayBadge::None),
-        MENU_TRAY_BADGE_5H => select_tray_badge(app, TrayBadge::FiveHour),
-        MENU_TRAY_BADGE_7D => select_tray_badge(app, TrayBadge::SevenDay),
+        MENU_TRAY_BADGE_5H_LIGHT => select_tray_badge(app, TrayBadge::FiveHourLight),
+        MENU_TRAY_BADGE_7D_LIGHT => select_tray_badge(app, TrayBadge::SevenDayLight),
+        MENU_TRAY_BADGE_5H_NUM => select_tray_badge(app, TrayBadge::FiveHourNumber),
+        MENU_TRAY_BADGE_7D_NUM => select_tray_badge(app, TrayBadge::SevenDayNumber),
         MENU_OPEN_DATA_DIR => open_data_dir(app),
         MENU_HELP_ABOUT => show_about(app),
         MENU_HELP_INSTRUCTIONS => show_setup_instructions(app),
@@ -383,8 +393,10 @@ fn select_tray_badge(app: &AppHandle, mode: TrayBadge) {
 fn sync_tray_badge_checks(app: &AppHandle, mode: TrayBadge) {
     let Some(handles) = app.try_state::<TrayHandles>() else { return };
     let _ = handles.tray_badge_none.set_checked(mode == TrayBadge::None);
-    let _ = handles.tray_badge_5h.set_checked(mode == TrayBadge::FiveHour);
-    let _ = handles.tray_badge_7d.set_checked(mode == TrayBadge::SevenDay);
+    let _ = handles.tray_badge_5h_light.set_checked(mode == TrayBadge::FiveHourLight);
+    let _ = handles.tray_badge_7d_light.set_checked(mode == TrayBadge::SevenDayLight);
+    let _ = handles.tray_badge_5h_num.set_checked(mode == TrayBadge::FiveHourNumber);
+    let _ = handles.tray_badge_7d_num.set_checked(mode == TrayBadge::SevenDayNumber);
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

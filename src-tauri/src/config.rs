@@ -73,10 +73,11 @@ pub struct Config {
     /// Multi-device session sync (see `sync.rs`). Disabled by default:
     /// `listen=false` and empty `peers` make every sync task a no-op.
     pub sync: SyncConfig,
-    /// Which usage-limit percentage to render as a number on the tray icon.
-    /// `None` keeps the plain app icon. Read by `tray_badge::refresh`; the
-    /// tray's "Tray usage badge" submenu writes it. The hover tooltip always
-    /// shows both buckets regardless of this setting.
+    /// What the tray icon shows for a usage bucket. `None` keeps the plain app
+    /// icon. The `*Light` modes recolor the traffic-light icon by usage; the
+    /// `*Number` modes draw the percentage (and the all-red light at 100%).
+    /// Read by `tray_badge::refresh`; the tray's "Tray usage badge" submenu
+    /// writes it. The hover tooltip always shows both buckets regardless.
     pub tray_badge: TrayBadge,
 }
 
@@ -85,8 +86,20 @@ pub struct Config {
 pub enum TrayBadge {
     #[default]
     None,
-    FiveHour,
-    SevenDay,
+    FiveHourLight,
+    SevenDayLight,
+    // `five_hour` / `seven_day` were the pre-light numeric-only values.
+    #[serde(alias = "five_hour")]
+    FiveHourNumber,
+    #[serde(alias = "seven_day")]
+    SevenDayNumber,
+}
+
+impl TrayBadge {
+    /// True for the traffic-light modes (vs the numeric modes or `None`).
+    pub fn is_light(self) -> bool {
+        matches!(self, Self::FiveHourLight | Self::SevenDayLight)
+    }
 }
 
 /// Settings for syncing sessions between dashboards on different devices
@@ -459,10 +472,18 @@ mod tests {
     fn tray_badge_defaults_to_none_and_parses_snake_case() {
         let cfg: Config = serde_json::from_str("{}").unwrap();
         assert_eq!(cfg.tray_badge, TrayBadge::None);
+        let light: Config = serde_json::from_str(r#"{ "tray_badge": "five_hour_light" }"#).unwrap();
+        assert_eq!(light.tray_badge, TrayBadge::FiveHourLight);
+        let num: Config = serde_json::from_str(r#"{ "tray_badge": "seven_day_number" }"#).unwrap();
+        assert_eq!(num.tray_badge, TrayBadge::SevenDayNumber);
+    }
+
+    #[test]
+    fn tray_badge_legacy_values_map_to_numeric_modes() {
         let five: Config = serde_json::from_str(r#"{ "tray_badge": "five_hour" }"#).unwrap();
-        assert_eq!(five.tray_badge, TrayBadge::FiveHour);
+        assert_eq!(five.tray_badge, TrayBadge::FiveHourNumber);
         let seven: Config = serde_json::from_str(r#"{ "tray_badge": "seven_day" }"#).unwrap();
-        assert_eq!(seven.tray_badge, TrayBadge::SevenDay);
+        assert_eq!(seven.tray_badge, TrayBadge::SevenDayNumber);
     }
 
     #[test]

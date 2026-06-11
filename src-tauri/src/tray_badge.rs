@@ -1,13 +1,16 @@
-//! Renders the selected usage-limit percentage as a number on the tray icon
-//! and keeps the tray tooltip showing both buckets.
+//! Renders a usage-limit indicator on the tray icon and keeps the tray tooltip
+//! showing both buckets. Two indicator styles (per the `TrayBadge` mode):
 //!
-//! The number is rasterized from a real font (Bebas Neue, bundled, OFL)
-//! directly at the OS tray pixel size, so it's anti-aliased and shown ~1:1
-//! instead of an upscaled bitmap or an OS-blurred oversized source. The tall,
-//! condensed face lets two digits fill the icon's full height without
-//! shrinking. `refresh` is the single entry point, called from the usage poll
-//! chokepoint (`commands::emit_usage_limits_updated`), the tray submenu, and
-//! the config watcher.
+//! - **Light**: recolor the app icon's three traffic lights by usage, stepping
+//!   green → amber → red as the bucket fills (`render_light_badge`).
+//! - **Number**: draw the percentage as a number, rasterized from a real font
+//!   (Bebas Neue, bundled, OFL) directly at the OS tray pixel size — anti-aliased
+//!   and shown ~1:1 rather than an upscaled bitmap or an OS-blurred oversized
+//!   source. A maxed (>=100%) bucket shows the all-red light instead.
+//!
+//! `refresh` is the single entry point, called from the usage poll chokepoint
+//! (`commands::emit_usage_limits_updated`), the tray submenu, and the config
+//! watcher.
 
 use std::sync::OnceLock;
 
@@ -23,12 +26,12 @@ use crate::usage_limits::{UsageLimits, UsageLimitsState, UsageStatus};
 /// without being shrunk to fit the icon width.
 const FONT_BYTES: &[u8] = include_bytes!("../assets/fonts/BebasNeue-Regular.ttf");
 
-/// Every glyph the badge can show — used to size the font by the *tallest*
+/// Every digit the badge can show — used to size the font by the *tallest*
 /// glyph so the digit height is consistent across all numbers.
-const HEIGHT_REFS: [char; 11] = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'X'];
-/// Widest two-character strings — used to size the font so the worst-case width
+const HEIGHT_REFS: [char; 10] = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9'];
+/// Widest two-digit strings — used to size the font so the worst-case width
 /// still fits, independent of the number actually shown.
-const WIDTH_REFS: [&str; 3] = ["88", "00", "XX"];
+const WIDTH_REFS: [&str; 2] = ["88", "00"];
 
 fn font() -> &'static Font {
     static FONT: OnceLock<Font> = OnceLock::new();
@@ -148,17 +151,16 @@ fn over(dst: &mut [u8], rgb: [u8; 3], a: u8) {
     dst[3] = (out_a * 255.0).round().clamp(0.0, 255.0) as u8;
 }
 
-/// Render the badge directly at `size` (the OS tray pixel size) so it displays
-/// ~1:1 instead of being resampled by the OS. `text` (1-2 chars: digits or
-/// "XX") is rasterized from the bundled condensed font, sized to fill the icon,
-/// anti-aliased, drawn over a dimmed copy of `base` in `color` with a 1px black
-/// outline for contrast.
-fn render_badge(base: &Image, text: &str, color: [u8; 3], size: usize) -> Image<'static> {
+/// Composite a coverage mask (0..255 per pixel, `size`x`size`) onto a dimmed,
+/// tray-sized copy of `base`, in `color` with a 1px black outline for contrast.
+/// The badge is built directly at `size` (the OS tray pixel size) so it
+/// displays ~1:1 instead of being resampled by the OS.
+fn compose_badge(base: &Image, cov: &[u8], color: [u8; 3], size: usize) -> Image<'static> {
     let w = size;
     let h = size;
 
     // Background: fit the source icon to the tray size with an area filter,
-    // dimmed so the number reads regardless of icon brightness.
+    // dimmed so the mark reads regardless of icon brightness.
     let mut buf = area_downscale(base.rgba(), base.width() as usize, base.height() as usize, w, h);
     for px in buf.chunks_exact_mut(4) {
         px[0] = (px[0] as u32 * 35 / 100) as u8;
@@ -166,6 +168,44 @@ fn render_badge(base: &Image, text: &str, color: [u8; 3], size: usize) -> Image<
         px[2] = (px[2] as u32 * 35 / 100) as u8;
     }
 
+    // Outline coverage: a 1px dilation of the mark coverage. Drawing it in black
+    // under the colored mark leaves a dark rim everywhere the mark doesn't fully
+    // cover — contrast against any background.
+    let mut outline = vec![0u8; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            let mut mx = 0u8;
+            for dy in -1i32..=1 {
+                for dx in -1i32..=1 {
+                    let nx = x as i32 + dx;
+                    let ny = y as i32 + dy;
+                    if nx >= 0 && ny >= 0 && (nx as usize) < w && (ny as usize) < h {
+                        let v = cov[ny as usize * w + nx as usize];
+                        if v > mx {
+                            mx = v;
+                        }
+                    }
+                }
+            }
+            outline[y * w + x] = mx;
+        }
+    }
+
+    // Composite: dimmed background -> black outline -> colored mark.
+    for i in 0..w * h {
+        let p = i * 4;
+        over(&mut buf[p..p + 4], [0, 0, 0], outline[i]);
+        over(&mut buf[p..p + 4], color, cov[i]);
+    }
+
+    Image::new_owned(buf, w as u32, h as u32)
+}
+
+/// Anti-aliased coverage mask of `text` (1-2 digits) rasterized from the
+/// bundled condensed font, sized to fill a `size`x`size` icon.
+fn text_coverage(text: &str, size: usize) -> Vec<u8> {
+    let w = size;
+    let h = size;
     let font = font();
     // Leave 1px around the text for the outline.
     let avail = (w.min(h).saturating_sub(2)).max(1) as i32;
@@ -198,7 +238,6 @@ fn render_badge(base: &Image, text: &str, color: [u8; 3], size: usize) -> Image<
     let (minx, _, maxx, _) = text_bounds(font, text, px);
     let off_x = (w as i32 - (maxx - minx)) / 2 - minx;
 
-    // Rasterize the glyphs into a single coverage mask (0..255 per pixel).
     let mut cov = vec![0u8; w * h];
     let mut pen = 0.0f32;
     for ch in text.chars() {
@@ -223,49 +262,81 @@ fn render_badge(base: &Image, text: &str, color: [u8; 3], size: usize) -> Image<
         }
         pen += m.advance_width;
     }
+    cov
+}
 
-    // Outline coverage: a 1px dilation of the glyph coverage. Drawing it in
-    // black under the colored glyph leaves a dark rim everywhere the glyph
-    // doesn't fully cover — contrast against any background.
-    let mut outline = vec![0u8; w * h];
-    for y in 0..h {
-        for x in 0..w {
-            let mut mx = 0u8;
-            for dy in -1i32..=1 {
-                for dx in -1i32..=1 {
-                    let nx = x as i32 + dx;
-                    let ny = y as i32 + dy;
-                    if nx >= 0 && ny >= 0 && (nx as usize) < w && (ny as usize) < h {
-                        let v = cov[ny as usize * w + nx as usize];
-                        if v > mx {
-                            mx = v;
-                        }
-                    }
-                }
+/// Render a 1-2 digit number badge over the app icon.
+fn render_badge(base: &Image, text: &str, color: [u8; 3], size: usize) -> Image<'static> {
+    compose_badge(base, &text_coverage(text, size), color, size)
+}
+
+/// Traffic-light colors. Green and red are sampled from the app icon's lights;
+/// the amber is shifted toward gold (the icon's native amber is too orange and
+/// reads too close to red at tray size). Indexed by level: 0=green, 1=amber,
+/// 2=red.
+const LEVEL_COLORS: [[u8; 3]; 3] = [[62, 182, 80], [245, 176, 48], [240, 79, 72]];
+
+/// Per-state color level of each light, indexed `[state][band]` where band is
+/// 0=top, 1=middle, 2=bottom. Reading bottom→top the 7 states progress
+/// GGG → GGY → GYY → YYY → YYR → YRR → RRR as usage climbs: the top light
+/// escalates first, then the middle, then the bottom.
+const LIGHT_LEVELS: [[u8; 3]; 7] = [
+    [0, 0, 0], // GGG
+    [1, 0, 0], // GGY
+    [1, 1, 0], // GYY
+    [1, 1, 1], // YYY
+    [2, 1, 1], // YYR
+    [2, 2, 1], // YRR
+    [2, 2, 2], // RRR
+];
+
+/// Map a percentage to a traffic-light state: 0..=99 split into 6 equal
+/// intervals (states 0-5), and 100% to the all-red state 6.
+fn light_state(pct: u32) -> usize {
+    (pct * 6 / 100).min(6) as usize
+}
+
+/// Render the traffic-light badge: recolor the app icon's three lights to the
+/// state for `pct`, keeping the housing. The `*Number` modes reuse this for the
+/// all-red 100% state. Drawn at the OS tray pixel size.
+fn render_light_badge(base: &Image, pct: u32, size: usize) -> Image<'static> {
+    let levels = LIGHT_LEVELS[light_state(pct)];
+    let bw = base.width() as usize;
+    let bh = base.height() as usize;
+    let src = base.rgba();
+    let mut buf = src.to_vec();
+
+    // Recolor every "lit" pixel (bright + saturated — i.e. one of the colored
+    // bulbs, not the dark housing) to its band's state color.
+    for y in 0..bh {
+        let band = (y * 3 / bh.max(1)).min(2);
+        let color = LEVEL_COLORS[levels[band] as usize];
+        for x in 0..bw {
+            let p = (y * bw + x) * 4;
+            if src[p + 3] == 0 {
+                continue;
             }
-            outline[y * w + x] = mx;
+            let (r, g, b) = (src[p] as i32, src[p + 1] as i32, src[p + 2] as i32);
+            let mx = r.max(g).max(b);
+            let mn = r.min(g).min(b);
+            let lit = mx > 110 && (mx - mn) * 100 > 30 * mx; // brightness + saturation > 0.30
+            if lit {
+                buf[p] = color[0];
+                buf[p + 1] = color[1];
+                buf[p + 2] = color[2];
+            }
         }
     }
 
-    // Composite: dimmed background -> black outline -> colored glyph.
-    for i in 0..w * h {
-        let p = i * 4;
-        over(&mut buf[p..p + 4], [0, 0, 0], outline[i]);
-        over(&mut buf[p..p + 4], color, cov[i]);
-    }
-
-    Image::new_owned(buf, w as u32, h as u32)
+    let small = area_downscale(&buf, bw, bh, size, size);
+    Image::new_owned(small, size as u32, size as u32)
 }
 
-/// Badge text for a percentage: always two characters — zero-padded for 0..=9
-/// ("09"), the value for 10..=99, or "XX" for a maxed (>=100%) bucket. Fixing
-/// the width keeps the digit size and position stable across every value.
+/// Badge text for a sub-100% percentage: always two digits, zero-padded ("09"),
+/// so the digit size and position stay stable across every value. A maxed
+/// (>=100%) bucket draws the all-red traffic light instead — see `refresh`.
 fn badge_text(pct: u32) -> String {
-    if pct >= 100 {
-        "XX".to_string()
-    } else {
-        format!("{pct:02}")
-    }
+    format!("{pct:02}")
 }
 
 /// Whole-percent value (0..=100) for the bucket the badge tracks, or `None`
@@ -276,8 +347,8 @@ fn badge_percent(badge: TrayBadge, usage: &UsageLimits) -> Option<u32> {
     }
     let bucket = match badge {
         TrayBadge::None => return None,
-        TrayBadge::FiveHour => usage.five_hour.as_ref(),
-        TrayBadge::SevenDay => usage.seven_day.as_ref(),
+        TrayBadge::FiveHourLight | TrayBadge::FiveHourNumber => usage.five_hour.as_ref(),
+        TrayBadge::SevenDayLight | TrayBadge::SevenDayNumber => usage.seven_day.as_ref(),
     }?;
     Some((bucket.utilization * 100.0).round().clamp(0.0, 100.0) as u32)
 }
@@ -326,7 +397,14 @@ pub fn refresh(app: &AppHandle) {
     let size = target_icon_px(app);
     match badge_percent(badge, &usage) {
         Some(pct) => {
-            let img = render_badge(&base, &badge_text(pct), urgency_color(pct), size);
+            // Light modes recolor the traffic light. Number modes draw the
+            // percentage, but a maxed (>=100%) bucket shows the all-red light
+            // instead of a number.
+            let img = if badge.is_light() || pct >= 100 {
+                render_light_badge(&base, pct, size)
+            } else {
+                render_badge(&base, &badge_text(pct), urgency_color(pct), size)
+            };
             let _ = tray.set_icon(Some(img));
         }
         None => {
@@ -355,26 +433,28 @@ mod tests {
     #[test]
     fn badge_percent_picks_the_selected_bucket() {
         let u = usage_ok(Some(0.42), Some(0.18));
-        assert_eq!(badge_percent(TrayBadge::FiveHour, &u), Some(42));
-        assert_eq!(badge_percent(TrayBadge::SevenDay, &u), Some(18));
+        assert_eq!(badge_percent(TrayBadge::FiveHourLight, &u), Some(42));
+        assert_eq!(badge_percent(TrayBadge::FiveHourNumber, &u), Some(42));
+        assert_eq!(badge_percent(TrayBadge::SevenDayLight, &u), Some(18));
+        assert_eq!(badge_percent(TrayBadge::SevenDayNumber, &u), Some(18));
         assert_eq!(badge_percent(TrayBadge::None, &u), None);
     }
 
     #[test]
     fn badge_percent_rounds_and_clamps() {
         let u = usage_ok(Some(0.846), Some(1.5));
-        assert_eq!(badge_percent(TrayBadge::FiveHour, &u), Some(85));
-        assert_eq!(badge_percent(TrayBadge::SevenDay, &u), Some(100));
+        assert_eq!(badge_percent(TrayBadge::FiveHourNumber, &u), Some(85));
+        assert_eq!(badge_percent(TrayBadge::SevenDayNumber, &u), Some(100));
     }
 
     #[test]
     fn badge_percent_none_when_not_ok_or_missing() {
         let mut u = usage_ok(Some(0.5), None);
         u.status = UsageStatus::NetworkError;
-        assert_eq!(badge_percent(TrayBadge::FiveHour, &u), None);
+        assert_eq!(badge_percent(TrayBadge::FiveHourNumber, &u), None);
 
         let ok_missing = usage_ok(None, Some(0.3));
-        assert_eq!(badge_percent(TrayBadge::FiveHour, &ok_missing), None);
+        assert_eq!(badge_percent(TrayBadge::FiveHourNumber, &ok_missing), None);
     }
 
     #[test]
@@ -397,12 +477,11 @@ mod tests {
     }
 
     #[test]
-    fn badge_text_is_always_two_chars() {
+    fn badge_text_is_always_two_digits() {
         assert_eq!(badge_text(0), "00");
         assert_eq!(badge_text(7), "07");
         assert_eq!(badge_text(85), "85");
         assert_eq!(badge_text(99), "99");
-        assert_eq!(badge_text(100), "XX");
     }
 
     #[test]
@@ -430,6 +509,43 @@ mod tests {
         assert!(m.width > 0 && m.height > 0, "digit should rasterize to a bitmap");
         assert_eq!(bmp.len(), m.width * m.height);
         assert!(bmp.iter().any(|&c| c > 0), "bitmap should have inked pixels");
+    }
+
+    #[test]
+    fn light_state_splits_into_six_intervals_plus_max() {
+        assert_eq!(light_state(0), 0);
+        assert_eq!(light_state(16), 0);
+        assert_eq!(light_state(17), 1);
+        assert_eq!(light_state(50), 3);
+        assert_eq!(light_state(83), 4);
+        assert_eq!(light_state(84), 5);
+        assert_eq!(light_state(99), 5);
+        assert_eq!(light_state(100), 6);
+    }
+
+    #[test]
+    fn render_light_badge_recolors_lights_per_state() {
+        // 1x3 base of three saturated "lit" pixels (top, middle, bottom bands).
+        let lit = [50u8, 200, 50, 255]; // green-ish, saturated, bright
+        let base = Image::new_owned([lit, lit, lit].concat(), 1, 3);
+
+        // State 0 (pct 0): all green.
+        let g = render_light_badge(&base, 0, 3);
+        for row in g.rgba().chunks_exact(4).take(3) {
+            assert_eq!(&row[0..3], &LEVEL_COLORS[0]);
+        }
+        // State 6 (pct 100): all red.
+        let r = render_light_badge(&base, 100, 3);
+        for row in r.rgba().chunks_exact(4).take(3) {
+            assert_eq!(&row[0..3], &LEVEL_COLORS[2]);
+        }
+        // State 1 (pct 20): top amber, middle + bottom green. Output is 3x3, so
+        // rows start at byte 0 (top), 12 (middle), 24 (bottom).
+        let s1 = render_light_badge(&base, 20, 3);
+        let px = s1.rgba();
+        assert_eq!(&px[0..3], &LEVEL_COLORS[1], "top -> amber");
+        assert_eq!(&px[12..15], &LEVEL_COLORS[0], "middle -> green");
+        assert_eq!(&px[24..27], &LEVEL_COLORS[0], "bottom -> green");
     }
 
     #[test]

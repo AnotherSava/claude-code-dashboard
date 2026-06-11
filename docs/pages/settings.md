@@ -25,7 +25,7 @@ Right-click the tray icon for the controls you reach for most:
 - **On system start** — launch at login: off, open the window, or start hidden in the tray.
 - **Auto-resize** — fit the window height to its content, growing upward or downward.
 - **History font size** — pick one of five sizes for the history window.
-- **Tray usage badge** — show the 5-hour or 7-day usage percentage as a number on the tray icon (or none).
+- **Tray usage badge** — show the 5-hour or 7-day usage on the tray icon, as the recolored traffic light or a number (or none).
 - **Open config/logs location** — open the app data folder.
 - **Quit** — close the widget.
 
@@ -125,7 +125,7 @@ For the full classification logic see [Classification](development/classificatio
 
 - `limit_bar_segments` — number of segments in the 5-hour / 7-day usage bars; higher is finer-grained.
 - `usage_limits_poll_interval_seconds` — how often to poll Anthropic for usage. Clamped to a 60-second minimum.
-- `tray_badge` — draw a usage percentage on the tray icon: `"five_hour"`, `"seven_day"`, or `"none"`. Colored green → amber → red by severity; the icon's hover tooltip always shows both figures. Set it from the tray's **Tray usage badge** submenu.
+- `tray_badge` — show a usage limit on the tray icon. Values: `"none"`; `"five_hour_light"` / `"seven_day_light"` (recolor the traffic-light icon by usage); `"five_hour_number"` / `"seven_day_number"` (show the percentage, all-red light at 100%). The hover tooltip always shows both figures. Set it from the tray's **Tray usage badge** submenu.
 
 ### Multi-device sync
 
