@@ -436,26 +436,41 @@ async fn drain(app: &AppHandle, chat_id: &str, path: &Path, state: &Arc<Mutex<Dr
     apply_and_emit(app, chat_id, &update, text_entries);
 }
 
-/// True when a freshly-flushed transcript update should correct a settled
-/// `Done` row to `Awaiting`: the newest conversational entry is an assistant
-/// text turn (so `infer_state` yielded `Done`) and that text reads as a
-/// question. The `Stop` hook fires before this text flushes, so it can't make
-/// this call itself — see `AppState::promote_done_to_awaiting`. Kept pure (no
-/// app/config handles) so the decision is unit-testable; the caller supplies
-/// `benign_closers` from config.
-fn flushed_turn_is_question(
+/// What a freshly-flushed transcript update says about the question-vs-done
+/// verdict the `Stop` hook had to guess before the final turn flushed.
+#[derive(Debug, PartialEq, Eq)]
+enum FlushedVerdict {
+    /// The settled final assistant turn reads as a question — correct a `Done`
+    /// row up to `Awaiting` (`AppState::promote_done_to_awaiting`).
+    Question,
+    /// The settled final assistant turn reads as a plain statement — correct a
+    /// scan-derived `Awaiting` row back down to `Done`
+    /// (`AppState::demote_scanned_awaiting_to_done`).
+    Statement,
+}
+
+/// Classify a freshly-flushed update, or `None` when it carries no verdict.
+/// A verdict exists only when `infer_state` yielded `Done` (the newest
+/// conversational entry is a *completed* assistant text turn, not a tool
+/// call or an in-flight turn) and that turn has text — exactly the moment the
+/// final assistant text lands, which the `Stop` hook fired too early to read.
+/// Kept pure (no app/config handles) so the decision is unit-testable; the
+/// caller supplies `benign_closers` from config and routes the verdict to the
+/// matching `AppState` correction.
+fn flushed_turn_verdict(
     update: &InferredState,
     text_entries: &[(DialogRole, String)],
     benign_closers: &[String],
-) -> bool {
+) -> Option<FlushedVerdict> {
     if !matches!(update.state, Some(Status::Done)) {
-        return false;
+        return None;
     }
-    text_entries
-        .iter()
-        .rev()
-        .find(|(role, _)| *role == DialogRole::Assistant)
-        .is_some_and(|(_, text)| crate::adapters::claude::is_a_question(text, benign_closers))
+    let (_, text) = text_entries.iter().rev().find(|(role, _)| *role == DialogRole::Assistant)?;
+    Some(if crate::adapters::claude::is_a_question(text, benign_closers) {
+        FlushedVerdict::Question
+    } else {
+        FlushedVerdict::Statement
+    })
 }
 
 fn apply_and_emit(app: &AppHandle, chat_id: &str, update: &InferredState, text_entries: Vec<(DialogRole, String)>) {
@@ -482,19 +497,29 @@ fn apply_and_emit(app: &AppHandle, chat_id: &str, update: &InferredState, text_e
     if demoted {
         tracing::debug!(chat_id, "turn cancelled (interrupt marker); reverted to pre-prompt state");
     }
-    // The `Stop` hook settles a finished turn to `Done` before its final
-    // assistant text flushes to JSONL, so it can't see a trailing question. Now
-    // that the text has flushed, correct `Done → Awaiting` for that case. Runs
-    // before `apply_text_entries` so the appended assistant entry is stamped
-    // with the corrected status.
-    let promoted = flushed_turn_is_question(
+    // The `Stop` hook settles a finished turn before its final assistant text
+    // flushes to JSONL, so it can read the *prior* turn and stamp the wrong
+    // question-vs-done verdict. Now that the text has flushed, correct it both
+    // ways: a real question that `Stop` called `Done` → `Awaiting`; a plain
+    // statement that `Stop` (reading a prior question) called `Awaiting` →
+    // `Done`. The demote is gated inside `AppState` on the scan-derived flag so
+    // a tool-gated `Awaiting` is never touched. Runs before `apply_text_entries`
+    // so the appended assistant entry is stamped with the corrected status.
+    let corrected = match flushed_turn_verdict(
         update,
         &text_entries,
         &app.try_state::<ConfigState>().map(|c| c.snapshot().benign_closers).unwrap_or_default(),
-    ) && app_state.promote_done_to_awaiting(chat_id, now);
-    if promoted {
-        tracing::debug!(chat_id, "flushed assistant turn is a question; promoted Done -> Awaiting");
-    }
+    ) {
+        Some(FlushedVerdict::Question) if app_state.promote_done_to_awaiting(chat_id, now) => {
+            tracing::debug!(chat_id, "flushed assistant turn is a question; promoted Done -> Awaiting");
+            true
+        }
+        Some(FlushedVerdict::Statement) if app_state.demote_scanned_awaiting_to_done(chat_id, now) => {
+            tracing::debug!(chat_id, "flushed assistant turn is a statement; demoted scan-derived Awaiting -> Done");
+            true
+        }
+        _ => false,
+    };
     let dialog_changed = if !text_entries.is_empty() {
         app_state.apply_text_entries(chat_id, &text_entries, now)
     } else {
@@ -510,7 +535,7 @@ fn apply_and_emit(app: &AppHandle, chat_id: &str, update: &InferredState, text_e
             h.save_to_disk();
         }
     }
-    if metric_changed || dialog_changed || demoted || promoted {
+    if metric_changed || dialog_changed || demoted || corrected {
         emit_sessions_updated(app);
     }
 }
@@ -889,6 +914,7 @@ mod tests {
             id: "s".into(),
             status,
             status_before_working: Status::Idle,
+            status_from_transcript_scan: false,
             label: String::new(),
             original_prompt: None,
             task_started_at: 0,
@@ -958,43 +984,51 @@ mod tests {
     }
 
     #[test]
-    fn flushed_question_promotes_when_done_and_last_assistant_is_a_question() {
+    fn flushed_verdict_is_question_when_done_and_last_assistant_is_a_question() {
         let entries = vec![(DialogRole::Assistant, "Should I proceed?".to_string())];
-        assert!(flushed_turn_is_question(&done(), &entries, &[]));
+        assert_eq!(flushed_turn_verdict(&done(), &entries, &[]), Some(FlushedVerdict::Question));
     }
 
     #[test]
-    fn flushed_question_ignored_when_last_assistant_is_not_a_question() {
+    fn flushed_verdict_is_statement_when_done_and_last_assistant_is_not_a_question() {
         let entries = vec![(DialogRole::Assistant, "All tests pass.".to_string())];
-        assert!(!flushed_turn_is_question(&done(), &entries, &[]));
+        assert_eq!(flushed_turn_verdict(&done(), &entries, &[]), Some(FlushedVerdict::Statement));
     }
 
     #[test]
-    fn flushed_question_ignored_when_state_is_not_done() {
+    fn flushed_verdict_is_none_when_state_is_not_done() {
         // Mid-turn the row is Working; a transient assistant text ending in `?`
-        // must not promote — only a settled Done turn is corrected.
+        // must yield no verdict — only a settled Done turn is corrected.
         let working = InferredState { state: Some(Status::Working), ..Default::default() };
         let entries = vec![(DialogRole::Assistant, "Should I proceed?".to_string())];
-        assert!(!flushed_turn_is_question(&working, &entries, &[]));
+        assert_eq!(flushed_turn_verdict(&working, &entries, &[]), None);
     }
 
     #[test]
-    fn flushed_question_decided_by_newest_assistant_entry() {
+    fn flushed_verdict_is_none_when_no_assistant_entry() {
+        let entries = vec![(DialogRole::User, "hi".to_string())];
+        assert_eq!(flushed_turn_verdict(&done(), &entries, &[]), None);
+    }
+
+    #[test]
+    fn flushed_verdict_decided_by_newest_assistant_entry() {
         // A user reply may separate two assistant turns in one flush; the newest
-        // assistant text decides — here the last turn carries no question.
+        // assistant text decides — here the last turn is a plain statement, so
+        // the verdict is Statement even though an earlier turn was a question.
         let entries = vec![
             (DialogRole::Assistant, "Should I proceed?".to_string()),
             (DialogRole::User, "yes".to_string()),
             (DialogRole::Assistant, "Done, no question here.".to_string()),
         ];
-        assert!(!flushed_turn_is_question(&done(), &entries, &[]));
+        assert_eq!(flushed_turn_verdict(&done(), &entries, &[]), Some(FlushedVerdict::Statement));
     }
 
     #[test]
-    fn flushed_question_respects_benign_closers() {
+    fn flushed_verdict_respects_benign_closers() {
+        // A benign closer isn't a real question → Statement, not Question.
         let entries = vec![(DialogRole::Assistant, "What's next?".to_string())];
         let benign = vec!["What's next?".to_string()];
-        assert!(!flushed_turn_is_question(&done(), &entries, &benign));
+        assert_eq!(flushed_turn_verdict(&done(), &entries, &benign), Some(FlushedVerdict::Statement));
     }
 
     #[test]

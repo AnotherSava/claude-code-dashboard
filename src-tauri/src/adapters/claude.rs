@@ -99,6 +99,16 @@ pub fn dispatch(event: &str, payload: &Value, cfg: &Config) -> AdapterOutput {
         _ => None,
     };
 
+    // Mark states the `classify` arms derive by scanning transcript text via
+    // `is_a_question` — `Stop` (always) and `Notification`/`SessionStart` of
+    // subtype `idle_prompt`. Because `Stop` fires before the final assistant
+    // turn flushes, that scan can read stale (prior-turn) text; the flag lets
+    // the watcher overturn the resulting `Awaiting`/`Done` once the real text
+    // lands. Every other event is an authoritative tool/lifecycle signal.
+    let from_transcript_scan = event == "Stop"
+        || (matches!(event, "Notification" | "SessionStart")
+            && payload.get("notification_type").and_then(|v| v.as_str()) == Some("idle_prompt"));
+
     AdapterOutput::Set {
         input: SetInput {
             id: chat_id,
@@ -108,6 +118,7 @@ pub fn dispatch(event: &str, payload: &Value, cfg: &Config) -> AdapterOutput {
             model: None,
             input_tokens: None,
             dialog_entry,
+            from_transcript_scan,
         },
         transcript_path,
     }

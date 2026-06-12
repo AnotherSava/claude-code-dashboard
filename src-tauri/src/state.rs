@@ -72,6 +72,19 @@ pub struct AgentSession {
     /// Internal bookkeeping — never serialized to the frontend / sync / disk.
     #[serde(skip)]
     pub status_before_working: Status,
+    /// True when the current status was produced by the Claude adapter's
+    /// transcript question-scan (the `Stop` / `idle_prompt` `is_a_question`
+    /// path) rather than by an authoritative tool-gating signal
+    /// (`AskUserQuestion`, `PermissionRequest`, …). Because `Stop` fires before
+    /// the final assistant turn flushes to JSONL, that scan can read the prior
+    /// turn's text and stamp the wrong question-vs-done verdict; this flag tells
+    /// the transcript watcher which `Awaiting` rows it may overturn once the
+    /// real text lands (`demote_scanned_awaiting_to_done`) and which it must
+    /// leave alone. Only ever set `true` for those scan-derived states, so a
+    /// tool-gated `Awaiting` is never demoted. Internal bookkeeping — never
+    /// serialized to the frontend / sync / disk.
+    #[serde(skip)]
+    pub status_from_transcript_scan: bool,
     pub label: String,
     pub original_prompt: Option<String>,
     #[serde(default)]
@@ -106,6 +119,9 @@ pub struct SetInput {
     pub model: Option<String>,
     pub input_tokens: Option<u64>,
     pub dialog_entry: Option<PendingDialogEntry>,
+    /// Set by the adapter for states derived from the transcript question-scan
+    /// (`Stop`, `idle_prompt`); copied onto [`AgentSession::status_from_transcript_scan`].
+    pub from_transcript_scan: bool,
 }
 
 /// True when `label` (after trim, case-insensitive) matches one of the
@@ -246,6 +262,7 @@ impl AppState {
             }
 
             existing.status = input.status;
+            existing.status_from_transcript_scan = input.from_transcript_scan;
             existing.label = new_label;
             existing.original_prompt = new_original_prompt;
             if let Some(src) = input.source {
@@ -337,6 +354,7 @@ impl AppState {
                 id: input.id,
                 status: input.status,
                 status_before_working: Status::Idle,
+                status_from_transcript_scan: input.from_transcript_scan,
                 label,
                 original_prompt,
                 task_started_at,
@@ -408,7 +426,38 @@ impl AppState {
             return false;
         }
         s.status = Status::Awaiting;
+        s.status_from_transcript_scan = true;
         s.label = "has a question".into();
+        s.state_entered_at = now_ms;
+        s.updated = now_ms;
+        true
+    }
+
+    /// The mirror of [`Self::promote_done_to_awaiting`]: correct a settled
+    /// `Awaiting` back to `Done` once the flushed transcript shows the final
+    /// assistant turn was *not* a question. Same root cause — `Stop` fires
+    /// before the final turn flushes, so when a non-question turn ends right
+    /// after a question turn it reads the *prior* (question) text and wrongly
+    /// stamps `Awaiting "has a question"`. Gated on
+    /// [`AgentSession::status_from_transcript_scan`], so only a scan-derived
+    /// `Awaiting` is touched — a genuine tool-gated `Awaiting` (`AskUserQuestion`,
+    /// `PermissionRequest`, …) is never demoted even though it shares the label.
+    /// The corrected `Done` shows the row's `original_prompt` (the stable task),
+    /// since the wrong `Awaiting` clobbered the prior label. Stays
+    /// scan-derived so a later flush can correct it again. Returns true if it
+    /// acted.
+    pub fn demote_scanned_awaiting_to_done(&self, id: &str, now_ms: i64) -> bool {
+        let mut sessions = self.sessions.lock().unwrap();
+        let Some(s) = sessions.iter_mut().find(|s| s.id == id) else {
+            return false;
+        };
+        if s.status != Status::Awaiting || !s.status_from_transcript_scan {
+            return false;
+        }
+        s.status = Status::Done;
+        if let Some(prompt) = s.original_prompt.clone() {
+            s.label = prompt;
+        }
         s.state_entered_at = now_ms;
         s.updated = now_ms;
         true
@@ -542,6 +591,7 @@ mod tests {
             model: None,
             input_tokens: None,
             dialog_entry: None,
+            from_transcript_scan: false,
         }
     }
 
@@ -554,7 +604,14 @@ mod tests {
             model: None,
             input_tokens: None,
             dialog_entry: None,
+            from_transcript_scan: false,
         }
+    }
+
+    /// A `set` whose status was derived from the transcript question-scan
+    /// (`Stop` / `idle_prompt`) — the only kind the watcher may overturn.
+    fn scan_set(id: &str, status: Status, label: &str) -> SetInput {
+        SetInput { from_transcript_scan: true, ..set(id, status, label) }
     }
 
     fn get<'a>(state: &'a AppState, id: &str) -> AgentSession {
@@ -636,6 +693,53 @@ mod tests {
         state.apply_set(set("a", Status::Working, "fix the parser"), 0, NO_CONTINUATIONS, None);
         assert!(!state.promote_done_to_awaiting("a", 5_000));
         assert_eq!(get(&state, "a").status, Status::Working);
+    }
+
+    #[test]
+    fn demote_scanned_awaiting_corrects_a_stale_question_read() {
+        // `Stop` read the *prior* turn's question and stamped Awaiting on a turn
+        // that actually ended on a statement; the watcher corrects it to Done,
+        // restoring the task label from original_prompt.
+        let state = AppState::new();
+        state.apply_set(set("a", Status::Working, "fix the parser"), 0, NO_CONTINUATIONS, None);
+        state.apply_set(scan_set("a", Status::Awaiting, "has a question"), 10_000, NO_CONTINUATIONS, None);
+        assert_eq!(get(&state, "a").status, Status::Awaiting);
+        assert!(state.demote_scanned_awaiting_to_done("a", 20_000));
+        let s = get(&state, "a");
+        assert_eq!(s.status, Status::Done);
+        assert_eq!(s.label, "fix the parser", "label restored to the task");
+        assert_eq!(s.state_entered_at, 20_000);
+    }
+
+    #[test]
+    fn demote_scanned_awaiting_leaves_tool_gated_awaiting_alone() {
+        // The safety-critical case: a real tool gate (not scan-derived) shares
+        // the "has a question" label but must never be demoted.
+        let state = AppState::new();
+        state.apply_set(set("a", Status::Working, "fix the parser"), 0, NO_CONTINUATIONS, None);
+        state.apply_set(set("a", Status::Awaiting, "needs approval: Bash"), 10_000, NO_CONTINUATIONS, None);
+        assert!(!state.demote_scanned_awaiting_to_done("a", 20_000));
+        assert_eq!(get(&state, "a").status, Status::Awaiting);
+    }
+
+    #[test]
+    fn demote_scanned_awaiting_is_noop_when_not_awaiting() {
+        let state = AppState::new();
+        state.apply_set(scan_set("a", Status::Done, ""), 0, NO_CONTINUATIONS, None);
+        assert!(!state.demote_scanned_awaiting_to_done("a", 5_000));
+        assert_eq!(get(&state, "a").status, Status::Done);
+    }
+
+    #[test]
+    fn tool_gate_clears_the_scan_flag_so_a_later_demote_is_blocked() {
+        // A scan-derived Awaiting that's then overwritten by a tool gate must
+        // lose its scan provenance, so the watcher can no longer demote it.
+        let state = AppState::new();
+        state.apply_set(set("a", Status::Working, "task"), 0, NO_CONTINUATIONS, None);
+        state.apply_set(scan_set("a", Status::Awaiting, "has a question"), 1_000, NO_CONTINUATIONS, None);
+        state.apply_set(set("a", Status::Awaiting, "needs approval: tool"), 2_000, NO_CONTINUATIONS, None);
+        assert!(!state.demote_scanned_awaiting_to_done("a", 3_000));
+        assert_eq!(get(&state, "a").status, Status::Awaiting);
     }
 
     #[test]
@@ -792,6 +896,7 @@ mod tests {
                 model: Some("claude-opus-4-7".into()),
                 input_tokens: Some(50_000),
                 dialog_entry: None,
+                from_transcript_scan: false,
             },
             1000,
             NO_CONTINUATIONS,
@@ -966,6 +1071,7 @@ mod tests {
                 role: DialogRole::User,
                 text: label.to_string(),
             }),
+            from_transcript_scan: false,
         }
     }
 
@@ -981,6 +1087,7 @@ mod tests {
                 role: DialogRole::Assistant,
                 text: agent_text.to_string(),
             }),
+            from_transcript_scan: false,
         }
     }
 
@@ -1128,6 +1235,7 @@ mod tests {
             id: "a".into(),
             status: Status::Done,
             status_before_working: Status::Idle,
+            status_from_transcript_scan: false,
             label: String::new(),
             original_prompt: None,
             task_started_at: 0,
@@ -1337,6 +1445,7 @@ mod tests {
             id: id.to_string(),
             status: Status::Working,
             status_before_working: Status::Idle,
+            status_from_transcript_scan: false,
             label: String::new(),
             original_prompt: None,
             task_started_at: 0,

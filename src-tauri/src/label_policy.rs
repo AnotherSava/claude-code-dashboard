@@ -74,6 +74,7 @@ mod tests {
             model: None,
             input_tokens: None,
             dialog_entry: None,
+            from_transcript_scan: false,
         }
     }
 
@@ -82,6 +83,7 @@ mod tests {
             id: "a".into(),
             status: Status::Idle,
             status_before_working: Status::Idle,
+            status_from_transcript_scan: false,
             label: label.into(),
             original_prompt: original_prompt.map(str::to_string),
             task_started_at: 0,
