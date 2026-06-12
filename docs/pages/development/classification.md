@@ -42,7 +42,7 @@ The adapter recognizes six event names. Anything else returns `Ignore` and the w
 | `UserPromptSubmit` | `working`                                                                           | Label is the cleaned prompt; blank prompt → label `None`.      |
 | `Notification`     | `awaiting` (default) — `done` if `notification_type == "idle_prompt"` with no question | See the notification-type table below.                      |
 | `PreToolUse`       | `awaiting` for `AskUserQuestion` / `ExitPlanMode` only; other tools ignored         | Label: `"has a question"` for `AskUserQuestion`, `"plan approval"` for `ExitPlanMode`. The matcher in `~/.claude/settings.json` should restrict the hook to these two tools (see [Installation → Wire the Claude Code hook](../install#2-wire-the-claude-code-hook)) — Claude Code buffers the `tool_use` block until the user answers, so the JSONL transcript can't carry the signal in flight. |
-| `Stop`             | `done` — flips to `awaiting` if last assistant turn contains a question (see [detection rules](#transcript-question-detection)) | Question check ignores configured benign closers.              |
+| `Stop`             | `done` — flips to `awaiting` if last assistant turn contains a question (see [detection rules](#transcript-question-detection)) | Question check ignores configured benign closers. `Stop` fires *before* the final assistant turn flushes to JSONL, so it often can't see a trailing question and defaults to `done`; the transcript watcher then corrects `done → awaiting` once the text lands (see [data flow](data-flow)). |
 | `SessionEnd`       | emits `Clear` (removes the row)                                                     | Bypasses status classification entirely.                       |
 
 `SessionStart` and `Notification` share a code path because Claude Code occasionally emits notifications under either name; the dispatcher merges them.
@@ -78,7 +78,7 @@ Other Unicode passes through untouched — accents, emoji, CJK, math symbols. Th
 
 ## Transcript question detection
 
-`Stop` and `Notification` (subtype `idle_prompt`) need to decide whether the agent is genuinely done or is actually waiting for an answer. The flow has two helpers:
+`Stop` and `Notification` (subtype `idle_prompt`) need to decide whether the agent is genuinely done or is actually waiting for an answer. The transcript watcher (`log_watcher.rs`) is a third caller: it reuses `is_a_question` to correct a settled `done` row to `awaiting` once the final assistant turn flushes to JSONL — the case `Stop` fires too early to catch (see [data flow](data-flow)). The flow has two helpers:
 
 **`last_assistant_text(path)`** — walks the JSONL transcript at `payload.transcript_path`:
 
@@ -90,7 +90,7 @@ Other Unicode passes through untouched — accents, emoji, CJK, math symbols. Th
    - if it's an array, walk each block and take the trimmed `text` from blocks where `type == "text"`.
 5. Track the last non-empty text seen (so trailing whitespace-only assistant turns don't reset the state) and return it.
 
-**`is_a_question(text, benign_closers)`** — pure check on a string, three detection paths. Before any path runs, inline Markdown formatting characters (`*`, `_`, `` ` ``, `#`, `~`) are stripped so a final `**Push?**` reduces to `Push?` and is still recognized — only those marker characters are removed; newlines and every other character (crucially the terminal `?`) are preserved.
+**`is_a_question(text, benign_closers)`** — pure check on a string, four detection paths. Before any path runs, inline Markdown formatting characters (`*`, `_`, `` ` ``, `#`, `~`) are stripped so a final `**Push?**` reduces to `Push?` and is still recognized — only those marker characters are removed; newlines and every other character (crucially the terminal `?`) are preserved.
 
 **Path 1 — trailing `?`:**
 
@@ -121,6 +121,16 @@ Only round brackets `()` are recognized for the option-list strip; `[]` and `{}`
 **Path 3 — hand-back request in last paragraph:**
 
 If neither path above matches, check whether any sentence in the last paragraph (split on `.!?` and newlines) starts with one of the hand-back openers `"paste "`, `"please provide "`, or `"confirm "` (case-insensitive). This catches the imperative hand-back where the agent waits for the user to supply something but never ends on a `?` — `"Paste the tableinfos output and I'll finish arena."`, `"Please provide the model group and the model name."`, `"Confirm to tag v1.2.0, or request edits."`. Only a **sentence-initial** opener counts, so a mid-sentence mention like `"you can paste this"` or `"I'll paste the result"` doesn't trigger. The list is kept narrow and phrase-matched — a blanket `"please "` would misfire on informational openers like *"Please note …"* / *"Please see …"*, and the trailing space in `"confirm "` keeps `Confirmed: …` statements out.
+
+**Path 4 — leading question in last paragraph:**
+
+If nothing above matches, check whether the **first sentence** of the last paragraph is itself a question — it ends with `?` before a concluding clause follows. This catches a hand-back whose question leads and is then trailed by context, like `"Apply this edit? (yes / no) Everything else is aligned."` — the trailing sentence defeats path 1 (the whole text no longer ends with `?`), the option menu sits mid-text rather than at the end, and `"apply"` is no path-2 phrase, so without this nothing sees it. Three guards keep it tight:
+
+1. The terminating `?` must immediately follow an **alphanumeric** character, so a bare mention of the glyph — `"a `` ` ``?`` ` `` immediately followed by …"`, which markdown-stripping leaves as `"a ? …"` — isn't read as a sentence terminator.
+2. The first sentence must **not** open with a self-directed phrase (`"let me "`, `"let's "`, `"lets "`, `"i'll "`, `"i will "`, `"i'm going to "`, `"i am going to "`). These mark the agent reasoning aloud and about to act, not asking — `"Let me investigate — does X have a cleaner fix? This affects what we do next."` stays `done`.
+3. Configured benign closers are honored, so a leading polite `"What's next? …"` still doesn't flag.
+
+This path was validated against the recorded dialog history (`prompt_history.json`): it fires on 12 of 60 real assistant turns with zero false positives. Like path 2 it scans only the **last** paragraph, and like it the question must be the paragraph's *first* sentence — a statement-first paragraph (`"The migration is ready. Looks good to you?"`) is left to path 1's trailing-`?` check.
 
 Failure modes are silent: a missing transcript file returns `None` from `last_assistant_text` (treated as "no question"), and malformed JSONL lines are individually skipped. The adapter never crashes a status update because of a transcript read error.
 

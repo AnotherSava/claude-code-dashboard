@@ -436,6 +436,28 @@ async fn drain(app: &AppHandle, chat_id: &str, path: &Path, state: &Arc<Mutex<Dr
     apply_and_emit(app, chat_id, &update, text_entries);
 }
 
+/// True when a freshly-flushed transcript update should correct a settled
+/// `Done` row to `Awaiting`: the newest conversational entry is an assistant
+/// text turn (so `infer_state` yielded `Done`) and that text reads as a
+/// question. The `Stop` hook fires before this text flushes, so it can't make
+/// this call itself — see `AppState::promote_done_to_awaiting`. Kept pure (no
+/// app/config handles) so the decision is unit-testable; the caller supplies
+/// `benign_closers` from config.
+fn flushed_turn_is_question(
+    update: &InferredState,
+    text_entries: &[(DialogRole, String)],
+    benign_closers: &[String],
+) -> bool {
+    if !matches!(update.state, Some(Status::Done)) {
+        return false;
+    }
+    text_entries
+        .iter()
+        .rev()
+        .find(|(role, _)| *role == DialogRole::Assistant)
+        .is_some_and(|(_, text)| crate::adapters::claude::is_a_question(text, benign_closers))
+}
+
 fn apply_and_emit(app: &AppHandle, chat_id: &str, update: &InferredState, text_entries: Vec<(DialogRole, String)>) {
     let Some(app_state) = app.try_state::<AppState>() else {
         return;
@@ -460,6 +482,19 @@ fn apply_and_emit(app: &AppHandle, chat_id: &str, update: &InferredState, text_e
     if demoted {
         tracing::debug!(chat_id, "turn cancelled (interrupt marker); reverted to pre-prompt state");
     }
+    // The `Stop` hook settles a finished turn to `Done` before its final
+    // assistant text flushes to JSONL, so it can't see a trailing question. Now
+    // that the text has flushed, correct `Done → Awaiting` for that case. Runs
+    // before `apply_text_entries` so the appended assistant entry is stamped
+    // with the corrected status.
+    let promoted = flushed_turn_is_question(
+        update,
+        &text_entries,
+        &app.try_state::<ConfigState>().map(|c| c.snapshot().benign_closers).unwrap_or_default(),
+    ) && app_state.promote_done_to_awaiting(chat_id, now);
+    if promoted {
+        tracing::debug!(chat_id, "flushed assistant turn is a question; promoted Done -> Awaiting");
+    }
     let dialog_changed = if !text_entries.is_empty() {
         app_state.apply_text_entries(chat_id, &text_entries, now)
     } else {
@@ -475,7 +510,7 @@ fn apply_and_emit(app: &AppHandle, chat_id: &str, update: &InferredState, text_e
             h.save_to_disk();
         }
     }
-    if metric_changed || dialog_changed || demoted {
+    if metric_changed || dialog_changed || demoted || promoted {
         emit_sessions_updated(app);
     }
 }
@@ -916,6 +951,50 @@ mod tests {
         );
         assert!(changed);
         assert_eq!(s.status, Status::Working);
+    }
+
+    fn done() -> InferredState {
+        InferredState { state: Some(Status::Done), ..Default::default() }
+    }
+
+    #[test]
+    fn flushed_question_promotes_when_done_and_last_assistant_is_a_question() {
+        let entries = vec![(DialogRole::Assistant, "Should I proceed?".to_string())];
+        assert!(flushed_turn_is_question(&done(), &entries, &[]));
+    }
+
+    #[test]
+    fn flushed_question_ignored_when_last_assistant_is_not_a_question() {
+        let entries = vec![(DialogRole::Assistant, "All tests pass.".to_string())];
+        assert!(!flushed_turn_is_question(&done(), &entries, &[]));
+    }
+
+    #[test]
+    fn flushed_question_ignored_when_state_is_not_done() {
+        // Mid-turn the row is Working; a transient assistant text ending in `?`
+        // must not promote — only a settled Done turn is corrected.
+        let working = InferredState { state: Some(Status::Working), ..Default::default() };
+        let entries = vec![(DialogRole::Assistant, "Should I proceed?".to_string())];
+        assert!(!flushed_turn_is_question(&working, &entries, &[]));
+    }
+
+    #[test]
+    fn flushed_question_decided_by_newest_assistant_entry() {
+        // A user reply may separate two assistant turns in one flush; the newest
+        // assistant text decides — here the last turn carries no question.
+        let entries = vec![
+            (DialogRole::Assistant, "Should I proceed?".to_string()),
+            (DialogRole::User, "yes".to_string()),
+            (DialogRole::Assistant, "Done, no question here.".to_string()),
+        ];
+        assert!(!flushed_turn_is_question(&done(), &entries, &[]));
+    }
+
+    #[test]
+    fn flushed_question_respects_benign_closers() {
+        let entries = vec![(DialogRole::Assistant, "What's next?".to_string())];
+        let benign = vec!["What's next?".to_string()];
+        assert!(!flushed_turn_is_question(&done(), &entries, &benign));
     }
 
     #[test]

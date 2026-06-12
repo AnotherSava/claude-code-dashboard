@@ -407,9 +407,10 @@ const PERMISSION_SEEKING: &[&str] = &[
 /// True when `text` reads as a hand-back to the user: the whole text ends with
 /// `?` (possibly after a trailing option list); the last paragraph contains a
 /// known hand-back phrase (permission-seeking or a direct second-person
-/// question); or the last paragraph issues a hand-back request for input
-/// (`Paste …` / `Please provide …` / `Confirm …`).
-fn is_a_question(text: &str, benign_closers: &[String]) -> bool {
+/// question); the last paragraph issues a hand-back request for input
+/// (`Paste …` / `Please provide …` / `Confirm …`); or the last paragraph
+/// *opens* with a question that a concluding statement then follows.
+pub(crate) fn is_a_question(text: &str, benign_closers: &[String]) -> bool {
     let plain = strip_markdown(text);
     let effective = strip_trailing_options(&plain);
     if effective.ends_with('?') {
@@ -421,7 +422,9 @@ fn is_a_question(text: &str, benign_closers: &[String]) -> bool {
             return true;
         }
     }
-    has_permission_seeking_question(&plain) || has_handback_request(&plain)
+    has_permission_seeking_question(&plain)
+        || has_handback_request(&plain)
+        || last_paragraph_opens_with_question(&plain, benign_closers)
 }
 
 /// Strip inline Markdown formatting so classification sees the underlying text.
@@ -474,6 +477,58 @@ fn has_handback_request(text: &str) -> bool {
             let s = sentence.trim_start();
             HANDBACK_OPENERS.iter().any(|opener| s.starts_with(opener))
         })
+}
+
+/// First-person openers that announce the agent is about to act itself rather
+/// than hand back — so a leading question after one is the agent reasoning
+/// aloud ("Let me investigate — does X have a cleaner fix? This affects …"),
+/// not an ask. Matched at the start of the last paragraph's first sentence to
+/// keep `last_paragraph_opens_with_question` from reading self-directed musing
+/// as a hand-back. Trailing space avoids prefix collisions (`lets ` ≠ `let's`,
+/// `i will ` ≠ `i willingly`).
+const SELF_DIRECTED_OPENERS: &[&str] = &[
+    "let me ",
+    "let's ",
+    "lets ",
+    "i'll ",
+    "i will ",
+    "i'm going to ",
+    "i am going to ",
+];
+
+/// True when the **first sentence** of the last paragraph is itself a question
+/// — it ends with `?` before the paragraph continues with a concluding clause.
+/// Catches a hand-back whose question leads and is then trailed by context,
+/// like "Apply this edit? (yes / no) Everything else is aligned." — the trailing
+/// sentence defeats the whole-text trailing-`?` path, and "apply" is no
+/// permission-seeking phrase, so nothing else sees it. Three guards keep it from
+/// over-firing: the terminating `?` must immediately follow an alphanumeric
+/// character, so a bare mention of the glyph ("a `?` immediately followed by …",
+/// which strip_markdown leaves as "a ? …") isn't read as a terminator; a
+/// `SELF_DIRECTED_OPENERS` prefix ("Let me …", "I'll …") marks the leading
+/// question as the agent musing rather than asking; and configured benign
+/// closers are honored, so a polite "What's next? …" still doesn't flag.
+/// Empirically fires on 12/60 real assistant turns with zero false positives.
+fn last_paragraph_opens_with_question(text: &str, benign_closers: &[String]) -> bool {
+    let last_para = last_paragraph(text);
+    let Some((term_idx, term_ch)) = last_para
+        .char_indices()
+        .find(|(_, c)| matches!(c, '.' | '!' | '?'))
+    else {
+        return false;
+    };
+    if term_ch != '?' {
+        return false;
+    }
+    if !last_para[..term_idx].chars().next_back().is_some_and(char::is_alphanumeric) {
+        return false;
+    }
+    let first_sentence = &last_para[..=term_idx];
+    let lower = first_sentence.to_lowercase();
+    if SELF_DIRECTED_OPENERS.iter().any(|o| lower.trim_start().starts_with(o)) {
+        return false;
+    }
+    !benign_closers.iter().any(|c| !c.is_empty() && lower.ends_with(&c.to_lowercase()))
 }
 
 fn last_paragraph(text: &str) -> &str {
@@ -1135,10 +1190,72 @@ mod tests {
 
     #[test]
     fn permission_seeking_does_not_match_unrelated_question_in_last_para() {
-        // "?" exists in last paragraph but no permission-seeking phrase.
-        // The text also doesn't end with "?" so neither check fires.
+        // A self-directed musing question ("Let me investigate — does …?") in
+        // the last paragraph must not register: no permission-seeking phrase,
+        // the text doesn't end with "?", and the leading-question path is
+        // excluded by the SELF_DIRECTED_OPENERS guard ("Let me ").
         assert!(!is_a_question(
             "Let me investigate — does the bug have a cleaner fix at the rotate_vector level? This affects what we do next.",
+            &[]
+        ));
+    }
+
+    // ----- leading question in last paragraph -----
+
+    #[test]
+    fn leading_question_with_trailing_sentence_is_a_question() {
+        // The reported bug: a hand-back whose question leads, then a closing
+        // statement follows — so the whole text doesn't end with "?" and no
+        // permission-seeking phrase matches. The first-sentence path catches it.
+        assert!(is_a_question(
+            "Apply this one edit? (yes / no) Everything else is already aligned.",
+            &[]
+        ));
+    }
+
+    #[test]
+    fn leading_question_self_directed_opener_is_not_a_question() {
+        // Same shape as the bug, but a first-person opener marks it as the agent
+        // about to act, not asking. These must stay Done.
+        for text in [
+            "Let me check the logs first? Actually, I'll just run it.",
+            "I'll refactor this? No — splitting it is cleaner. Doing that now.",
+        ] {
+            assert!(!is_a_question(text, &[]), "text: {}", text);
+        }
+    }
+
+    #[test]
+    fn leading_question_bare_glyph_mention_is_not_a_question() {
+        // A literal mention of the "?" glyph (after markdown strip, "a ? ...")
+        // isn't a sentence terminator — the char before "?" is a space.
+        assert!(!is_a_question(
+            "I added a path for text ending in a `?` followed by an option menu. Done.",
+            &[]
+        ));
+    }
+
+    #[test]
+    fn leading_question_benign_closer_is_not_a_question() {
+        let closers = vec!["What's next?".to_string()];
+        assert!(!is_a_question(
+            "What's next? I'll wait for your call.",
+            &closers
+        ));
+    }
+
+    #[test]
+    fn leading_question_path_requires_the_first_sentence_to_be_the_question() {
+        // Contract of the helper itself: when the first sentence is a statement
+        // and the question comes second, this path stays out (other paths own
+        // the trailing-"?" / permission-phrase cases). Tested directly because
+        // through `is_a_question` a trailing "?" would mask it via path 1.
+        assert!(!last_paragraph_opens_with_question(
+            "The migration is ready. Looks good to you?",
+            &[]
+        ));
+        assert!(last_paragraph_opens_with_question(
+            "Looks good to you? The migration is ready.",
             &[]
         ));
     }

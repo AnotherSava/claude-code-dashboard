@@ -389,6 +389,31 @@ impl AppState {
         true
     }
 
+    /// Correct a settled `Done` row to `Awaiting` once the transcript reveals
+    /// its final assistant turn was a question. The `Stop` hook fires *before*
+    /// Claude flushes that final turn to JSONL, so it reads stale text and can't
+    /// tell a question-ending turn from a plain one — it defaults to `Done`. The
+    /// watcher sees the flushed text moments later and calls this to fix the one
+    /// case `Stop` was blind to. Restricted to `Done → Awaiting`: a row still
+    /// `Working` is left for `Stop`/`UserPromptSubmit` to settle (so a transient
+    /// mid-turn assistant text block ending in `?` can't false-promote), and a
+    /// row that already moved on (e.g. the user sent the next prompt) is left
+    /// alone. Returns true if it acted.
+    pub fn promote_done_to_awaiting(&self, id: &str, now_ms: i64) -> bool {
+        let mut sessions = self.sessions.lock().unwrap();
+        let Some(s) = sessions.iter_mut().find(|s| s.id == id) else {
+            return false;
+        };
+        if s.status != Status::Done {
+            return false;
+        }
+        s.status = Status::Awaiting;
+        s.label = "has a question".into();
+        s.state_entered_at = now_ms;
+        s.updated = now_ms;
+        true
+    }
+
     /// Mark a session-boundary in the in-memory dialog. Called when the
     /// hook reports a transcript_path different from the one we're already
     /// watching for this chat_id — Claude Code's `/clear` keeps the cwd
@@ -587,6 +612,30 @@ mod tests {
         state.apply_set(set("a", Status::Awaiting, "run bash?"), 0, NO_CONTINUATIONS, None);
         assert!(!state.revert_cancelled_turn("a", 20_000));
         assert_eq!(get(&state, "a").status, Status::Awaiting);
+    }
+
+    #[test]
+    fn promote_done_to_awaiting_corrects_a_settled_question_turn() {
+        // `Stop` settled the row to Done before the final assistant text flushed
+        // (so it couldn't see the trailing question); the watcher now corrects it.
+        let state = AppState::new();
+        state.apply_set(set("a", Status::Done, ""), 0, NO_CONTINUATIONS, None);
+        assert!(state.promote_done_to_awaiting("a", 5_000));
+        let s = get(&state, "a");
+        assert_eq!(s.status, Status::Awaiting);
+        assert_eq!(s.label, "has a question");
+        assert_eq!(s.state_entered_at, 5_000);
+        assert_eq!(s.updated, 5_000);
+    }
+
+    #[test]
+    fn promote_done_to_awaiting_is_noop_when_not_done() {
+        // Mid-turn the row is Working; a transient assistant text block ending in
+        // `?` must not flip it — only a settled Done row is corrected.
+        let state = AppState::new();
+        state.apply_set(set("a", Status::Working, "fix the parser"), 0, NO_CONTINUATIONS, None);
+        assert!(!state.promote_done_to_awaiting("a", 5_000));
+        assert_eq!(get(&state, "a").status, Status::Working);
     }
 
     #[test]

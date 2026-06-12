@@ -119,7 +119,7 @@ Rust tests live inline in `#[cfg(test)]` modules next to the code they cover:
 
 - `state::tests` — sticky-label machine, working-time accumulator, error transitions.
 - `label_policy::tests` — the `(label, original_prompt)` decision extracted from `apply_set`.
-- `log_watcher::tests` — the transcript parser (`infer_state`, `split_complete`) and the upgrade-only merge policy.
+- `log_watcher::tests` — the transcript parser (`infer_state`, `split_complete`), the upgrade-only merge policy, and the `done → awaiting` question correction.
 - `sync::tests` — the receive-side `ingest` (namespacing, dialog seeding, contiguity guard) and the oldest-first chunked `build_push_chunk`.
 - `adapters::claude::tests` — `classify`, `derive_chat_id`, `clean_prompt`, `last_assistant_text`, `is_a_question`, and the outer `dispatch`.
 
