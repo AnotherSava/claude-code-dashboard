@@ -331,6 +331,8 @@ async fn watch_loop(app: AppHandle, chat_id: String, path: PathBuf) {
         }
     };
 
+    ensure_watch_dir(&parent);
+
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
     let watched = path.clone();
     let mut watcher: RecommendedWatcher = match notify::recommended_watcher(
@@ -367,6 +369,20 @@ async fn watch_loop(app: AppHandle, chat_id: String, path: PathBuf) {
 
     while let Some(()) = rx.recv().await {
         drain(&app, &chat_id, &path, &state).await;
+    }
+}
+
+/// A brand-new project's transcript dir doesn't exist yet at SessionStart —
+/// Claude Code creates it lazily when it writes the first turn. Watching a
+/// missing dir fails permanently (no retry), which strands the session: the
+/// watcher is the only thing that promotes Awaiting -> Working mid-turn, so a
+/// post-question resume never clears. Pre-create the dir (idempotent; it's the
+/// exact dir Claude is about to use) so the watch always attaches.
+fn ensure_watch_dir(dir: &Path) {
+    if !dir.exists() {
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            tracing::warn!(dir = %dir.display(), error = %e, "failed to pre-create transcript dir");
+        }
     }
 }
 
@@ -1065,5 +1081,29 @@ mod tests {
             500,
         );
         assert!(!changed);
+    }
+
+    #[test]
+    fn ensure_watch_dir_creates_missing_nested_dir() {
+        // Regression: a brand-new project's transcript dir doesn't exist at
+        // SessionStart, and watching a missing dir fails permanently — stranding
+        // the session on Awaiting. ensure_watch_dir must create it first.
+        let base = std::env::temp_dir().join(format!(
+            "ccd-watch-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let dir = base.join("-Users-someone-Projects-players");
+        assert!(!dir.exists());
+
+        ensure_watch_dir(&dir);
+        assert!(dir.exists() && dir.is_dir());
+
+        // Idempotent: a second call on an existing dir is a no-op, not an error.
+        ensure_watch_dir(&dir);
+        assert!(dir.exists());
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
