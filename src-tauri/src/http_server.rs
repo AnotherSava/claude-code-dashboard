@@ -98,13 +98,20 @@ async fn post_event(
     }
 
     match output {
-        AdapterOutput::Set { input, transcript_path } => {
+        AdapterOutput::Set { input, transcript_path, reason } => {
+            // Permanent decision record: why this row landed in this state. The
+            // `decision` field makes it greppable (the `investigate` skill reads
+            // these), and `reason` carries the matched question-rule + a text
+            // snippet so "why is it Awaiting?" is answerable without the
+            // transcript or the code. Keyed by the resolved chat_id.
             tracing::debug!(
                 client = %req.client,
                 event = %req.event,
                 chat_id = %input.id,
+                decision = "classify",
                 status = ?input.status,
                 label = ?input.label,
+                reason = %reason,
                 console_pids = ?req.console_pids,
                 "event -> set"
             );
@@ -154,6 +161,8 @@ async fn post_event(
                 client = %req.client,
                 event = %req.event,
                 chat_id = %id,
+                decision = "session_clear",
+                reason = "session ended; row removed",
                 "event -> clear"
             );
             // Mark a boundary on the existing dialog before destroying the
@@ -186,6 +195,8 @@ async fn post_event(
                 client = %req.client,
                 event = %req.event,
                 chat_id = %id,
+                decision = "compact_boundary",
+                reason = "context compaction; history separator inserted",
                 "event -> boundary"
             );
             // The session continues (no status change) — just append a history

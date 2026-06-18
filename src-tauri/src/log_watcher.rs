@@ -494,25 +494,50 @@ fn apply_and_emit(app: &AppHandle, chat_id: &str, update: &InferredState, text_e
         return;
     };
     let now = now_ms();
-    let metric_changed = {
+    let (metric_changed, resumed_working) = {
         let mut sessions = app_state.sessions.lock().unwrap();
         match sessions.iter_mut().find(|s| s.id == chat_id) {
-            Some(session) => apply_watcher_update(session, update, now),
-            None => false,
+            Some(session) => {
+                let prior = session.status;
+                let changed = apply_watcher_update(session, update, now);
+                (changed, prior != Status::Working && session.status == Status::Working)
+            }
+            None => (false, false),
         }
     };
+    if resumed_working {
+        // The only path that carries a row back to Working without a lifecycle
+        // hook — e.g. the user answered an AskUserQuestion and the agent resumed.
+        tracing::debug!(
+            chat_id,
+            decision = "resume_working",
+            reason = "transcript shows new activity (tool call or user turn) after a pause; promoted to Working",
+            "decision"
+        );
+    }
     // The turn was cancelled with Esc (no lifecycle hook). Settle the row back
     // to its pre-prompt status — unless the user opted out. Gated here rather
     // than in `infer_state` so detection stays pure and testable.
-    let demoted = update.ended
+    let reverted_to = if update.ended
         && app
             .try_state::<ConfigState>()
             .map(|c| c.snapshot().detect_cancelled_turns)
             .unwrap_or(true)
-        && app_state.revert_cancelled_turn(chat_id, now);
-    if demoted {
-        tracing::debug!(chat_id, "turn cancelled (interrupt marker); reverted to pre-prompt state");
+    {
+        app_state.revert_cancelled_turn(chat_id, now)
+    } else {
+        None
+    };
+    if let Some(status) = reverted_to {
+        tracing::debug!(
+            chat_id,
+            decision = "revert_cancelled",
+            status = ?status,
+            reason = "turn cancelled with Esc (interrupt marker, no lifecycle hook); reverted to pre-prompt status",
+            "decision"
+        );
     }
+    let demoted = reverted_to.is_some();
     // The `Stop` hook settles a finished turn before its final assistant text
     // flushes to JSONL, so it can read the *prior* turn and stamp the wrong
     // question-vs-done verdict. Now that the text has flushed, correct it both
@@ -521,17 +546,33 @@ fn apply_and_emit(app: &AppHandle, chat_id: &str, update: &InferredState, text_e
     // `Done`. The demote is gated inside `AppState` on the scan-derived flag so
     // a tool-gated `Awaiting` is never touched. Runs before `apply_text_entries`
     // so the appended assistant entry is stamped with the corrected status.
+    let last_assistant = text_entries
+        .iter()
+        .rev()
+        .find(|(role, _)| *role == DialogRole::Assistant)
+        .map(|(_, t)| crate::adapters::claude::evidence_snippet(t))
+        .unwrap_or_default();
     let corrected = match flushed_turn_verdict(
         update,
         &text_entries,
         &app.try_state::<ConfigState>().map(|c| c.snapshot().benign_closers).unwrap_or_default(),
     ) {
         Some(FlushedVerdict::Question) if app_state.promote_done_to_awaiting(chat_id, now) => {
-            tracing::debug!(chat_id, "flushed assistant turn is a question; promoted Done -> Awaiting");
+            tracing::debug!(
+                chat_id,
+                decision = "correct_to_awaiting",
+                reason = %format!("flushed final assistant turn reads as a question (Stop fired before it landed and settled Done): \"{last_assistant}\""),
+                "decision"
+            );
             true
         }
         Some(FlushedVerdict::Statement) if app_state.demote_scanned_awaiting_to_done(chat_id, now) => {
-            tracing::debug!(chat_id, "flushed assistant turn is a statement; demoted scan-derived Awaiting -> Done");
+            tracing::debug!(
+                chat_id,
+                decision = "correct_to_done",
+                reason = %format!("flushed final assistant turn reads as a statement (Stop had read a stale prior question and settled Awaiting): \"{last_assistant}\""),
+                "decision"
+            );
             true
         }
         _ => false,

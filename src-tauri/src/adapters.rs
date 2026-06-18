@@ -21,6 +21,12 @@ pub enum AdapterOutput {
     Set {
         input: SetInput,
         transcript_path: Option<PathBuf>,
+        /// Human-readable explanation of *why* this status/label was chosen.
+        /// The HTTP layer writes it to the `decision` log in `widget.jsonl` so
+        /// "why is this row in state X?" is answerable without the transcript
+        /// or the code — it carries the matched question-rule and a text
+        /// snippet for the question path.
+        reason: String,
     },
     /// Remove a session.
     Clear { id: String },

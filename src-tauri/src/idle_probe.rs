@@ -120,12 +120,18 @@ pub fn spawn(app: AppHandle) {
                     Screen::Idle => {
                         let streak = idle_streak.entry(s.id.clone()).or_insert(0);
                         *streak += 1;
-                        if *streak >= IDLE_STREAK_TO_DEMOTE
-                            && app_state.revert_cancelled_turn(&s.id, now_ms())
-                        {
-                            tracing::debug!(id = %s.id, "idle prompt with no in-flight turn; reverted to pre-prompt state");
-                            idle_streak.remove(&s.id);
-                            emit_sessions_updated(&app);
+                        if *streak >= IDLE_STREAK_TO_DEMOTE {
+                            if let Some(status) = app_state.revert_cancelled_turn(&s.id, now_ms()) {
+                                tracing::debug!(
+                                    chat_id = %s.id,
+                                    decision = "revert_cancelled",
+                                    status = ?status,
+                                    reason = "terminal shows Claude's idle prompt with no in-flight turn (instant Esc-cancel, no transcript marker); reverted to pre-prompt status",
+                                    "decision"
+                                );
+                                idle_streak.remove(&s.id);
+                                emit_sessions_updated(&app);
+                            }
                         }
                     }
                     // Busy or an unrecognised screen both reset the streak —

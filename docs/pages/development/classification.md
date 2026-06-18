@@ -134,6 +134,21 @@ This path was validated against the recorded dialog history (`prompt_history.jso
 
 Failure modes are silent: a missing transcript file returns `None` from `last_assistant_text` (treated as "no question"), and malformed JSONL lines are individually skipped. The adapter never crashes a status update because of a transcript read error.
 
+## Decision log
+
+Every status-affecting decision is written to `widget.jsonl` (the same tracing sink `logging.rs` owns) as a structured line carrying a stable `decision` field and a human `reason`, keyed by the resolved `chat_id`. The reason for a question verdict names which detection path fired and quotes a snippet of the assistant text, so "why is this row `awaiting`?" is answerable from the log alone — no transcript or source reading.
+
+| `decision`                            | Emitted from              | Meaning                                                                                                                                                                      |
+|---                                    |---                        |---                                                                                                                                                                          |
+| `classify`                            | `http_server` (`event -> set`) | A hook event set the row's status. For `Stop` / idle prompts the `reason` reads `<kind> on a question [<rule>]: "<snippet>"` or `<kind>; final message is not a question: "<snippet>"`, where `<kind>` is `turn ended` or `idle prompt`. |
+| `resume_working`                      | `log_watcher`             | The transcript watcher saw new activity (a tool call or user turn) after a pause and promoted the row back to `working` — the path that clears a stale `awaiting` once the user answers an `AskUserQuestion`. |
+| `correct_to_awaiting` / `correct_to_done` | `log_watcher`         | The watcher re-judged the final assistant turn once it flushed, fixing a verdict `Stop` made too early (see [transcript question detection](#transcript-question-detection)). |
+| `revert_cancelled`                    | `log_watcher` / `idle_probe` | An Esc-cancelled turn (no lifecycle hook) reverted to its pre-prompt status — the `status` field records where it landed.                                              |
+| `apply_set`                           | `state.rs`                | The state-machine transition: `prior_status` → `new_status`, plus `task_boundary` and `continuation_suppressed`.                                                            |
+| `session_clear` / `compact_boundary`  | `http_server`             | Session removed / context-compaction history separator inserted.                                                                                                            |
+
+The project-local `investigate` skill (`.claude/skills/investigate/investigate.py`) reads these lines to reconstruct an agent's current state and its decision chain: `investigate.py <agent>` explains one session; no argument lists the active sessions to choose from.
+
 ## What this layer does *not* decide
 
 - **Whether the user-visible label changes.** The adapter emits a candidate `(status, label)` pair; the [sticky-label state machine](sticky-labels) decides whether the row's `original_prompt` updates, gets re-captured at a task boundary, or stays pinned across an approval cycle.

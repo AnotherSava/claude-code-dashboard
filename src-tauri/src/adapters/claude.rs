@@ -64,7 +64,7 @@ pub fn dispatch(event: &str, payload: &Value, cfg: &Config) -> AdapterOutput {
         return AdapterOutput::Boundary { id: chat_id };
     }
 
-    let Some((status, label)) = classify(event, payload, &cfg.benign_closers) else {
+    let Some(Classification { status, label, reason }) = classify_detailed(event, payload, &cfg.benign_closers) else {
         return AdapterOutput::Ignore;
     };
 
@@ -121,6 +121,7 @@ pub fn dispatch(event: &str, payload: &Value, cfg: &Config) -> AdapterOutput {
             from_transcript_scan,
         },
         transcript_path,
+        reason,
     }
 }
 
@@ -167,11 +168,59 @@ fn derive_chat_id(cwd: Option<&str>, projects_root: Option<&str>) -> String {
 /// Returns [`None`] for events we don't recognize (caller should `Ignore`).
 /// Missing/empty `label` in the return tuple means "preserve prior label" in
 /// the state layer.
+/// A classified event: the resulting status/label plus a human-readable
+/// `reason` for the decision log. Built by [`classify_detailed`]; the public
+/// [`classify`] drops `reason` for callers (tests) that only assert status/label.
+struct Classification {
+    status: Status,
+    label: Option<String>,
+    reason: String,
+}
+
+impl Classification {
+    fn new(status: Status, label: Option<String>, reason: impl Into<String>) -> Self {
+        Self { status, label, reason: reason.into() }
+    }
+}
+
+/// Thin wrapper over [`classify_detailed`] returning just `(status, label)`.
+/// Kept so the adapter's unit tests assert the user-visible outcome without
+/// threading the decision-log `reason` through every assertion.
+#[cfg(test)]
 fn classify(
     event: &str,
     payload: &Value,
     benign_closers: &[String],
 ) -> Option<(Status, Option<String>)> {
+    classify_detailed(event, payload, benign_closers).map(|c| (c.status, c.label))
+}
+
+/// Classify a turn-ending event (`Stop` / idle prompt) by inspecting the final
+/// assistant text: `Awaiting "has a question"` if it reads as a hand-back, else
+/// `Done`. `kind` prefixes the decision-log reason ("turn ended" / "idle
+/// prompt"). Shared so both arms detect the question and snippet identically.
+fn classify_turn_end(transcript_path: Option<&str>, benign_closers: &[String], kind: &str) -> Classification {
+    let Some(path) = transcript_path else {
+        return Classification::new(Status::Done, None, format!("{kind}; no transcript path in payload"));
+    };
+    let Some(text) = last_assistant_text(Path::new(path)) else {
+        return Classification::new(Status::Done, None, format!("{kind}; no assistant text flushed to transcript yet"));
+    };
+    if let Some(rule) = question_reason(&text, benign_closers) {
+        return Classification::new(
+            Status::Awaiting,
+            Some("has a question".into()),
+            format!("{kind} on a question [{rule}]: \"{}\"", evidence_snippet(&text)),
+        );
+    }
+    Classification::new(Status::Done, None, format!("{kind}; final message is not a question: \"{}\"", evidence_snippet(&text)))
+}
+
+fn classify_detailed(
+    event: &str,
+    payload: &Value,
+    benign_closers: &[String],
+) -> Option<Classification> {
     let transcript_path = payload
         .get("transcript_path")
         .and_then(|v| v.as_str())
@@ -181,9 +230,9 @@ fn classify(
         "UserPromptSubmit" => {
             let prompt = payload.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
             if prompt.trim().is_empty() {
-                Some((Status::Working, None))
+                Some(Classification::new(Status::Working, None, "user submitted a prompt (empty/continuation)"))
             } else {
-                Some((Status::Working, Some(clean_prompt(prompt))))
+                Some(Classification::new(Status::Working, Some(clean_prompt(prompt)), "user submitted a prompt"))
             }
         }
         "UserPromptExpansion" => {
@@ -200,27 +249,22 @@ fn classify(
             }
             let prompt = payload.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
             if prompt.trim().is_empty() {
-                Some((Status::Working, None))
+                Some(Classification::new(Status::Working, None, "slash command invoked (early Working signal)"))
             } else {
-                Some((Status::Working, Some(clean_prompt(prompt))))
+                Some(Classification::new(Status::Working, Some(clean_prompt(prompt)), "slash command invoked (early Working signal)"))
             }
         }
-        "Stop" => {
-            if let Some(path) = transcript_path {
-                if let Some(text) = last_assistant_text(Path::new(path)) {
-                    if is_a_question(&text, benign_closers) {
-                        return Some((Status::Awaiting, Some("has a question".into())));
-                    }
-                }
-            }
-            Some((Status::Done, None))
-        }
+        "Stop" => Some(classify_turn_end(transcript_path, benign_closers, "turn ended")),
         "PreToolUse" => {
             let tool_name = payload.get("tool_name").and_then(|v| v.as_str()).unwrap_or("");
             if !USER_GATING_TOOLS.contains(&tool_name) {
                 return None;
             }
-            Some((Status::Awaiting, Some(awaiting_label_for(tool_name).into())))
+            Some(Classification::new(
+                Status::Awaiting,
+                Some(awaiting_label_for(tool_name).into()),
+                format!("{tool_name} tool gated the turn on the user (buffered until answered)"),
+            ))
         }
         "Notification" | "SessionStart" => {
             let notif_type = payload
@@ -230,26 +274,19 @@ fn classify(
             let message = payload.get("message").and_then(|v| v.as_str()).unwrap_or("");
 
             if notif_type.is_empty() && message.trim().is_empty() {
-                return Some((Status::Idle, None));
+                return Some(Classification::new(Status::Idle, None, format!("{event} with no notification payload → idle")));
             }
             if notif_type == "idle_prompt" {
-                if let Some(path) = transcript_path {
-                    if let Some(text) = last_assistant_text(Path::new(path)) {
-                        if is_a_question(&text, benign_closers) {
-                            return Some((Status::Awaiting, Some("has a question".into())));
-                        }
-                    }
-                }
-                return Some((Status::Done, None));
+                return Some(classify_turn_end(transcript_path, benign_closers, "idle prompt"));
             }
             let label = notification_label(notif_type, message);
             let cleaned = clean_prompt(&label);
             if cleaned.is_empty() {
-                Some((Status::Awaiting, None))
+                Some(Classification::new(Status::Awaiting, None, format!("notification [{notif_type}] blocked on user")))
             } else {
                 // chars — not bytes — so multi-byte glyphs don't split mid-codepoint
                 let truncated: String = cleaned.chars().take(60).collect();
-                Some((Status::Awaiting, Some(truncated)))
+                Some(Classification::new(Status::Awaiting, Some(truncated), format!("notification [{notif_type}] blocked on user")))
             }
         }
         "StopFailure" => {
@@ -266,7 +303,8 @@ fn classify(
                 .filter(|s| !s.is_empty())
                 .map(clean_prompt)
                 .filter(|s| !s.is_empty());
-            Some((Status::Error, Some(reason.unwrap_or_else(|| "turn failed".into()))))
+            let kind = reason.unwrap_or_else(|| "turn failed".into());
+            Some(Classification::new(Status::Error, Some(kind.clone()), format!("turn failed on API error: {kind}")))
         }
         "PermissionRequest" => {
             // A tool-permission dialog appeared — blocked on the user. Carries a
@@ -278,7 +316,11 @@ fn classify(
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .unwrap_or("tool");
-            Some((Status::Awaiting, Some(format!("needs approval: {}", tool))))
+            Some(Classification::new(
+                Status::Awaiting,
+                Some(format!("needs approval: {}", tool)),
+                format!("tool-permission dialog for {tool}; blocked on user"),
+            ))
         }
         "Elicitation" => {
             // An MCP tool is requesting input — blocked on the user. The message
@@ -291,7 +333,11 @@ fn classify(
                 .map(clean_prompt)
                 .map(|s| s.chars().take(60).collect::<String>())
                 .filter(|s| !s.is_empty());
-            Some((Status::Awaiting, Some(msg.unwrap_or_else(|| "needs your input".into()))))
+            Some(Classification::new(
+                Status::Awaiting,
+                Some(msg.unwrap_or_else(|| "needs your input".into())),
+                "MCP tool requested input; blocked on user",
+            ))
         }
         _ => None,
     }
@@ -422,6 +468,14 @@ const PERMISSION_SEEKING: &[&str] = &[
 /// (`Paste …` / `Please provide …` / `Confirm …`); or the last paragraph
 /// *opens* with a question that a concluding statement then follows.
 pub(crate) fn is_a_question(text: &str, benign_closers: &[String]) -> bool {
+    question_reason(text, benign_closers).is_some()
+}
+
+/// Like [`is_a_question`] but returns *which* rule fired (or `None` when the
+/// text reads as a plain statement). The matched-rule string is recorded in the
+/// decision log so an investigation can see why a turn was judged a question
+/// without re-running the heuristics or reading the transcript.
+pub(crate) fn question_reason(text: &str, benign_closers: &[String]) -> Option<&'static str> {
     let plain = strip_markdown(text);
     let effective = strip_trailing_options(&plain);
     if effective.ends_with('?') {
@@ -430,12 +484,34 @@ pub(crate) fn is_a_question(text: &str, benign_closers: &[String]) -> bool {
             !c.is_empty() && lower.ends_with(&c.to_lowercase())
         });
         if !is_benign {
-            return true;
+            return Some("text ends with '?'");
         }
     }
-    has_permission_seeking_question(&plain)
-        || has_handback_request(&plain)
-        || last_paragraph_opens_with_question(&plain, benign_closers)
+    if has_permission_seeking_question(&plain) {
+        return Some("permission-seeking phrase before a '?'");
+    }
+    if has_handback_request(&plain) {
+        return Some("sentence-initial hand-back request");
+    }
+    if last_paragraph_opens_with_question(&plain, benign_closers) {
+        return Some("last paragraph opens with a question");
+    }
+    None
+}
+
+/// A short single-line tail of assistant text for the decision log. The
+/// hand-back is at the end of a message, so the *tail* is kept; chrome is
+/// stripped via [`clean_prompt`] and the result capped so the log stays compact.
+pub(crate) fn evidence_snippet(text: &str) -> String {
+    const MAX: usize = 160;
+    let cleaned = clean_prompt(text);
+    let chars: Vec<char> = cleaned.chars().collect();
+    if chars.len() <= MAX {
+        cleaned
+    } else {
+        let tail: String = chars[chars.len() - MAX..].iter().collect();
+        format!("…{tail}")
+    }
 }
 
 /// Strip inline Markdown formatting so classification sees the underlying text.
@@ -938,6 +1014,32 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // ----- question_reason / evidence_snippet (decision-log evidence) -----
+
+    #[test]
+    fn question_reason_names_the_matched_rule() {
+        assert_eq!(question_reason("Should I proceed?", &[]), Some("text ends with '?'"));
+        assert_eq!(
+            question_reason("Want me to add that? The plan continues here.", &[]),
+            Some("permission-seeking phrase before a '?'"),
+        );
+        assert_eq!(
+            question_reason("Paste the full error output here.", &[]),
+            Some("sentence-initial hand-back request"),
+        );
+        assert_eq!(question_reason("All done. Everything passed.", &[]), None);
+    }
+
+    #[test]
+    fn evidence_snippet_keeps_short_text_and_tails_long_text() {
+        assert_eq!(evidence_snippet("All done."), "All done.");
+        let long = format!("{} Push?", "x".repeat(400));
+        let snip = evidence_snippet(&long);
+        assert!(snip.starts_with('…'), "long text is tail-truncated with a leading ellipsis");
+        assert!(snip.ends_with("Push?"), "the trailing question survives truncation");
+        assert!(snip.chars().count() <= 161);
+    }
+
     // ----- is_a_question -----
 
     #[test]
@@ -1364,7 +1466,7 @@ mod tests {
             "transcript_path": "/tmp/t.jsonl"
         });
         match dispatch("UserPromptSubmit", &p, &cfg) {
-            AdapterOutput::Set { input, transcript_path } => {
+            AdapterOutput::Set { input, transcript_path, .. } => {
                 assert_eq!(input.id, "demo");
                 assert_eq!(input.status, Status::Working);
                 assert_eq!(input.label.as_deref(), Some("fix bug"));

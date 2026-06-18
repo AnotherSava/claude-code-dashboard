@@ -1,3 +1,4 @@
+- [Check remote before fixing](feedback_check_remote_before_fixing.md) — deployed app often lags origin/main; git fetch + check log before reimplementing a fix that may already be merged
 - [Hook env var setup](hook_env_var_setup.md) — Claude Code hooks in ~/.claude/settings.json need $CLAUDE_AI_AGENT_DASHBOARD set to the repo root; silent failure when unset
 - [Frontend question detector is lenient](feedback_frontend_question_detector_lenient.md) — src/lib/dialog.ts intentionally diverges from Rust is_a_question; don't unify
 - [macOS ad-hoc signing strategy](macos_signing_strategy.md) — DMG uses signingIdentity="-" + documented user workaround; don't push for $99/yr Apple notarization unprompted
@@ -24,5 +25,5 @@
 - [Auto-resize DPI drift](debug_auto_resize_dpi_drift.md) — mixed-DPI multi-monitor needed to repro; widget.jsonl dpr≠scale + xy march = resize loop; fix = send physical px
 - [Auto-resize children-sum race](debug_auto_resize_children_race.md) — stuck scrollbar (window < content); summing .list children raced Svelte reconciliation, desired one row short; fix = measure non-stretching .list-inner + ResizeObserver
 - [Terminal promote-to-Working unsafe](terminal_promote_to_working_unsafe.md) — reverted; esc-to-interrupt strands rows; use UserPromptExpansion hook; idle_probe stays demote-only
-- [Diagnose state via widget.jsonl apply_set](debug_state_transitions_via_widget_jsonl.md) — grep apply_set lines (prior_status/task_boundary/continuation_suppressed) for the chat_id; read the decision log, don't theorize
+- [Diagnose state via widget.jsonl](debug_state_transitions_via_widget_jsonl.md) — run /investigate <agent> to reconstruct state + decision chain; or grep the "decision"-tagged lines; don't theorize
 - [Tray badge deferred work](tray_badge_deferred.md) — macOS contrast on number modes + live DPI re-render not done; config.tray_badge set in config/local.json

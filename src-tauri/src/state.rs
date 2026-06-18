@@ -242,6 +242,7 @@ impl AppState {
 
             tracing::debug!(
                 id = %input.id,
+                decision = "apply_set",
                 path = "existing",
                 prior_status = ?prior,
                 new_status = ?input.status,
@@ -292,6 +293,7 @@ impl AppState {
             let (label, event_prompt) = crate::label_policy::select(None, &input, false);
             tracing::debug!(
                 id = %input.id,
+                decision = "apply_set",
                 path = "new",
                 new_status = ?input.status,
                 input_label = ?input.label,
@@ -391,20 +393,20 @@ impl AppState {
     /// turn that already moved on is left alone. Mirrors `apply_set`'s
     /// Working→non-Working accounting (banks the elapsed run, resets the timer).
     /// Returns true if it acted.
-    pub fn revert_cancelled_turn(&self, id: &str, now_ms: i64) -> bool {
+    /// Returns the status it reverted to (for the decision log), or `None` when
+    /// it was a no-op because the row had already left `Working`.
+    pub fn revert_cancelled_turn(&self, id: &str, now_ms: i64) -> Option<Status> {
         let mut sessions = self.sessions.lock().unwrap();
-        let Some(s) = sessions.iter_mut().find(|s| s.id == id) else {
-            return false;
-        };
+        let s = sessions.iter_mut().find(|s| s.id == id)?;
         if s.status != Status::Working {
-            return false;
+            return None;
         }
         let delta = (now_ms - s.state_entered_at).max(0) as u64;
         s.working_accumulated_ms = s.working_accumulated_ms.saturating_add(delta);
         s.status = s.status_before_working;
         s.state_entered_at = now_ms;
         s.updated = now_ms;
-        true
+        Some(s.status)
     }
 
     /// Correct a settled `Done` row to `Awaiting` once the transcript reveals
@@ -631,7 +633,7 @@ mod tests {
         let state = AppState::new();
         state.apply_set(set("a", Status::Working, "fix foo.py"), 0, NO_CONTINUATIONS, None);
 
-        assert!(state.revert_cancelled_turn("a", 20_000));
+        assert_eq!(state.revert_cancelled_turn("a", 20_000), Some(Status::Idle));
         let s = get(&state, "a");
         assert_eq!(s.status, Status::Idle);
         assert_eq!(s.working_accumulated_ms, 20_000, "elapsed run banked");
@@ -652,7 +654,7 @@ mod tests {
         state.apply_set(set("a", Status::Working, "ny"), 12_000, NO_CONTINUATIONS, None);
         // ...then cancels it with Esc (no Stop hook) — idle_probe / the watcher
         // calls revert_cancelled_turn.
-        assert!(state.revert_cancelled_turn("a", 13_000));
+        assert_eq!(state.revert_cancelled_turn("a", 13_000), Some(Status::Awaiting));
         let reverted = get(&state, "a");
         assert_eq!(reverted.status, Status::Awaiting, "cancelled reply reverts to the pending question");
 
@@ -667,7 +669,7 @@ mod tests {
     fn revert_cancelled_turn_is_noop_when_not_working() {
         let state = AppState::new();
         state.apply_set(set("a", Status::Awaiting, "run bash?"), 0, NO_CONTINUATIONS, None);
-        assert!(!state.revert_cancelled_turn("a", 20_000));
+        assert_eq!(state.revert_cancelled_turn("a", 20_000), None);
         assert_eq!(get(&state, "a").status, Status::Awaiting);
     }
 
