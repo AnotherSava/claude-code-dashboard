@@ -82,6 +82,7 @@ pub fn apply(
 /// keeps a (x, y, w, h) rect inside it. Extracted so the clamping logic is
 /// testable without a real `Monitor` and reusable across `auto_resize::apply`,
 /// `config_watcher::apply_default_position`, and `commands::set_window_size`.
+#[derive(Clone, Copy)]
 pub(crate) struct WorkAreaBounds {
     left: i32,
     top: i32,
@@ -102,6 +103,24 @@ impl WorkAreaBounds {
 
     fn unbounded() -> Self {
         Self { left: i32::MIN / 2, top: i32::MIN / 2, right: i32::MAX / 2, bottom: i32::MAX / 2 }
+    }
+
+    /// Physical-px overlap between this work area and the rect `(x, y, w, h)`
+    /// on the horizontal axis; 0 when they don't overlap.
+    pub(crate) fn overlap_x(&self, x: i32, w: i32) -> i32 {
+        ((x + w).min(self.right) - x.max(self.left)).max(0)
+    }
+
+    /// Vertical-axis counterpart of [`WorkAreaBounds::overlap_x`].
+    pub(crate) fn overlap_y(&self, y: i32, h: i32) -> i32 {
+        ((y + h).min(self.bottom) - y.max(self.top)).max(0)
+    }
+
+    /// Area (physical px²) of the intersection between this work area and the
+    /// rect `(x, y, w, h)`; 0 when they don't overlap. `i64` so stacked-4K
+    /// virtual desktops can't overflow the multiply.
+    pub(crate) fn intersection_area(&self, x: i32, y: i32, w: i32, h: i32) -> i64 {
+        self.overlap_x(x, w) as i64 * self.overlap_y(y, h) as i64
     }
 
     /// Clamp a top-left position so the rect `(x, y, w, h)` lies within the
@@ -368,5 +387,27 @@ mod tests {
     fn clamp_unbounded_is_a_noop() {
         let b = WorkAreaBounds::unbounded();
         assert_eq!(b.clamp(12_345, -678, 840, 600), (12_345, -678));
+    }
+
+    #[test]
+    fn overlap_zero_when_rect_fully_outside() {
+        // Window stranded to the right of a now-disconnected external monitor.
+        let b = screen_1440_900();
+        assert_eq!(b.overlap_x(3000, 840), 0);
+        assert_eq!(b.intersection_area(3000, 500, 840, 600), 0);
+    }
+
+    #[test]
+    fn overlap_partial_sliver_is_small() {
+        // Only 40px of an 840px-wide window pokes onto the left edge.
+        let b = screen_1440_900();
+        assert_eq!(b.overlap_x(-800, 840), 40);
+    }
+
+    #[test]
+    fn intersection_area_counts_visible_patch() {
+        let b = screen_1440_900();
+        // Fully inside: area is the whole rect.
+        assert_eq!(b.intersection_area(500, 500, 840, 600), 840 * 600);
     }
 }

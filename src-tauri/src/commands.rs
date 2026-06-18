@@ -104,6 +104,7 @@ pub fn show_window(window: WebviewWindow, app: AppHandle) -> Result<(), String> 
             return Ok(());
         }
     }
+    ensure_window_on_screen(&window);
     window.show().map_err(|e| e.to_string())?;
     window.set_focus().map_err(|e| e.to_string())?;
     // The webview can invoke get_config before setup() finishes managing
@@ -121,6 +122,7 @@ pub fn toggle_window(window: WebviewWindow) -> Result<(), String> {
     if visible {
         window.hide().map_err(|e| e.to_string())
     } else {
+        ensure_window_on_screen(&window);
         window.show().map_err(|e| e.to_string())?;
         window.set_focus().map_err(|e| e.to_string())
     }
@@ -234,6 +236,69 @@ pub fn apply_window_position(window: &WebviewWindow, pos: &crate::config::Window
     if let (Some(w), Some(h)) = (pos.width, pos.height) {
         let _ = window.set_size(tauri::PhysicalSize::new(w, h));
     }
+}
+
+/// Minimum overlap (physical px, per axis) between the window and some
+/// monitor's work area for the window to count as reachable — enough that the
+/// user can both see it and grab its drag region. A window narrower/shorter
+/// than this can't be asked to overlap by more than its own span.
+const MIN_ONSCREEN_OVERLAP: i32 = 64;
+
+/// Rescue a window that has drifted entirely off every connected monitor.
+///
+/// A saved `window_position` is restored verbatim (`apply_window_position`),
+/// and a window that was on-screen keeps its physical coordinates across a
+/// monitor unplug / resolution / DPI change. Either way it can end up floating
+/// in dead space where it's invisible *and* immovable — its drag region is
+/// off-screen too — so the tray Show/Hide just toggles a window nobody can see.
+/// Detect that and pull the window back onto the monitor it overlaps most (the
+/// primary when it overlaps none), clamped fully into that work area. Returns
+/// true if it moved. Call after any position restore and on every show path.
+pub fn ensure_window_on_screen(window: &WebviewWindow) -> bool {
+    use crate::auto_resize::WorkAreaBounds;
+    let (Ok(pos), Ok(size)) = (window.outer_position(), window.outer_size()) else {
+        return false;
+    };
+    let (w, h) = (size.width as i32, size.height as i32);
+    let Ok(monitors) = window.available_monitors() else {
+        return false;
+    };
+    if monitors.is_empty() {
+        return false;
+    }
+    let bounds: Vec<WorkAreaBounds> = monitors.iter().map(WorkAreaBounds::from_monitor).collect();
+
+    // Reachable if some work area overlaps the window by a usable patch on both
+    // axes — a thin sliver poking onto a screen isn't grabbable, so it doesn't
+    // count as on-screen.
+    let reachable = bounds.iter().any(|b| {
+        b.overlap_x(pos.x, w) >= MIN_ONSCREEN_OVERLAP.min(w)
+            && b.overlap_y(pos.y, h) >= MIN_ONSCREEN_OVERLAP.min(h)
+    });
+    if reachable {
+        return false;
+    }
+
+    // Off-screen — prefer the monitor it already overlaps most; fall back to the
+    // primary when it overlaps none at all, then to the first connected one.
+    let target = bounds
+        .iter()
+        .copied()
+        .filter(|b| b.intersection_area(pos.x, pos.y, w, h) > 0)
+        .max_by_key(|b| b.intersection_area(pos.x, pos.y, w, h))
+        .or_else(|| window.primary_monitor().ok().flatten().map(|m| WorkAreaBounds::from_monitor(&m)))
+        .unwrap_or(bounds[0]);
+    let (x, y) = target.clamp(pos.x, pos.y, w, h);
+    tracing::info!(
+        label = %window.label(),
+        from = ?(pos.x, pos.y),
+        to = ?(x, y),
+        size = ?(w, h),
+        monitors = monitors.len(),
+        "ensure_window_on_screen: window was off every monitor, pulled back",
+    );
+    let _ = window.set_position(tauri::PhysicalPosition::new(x, y));
+    true
 }
 
 /// Right-edge padding (physical pixels) preserved when an anchored window

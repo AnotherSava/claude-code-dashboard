@@ -234,6 +234,11 @@ pub fn run() {
                         config_watcher::apply_default_position(&window);
                     }
                 }
+                // A saved position is restored verbatim — if the monitor it
+                // lived on is gone (unplugged dock, resolution change), pull the
+                // window back on-screen so it isn't stranded in dead space where
+                // even the tray Show/Hide can't surface it.
+                commands::ensure_window_on_screen(&window);
                 // Install the WM_NCHITTEST + WM_NCLBUTTONDOWN subclass.
                 // Lock is inactive until apply() flips it on, so this is a
                 // no-op until the user picks an Up/Down mode.

@@ -273,6 +273,9 @@ fn toggle_window(app: &AppHandle) {
             let _ = about.hide();
         }
     } else {
+        // Recover a window stranded off-screen by a monitor change while the
+        // app was running — otherwise "show" reveals it where it can't be seen.
+        crate::commands::ensure_window_on_screen(&window);
         let _ = window.show();
         let _ = window.set_focus();
     }

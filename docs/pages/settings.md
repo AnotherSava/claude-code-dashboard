@@ -86,7 +86,7 @@ Whether autostart is enabled isn't a config field — it lives in the OS launch 
 - `always_on_top` — keep the widget above other windows.
 - `history_font_size` — history-window text size, one of `"smallest"`, `"small"`, `"regular"`, `"large"`, `"largest"`.
 - `auto_resize` — fit the window height to its content: `"up"` grows from a fixed bottom edge, `"down"` from a fixed top edge, `"none"` leaves the window manually sized.
-- `save_window_position` — remember each window's position and size on close. The saved geometry lives in `window_position`, `history_window_position`, and `history_window_maximized`, which the widget manages for you — no need to edit them by hand.
+- `save_window_position` — remember each window's position and size on close. The saved geometry lives in `window_position`, `history_window_position`, and `history_window_maximized`, which the widget manages for you — no need to edit them by hand. If the monitor a window was saved on is later disconnected or rearranged, the widget pulls it back onto a visible screen so it can't get stranded off-screen.
 - `start_minimized` — when launched at login, stay hidden in the tray. Set it through the tray's **On system start → Open to tray**; it's ignored on a manual launch.
 
 ### Session identity
