@@ -64,7 +64,8 @@ Every field is optional — omit one and the built-in default applies. A complet
     "claude-opus": 1000000,
     "claude": 200000
   },
-  "benign_closers": ["What's next?", "Anything else?"],
+  "benign_closers": ["What's next?"],
+  "benign_openers": ["anything"],
   "continuation_prompts": ["go", "continue", "proceed", "yes", "y", "yeah", "yep", "yup", "ok", "okay", "sure", "go ahead", "do it"],
   "limit_bar_segments": 16,
   "usage_limits_poll_interval_seconds": 600,
@@ -117,6 +118,7 @@ The `notifications` block controls alerts when a session needs you. Set it to `n
 ### Prompt classification
 
 - `benign_closers` — polite trailing questions that end in `?` but shouldn't flip a finished row to WAIT. Matched case-insensitively as a suffix.
+- `benign_openers` — words that, when they open the final question, mark it an optional offer rather than a hand-back, so a sign-off like "Anything you'd like to look at?" stays DONE. Matched case-insensitively as a prefix of the last sentence. An embedded real ask still flips to WAIT, so "Anything else, or shall I commit?" still waits. Default: `["anything"]`.
 - `continuation_prompts` — short replies that mean *keep going* or *yes, go ahead* rather than a new task (the defaults cover `go` / `continue` / `proceed` plus approvals like `yes` / `y` / `ok` / `sure`), so the original prompt and work timer carry over instead of resetting. Matched exactly, case-insensitively, after trimming.
 
 For the full classification logic see [Classification](development/classification) and [Sticky labels](development/sticky-labels) in the Development section.

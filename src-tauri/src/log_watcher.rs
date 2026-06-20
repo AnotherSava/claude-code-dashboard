@@ -476,13 +476,13 @@ enum FlushedVerdict {
 fn flushed_turn_verdict(
     update: &InferredState,
     text_entries: &[(DialogRole, String)],
-    benign_closers: &[String],
+    rules: crate::adapters::claude::QuestionRules,
 ) -> Option<FlushedVerdict> {
     if !matches!(update.state, Some(Status::Done)) {
         return None;
     }
     let (_, text) = text_entries.iter().rev().find(|(role, _)| *role == DialogRole::Assistant)?;
-    Some(if crate::adapters::claude::is_a_question(text, benign_closers) {
+    Some(if crate::adapters::claude::is_a_question(text, rules) {
         FlushedVerdict::Question
     } else {
         FlushedVerdict::Statement
@@ -552,10 +552,11 @@ fn apply_and_emit(app: &AppHandle, chat_id: &str, update: &InferredState, text_e
         .find(|(role, _)| *role == DialogRole::Assistant)
         .map(|(_, t)| crate::adapters::claude::evidence_snippet(t))
         .unwrap_or_default();
+    let cfg = app.try_state::<ConfigState>().map(|c| c.snapshot()).unwrap_or_default();
     let corrected = match flushed_turn_verdict(
         update,
         &text_entries,
-        &app.try_state::<ConfigState>().map(|c| c.snapshot().benign_closers).unwrap_or_default(),
+        crate::adapters::claude::QuestionRules::from_config(&cfg),
     ) {
         Some(FlushedVerdict::Question) if app_state.promote_done_to_awaiting(chat_id, now) => {
             tracing::debug!(
@@ -1040,16 +1041,20 @@ mod tests {
         InferredState { state: Some(Status::Done), ..Default::default() }
     }
 
+    use crate::adapters::claude::QuestionRules;
+    /// No config-driven openers/closers — the bare heuristics only.
+    const NO_RULES: QuestionRules = QuestionRules { closers: &[], openers: &[] };
+
     #[test]
     fn flushed_verdict_is_question_when_done_and_last_assistant_is_a_question() {
         let entries = vec![(DialogRole::Assistant, "Should I proceed?".to_string())];
-        assert_eq!(flushed_turn_verdict(&done(), &entries, &[]), Some(FlushedVerdict::Question));
+        assert_eq!(flushed_turn_verdict(&done(), &entries, NO_RULES), Some(FlushedVerdict::Question));
     }
 
     #[test]
     fn flushed_verdict_is_statement_when_done_and_last_assistant_is_not_a_question() {
         let entries = vec![(DialogRole::Assistant, "All tests pass.".to_string())];
-        assert_eq!(flushed_turn_verdict(&done(), &entries, &[]), Some(FlushedVerdict::Statement));
+        assert_eq!(flushed_turn_verdict(&done(), &entries, NO_RULES), Some(FlushedVerdict::Statement));
     }
 
     #[test]
@@ -1058,13 +1063,13 @@ mod tests {
         // must yield no verdict — only a settled Done turn is corrected.
         let working = InferredState { state: Some(Status::Working), ..Default::default() };
         let entries = vec![(DialogRole::Assistant, "Should I proceed?".to_string())];
-        assert_eq!(flushed_turn_verdict(&working, &entries, &[]), None);
+        assert_eq!(flushed_turn_verdict(&working, &entries, NO_RULES), None);
     }
 
     #[test]
     fn flushed_verdict_is_none_when_no_assistant_entry() {
         let entries = vec![(DialogRole::User, "hi".to_string())];
-        assert_eq!(flushed_turn_verdict(&done(), &entries, &[]), None);
+        assert_eq!(flushed_turn_verdict(&done(), &entries, NO_RULES), None);
     }
 
     #[test]
@@ -1077,7 +1082,7 @@ mod tests {
             (DialogRole::User, "yes".to_string()),
             (DialogRole::Assistant, "Done, no question here.".to_string()),
         ];
-        assert_eq!(flushed_turn_verdict(&done(), &entries, &[]), Some(FlushedVerdict::Statement));
+        assert_eq!(flushed_turn_verdict(&done(), &entries, NO_RULES), Some(FlushedVerdict::Statement));
     }
 
     #[test]
@@ -1085,7 +1090,8 @@ mod tests {
         // A benign closer isn't a real question → Statement, not Question.
         let entries = vec![(DialogRole::Assistant, "What's next?".to_string())];
         let benign = vec!["What's next?".to_string()];
-        assert_eq!(flushed_turn_verdict(&done(), &entries, &benign), Some(FlushedVerdict::Statement));
+        let rules = QuestionRules { closers: &benign, openers: &[] };
+        assert_eq!(flushed_turn_verdict(&done(), &entries, rules), Some(FlushedVerdict::Statement));
     }
 
     #[test]

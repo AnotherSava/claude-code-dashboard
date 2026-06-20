@@ -13,8 +13,16 @@ pub struct Config {
     pub context_window_tokens: HashMap<String, u64>,
     pub context_bar_thresholds: Vec<Threshold>,
     /// Read by `adapters::claude`: conversational closers that end with '?'
-    /// but shouldn't register as awaiting (e.g. "What's next?").
+    /// but shouldn't register as awaiting (e.g. "What's next?"). Matched
+    /// case-insensitively as a *suffix* of the final question.
     pub benign_closers: Vec<String>,
+    /// Read by `adapters::claude`: conversational *openers* of the final
+    /// question that mark it an optional offer rather than a hand-back (e.g.
+    /// "anything" → "Anything you'd like to look at?"). Matched
+    /// case-insensitively as a *prefix* of the last sentence. An embedded real
+    /// ask still registers via the permission-seeking path, so
+    /// "Anything else, or shall I commit?" still awaits.
+    pub benign_openers: Vec<String>,
     /// Read by `adapters::claude`: used to derive a friendly chat_id from
     /// `cwd`. When a Claude session starts under this directory, the relative
     /// path is used as the session id. None = always use the basename of cwd.
@@ -245,7 +253,8 @@ impl Default for Config {
                 Threshold { percent: 60.0, color: "#c6a03c".into() },
                 Threshold { percent: 85.0, color: "#c64a4a".into() },
             ],
-            benign_closers: vec!["What's next?".into(), "Anything else?".into()],
+            benign_closers: vec!["What's next?".into()],
+            benign_openers: vec!["anything".into()],
             projects_root: None,
             notifications: Some(NotificationsConfig::default()),
             usage_limits_poll_interval_seconds: 600,

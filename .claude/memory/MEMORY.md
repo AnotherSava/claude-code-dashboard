@@ -1,6 +1,7 @@
 - [Check remote before fixing](feedback_check_remote_before_fixing.md) — deployed app often lags origin/main; git fetch + check log before reimplementing a fix that may already be merged
 - [Hook env var setup](hook_env_var_setup.md) — Claude Code hooks in ~/.claude/settings.json need $CLAUDE_AI_AGENT_DASHBOARD set to the repo root; silent failure when unset
 - [Frontend question detector is lenient](feedback_frontend_question_detector_lenient.md) — src/lib/dialog.ts intentionally diverges from Rust is_a_question; don't unify
+- [Benign openers for offer questions](benign_openers_offer_questions.md) — config benign_openers (prefix) keeps "Anything …?" sign-offs DONE; distinct from benign_closers (suffix), don't merge
 - [macOS ad-hoc signing strategy](macos_signing_strategy.md) — DMG uses signingIdentity="-" + documented user workaround; don't push for $99/yr Apple notarization unprompted
 - [Test SetupPanel via port override](dashboard_test_port_override.md) — `config/local.json {"server_port": 9078}` keeps prompt_history empty; revert to 9077 after or the dashboard goes deaf
 - [Run deploy directly, don't hand it back](feedback_run_deploy_directly.md) — after code changes that need visual verification, call `Bash deploy` instead of asking the user

@@ -51,6 +51,7 @@ export interface Config {
   context_window_tokens: Record<string, number>
   context_bar_thresholds: ContextBarThreshold[]
   benign_closers: string[]
+  benign_openers: string[]
   usage_limits_poll_interval_seconds: number
   limit_bar_segments: number
   auto_resize: AutoResize

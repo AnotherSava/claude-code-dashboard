@@ -64,7 +64,7 @@ pub fn dispatch(event: &str, payload: &Value, cfg: &Config) -> AdapterOutput {
         return AdapterOutput::Boundary { id: chat_id };
     }
 
-    let Some(Classification { status, label, reason }) = classify_detailed(event, payload, &cfg.benign_closers) else {
+    let Some(Classification { status, label, reason }) = classify_detailed(event, payload, QuestionRules::from_config(cfg)) else {
         return AdapterOutput::Ignore;
     };
 
@@ -190,23 +190,23 @@ impl Classification {
 fn classify(
     event: &str,
     payload: &Value,
-    benign_closers: &[String],
+    rules: QuestionRules,
 ) -> Option<(Status, Option<String>)> {
-    classify_detailed(event, payload, benign_closers).map(|c| (c.status, c.label))
+    classify_detailed(event, payload, rules).map(|c| (c.status, c.label))
 }
 
 /// Classify a turn-ending event (`Stop` / idle prompt) by inspecting the final
 /// assistant text: `Awaiting "has a question"` if it reads as a hand-back, else
 /// `Done`. `kind` prefixes the decision-log reason ("turn ended" / "idle
 /// prompt"). Shared so both arms detect the question and snippet identically.
-fn classify_turn_end(transcript_path: Option<&str>, benign_closers: &[String], kind: &str) -> Classification {
+fn classify_turn_end(transcript_path: Option<&str>, rules: QuestionRules, kind: &str) -> Classification {
     let Some(path) = transcript_path else {
         return Classification::new(Status::Done, None, format!("{kind}; no transcript path in payload"));
     };
     let Some(text) = last_assistant_text(Path::new(path)) else {
         return Classification::new(Status::Done, None, format!("{kind}; no assistant text flushed to transcript yet"));
     };
-    if let Some(rule) = question_reason(&text, benign_closers) {
+    if let Some(rule) = question_reason(&text, rules) {
         return Classification::new(
             Status::Awaiting,
             Some("has a question".into()),
@@ -219,7 +219,7 @@ fn classify_turn_end(transcript_path: Option<&str>, benign_closers: &[String], k
 fn classify_detailed(
     event: &str,
     payload: &Value,
-    benign_closers: &[String],
+    rules: QuestionRules,
 ) -> Option<Classification> {
     let transcript_path = payload
         .get("transcript_path")
@@ -254,7 +254,7 @@ fn classify_detailed(
                 Some(Classification::new(Status::Working, Some(clean_prompt(prompt)), "slash command invoked (early Working signal)"))
             }
         }
-        "Stop" => Some(classify_turn_end(transcript_path, benign_closers, "turn ended")),
+        "Stop" => Some(classify_turn_end(transcript_path, rules, "turn ended")),
         "PreToolUse" => {
             let tool_name = payload.get("tool_name").and_then(|v| v.as_str()).unwrap_or("");
             if !USER_GATING_TOOLS.contains(&tool_name) {
@@ -277,7 +277,7 @@ fn classify_detailed(
                 return Some(Classification::new(Status::Idle, None, format!("{event} with no notification payload → idle")));
             }
             if notif_type == "idle_prompt" {
-                return Some(classify_turn_end(transcript_path, benign_closers, "idle prompt"));
+                return Some(classify_turn_end(transcript_path, rules, "idle prompt"));
             }
             let label = notification_label(notif_type, message);
             let cleaned = clean_prompt(&label);
@@ -461,29 +461,67 @@ const PERMISSION_SEEKING: &[&str] = &[
     "ready to ",
 ];
 
+/// The two config-driven question heuristics, borrowed together because they
+/// always travel as a pair from [`Config`]. `closers` are suffix-matched on the
+/// final question (a polite sign-off like "What's next?"); `openers` are
+/// prefix-matched on the last sentence (an optional offer like "Anything …?").
+#[derive(Clone, Copy)]
+pub(crate) struct QuestionRules<'a> {
+    pub closers: &'a [String],
+    pub openers: &'a [String],
+}
+
+impl<'a> QuestionRules<'a> {
+    pub(crate) fn from_config(cfg: &'a Config) -> Self {
+        Self { closers: &cfg.benign_closers, openers: &cfg.benign_openers }
+    }
+}
+
+/// The final sentence of `text` — the segment after the last interior sentence
+/// terminator. Used to test whether the closing question *opens* with a benign
+/// offer word (e.g. "Anything …") rather than reading the whole message.
+fn final_sentence(text: &str) -> &str {
+    text.split(|c| matches!(c, '.' | '!' | '?' | '\n'))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .last()
+        .unwrap_or("")
+}
+
+/// True when `sentence` opens with one of the configured benign offer openers
+/// (case-insensitive, after trimming) — marking the question an optional offer
+/// to do more ("Anything you'd like to look at?") rather than a hand-back. An
+/// embedded real ask isn't suppressed here: it's still caught downstream by the
+/// permission-seeking path, so "Anything else, or shall I commit?" awaits.
+fn opens_with_benign_offer(sentence: &str, benign_openers: &[String]) -> bool {
+    let lower = sentence.trim_start().to_lowercase();
+    benign_openers.iter().any(|o| !o.is_empty() && lower.starts_with(&o.to_lowercase()))
+}
+
 /// True when `text` reads as a hand-back to the user: the whole text ends with
 /// `?` (possibly after a trailing option list); the last paragraph contains a
 /// known hand-back phrase (permission-seeking or a direct second-person
 /// question); the last paragraph issues a hand-back request for input
 /// (`Paste …` / `Please provide …` / `Confirm …`); or the last paragraph
 /// *opens* with a question that a concluding statement then follows.
-pub(crate) fn is_a_question(text: &str, benign_closers: &[String]) -> bool {
-    question_reason(text, benign_closers).is_some()
+pub(crate) fn is_a_question(text: &str, rules: QuestionRules) -> bool {
+    question_reason(text, rules).is_some()
 }
 
 /// Like [`is_a_question`] but returns *which* rule fired (or `None` when the
 /// text reads as a plain statement). The matched-rule string is recorded in the
 /// decision log so an investigation can see why a turn was judged a question
 /// without re-running the heuristics or reading the transcript.
-pub(crate) fn question_reason(text: &str, benign_closers: &[String]) -> Option<&'static str> {
+pub(crate) fn question_reason(text: &str, rules: QuestionRules) -> Option<&'static str> {
     let plain = strip_markdown(text);
     let effective = strip_trailing_options(&plain);
     if effective.ends_with('?') {
         let lower = effective.to_lowercase();
-        let is_benign = benign_closers.iter().any(|c| {
+        let is_benign_closer = rules.closers.iter().any(|c| {
             !c.is_empty() && lower.ends_with(&c.to_lowercase())
         });
-        if !is_benign {
+        let is_benign_offer = opens_with_benign_offer(final_sentence(effective), rules.openers);
+        if !is_benign_closer && !is_benign_offer {
             return Some("text ends with '?'");
         }
     }
@@ -493,7 +531,7 @@ pub(crate) fn question_reason(text: &str, benign_closers: &[String]) -> Option<&
     if has_handback_request(&plain) {
         return Some("sentence-initial hand-back request");
     }
-    if last_paragraph_opens_with_question(&plain, benign_closers) {
+    if last_paragraph_opens_with_question(&plain, rules) {
         return Some("last paragraph opens with a question");
     }
     None
@@ -596,7 +634,7 @@ const SELF_DIRECTED_OPENERS: &[&str] = &[
 /// question as the agent musing rather than asking; and configured benign
 /// closers are honored, so a polite "What's next? …" still doesn't flag.
 /// Empirically fires on 12/60 real assistant turns with zero false positives.
-fn last_paragraph_opens_with_question(text: &str, benign_closers: &[String]) -> bool {
+fn last_paragraph_opens_with_question(text: &str, rules: QuestionRules) -> bool {
     let last_para = last_paragraph(text);
     let Some((term_idx, term_ch)) = last_para
         .char_indices()
@@ -615,7 +653,10 @@ fn last_paragraph_opens_with_question(text: &str, benign_closers: &[String]) -> 
     if SELF_DIRECTED_OPENERS.iter().any(|o| lower.trim_start().starts_with(o)) {
         return false;
     }
-    !benign_closers.iter().any(|c| !c.is_empty() && lower.ends_with(&c.to_lowercase()))
+    if opens_with_benign_offer(first_sentence, rules.openers) {
+        return false;
+    }
+    !rules.closers.iter().any(|c| !c.is_empty() && lower.ends_with(&c.to_lowercase()))
 }
 
 fn last_paragraph(text: &str) -> &str {
@@ -652,6 +693,15 @@ mod tests {
         cfg.projects_root = projects_root.map(str::to_string);
         cfg.benign_closers = benign_closers.iter().map(|s| s.to_string()).collect();
         cfg
+    }
+
+    /// No config-driven openers/closers — the bare heuristics only.
+    const NO_RULES: QuestionRules = QuestionRules { closers: &[], openers: &[] };
+
+    /// Borrow a closer list as [`QuestionRules`] with no openers, so the
+    /// closer-suffix tests read the same as before the openers were added.
+    fn with_closers(closers: &[String]) -> QuestionRules<'_> {
+        QuestionRules { closers, openers: &[] }
     }
 
     fn write_transcript(lines: &[Value]) -> std::path::PathBuf {
@@ -805,7 +855,7 @@ mod tests {
     #[test]
     fn user_prompt_submit_with_prompt_returns_working_with_cleaned_label() {
         let p = json!({"prompt": "fix the bug"});
-        let (status, label) = classify("UserPromptSubmit", &p, &[]).unwrap();
+        let (status, label) = classify("UserPromptSubmit", &p, NO_RULES).unwrap();
         assert_eq!(status, Status::Working);
         assert_eq!(label.as_deref(), Some("fix the bug"));
     }
@@ -813,7 +863,7 @@ mod tests {
     #[test]
     fn user_prompt_submit_with_blank_prompt_returns_working_without_label() {
         let p = json!({"prompt": "   "});
-        let (status, label) = classify("UserPromptSubmit", &p, &[]).unwrap();
+        let (status, label) = classify("UserPromptSubmit", &p, NO_RULES).unwrap();
         assert_eq!(status, Status::Working);
         assert_eq!(label, None);
     }
@@ -821,7 +871,7 @@ mod tests {
     #[test]
     fn user_prompt_submit_missing_prompt_returns_working_without_label() {
         let p = json!({});
-        let (status, label) = classify("UserPromptSubmit", &p, &[]).unwrap();
+        let (status, label) = classify("UserPromptSubmit", &p, NO_RULES).unwrap();
         assert_eq!(status, Status::Working);
         assert_eq!(label, None);
     }
@@ -830,7 +880,7 @@ mod tests {
 
     #[test]
     fn stop_without_transcript_is_done() {
-        let (status, label) = classify("Stop", &json!({}), &[]).unwrap();
+        let (status, label) = classify("Stop", &json!({}), NO_RULES).unwrap();
         assert_eq!(status, Status::Done);
         assert_eq!(label, None);
     }
@@ -839,7 +889,7 @@ mod tests {
     fn stop_with_question_ending_is_awaiting() {
         let t = write_transcript(&[assistant_text("Should I proceed?")]);
         let p = json!({"transcript_path": t.to_string_lossy()});
-        let (status, label) = classify("Stop", &p, &[]).unwrap();
+        let (status, label) = classify("Stop", &p, NO_RULES).unwrap();
         assert_eq!(status, Status::Awaiting);
         assert_eq!(label.as_deref(), Some("has a question"));
         let _ = std::fs::remove_dir_all(t.parent().unwrap());
@@ -849,7 +899,7 @@ mod tests {
     fn stop_without_question_ending_is_done() {
         let t = write_transcript(&[assistant_text("All tests passing.")]);
         let p = json!({"transcript_path": t.to_string_lossy()});
-        let (status, label) = classify("Stop", &p, &[]).unwrap();
+        let (status, label) = classify("Stop", &p, NO_RULES).unwrap();
         assert_eq!(status, Status::Done);
         assert_eq!(label, None);
         let _ = std::fs::remove_dir_all(t.parent().unwrap());
@@ -863,7 +913,7 @@ mod tests {
             "notification_type": "permission_prompt",
             "message": "Claude needs your permission to use Bash"
         });
-        let (status, label) = classify("Notification", &p, &[]).unwrap();
+        let (status, label) = classify("Notification", &p, NO_RULES).unwrap();
         assert_eq!(status, Status::Awaiting);
         assert_eq!(label.as_deref(), Some("needs approval: Bash"));
     }
@@ -871,7 +921,7 @@ mod tests {
     #[test]
     fn notification_plan_approval_fixed_label() {
         let p = json!({"notification_type": "plan_approval", "message": "ignored"});
-        let (_, label) = classify("Notification", &p, &[]).unwrap();
+        let (_, label) = classify("Notification", &p, NO_RULES).unwrap();
         assert_eq!(label.as_deref(), Some("plan approval"));
     }
 
@@ -882,7 +932,7 @@ mod tests {
             "notification_type": "idle_prompt",
             "transcript_path": t.to_string_lossy(),
         });
-        let (status, label) = classify("Notification", &p, &[]).unwrap();
+        let (status, label) = classify("Notification", &p, NO_RULES).unwrap();
         assert_eq!(status, Status::Awaiting);
         assert_eq!(label.as_deref(), Some("has a question"));
         let _ = std::fs::remove_dir_all(t.parent().unwrap());
@@ -895,7 +945,7 @@ mod tests {
             "notification_type": "idle_prompt",
             "transcript_path": t.to_string_lossy(),
         });
-        let (status, label) = classify("Notification", &p, &[]).unwrap();
+        let (status, label) = classify("Notification", &p, NO_RULES).unwrap();
         assert_eq!(status, Status::Done);
         assert_eq!(label, None);
         let _ = std::fs::remove_dir_all(t.parent().unwrap());
@@ -904,7 +954,7 @@ mod tests {
     #[test]
     fn notification_without_type_but_with_message_is_awaiting() {
         let p = json!({"message": "Claude needs your attention"});
-        let (status, label) = classify("Notification", &p, &[]).unwrap();
+        let (status, label) = classify("Notification", &p, NO_RULES).unwrap();
         assert_eq!(status, Status::Awaiting);
         assert_eq!(label.as_deref(), Some("Claude needs your attention"));
     }
@@ -912,14 +962,14 @@ mod tests {
     #[test]
     fn notification_label_truncates_to_60_chars() {
         let p = json!({"notification_type": "attention", "message": "y".repeat(200)});
-        let (_, label) = classify("Notification", &p, &[]).unwrap();
+        let (_, label) = classify("Notification", &p, NO_RULES).unwrap();
         assert_eq!(label.unwrap().chars().count(), 60);
     }
 
     #[test]
     fn notification_message_strips_terminal_chrome() {
         let p = json!({"message": "⎿  Error: pattern blocked"});
-        let (_, label) = classify("Notification", &p, &[]).unwrap();
+        let (_, label) = classify("Notification", &p, NO_RULES).unwrap();
         assert_eq!(label.as_deref(), Some("Error: pattern blocked"));
     }
 
@@ -928,7 +978,7 @@ mod tests {
     #[test]
     fn pre_tool_use_ask_user_question_is_awaiting_with_question_label() {
         let p = json!({"tool_name": "AskUserQuestion", "tool_input": {"questions": [{"question": "?"}]}});
-        let (status, label) = classify("PreToolUse", &p, &[]).unwrap();
+        let (status, label) = classify("PreToolUse", &p, NO_RULES).unwrap();
         assert_eq!(status, Status::Awaiting);
         assert_eq!(label.as_deref(), Some("has a question"));
     }
@@ -936,7 +986,7 @@ mod tests {
     #[test]
     fn pre_tool_use_exit_plan_mode_is_awaiting_with_plan_label() {
         let p = json!({"tool_name": "ExitPlanMode", "tool_input": {"plan": "..."}});
-        let (status, label) = classify("PreToolUse", &p, &[]).unwrap();
+        let (status, label) = classify("PreToolUse", &p, NO_RULES).unwrap();
         assert_eq!(status, Status::Awaiting);
         assert_eq!(label.as_deref(), Some("plan approval"));
     }
@@ -944,19 +994,19 @@ mod tests {
     #[test]
     fn pre_tool_use_for_unrelated_tool_is_ignored() {
         let p = json!({"tool_name": "Bash", "tool_input": {"command": "ls"}});
-        assert!(classify("PreToolUse", &p, &[]).is_none());
+        assert!(classify("PreToolUse", &p, NO_RULES).is_none());
     }
 
     #[test]
     fn pre_tool_use_without_tool_name_is_ignored() {
-        assert!(classify("PreToolUse", &json!({}), &[]).is_none());
+        assert!(classify("PreToolUse", &json!({}), NO_RULES).is_none());
     }
 
     // ----- classify: SessionStart -----
 
     #[test]
     fn session_start_with_no_fields_is_idle() {
-        let (status, label) = classify("SessionStart", &json!({}), &[]).unwrap();
+        let (status, label) = classify("SessionStart", &json!({}), NO_RULES).unwrap();
         assert_eq!(status, Status::Idle);
         assert_eq!(label, None);
     }
@@ -965,7 +1015,7 @@ mod tests {
 
     #[test]
     fn unknown_event_returns_none() {
-        assert!(classify("PreToolUse", &json!({}), &[]).is_none());
+        assert!(classify("PreToolUse", &json!({}), NO_RULES).is_none());
     }
 
     // ----- last_assistant_text -----
@@ -1018,16 +1068,16 @@ mod tests {
 
     #[test]
     fn question_reason_names_the_matched_rule() {
-        assert_eq!(question_reason("Should I proceed?", &[]), Some("text ends with '?'"));
+        assert_eq!(question_reason("Should I proceed?", NO_RULES), Some("text ends with '?'"));
         assert_eq!(
-            question_reason("Want me to add that? The plan continues here.", &[]),
+            question_reason("Want me to add that? The plan continues here.", NO_RULES),
             Some("permission-seeking phrase before a '?'"),
         );
         assert_eq!(
-            question_reason("Paste the full error output here.", &[]),
+            question_reason("Paste the full error output here.", NO_RULES),
             Some("sentence-initial hand-back request"),
         );
-        assert_eq!(question_reason("All done. Everything passed.", &[]), None);
+        assert_eq!(question_reason("All done. Everything passed.", NO_RULES), None);
     }
 
     #[test]
@@ -1044,24 +1094,24 @@ mod tests {
 
     #[test]
     fn is_a_question_simple_question_mark() {
-        assert!(is_a_question("Should I proceed?", &[]));
+        assert!(is_a_question("Should I proceed?", NO_RULES));
     }
 
     #[test]
     fn is_a_question_no_question_mark() {
-        assert!(!is_a_question("All done.", &[]));
+        assert!(!is_a_question("All done.", NO_RULES));
     }
 
     #[test]
     fn is_a_question_empty_text() {
-        assert!(!is_a_question("", &[]));
+        assert!(!is_a_question("", NO_RULES));
     }
 
     #[test]
     fn is_a_question_strips_trailing_option_list() {
         assert!(is_a_question(
             "Save these? (all / numbers / none)",
-            &[]
+            NO_RULES
         ));
     }
 
@@ -1071,33 +1121,33 @@ mod tests {
         // "**" used to hide the "?" so the row went Done instead of Awaiting.
         assert!(is_a_question(
             "Remote was in sync, so this will fast-forward cleanly.\n\n**Push?**",
-            &[]
+            NO_RULES
         ));
     }
 
     #[test]
     fn is_a_question_other_markdown_emphasis_is_stripped() {
-        assert!(is_a_question("*continue?*", &[]));
-        assert!(is_a_question("`run this?`", &[]));
-        assert!(is_a_question("__ready to deploy?__", &[]));
-        assert!(is_a_question("## Proceed?", &[]));
+        assert!(is_a_question("*continue?*", NO_RULES));
+        assert!(is_a_question("`run this?`", NO_RULES));
+        assert!(is_a_question("__ready to deploy?__", NO_RULES));
+        assert!(is_a_question("## Proceed?", NO_RULES));
     }
 
     #[test]
     fn is_a_question_bold_question_with_trailing_options() {
-        assert!(is_a_question("**Save these?** (all / none)", &[]));
+        assert!(is_a_question("**Save these?** (all / none)", NO_RULES));
     }
 
     #[test]
     fn is_a_question_bold_statement_is_not_a_question() {
-        assert!(!is_a_question("**All done.**", &[]));
+        assert!(!is_a_question("**All done.**", NO_RULES));
     }
 
     #[test]
     fn is_a_question_strips_trailing_option_list_with_extra_whitespace() {
         assert!(is_a_question(
             "Continue?   (yes / no)  \n",
-            &[]
+            NO_RULES
         ));
     }
 
@@ -1105,32 +1155,80 @@ mod tests {
     fn is_a_question_does_not_strip_unrelated_parens() {
         // Trailing "(foo.py)" doesn't follow a "?", so we don't strip and the
         // text doesn't end with "?" → not a question.
-        assert!(!is_a_question("Look at this code (foo.py)", &[]));
+        assert!(!is_a_question("Look at this code (foo.py)", NO_RULES));
     }
 
     #[test]
     fn is_a_question_keeps_inline_parens() {
-        assert!(is_a_question("Should I update foo (the helper)?", &[]));
+        assert!(is_a_question("Should I update foo (the helper)?", NO_RULES));
     }
 
     #[test]
     fn is_a_question_benign_closer_with_options_is_not_a_question() {
         let closers = vec!["What's next?".to_string()];
-        assert!(!is_a_question("What's next? (continue / stop)", &closers));
+        assert!(!is_a_question("What's next? (continue / stop)", with_closers(&closers)));
     }
 
     #[test]
     fn is_a_question_benign_closer_alone_is_not_a_question() {
         let closers = vec!["What's next?".to_string()];
         for text in ["What's next?", "what's next?", "Done. What's next?"] {
-            assert!(!is_a_question(text, &closers), "text: {}", text);
+            assert!(!is_a_question(text, with_closers(&closers)), "text: {}", text);
         }
     }
 
     #[test]
     fn is_a_question_non_matching_closer_still_awaits() {
         let closers = vec!["What's next?".to_string()];
-        assert!(is_a_question("Which option do you prefer?", &closers));
+        assert!(is_a_question("Which option do you prefer?", with_closers(&closers)));
+    }
+
+    // ----- benign openers (offer questions) -----
+
+    fn with_openers(openers: &[String]) -> QuestionRules<'_> {
+        QuestionRules { closers: &[], openers }
+    }
+
+    #[test]
+    fn benign_opener_offer_is_not_a_question() {
+        // A question whose final sentence opens with "anything" is an optional
+        // offer to do more, not a hand-back — every one of these is drawn from
+        // real assistant sign-offs in prompt_history.json.
+        let openers = vec!["anything".to_string()];
+        for text in [
+            "Anything you'd like to look at?",
+            "Anything you'd like me to pick up from here?",
+            "anything to adjust?",
+            "I've finished the refactor and tests pass.\n\nAnything else?",
+        ] {
+            assert!(!is_a_question(text, with_openers(&openers)), "text: {}", text);
+        }
+    }
+
+    #[test]
+    fn benign_opener_does_not_suppress_embedded_ask() {
+        // An offer that also poses a real decision still awaits: the bare-`?`
+        // path is skipped, but the permission-seeking path catches "shall i" /
+        // "ready to" even though the sentence opens with a benign offer word.
+        let openers = vec!["anything".to_string()];
+        assert!(is_a_question("Anything else, or shall I commit the batch?", with_openers(&openers)));
+        assert!(is_a_question("Anything else, or ready to commit?", with_openers(&openers)));
+    }
+
+    #[test]
+    fn benign_opener_only_applies_to_the_final_sentence() {
+        // An earlier "Anything…" mention must not neutralize a genuine closing
+        // question — only the final sentence's opener is consulted.
+        let openers = vec!["anything".to_string()];
+        assert!(is_a_question("Anything goes here. Should I proceed?", with_openers(&openers)));
+    }
+
+    #[test]
+    fn benign_opener_default_config_neutralizes_offer() {
+        // The shipped default opener list is `["anything"]`, so a fresh config
+        // treats the offer as Done without any user tuning.
+        let cfg = Config::default();
+        assert!(!is_a_question("Anything you'd like to look at?", QuestionRules::from_config(&cfg)));
     }
 
     // ----- permission-seeking in last paragraph -----
@@ -1139,7 +1237,7 @@ mod tests {
     fn permission_seeking_want_me_to_mid_paragraph() {
         assert!(is_a_question(
             "The state is ephemeral. Want me to add persistence? The plan: write sessions.json to disk.",
-            &[]
+            NO_RULES
         ));
     }
 
@@ -1147,7 +1245,7 @@ mod tests {
     fn permission_seeking_shall_i_mid_paragraph() {
         assert!(is_a_question(
             "Three changes here. Shall I proceed? I'll create separate commits.",
-            &[]
+            NO_RULES
         ));
     }
 
@@ -1155,7 +1253,7 @@ mod tests {
     fn permission_seeking_should_i_mid_paragraph() {
         assert!(is_a_question(
             "Found the issue. Should I use the cached value? It would avoid the network call.",
-            &[]
+            NO_RULES
         ));
     }
 
@@ -1163,7 +1261,7 @@ mod tests {
     fn permission_seeking_do_you_want_mid_paragraph() {
         assert!(is_a_question(
             "Deployed. Do you want me to run the tests? I can also check coverage.",
-            &[]
+            NO_RULES
         ));
     }
 
@@ -1173,7 +1271,7 @@ mod tests {
         // ("Ready to tag v0.5.1 and push it? Reply with y …").
         assert!(is_a_question(
             "Ready to tag v0.5.1 and push it? Reply with y to tag + push, or tell me what to tweak in the notes first.",
-            &[]
+            NO_RULES
         ));
     }
 
@@ -1184,11 +1282,11 @@ mod tests {
         // The "save this?"/"save these?" phrasing flips it to awaiting.
         assert!(is_a_question(
             "Save this? (all / 1 / none) — then I'll run /commit.",
-            &[]
+            NO_RULES
         ));
         assert!(is_a_question(
             "Save these? (all / numbers / none) — I'll commit after.",
-            &[]
+            NO_RULES
         ));
     }
 
@@ -1198,7 +1296,7 @@ mod tests {
         // must not match — only the literal "save this?" question does.
         assert!(!is_a_question(
             "Let me save this config before continuing. Running the build now.",
-            &[]
+            NO_RULES
         ));
     }
 
@@ -1211,7 +1309,7 @@ mod tests {
             "Did you try the admin launch? That's the most likely fix.",
             "Want to try a clean test? Reset the config and relaunch.",
         ] {
-            assert!(is_a_question(text, &[]), "text: {}", text);
+            assert!(is_a_question(text, NO_RULES), "text: {}", text);
         }
     }
 
@@ -1221,7 +1319,7 @@ mod tests {
         // shape of the release skill's "Confirm vX? On approval I'll …".
         assert!(is_a_question(
             "Confirm v0.5.0 and these notes? On approval I'll tag and push.",
-            &[]
+            NO_RULES
         ));
         // Trailing space guards against `confirmed` / `confirmation` matching
         // a declarative sentence that happens to share a paragraph with a "?".
@@ -1229,22 +1327,22 @@ mod tests {
         // the text doesn't end with "?" so the trailing-? path stays quiet.)
         assert!(!is_a_question(
             "The change is confirmed working. Does that match? Shipping it now.",
-            &[]
+            NO_RULES
         ));
     }
 
     #[test]
     fn paste_request_is_awaiting() {
         // A sentence-initial "Paste ..." imperative means the agent is waiting.
-        assert!(is_a_question("Paste the tableinfos output and I'll finish arena.", &[]));
-        assert!(is_a_question("Looks good. Paste whatever it prints.", &[]));
+        assert!(is_a_question("Paste the tableinfos output and I'll finish arena.", NO_RULES));
+        assert!(is_a_question("Looks good. Paste whatever it prints.", NO_RULES));
     }
 
     #[test]
     fn paste_mention_mid_sentence_is_not_awaiting() {
         // Only a sentence-initial imperative counts — a mention does not.
-        assert!(!is_a_question("You can paste this into the terminal later. All set.", &[]));
-        assert!(!is_a_question("I'll paste the result here once it's done.", &[]));
+        assert!(!is_a_question("You can paste this into the terminal later. All set.", NO_RULES));
+        assert!(!is_a_question("I'll paste the result here once it's done.", NO_RULES));
     }
 
     #[test]
@@ -1252,28 +1350,28 @@ mod tests {
         // A sentence-initial "Please provide ..." imperative hands back to the user.
         assert!(is_a_question(
             "Please provide the model group (e.g. `other`, `inserts`) and the model name.",
-            &[]
+            NO_RULES
         ));
-        assert!(is_a_question("Looks good. Please provide your API key.", &[]));
+        assert!(is_a_question("Looks good. Please provide your API key.", NO_RULES));
     }
 
     #[test]
     fn confirm_request_without_question_mark_is_awaiting() {
         // A sentence-initial "Confirm ..." imperative hands back even without a `?`.
-        assert!(is_a_question("Confirm to tag v1.2.0, or request edits.", &[]));
+        assert!(is_a_question("Confirm to tag v1.2.0, or request edits.", NO_RULES));
         assert!(is_a_question(
             "Skipped as internal: docs and the memory chore. Confirm to tag v1.2.0, or request edits.",
-            &[]
+            NO_RULES
         ));
         // "Confirmed ..." is a statement, not a hand-back — trailing space keeps it out.
-        assert!(!is_a_question("Confirmed: the fix works on both platforms.", &[]));
+        assert!(!is_a_question("Confirmed: the fix works on both platforms.", NO_RULES));
     }
 
     #[test]
     fn please_note_is_not_awaiting() {
         // Informational "Please ..." openers must not register as hand-backs.
-        assert!(!is_a_question("Please note the migration runs on next launch.", &[]));
-        assert!(!is_a_question("Done. Please see the updated README for details.", &[]));
+        assert!(!is_a_question("Please note the migration runs on next launch.", NO_RULES));
+        assert!(!is_a_question("Done. Please see the updated README for details.", NO_RULES));
     }
 
     #[test]
@@ -1281,7 +1379,7 @@ mod tests {
         // Question in first paragraph, statement in last — should NOT match.
         assert!(!is_a_question(
             "Want me to fix it?\n\nI went ahead and fixed it. All tests pass.",
-            &[]
+            NO_RULES
         ));
     }
 
@@ -1289,7 +1387,7 @@ mod tests {
     fn permission_seeking_case_insensitive() {
         assert!(is_a_question(
             "WANT ME TO add this? Here's the plan.",
-            &[]
+            NO_RULES
         ));
     }
 
@@ -1297,7 +1395,7 @@ mod tests {
     fn permission_seeking_no_question_mark_after_phrase() {
         assert!(!is_a_question(
             "I want me to clarify: the fix is in place. All done.",
-            &[]
+            NO_RULES
         ));
     }
 
@@ -1309,7 +1407,7 @@ mod tests {
         // excluded by the SELF_DIRECTED_OPENERS guard ("Let me ").
         assert!(!is_a_question(
             "Let me investigate — does the bug have a cleaner fix at the rotate_vector level? This affects what we do next.",
-            &[]
+            NO_RULES
         ));
     }
 
@@ -1322,7 +1420,7 @@ mod tests {
         // permission-seeking phrase matches. The first-sentence path catches it.
         assert!(is_a_question(
             "Apply this one edit? (yes / no) Everything else is already aligned.",
-            &[]
+            NO_RULES
         ));
     }
 
@@ -1334,7 +1432,7 @@ mod tests {
             "Let me check the logs first? Actually, I'll just run it.",
             "I'll refactor this? No — splitting it is cleaner. Doing that now.",
         ] {
-            assert!(!is_a_question(text, &[]), "text: {}", text);
+            assert!(!is_a_question(text, NO_RULES), "text: {}", text);
         }
     }
 
@@ -1344,7 +1442,7 @@ mod tests {
         // isn't a sentence terminator — the char before "?" is a space.
         assert!(!is_a_question(
             "I added a path for text ending in a `?` followed by an option menu. Done.",
-            &[]
+            NO_RULES
         ));
     }
 
@@ -1353,7 +1451,7 @@ mod tests {
         let closers = vec!["What's next?".to_string()];
         assert!(!is_a_question(
             "What's next? I'll wait for your call.",
-            &closers
+            with_closers(&closers)
         ));
     }
 
@@ -1365,11 +1463,11 @@ mod tests {
         // through `is_a_question` a trailing "?" would mask it via path 1.
         assert!(!last_paragraph_opens_with_question(
             "The migration is ready. Looks good to you?",
-            &[]
+            NO_RULES
         ));
         assert!(last_paragraph_opens_with_question(
             "Looks good to you? The migration is ready.",
-            &[]
+            NO_RULES
         ));
     }
 

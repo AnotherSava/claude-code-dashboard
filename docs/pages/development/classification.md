@@ -90,12 +90,12 @@ Other Unicode passes through untouched — accents, emoji, CJK, math symbols. Th
    - if it's an array, walk each block and take the trimmed `text` from blocks where `type == "text"`.
 5. Track the last non-empty text seen (so trailing whitespace-only assistant turns don't reset the state) and return it.
 
-**`is_a_question(text, benign_closers)`** — pure check on a string, four detection paths. Before any path runs, inline Markdown formatting characters (`*`, `_`, `` ` ``, `#`, `~`) are stripped so a final `**Push?**` reduces to `Push?` and is still recognized — only those marker characters are removed; newlines and every other character (crucially the terminal `?`) are preserved.
+**`is_a_question(text, rules)`** — pure check on a string, four detection paths. The `rules` argument bundles two config-driven lists that always travel together: `benign_closers` (suffix-matched) and `benign_openers` (prefix-matched). Before any path runs, inline Markdown formatting characters (`*`, `_`, `` ` ``, `#`, `~`) are stripped so a final `**Push?**` reduces to `Push?` and is still recognized — only those marker characters are removed; newlines and every other character (crucially the terminal `?`) are preserved.
 
 **Path 1 — trailing `?`:**
 
 1. If `text` (after trim) ends with `)`, peel off one trailing `(...)` group **only when** the substring before the matching `(` ends with `?`. This handles option lists like `"Save these? (all / numbers / none)"` → `"Save these?"`. Other trailing parens (e.g. `"Look at this code (foo.py)"`) are left alone — there's no `?` before them, so the text falls through unchanged.
-2. After that strip, if the text ends with `?`, check against `Config::benign_closers` — case-insensitive suffix match. A hit skips this path. Defaults: `"What's next?"`, `"Anything else?"`. They exist because Claude often signs off with a polite question that isn't a real ask — flipping to `awaiting` on every `What's next?` would be noise.
+2. After that strip, if the text ends with `?`, two filters can skip this path. First, `Config::benign_closers` — case-insensitive suffix match (default `"What's next?"`); a hit skips. Second, `Config::benign_openers` — case-insensitive prefix match against the **final sentence** (default `"anything"`); a sign-off like `"Anything you'd like to look at?"` opens with a benign offer word and so skips. Both exist because Claude often signs off with a polite question that isn't a real ask — flipping to `awaiting` on every `What's next?` or `Anything else?` would be noise. An embedded real ask isn't lost: it's still caught downstream by the permission-seeking path (Path 2), so `"Anything else, or shall I commit?"` stays `awaiting`.
 
 **Path 2 — hand-back phrase in last paragraph:**
 
@@ -128,7 +128,7 @@ If nothing above matches, check whether the **first sentence** of the last parag
 
 1. The terminating `?` must immediately follow an **alphanumeric** character, so a bare mention of the glyph — `"a `` ` ``?`` ` `` immediately followed by …"`, which markdown-stripping leaves as `"a ? …"` — isn't read as a sentence terminator.
 2. The first sentence must **not** open with a self-directed phrase (`"let me "`, `"let's "`, `"lets "`, `"i'll "`, `"i will "`, `"i'm going to "`, `"i am going to "`). These mark the agent reasoning aloud and about to act, not asking — `"Let me investigate — does X have a cleaner fix? This affects what we do next."` stays `done`.
-3. Configured benign closers are honored, so a leading polite `"What's next? …"` still doesn't flag.
+3. Configured benign closers (suffix) and benign openers (prefix) are both honored, so a leading polite `"What's next? …"` or a leading offer `"Anything you'd like to look at? …"` still doesn't flag.
 
 This path was validated against the recorded dialog history (`prompt_history.json`): it fires on 12 of 60 real assistant turns with zero false positives. Like path 2 it scans only the **last** paragraph, and like it the question must be the paragraph's *first* sentence — a statement-first paragraph (`"The migration is ready. Looks good to you?"`) is left to path 1's trailing-`?` check.
 
