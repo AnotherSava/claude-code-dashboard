@@ -101,6 +101,7 @@ pub fn show_window(window: WebviewWindow, app: AppHandle) -> Result<(), String> 
             // still re-push config (the get_config race fix below applies even
             // when the window stays hidden — the history window reads it too).
             emit_config_updated(&app);
+            emit_setup_state(&app);
             return Ok(());
         }
     }
@@ -113,6 +114,7 @@ pub fn show_window(window: WebviewWindow, app: AppHandle) -> Result<(), String> 
     // config_updated listener before calling show_window, so re-pushing the
     // now-authoritative config here corrects any value lost to that race.
     emit_config_updated(window.app_handle());
+    emit_setup_state(window.app_handle());
     Ok(())
 }
 
@@ -137,7 +139,7 @@ pub fn quit_app(_app: AppHandle) {
 /// Information the onboarding panel needs from Rust: the path to the deployed
 /// hook script, the ready-to-paste settings.json snippet, and whether any
 /// hook event has ever been received (the panel hides as soon as one has).
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct SetupState {
     pub hook_script_path: String,
     pub settings_snippet: String,
@@ -550,6 +552,16 @@ pub fn emit_config_updated(app: &AppHandle) {
     if let Some(state) = app.try_state::<ConfigState>() {
         let _ = app.emit("config_updated", state.snapshot());
     }
+}
+
+/// Push the authoritative setup state to the frontend. Like `get_config`,
+/// `get_setup_state` can be invoked at mount before `setup()` has managed
+/// `PromptHistoryStore`, returning `has_history: false` and flashing the
+/// onboarding panel on a configured install. The frontend registers its
+/// `setup_state` listener before calling `show_window`, so re-pushing from there
+/// reliably corrects any value lost to that race.
+pub fn emit_setup_state(app: &AppHandle) {
+    let _ = app.emit("setup_state", get_setup_state(app.clone()));
 }
 
 pub fn emit_usage_limits_updated(app: &AppHandle) {

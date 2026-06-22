@@ -16,6 +16,7 @@
     hideWindow,
     onConfigUpdated,
     onSessionsUpdated,
+    onSetupState,
     onShowSetupInstructions,
     onUsageLimitsUpdated,
     refreshUsageLimits,
@@ -165,6 +166,7 @@
     let unlistenConfig: (() => void) | undefined
     let unlistenUsage: (() => void) | undefined
     let unlistenShowSetup: (() => void) | undefined
+    let unlistenSetupState: (() => void) | undefined
 
     ;(async () => {
       try {
@@ -177,6 +179,13 @@
           aboutMode = true
           return
         }
+        // Attach before show_window below: the mount-time getSetupState() can
+        // win the race against the backend managing PromptHistoryStore and latch
+        // has_history=false (flashing the onboarding panel on a configured
+        // install). show_window re-emits the authoritative setup_state (same fix
+        // as config_updated), and this listener overwrites the stale snapshot —
+        // registered first so it's listening before show_window fires.
+        unlistenSetupState = await onSetupState((s) => (setup = s))
         config = await getConfig()
         sessions = await getSessions()
         usage = await getUsageLimits()
@@ -263,6 +272,7 @@
       unlistenConfig?.()
       unlistenUsage?.()
       unlistenShowSetup?.()
+      unlistenSetupState?.()
       if (measureTimer !== null) clearTimeout(measureTimer)
       contentObserver?.disconnect()
     }
