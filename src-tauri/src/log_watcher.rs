@@ -29,6 +29,12 @@ pub struct InferredState {
     /// The newest state-bearing entry is an Esc-cancel interrupt marker — the
     /// turn ended with no hook. Drives a `Working`→`Idle` demotion.
     pub ended: bool,
+    /// Background subagents still running at the latest turn boundary (from the
+    /// newest `turn_duration` record's `pendingBackgroundAgentCount`). Non-zero
+    /// means the main turn's `Stop` settled the row to `Done` while work
+    /// continues — `infer_state` forces `state = Working` so the promote-only
+    /// watcher holds the row there until the final (zero-pending) turn's `Stop`.
+    pub pending_background: u64,
 }
 
 /// Walk JSONL lines newest-first and derive current state, last-known model,
@@ -36,12 +42,26 @@ pub struct InferredState {
 pub fn infer_state(lines: &[&str]) -> Option<InferredState> {
     let mut result = InferredState::default();
     let mut saw_conversational = false;
+    let mut saw_turn_duration = false;
 
     for line in lines.iter().rev() {
         let entry: TranscriptEntry = match serde_json::from_str(line) {
             Ok(e) => e,
             Err(_) => continue,
         };
+        // `turn_duration` is the last record Claude Code writes at each turn
+        // boundary, carrying `pendingBackgroundAgentCount` only when background
+        // subagents are still in flight. Walking newest-first, the first one we
+        // hit is the current count; lock onto it so a stale older turn's count
+        // can't leak through. (Claude-Code-version-specific field — absent on
+        // versions that don't emit it, leaving `pending_background` at 0.)
+        if entry.entry_type == "system" {
+            if !saw_turn_duration && !entry.is_sidechain && entry.subtype.as_deref() == Some("turn_duration") {
+                saw_turn_duration = true;
+                result.pending_background = entry.pending_background_agent_count.unwrap_or(0);
+            }
+            continue;
+        }
         if entry.entry_type != "user" && entry.entry_type != "assistant" {
             continue;
         }
@@ -115,7 +135,19 @@ pub fn infer_state(lines: &[&str]) -> Option<InferredState> {
         }
     }
 
-    if !saw_conversational && result.state.is_none() && result.model.is_none() && result.input_tokens.is_none() {
+    // Background subagents are still running after the main turn's `Stop` settled
+    // the row to `Done`. Force `Working` so the promote-only watcher carries the
+    // row back; the final (zero-pending) turn's `Stop` settles `Done` naturally.
+    // Don't override an Esc-cancel: a cancelled turn has no pending background work.
+    if result.pending_background >= 1 && !result.ended {
+        result.state = Some(Status::Working);
+    }
+
+    if !saw_conversational
+        && result.state.is_none()
+        && result.model.is_none()
+        && result.input_tokens.is_none()
+    {
         return None;
     }
     Some(result)
@@ -232,6 +264,14 @@ struct TranscriptEntry {
     entry_type: String,
     #[serde(default, rename = "isSidechain")]
     is_sidechain: bool,
+    /// Discriminator on `system`-type entries (e.g. `"turn_duration"`,
+    /// `"stop_hook_summary"`). Absent on conversational entries.
+    #[serde(default)]
+    subtype: Option<String>,
+    /// Present on a `turn_duration` system entry only while background subagents
+    /// are still running after the turn — the count of in-flight agents.
+    #[serde(default, rename = "pendingBackgroundAgentCount")]
+    pending_background_agent_count: Option<u64>,
     message: Option<TranscriptMessage>,
     attachment: Option<TranscriptAttachment>,
 }
@@ -507,13 +547,18 @@ fn apply_and_emit(app: &AppHandle, chat_id: &str, update: &InferredState, text_e
     };
     if resumed_working {
         // The only path that carries a row back to Working without a lifecycle
-        // hook — e.g. the user answered an AskUserQuestion and the agent resumed.
-        tracing::debug!(
-            chat_id,
-            decision = "resume_working",
-            reason = "transcript shows new activity (tool call or user turn) after a pause; promoted to Working",
-            "decision"
-        );
+        // hook — e.g. the user answered an AskUserQuestion and the agent resumed,
+        // or (below) the main turn's Stop settled Done while background subagents
+        // keep running.
+        let reason = if update.pending_background >= 1 {
+            format!(
+                "{} background agent(s) still running after the main turn's Stop settled Done; held on Working",
+                update.pending_background
+            )
+        } else {
+            "transcript shows new activity (tool call or user turn) after a pause; promoted to Working".to_string()
+        };
+        tracing::debug!(chat_id, decision = "resume_working", reason = %reason, "decision");
     }
     // The turn was cancelled with Esc (no lifecycle hook). Settle the row back
     // to its pre-prompt status — unless the user opted out. Gated here rather
@@ -645,6 +690,17 @@ mod tests {
         json!({ "type": entry_type }).to_string()
     }
 
+    /// A `turn_duration` system record. Claude Code includes
+    /// `pendingBackgroundAgentCount` only when background subagents are still
+    /// running, so `None` omits the field (mirroring a zero-pending turn).
+    fn turn_duration(pending: Option<u64>) -> String {
+        let mut o = json!({ "type": "system", "subtype": "turn_duration", "isSidechain": false });
+        if let Some(n) = pending {
+            o["pendingBackgroundAgentCount"] = json!(n);
+        }
+        o.to_string()
+    }
+
     fn assistant_with_usage(model: &str, input: u64, cc: u64, cr: u64) -> String {
         json!({
             "type": "assistant",
@@ -729,6 +785,84 @@ mod tests {
         let r = infer_state(&refs(&lines)).unwrap();
         assert!(!r.ended, "the newer entry is a real prompt, not a cancel");
         assert_eq!(r.state, Some(Status::Working));
+    }
+
+    // -------- background-agent (turn_duration) tests --------
+
+    #[test]
+    fn pending_background_forces_working_over_done() {
+        // The main turn ended (assistant text → Done), but a trailing
+        // turn_duration reports 4 background agents still running. The row must
+        // be held on Working, not allowed to settle Done.
+        let lines = [assistant_text("Batch B done."), turn_duration(Some(4))];
+        let r = infer_state(&refs(&lines)).unwrap();
+        assert_eq!(r.pending_background, 4);
+        assert_eq!(r.state, Some(Status::Working));
+    }
+
+    #[test]
+    fn zero_pending_turn_duration_leaves_done() {
+        // The final turn writes a turn_duration with no count → background work
+        // is finished → the assistant-text Done verdict stands.
+        let lines = [assistant_text("All batches in."), turn_duration(None)];
+        let r = infer_state(&refs(&lines)).unwrap();
+        assert_eq!(r.pending_background, 0);
+        assert_eq!(r.state, Some(Status::Done));
+    }
+
+    #[test]
+    fn newest_turn_duration_wins_over_stale_pending() {
+        // An earlier turn had agents pending; the latest turn closed them out
+        // (no count). Walking newest-first must lock onto the latest → Done.
+        let lines = [
+            assistant_text("kicked off agents"),
+            turn_duration(Some(2)),
+            assistant_text("all agents reported in"),
+            turn_duration(None),
+        ];
+        let r = infer_state(&refs(&lines)).unwrap();
+        assert_eq!(r.pending_background, 0);
+        assert_eq!(r.state, Some(Status::Done));
+    }
+
+    #[test]
+    fn pending_background_alone_yields_working() {
+        // The turn_duration can flush in its own write, separate from the
+        // assistant text — a chunk with no conversational entry must still
+        // promote the row (rather than returning None).
+        let lines = [turn_duration(Some(1))];
+        let r = infer_state(&refs(&lines)).unwrap();
+        assert_eq!(r.pending_background, 1);
+        assert_eq!(r.state, Some(Status::Working));
+    }
+
+    #[test]
+    fn interrupt_marker_not_overridden_by_stale_pending() {
+        // An Esc-cancel must still demote even if an older turn_duration carried
+        // a pending count — a cancelled turn has no live background work.
+        let lines = [
+            turn_duration(Some(2)),
+            assistant_tool_use(),
+            user_text("[Request interrupted by user]"),
+        ];
+        let r = infer_state(&refs(&lines)).unwrap();
+        assert!(r.ended);
+        assert_ne!(r.state, Some(Status::Working));
+    }
+
+    #[test]
+    fn sidechain_turn_duration_is_ignored() {
+        // Defensive: a turn_duration flagged isSidechain isn't the main session's
+        // boundary and must not drive the row.
+        let sidechain_td = json!({
+            "type": "system", "subtype": "turn_duration",
+            "isSidechain": true, "pendingBackgroundAgentCount": 3
+        })
+        .to_string();
+        let lines = [assistant_text("done"), sidechain_td];
+        let r = infer_state(&refs(&lines)).unwrap();
+        assert_eq!(r.pending_background, 0);
+        assert_eq!(r.state, Some(Status::Done));
     }
 
     // -------- extract_text_entries tests --------
@@ -1104,6 +1238,7 @@ mod tests {
                 model: Some("claude-opus-4-7".into()),
                 input_tokens: Some(42_100),
                 ended: false,
+                pending_background: 0,
             },
             500,
         );
@@ -1124,6 +1259,7 @@ mod tests {
                 model: Some("claude-opus-4-7".into()),
                 input_tokens: Some(100),
                 ended: false,
+                pending_background: 0,
             },
             500,
         );
