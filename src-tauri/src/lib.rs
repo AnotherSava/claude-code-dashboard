@@ -6,6 +6,7 @@ mod config;
 mod config_watcher;
 mod custom_names;
 mod http_server;
+mod idle;
 mod idle_probe;
 mod label_policy;
 mod log_watcher;

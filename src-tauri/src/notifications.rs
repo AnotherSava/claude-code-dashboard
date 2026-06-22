@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tauri::{AppHandle, Manager};
 
-use crate::config::ConfigState;
+use crate::config::{ConfigState, StateNotify};
 use crate::state::{AgentSession, AppState, Status};
 use crate::telegram::{SyncOutcome, TelegramNotifier};
 
@@ -18,7 +18,7 @@ pub struct Outstanding {
 pub trait Notifier: Send + Sync {
     fn channel_name(&self) -> &'static str;
     fn is_enabled(&self) -> bool;
-    fn thresholds(&self) -> HashMap<String, u64>;
+    fn state_rules(&self) -> HashMap<String, StateNotify>;
     async fn send(&self, session: &AgentSession) -> anyhow::Result<String>;
     async fn dismiss(&self, handle: &str) -> anyhow::Result<()>;
 }
@@ -97,13 +97,35 @@ pub fn context_alerts_due<'a>(
     due
 }
 
+/// Decide whether a state in `rule` is due to fire, given how long it has been
+/// in that state and the system-wide input-idle time. Returns the reason it
+/// fired (for logging), or `None` if neither criterion is met.
+///
+/// - **AFK** (`afk_window_ms`): the user is idle past the window *and* has not
+///   touched the machine since the state began (`idle >= time_in_state`, the
+///   "saw it" guard). Skipped when idle is unknown (presence can't be proven).
+/// - **Reaction** (`reaction_window_ms`): the state has outlasted the backstop
+///   regardless of presence.
+///
+/// Whichever trips first wins; AFK lets a notification fire sooner once the
+/// user has stepped away.
+pub fn fire_reason(rule: &StateNotify, time_in_state_ms: u64, idle_ms: Option<u64>) -> Option<&'static str> {
+    let afk_due = matches!((rule.afk_window_ms, idle_ms), (Some(afk), Some(idle)) if afk > 0 && idle >= afk && idle >= time_in_state_ms);
+    if afk_due {
+        return Some("afk");
+    }
+    let reaction_due = matches!(rule.reaction_window_ms, Some(r) if r > 0 && time_in_state_ms >= r);
+    reaction_due.then_some("reaction")
+}
+
 pub async fn reconcile(
     notifier: &dyn Notifier,
     sessions: &[AgentSession],
     outstanding: &mut HashMap<String, Outstanding>,
     now_ms: i64,
+    idle_ms: Option<u64>,
 ) {
-    let thresholds = notifier.thresholds();
+    let rules = notifier.state_rules();
 
     let stale: Vec<(String, Outstanding)> = outstanding
         .iter()
@@ -132,15 +154,18 @@ pub async fn reconcile(
             continue;
         }
         let key = status_key(s.status);
-        let Some(&threshold) = thresholds.get(key) else { continue };
-        if threshold == 0 {
-            continue;
-        }
-        if (now_ms - s.state_entered_at) < threshold as i64 {
-            continue;
-        }
+        let Some(rule) = rules.get(key) else { continue };
+        let time_in_state = (now_ms - s.state_entered_at).max(0) as u64;
+        let Some(reason) = fire_reason(rule, time_in_state, idle_ms) else { continue };
         match notifier.send(s).await {
             Ok(handle) => {
+                tracing::debug!(
+                    channel = notifier.channel_name(),
+                    id = %s.id,
+                    status = key,
+                    reason,
+                    "notification fired"
+                );
                 outstanding.insert(
                     s.id.clone(),
                     Outstanding { handle, for_status: s.status },
@@ -205,6 +230,7 @@ impl NotificationManager {
                         &sessions,
                         &mut outstanding,
                         now_ms(),
+                        crate::idle::idle_ms(),
                     )
                     .await;
 
@@ -245,16 +271,20 @@ mod tests {
     }
 
     struct Mock {
-        thresholds: HashMap<String, u64>,
+        rules: HashMap<String, StateNotify>,
         events: Mutex<Vec<Event>>,
         handle_counter: Mutex<u64>,
         send_err: Mutex<bool>,
     }
 
     impl Mock {
+        /// Reaction-window-only rules, matching the pre-AFK threshold behavior.
         fn with(thresholds: &[(&str, u64)]) -> Arc<Self> {
+            Self::with_rules(&thresholds.iter().map(|(k, v)| (*k, StateNotify { afk_window_ms: None, reaction_window_ms: Some(*v) })).collect::<Vec<_>>())
+        }
+        fn with_rules(rules: &[(&str, StateNotify)]) -> Arc<Self> {
             Arc::new(Self {
-                thresholds: thresholds.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
+                rules: rules.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
                 events: Mutex::new(vec![]),
                 handle_counter: Mutex::new(0),
                 send_err: Mutex::new(false),
@@ -269,7 +299,7 @@ mod tests {
     impl Notifier for Mock {
         fn channel_name(&self) -> &'static str { "mock" }
         fn is_enabled(&self) -> bool { true }
-        fn thresholds(&self) -> HashMap<String, u64> { self.thresholds.clone() }
+        fn state_rules(&self) -> HashMap<String, StateNotify> { self.rules.clone() }
         async fn send(&self, session: &AgentSession) -> anyhow::Result<String> {
             if *self.send_err.lock().unwrap() {
                 return Err(anyhow::anyhow!("boom"));
@@ -319,7 +349,7 @@ mod tests {
         let m = Mock::with(&[("awaiting", 60_000)]);
         let mut out = HashMap::new();
         let sessions = vec![session("s1", Status::Awaiting, 0)];
-        reconcile(m.as_ref(), &sessions, &mut out, 60_000).await;
+        reconcile(m.as_ref(), &sessions, &mut out, 60_000, None).await;
         assert_eq!(out.len(), 1);
         assert_eq!(out["s1"].for_status, Status::Awaiting);
         assert_eq!(out["s1"].handle, "h1");
@@ -331,7 +361,7 @@ mod tests {
         let m = Mock::with(&[("awaiting", 60_000)]);
         let mut out = HashMap::new();
         let sessions = vec![session("s1", Status::Awaiting, 0)];
-        reconcile(m.as_ref(), &sessions, &mut out, 59_999).await;
+        reconcile(m.as_ref(), &sessions, &mut out, 59_999, None).await;
         assert!(out.is_empty());
         assert!(m.events().is_empty());
     }
@@ -345,7 +375,7 @@ mod tests {
             Outstanding { handle: "h1".into(), for_status: Status::Awaiting, },
         );
         let sessions = vec![session("s1", Status::Awaiting, 0)];
-        reconcile(m.as_ref(), &sessions, &mut out, 120_000).await;
+        reconcile(m.as_ref(), &sessions, &mut out, 120_000, None).await;
         assert_eq!(out.len(), 1);
         assert!(m.events().is_empty(), "no events when nothing changes");
     }
@@ -359,7 +389,7 @@ mod tests {
             Outstanding { handle: "h9".into(), for_status: Status::Awaiting, },
         );
         let sessions = vec![session("s1", Status::Working, 100_000)];
-        reconcile(m.as_ref(), &sessions, &mut out, 120_000).await;
+        reconcile(m.as_ref(), &sessions, &mut out, 120_000, None).await;
         assert!(out.is_empty());
         assert_eq!(m.events(), vec![Event::Dismiss { handle: "h9".into() }]);
     }
@@ -375,7 +405,7 @@ mod tests {
             Outstanding { handle: "h7".into(), for_status: Status::Awaiting, },
         );
         let sessions: Vec<AgentSession> = vec![];
-        reconcile(m.as_ref(), &sessions, &mut out, 120_000).await;
+        reconcile(m.as_ref(), &sessions, &mut out, 120_000, None).await;
         assert!(out.is_empty());
         assert_eq!(m.events(), vec![Event::Dismiss { handle: "h7".into() }]);
     }
@@ -386,7 +416,7 @@ mod tests {
         let m = Mock::with(&[("awaiting", 60_000)]);
         let mut out = HashMap::new();
         let sessions: Vec<AgentSession> = vec![];
-        reconcile(m.as_ref(), &sessions, &mut out, 30_000).await;
+        reconcile(m.as_ref(), &sessions, &mut out, 30_000, None).await;
         assert!(out.is_empty());
         assert!(m.events().is_empty());
     }
@@ -396,7 +426,7 @@ mod tests {
         let m = Mock::with(&[("awaiting", 0)]);
         let mut out = HashMap::new();
         let sessions = vec![session("s1", Status::Awaiting, 0)];
-        reconcile(m.as_ref(), &sessions, &mut out, 1_000_000).await;
+        reconcile(m.as_ref(), &sessions, &mut out, 1_000_000, None).await;
         assert!(out.is_empty());
         assert!(m.events().is_empty());
     }
@@ -406,7 +436,7 @@ mod tests {
         let m = Mock::with(&[("error", 60_000)]);
         let mut out = HashMap::new();
         let sessions = vec![session("s1", Status::Awaiting, 0)];
-        reconcile(m.as_ref(), &sessions, &mut out, 1_000_000).await;
+        reconcile(m.as_ref(), &sessions, &mut out, 1_000_000, None).await;
         assert!(out.is_empty());
         assert!(m.events().is_empty());
     }
@@ -417,8 +447,86 @@ mod tests {
         *m.send_err.lock().unwrap() = true;
         let mut out = HashMap::new();
         let sessions = vec![session("s1", Status::Awaiting, 0)];
-        reconcile(m.as_ref(), &sessions, &mut out, 60_000).await;
+        reconcile(m.as_ref(), &sessions, &mut out, 60_000, None).await;
         assert!(out.is_empty(), "failed send must not populate outstanding");
+    }
+
+    // -------- fire_reason (per-state AFK + reaction rule) --------
+
+    const AFK_ONLY: StateNotify = StateNotify { afk_window_ms: Some(60_000), reaction_window_ms: None };
+    const BOTH: StateNotify = StateNotify { afk_window_ms: Some(60_000), reaction_window_ms: Some(120_000) };
+
+    #[test]
+    fn afk_fires_when_idle_past_window_and_no_input_since_state_began() {
+        // 10s into the state, user idle 70s — away the whole time, fires.
+        assert_eq!(fire_reason(&AFK_ONLY, 10_000, Some(70_000)), Some("afk"));
+    }
+
+    #[test]
+    fn afk_suppressed_when_user_active_since_state_began() {
+        // Idle 30s but the state has lasted 50s → there was input 30s ago,
+        // i.e. after the state began → "saw it", never fire via AFK.
+        assert_eq!(fire_reason(&AFK_ONLY, 50_000, Some(30_000)), None);
+    }
+
+    #[test]
+    fn afk_credits_idle_accrued_before_state_began() {
+        // Discussion example: idle X/3 at T_state, X=60s. Fires at 2X/3 in,
+        // when total idle first reaches X — not after a full X wait.
+        // At 40s in, idle = 20s(before) + 40s = 60s → fires.
+        assert_eq!(fire_reason(&AFK_ONLY, 40_000, Some(60_000)), Some("afk"));
+        // At 39s in, idle = 59s < 60s → not yet.
+        assert_eq!(fire_reason(&AFK_ONLY, 39_000, Some(59_000)), None);
+    }
+
+    #[test]
+    fn afk_skipped_when_idle_unknown() {
+        assert_eq!(fire_reason(&AFK_ONLY, 999_999, None), None);
+    }
+
+    #[test]
+    fn reaction_backstop_fires_regardless_of_presence() {
+        // User active (idle 0), but the reaction window has elapsed → fire.
+        assert_eq!(fire_reason(&BOTH, 120_000, Some(0)), Some("reaction"));
+        // Before the backstop and not AFK → nothing.
+        assert_eq!(fire_reason(&BOTH, 119_999, Some(0)), None);
+    }
+
+    #[test]
+    fn afk_wins_when_both_could_fire() {
+        // AFK trips well before the 120s backstop.
+        assert_eq!(fire_reason(&BOTH, 65_000, Some(65_000)), Some("afk"));
+    }
+
+    #[test]
+    fn no_windows_set_never_fires() {
+        let none = StateNotify { afk_window_ms: None, reaction_window_ms: None };
+        assert_eq!(fire_reason(&none, 1_000_000, Some(1_000_000)), None);
+        // Zero is treated as unset for both windows.
+        let zeros = StateNotify { afk_window_ms: Some(0), reaction_window_ms: Some(0) };
+        assert_eq!(fire_reason(&zeros, 1_000_000, Some(1_000_000)), None);
+    }
+
+    #[tokio::test]
+    async fn reconcile_fires_done_via_afk_when_user_away() {
+        let m = Mock::with_rules(&[("done", AFK_ONLY)]);
+        let mut out = HashMap::new();
+        // Done for 10s, user idle 70s (away since before it finished).
+        let sessions = vec![session("s1", Status::Done, 0)];
+        reconcile(m.as_ref(), &sessions, &mut out, 10_000, Some(70_000)).await;
+        assert_eq!(out.len(), 1, "AFK path fires done");
+        assert_eq!(out["s1"].for_status, Status::Done);
+    }
+
+    #[tokio::test]
+    async fn reconcile_suppresses_done_when_user_present() {
+        let m = Mock::with_rules(&[("done", AFK_ONLY)]);
+        let mut out = HashMap::new();
+        // Done for 10s but user touched the machine 2s ago → saw it.
+        let sessions = vec![session("s1", Status::Done, 0)];
+        reconcile(m.as_ref(), &sessions, &mut out, 10_000, Some(2_000)).await;
+        assert!(out.is_empty(), "present user => no done ping");
+        assert!(m.events().is_empty());
     }
 
     #[test]

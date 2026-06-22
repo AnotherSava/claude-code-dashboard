@@ -53,7 +53,7 @@ Ctrl+`+` and Ctrl+`-` cycle through five font sizes; Esc closes the window. The 
 
 ## Notifications
 
-Get pinged when a session needs you — for example, when it sits in WAIT longer than a threshold you set. Once the agent moves on — you answer the prompt and it resumes work — the message is deleted automatically, so your Telegram chat shows only the sessions still waiting on you. You can also get a heads-up when a session's context fills past a percentage you choose, so a long run doesn't quietly run out of room. Notifications are delivered via Telegram and stay off until you configure them. See [Settings](settings) for setup and thresholds.
+Get pinged when a session needs you — for example, when it finishes or sits waiting while you're away from your machine. The widget watches your keyboard and mouse, so a session that finishes while you're sitting right there stays quiet (you already saw it), and you only get a ping once you've stepped away. For things you need to act on, like a pending question, it also pings after a set time even if you're present, so nothing waits on you forever. Once the agent moves on — you answer the prompt and it resumes work — the message is deleted automatically, so your Telegram chat shows only the sessions still waiting on you. You can also get a heads-up when a session's context fills past a percentage you choose, so a long run doesn't quietly run out of room. Notifications are delivered via Telegram and stay off until you configure them. See [Settings](settings) for setup.
 
 ## Usage limits
 

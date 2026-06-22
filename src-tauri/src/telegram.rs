@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::sync::RwLock;
 use std::time::Duration;
 
-use crate::config::TelegramConfig;
+use crate::config::{StateNotify, TelegramConfig};
 use crate::notifications::{build_message_text, Notifier};
 use crate::state::AgentSession;
 
@@ -23,7 +23,7 @@ struct Creds {
 #[derive(Default)]
 struct Inner {
     creds: Option<Creds>,
-    thresholds: HashMap<String, u64>,
+    rules: HashMap<String, StateNotify>,
 }
 
 pub struct TelegramNotifier {
@@ -61,13 +61,11 @@ impl TelegramNotifier {
                 .clone();
             Some(Creds { bot_token: token, chat_id: chat })
         });
-        let new_thresholds = cfg
-            .map(|c| c.state_thresholds_ms.clone())
-            .unwrap_or_default();
+        let new_rules = cfg.map(|c| c.states.clone()).unwrap_or_default();
 
         let mut inner = self.inner.write().unwrap();
         let prev = inner.creds.clone();
-        inner.thresholds = new_thresholds;
+        inner.rules = new_rules;
         inner.creds = new_creds.clone();
 
         match (prev, new_creds) {
@@ -167,8 +165,8 @@ impl Notifier for TelegramNotifier {
         self.inner.read().unwrap().creds.is_some()
     }
 
-    fn thresholds(&self) -> HashMap<String, u64> {
-        self.inner.read().unwrap().thresholds.clone()
+    fn state_rules(&self) -> HashMap<String, StateNotify> {
+        self.inner.read().unwrap().rules.clone()
     }
 
     async fn send(&self, session: &AgentSession) -> anyhow::Result<String> {
@@ -205,9 +203,9 @@ mod tests {
         TelegramConfig {
             bot_token: token.map(String::from),
             chat_id: chat.map(String::from),
-            state_thresholds_ms: thresholds
+            states: thresholds
                 .iter()
-                .map(|(k, v)| (k.to_string(), *v))
+                .map(|(k, v)| (k.to_string(), StateNotify { afk_window_ms: None, reaction_window_ms: Some(*v) }))
                 .collect(),
             context_alert_percent: None,
         }
@@ -237,12 +235,12 @@ mod tests {
     }
 
     #[test]
-    fn sync_sets_credentials_and_thresholds() {
+    fn sync_sets_credentials_and_rules() {
         let n = TelegramNotifier::new();
         let c = cfg(Some("t"), Some("c"), &[("awaiting", 60_000)]);
         assert_eq!(n.sync_config(Some(&c)), SyncOutcome::CredsChanged);
         assert!(n.is_enabled());
-        assert_eq!(n.thresholds().get("awaiting"), Some(&60_000));
+        assert_eq!(n.state_rules().get("awaiting").and_then(|s| s.reaction_window_ms), Some(60_000));
     }
 
     #[test]
@@ -250,10 +248,10 @@ mod tests {
         let n = TelegramNotifier::new();
         let c = cfg(Some("t"), Some("c"), &[("awaiting", 60_000)]);
         let _ = n.sync_config(Some(&c));
-        // threshold change alone is not a credential change
+        // rule change alone is not a credential change
         let c2 = cfg(Some("t"), Some("c"), &[("awaiting", 120_000)]);
         assert_eq!(n.sync_config(Some(&c2)), SyncOutcome::Unchanged);
-        assert_eq!(n.thresholds().get("awaiting"), Some(&120_000));
+        assert_eq!(n.state_rules().get("awaiting").and_then(|s| s.reaction_window_ms), Some(120_000));
     }
 
     #[test]

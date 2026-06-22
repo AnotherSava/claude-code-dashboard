@@ -51,7 +51,11 @@ Every field is optional — omit one and the built-in default applies. A complet
     "telegram": {
       "bot_token": null,
       "chat_id": null,
-      "state_thresholds_ms": { "awaiting": 120000, "error": 60000 },
+      "states": {
+        "done":     { "afk_window_ms": 60000 },
+        "awaiting": { "afk_window_ms": 60000, "reaction_window_ms": 120000 },
+        "error":    { "afk_window_ms": 60000, "reaction_window_ms": 60000 }
+      },
       "context_alert_percent": 80
     }
   },
@@ -107,7 +111,10 @@ Whether autostart is enabled isn't a config field — it lives in the OS launch 
 The `notifications` block controls alerts when a session needs you. Set it to `null` (or omit it) to turn notifications off entirely. Telegram is the only channel today:
 
 - `bot_token` / `chat_id` — your Telegram bot credentials; get `bot_token` from [@BotFather](https://t.me/BotFather).
-- `state_thresholds_ms` — how long a session must sit in a state before it alerts, in milliseconds, keyed by state: `"idle"`, `"working"`, `"awaiting"`, `"done"`, `"error"`. A missing key or `0` keeps that state silent.
+- `states` — per-state notification rules, keyed by state (`"idle"`, `"working"`, `"awaiting"`, `"done"`, `"error"`). Each state takes two independent, optional windows in milliseconds, and alerts as soon as *either* is met:
+  - `afk_window_ms` — alert once you've been away from the keyboard/mouse this long *and* haven't touched the machine since the state began. This is the "you stepped away and missed it" trigger: if you were at the machine when it happened, it stays silent (you saw it). Omit it to disable the away-detection for that state.
+  - `reaction_window_ms` — alert once the state has lasted this long regardless of whether you're present — the backstop for something you need to act on but haven't. Omit it for no backstop.
+  - A state with neither window set, or a missing state key, never alerts. By default `done` is away-only (no backstop — a finished task you saw needs no nag), while `awaiting` and `error` also carry a reaction backstop.
 - `context_alert_percent` — send a one-off message when a session's context usage crosses this percent of the active model's window (the same percentage that colors the token counter). It fires once on crossing and re-arms only after usage drops back below — so a new task or `/clear` lets it alert again. `null` or `0` turns it off.
 
 ### Token coloring

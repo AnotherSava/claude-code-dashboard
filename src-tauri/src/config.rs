@@ -177,15 +177,35 @@ impl Default for NotificationsConfig {
     }
 }
 
+/// Per-state notification rule. Both windows are independent and optional:
+/// the reconciler fires when *either* the AFK criterion or the reaction
+/// backstop is met (see `notifications::reconcile`).
+///
+/// - `afk_window_ms`: fire once the user has been idle this long *and* has had
+///   no input since the state began (the "saw it" guard). Unset/0 = no AFK
+///   trigger for this state.
+/// - `reaction_window_ms`: fire once the state has lasted this long regardless
+///   of presence — the "you didn't react in time" backstop. Unset/0 = no
+///   backstop.
+///
+/// A state with neither window set never notifies.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StateNotify {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub afk_window_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reaction_window_ms: Option<u64>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TelegramConfig {
     pub bot_token: Option<String>,
     pub chat_id: Option<String>,
-    /// Per-state minimum duration (ms) before firing. Keys must be one of
-    /// "idle" | "working" | "awaiting" | "done" | "error". Missing key or
-    /// value 0 = silent for that state.
-    pub state_thresholds_ms: HashMap<String, u64>,
+    /// Per-state notification rules, keyed by status: "idle" | "working" |
+    /// "awaiting" | "done" | "error". Missing key = silent for that state.
+    pub states: HashMap<String, StateNotify>,
     /// Context-usage alert: fire a one-shot message when a session's
     /// `input_tokens` over its model's window (longest-prefix lookup in
     /// `context_window_tokens`) crosses this percent.
@@ -200,9 +220,14 @@ impl Default for TelegramConfig {
         Self {
             bot_token: None,
             chat_id: None,
-            state_thresholds_ms: [
-                ("awaiting".to_string(), 120_000),
-                ("error".to_string(), 60_000),
+            states: [
+                // done: informational — only ping if the user was away when it
+                // finished and never came back (AFK-only, no backstop).
+                ("done".to_string(), StateNotify { afk_window_ms: Some(60_000), reaction_window_ms: None }),
+                // awaiting / error: actionable — ping early if away, but also
+                // after the reaction window regardless of presence.
+                ("awaiting".to_string(), StateNotify { afk_window_ms: Some(60_000), reaction_window_ms: Some(120_000) }),
+                ("error".to_string(), StateNotify { afk_window_ms: Some(60_000), reaction_window_ms: Some(60_000) }),
             ]
             .into_iter()
             .collect(),
@@ -358,11 +383,17 @@ mod tests {
         assert_eq!(tg.bot_token.as_deref(), Some("t"));
         assert_eq!(tg.chat_id.as_deref(), Some("c"));
         assert_eq!(
-            tg.state_thresholds_ms.get("awaiting"),
-            Some(&120_000),
-            "default thresholds survive when caller only supplies creds"
+            tg.states.get("awaiting").and_then(|s| s.reaction_window_ms),
+            Some(120_000),
+            "default state rules survive when caller only supplies creds"
         );
-        assert_eq!(tg.state_thresholds_ms.get("error"), Some(&60_000));
+        assert_eq!(tg.states.get("awaiting").and_then(|s| s.afk_window_ms), Some(60_000));
+        assert_eq!(tg.states.get("error").and_then(|s| s.reaction_window_ms), Some(60_000));
+        assert_eq!(
+            tg.states.get("done").map(|s| (s.afk_window_ms, s.reaction_window_ms)),
+            Some((Some(60_000), None)),
+            "done is AFK-only with no backstop"
+        );
         assert_eq!(
             tg.context_alert_percent,
             Some(80.0),
@@ -388,11 +419,29 @@ mod tests {
     }
 
     #[test]
+    fn states_parse_with_independent_optional_windows() {
+        // A user override supplying only some states / only some windows; each
+        // window stays None when absent (no AFK / no backstop respectively).
+        let json = r#"{ "notifications": { "telegram": { "states": {
+            "done": { "afk_window_ms": 30000 },
+            "awaiting": { "reaction_window_ms": 90000 }
+        } } } }"#;
+        let cfg: Config = serde_json::from_str(json).unwrap();
+        let tg = cfg.notifications.unwrap().telegram.unwrap();
+        let done = tg.states.get("done").unwrap();
+        assert_eq!((done.afk_window_ms, done.reaction_window_ms), (Some(30_000), None));
+        let awaiting = tg.states.get("awaiting").unwrap();
+        assert_eq!((awaiting.afk_window_ms, awaiting.reaction_window_ms), (None, Some(90_000)));
+        // Supplying `states` at all replaces the default map wholesale.
+        assert!(tg.states.get("error").is_none());
+    }
+
+    #[test]
     fn empty_json_object_gives_full_defaults() {
         let cfg: Config = serde_json::from_str("{}").unwrap();
         let tg = cfg.notifications.unwrap().telegram.unwrap();
         assert!(tg.bot_token.is_none());
-        assert_eq!(tg.state_thresholds_ms.get("awaiting"), Some(&120_000));
+        assert_eq!(tg.states.get("awaiting").and_then(|s| s.reaction_window_ms), Some(120_000));
     }
 
     #[test]
