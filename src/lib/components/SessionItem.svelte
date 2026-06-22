@@ -11,6 +11,48 @@
     historyTarget.set(null)
     historyClosedAt.set(Date.now())
   })
+
+  // The OS-native tooltip renders a proportional font (Segoe UI on Windows), so
+  // a marker padded by character count can't pixel-align — the ▸ glyph isn't a
+  // whole number of spaces wide. Measure the glyphs once and build, for the
+  // current task: `current` — a marker the exact width of the `gap` the other
+  // rows use, with the ▸ centered; and `arrowBlank` — a blank the ▸'s exact
+  // width, for the wrapped-line indent. Ratios are size-independent, so the
+  // measurement px size is irrelevant. Falls back to a space approximation if
+  // canvas/font measurement is unavailable.
+  function measureMarker(): { gap: string; current: string; arrowBlank: string } {
+    const fallback = { gap: '    ', current: ' ▸ ', arrowBlank: ' ' }
+    try {
+      const ctx = document.createElement('canvas').getContext('2d')
+      if (!ctx) return fallback
+      ctx.font = '40px "Segoe UI", system-ui, sans-serif'
+      const w = (s: string) => ctx.measureText(s).width
+      const space = w(' ')
+      const arrow = w('▸')
+      if (!(space > 0) || !(arrow > 0)) return fallback
+      // Blank glyphs, widest first, for sub-space padding precision: regular,
+      // figure (U+2007), thin (U+2009), hair (U+200A) space.
+      const palette = ([[' ', space], [' ', w(' ')], [' ', w(' ')], [' ', w(' ')]] as Array<[string, number]>)
+        .filter(([, width]) => width > 0)
+        .sort((a, b) => b[1] - a[1])
+      // Greedily approximate `target` px with palette glyphs (never overshoots;
+      // residual is under one hair space, i.e. sub-pixel at tooltip size).
+      const pad = (target: number): string => {
+        let s = '', rem = target
+        for (const [ch, width] of palette) while (rem >= width) { s += ch; rem -= width }
+        return s
+      }
+      const gapPx = 4 * space
+      const leftover = Math.max(0, gapPx - arrow)
+      const left = pad(leftover / 2)
+      const right = pad(gapPx - arrow - w(left))
+      return { gap: '    ', current: left + '▸' + right, arrowBlank: pad(arrow) }
+    } catch {
+      return fallback
+    }
+  }
+
+  const MARKER = measureMarker()
 </script>
 
 <script lang="ts">
@@ -110,16 +152,73 @@
     return `${pad(d.getHours())}:${pad(d.getMinutes())}`
   }
 
+  // Target line width before a prompt wraps in the tooltip. The OS tooltip uses
+  // a proportional font so this is approximate; kept comfortably below the
+  // tooltip's own max width so it never re-wraps our already-wrapped lines.
+  const TOOLTIP_WRAP_COLS = 80
+
+  // Build a blank string the same *rendered* width as `prefix` for the hanging
+  // indent. The OS tooltip uses a proportional font, so plain spaces are
+  // narrower than the `HH:MM` digits and continuation lines drift left. Map each
+  // glyph to a width-matched blank: figure space (U+2007 ≈ a tabular digit) for
+  // digits, punctuation space (U+2008 ≈ a colon/period) for `:`, the measured
+  // equal-width blank for the ▸ marker, and existing blanks (the marker's
+  // padding) pass through unchanged. Wrap math keys off prefix.length, not the
+  // indent, so variable-length blanks are harmless.
+  function blankLike(prefix: string): string {
+    let out = ''
+    for (const ch of prefix) {
+      if (ch >= '0' && ch <= '9') out += ' '
+      else if (ch === ':') out += ' '
+      else if (ch === '▸') out += MARKER.arrowBlank // arrow → its measured equal-width blank
+      else if (ch === ' ' || ch === ' ' || ch === ' ' || ch === ' ') out += ch
+      else out += ' '
+    }
+    return out
+  }
+
+  // Word-wrap `text` to `TOOLTIP_WRAP_COLS`, prefixing the first line with
+  // `prefix` (the `HH:MM` + marker column) and every continuation line with a
+  // hanging indent of the same width — so wrapped text lines up under the
+  // prompt's first character instead of falling back to the time column on the
+  // left. Newlines already in the prompt are honoured and indented too.
+  function wrapWithHangingIndent(prefix: string, text: string): string {
+    const indent = blankLike(prefix)
+    const avail = Math.max(16, TOOLTIP_WRAP_COLS - prefix.length)
+    const out: string[] = []
+    for (const segment of text.split('\n')) {
+      let line = ''
+      for (const word of segment.split(/\s+/).filter((w) => w !== '')) {
+        let w = word
+        // A single word wider than the budget is hard-broken across lines.
+        while (w.length > avail) {
+          if (line) { out.push(line); line = '' }
+          out.push(w.slice(0, avail))
+          w = w.slice(avail)
+        }
+        if (line === '') line = w
+        else if (line.length + 1 + w.length <= avail) line += ' ' + w
+        else { out.push(line); line = w }
+      }
+      out.push(line) // preserves blank lines from the original prompt
+    }
+    return out.map((l, i) => (i === 0 ? prefix : indent) + l).join('\n')
+  }
+
   // Multi-line plain-text history rendered by the OS-native title tooltip,
   // which is what gives us the ability to exceed the dashboard window's
-  // width. Format: each line is `HH:MM  prompt`. Older prompts on top,
-  // current on the bottom, prefixed with an arrow marker.
+  // width. Format: each line is `HH:MM  prompt`, with long prompts wrapped to a
+  // hanging-indented second column. Older prompts on top, current on the
+  // bottom, prefixed with an arrow marker.
   const titleText = $derived.by(() => {
     const taskPrompts = session.dialog.filter((e) => e.task_start)
     const visible = taskPrompts.slice(-(HISTORY_VISIBLE + 1))
     const lines: string[] = visible.map((e, i) => {
-      const marker = i === visible.length - 1 ? '  ▸ ' : '    '
-      return `${formatClock(e.timestamp)}${marker}${e.text}`
+      // Current task gets the ▸ centered in a marker measured to the exact width
+      // of the gap (MARKER.gap) the other rows fill, so its prompt text lines up
+      // with the rows above it regardless of the proportional triangle width.
+      const marker = i === visible.length - 1 ? MARKER.current : MARKER.gap
+      return wrapWithHangingIndent(`${formatClock(e.timestamp)}${marker}`, e.text)
     })
     return lines.join('\n')
   })
