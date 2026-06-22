@@ -403,7 +403,7 @@ dependencies = [
 
 [[package]]
 name = "claude-code-dashboard"
-version = "0.8.4"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
