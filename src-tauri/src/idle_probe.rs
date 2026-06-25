@@ -20,17 +20,28 @@
 //! recovery. (The input-box border is the anchor rather than a footer hint
 //! like "? for shortcuts" because that hint is absent in auto-accept mode.)
 //!
+//! The screen alone isn't enough: queuing a *second* prompt while a turn is
+//! still running grows the input box, which can scroll the "esc to interrupt"
+//! footer past the [`TAIL_LINES`] window and make a busy turn read as idle. So
+//! a demote is corroborated against the transcript — when the idle streak
+//! begins we latch the transcript file's mtime, and any write past that
+//! baseline means the turn is still alive (re-arm, don't demote). Only an
+//! unbroken idle streak over a *quiet* transcript demotes; an unreadable
+//! transcript is treated as "can't confirm" and never demotes.
+//!
 //! Windows-only: reading a console's screen buffer is a Win32 facility with no
 //! macOS equivalent. [`crate::terminal_title::read_console_screen`] returns
 //! `None` off-Windows, so the loop never demotes there.
 
 use std::collections::HashMap;
-use std::time::Duration;
+use std::path::PathBuf;
+use std::time::{Duration, SystemTime};
 
 use tauri::{AppHandle, Manager};
 
 use crate::commands::{emit_sessions_updated, now_ms};
 use crate::config::ConfigState;
+use crate::log_watcher::WatcherRegistry;
 use crate::state::{AppState, Status};
 use crate::terminal_title::{read_console_screen, TerminalTitles};
 
@@ -82,10 +93,50 @@ fn classify(screen: &str) -> Screen {
     }
 }
 
+/// Read a transcript file's last-modified time, or `None` if it can't be
+/// stat'd (missing, permission, or off a path the watcher isn't tracking).
+fn transcript_mtime(path: PathBuf) -> Option<SystemTime> {
+    std::fs::metadata(&path).and_then(|m| m.modified()).ok()
+}
+
+/// What one idle screen read resolves to, once corroborated against the
+/// transcript. Returned by [`idle_step`]; the caller owns the bookkeeping maps.
+#[derive(PartialEq, Debug)]
+enum IdleStep {
+    /// First idle read of a streak — caller latches `mtime` as the baseline.
+    Latch,
+    /// The transcript advanced past the baseline since we began suspecting
+    /// idle — the turn is still running (e.g. a queued second prompt scrolled
+    /// the busy footer off-screen). Caller drops the streak and re-arms.
+    Rearm,
+    /// Idle persisting with no new transcript activity — caller demotes.
+    Demote,
+    /// Idle persisting but short of the demote streak — caller stores the count.
+    Hold(u32),
+}
+
+/// Pure decision for an idle read. `baseline` is the latched transcript mtime
+/// (`None` until the first idle read of a streak); `mtime` is the transcript's
+/// current mtime. A write strictly past the baseline re-arms; otherwise an
+/// unbroken streak of [`IDLE_STREAK_TO_DEMOTE`] quiet idle reads demotes.
+fn idle_step(prior_streak: u32, baseline: Option<SystemTime>, mtime: SystemTime) -> IdleStep {
+    match baseline {
+        None => IdleStep::Latch,
+        Some(b) if mtime > b => IdleStep::Rearm,
+        Some(_) if prior_streak + 1 >= IDLE_STREAK_TO_DEMOTE => IdleStep::Demote,
+        Some(_) => IdleStep::Hold(prior_streak + 1),
+    }
+}
+
 pub fn spawn(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
         // chat_id → consecutive idle reads.
         let mut idle_streak: HashMap<String, u32> = HashMap::new();
+        // chat_id → transcript mtime latched when the idle streak began. A
+        // write past this baseline means the turn is still alive (e.g. a second
+        // prompt queued mid-turn scrolled the busy footer off the tail), so we
+        // re-arm rather than demote.
+        let mut suspect_mtime: HashMap<String, SystemTime> = HashMap::new();
         let mut ticker = tokio::time::interval(POLL);
         ticker.tick().await; // skip the immediate first tick
 
@@ -97,16 +148,19 @@ pub fn spawn(app: AppHandle) {
             let Some(cfg_state) = app.try_state::<ConfigState>() else { continue };
             if !cfg_state.snapshot().detect_cancelled_turns {
                 idle_streak.clear();
+                suspect_mtime.clear();
                 continue;
             }
             let Some(app_state) = app.try_state::<AppState>() else { continue };
             let Some(titles) = app.try_state::<TerminalTitles>() else { continue };
+            let Some(registry) = app.try_state::<WatcherRegistry>() else { continue };
 
             let sessions = app_state.snapshot();
             // Drop bookkeeping for any session no longer Working.
             idle_streak.retain(|id, _| {
                 sessions.iter().any(|s| s.id == *id && s.status == Status::Working)
             });
+            suspect_mtime.retain(|id, _| idle_streak.contains_key(id));
 
             for s in sessions.iter().filter(|s| s.status == Status::Working) {
                 let candidates = titles.candidates(&s.id);
@@ -118,19 +172,40 @@ pub fn spawn(app: AppHandle) {
                 };
                 match classify(&screen) {
                     Screen::Idle => {
-                        let streak = idle_streak.entry(s.id.clone()).or_insert(0);
-                        *streak += 1;
-                        if *streak >= IDLE_STREAK_TO_DEMOTE {
-                            if let Some(status) = app_state.revert_cancelled_turn(&s.id, now_ms()) {
-                                tracing::debug!(
-                                    chat_id = %s.id,
-                                    decision = "revert_cancelled",
-                                    status = ?status,
-                                    reason = "terminal shows Claude's idle prompt with no in-flight turn (instant Esc-cancel, no transcript marker); reverted to pre-prompt status",
-                                    "decision"
-                                );
+                        // Corroborate the idle-looking screen against the
+                        // transcript. With no readable transcript we can't prove
+                        // the turn ended, so stay fail-safe and never demote.
+                        let Some(mtime) = registry.current_path(&s.id).and_then(transcript_mtime) else {
+                            idle_streak.remove(&s.id);
+                            suspect_mtime.remove(&s.id);
+                            continue;
+                        };
+                        let prior = idle_streak.get(&s.id).copied().unwrap_or(0);
+                        match idle_step(prior, suspect_mtime.get(&s.id).copied(), mtime) {
+                            IdleStep::Latch => {
+                                suspect_mtime.insert(s.id.clone(), mtime);
+                                idle_streak.insert(s.id.clone(), 1);
+                            }
+                            IdleStep::Rearm => {
                                 idle_streak.remove(&s.id);
-                                emit_sessions_updated(&app);
+                                suspect_mtime.remove(&s.id);
+                            }
+                            IdleStep::Hold(n) => {
+                                idle_streak.insert(s.id.clone(), n);
+                            }
+                            IdleStep::Demote => {
+                                if let Some(status) = app_state.revert_cancelled_turn(&s.id, now_ms()) {
+                                    tracing::debug!(
+                                        chat_id = %s.id,
+                                        decision = "revert_cancelled",
+                                        status = ?status,
+                                        reason = "terminal shows Claude's idle prompt and the transcript stopped advancing (instant Esc-cancel, no transcript marker); reverted to pre-prompt status",
+                                        "decision"
+                                    );
+                                    emit_sessions_updated(&app);
+                                }
+                                idle_streak.remove(&s.id);
+                                suspect_mtime.remove(&s.id);
                             }
                         }
                     }
@@ -138,6 +213,7 @@ pub fn spawn(app: AppHandle) {
                     // only an unbroken run of positive idle reads demotes.
                     Screen::Busy | Screen::Unknown => {
                         idle_streak.remove(&s.id);
+                        suspect_mtime.remove(&s.id);
                     }
                 }
             }
@@ -184,6 +260,29 @@ mod tests {
         assert_eq!(classify(""), Screen::Unknown);
         assert_eq!(classify("\n\n  \n"), Screen::Unknown);
         assert_eq!(classify("PS C:\\> some shell prompt"), Screen::Unknown);
+    }
+
+    #[test]
+    fn first_idle_read_latches_baseline() {
+        // No baseline yet → start the streak and latch, never demote on read 1.
+        assert_eq!(idle_step(0, None, SystemTime::UNIX_EPOCH), IdleStep::Latch);
+    }
+
+    #[test]
+    fn transcript_advance_rearms() {
+        // A write past the baseline (queued prompt while still working) re-arms
+        // instead of demoting, even after the screen has looked idle.
+        let base = SystemTime::UNIX_EPOCH;
+        let later = base + Duration::from_secs(1);
+        assert_eq!(idle_step(1, Some(base), later), IdleStep::Rearm);
+    }
+
+    #[test]
+    fn quiet_idle_streak_demotes() {
+        // Baseline unchanged across the streak → genuine cancel → demote once
+        // the streak reaches IDLE_STREAK_TO_DEMOTE.
+        let base = SystemTime::UNIX_EPOCH;
+        assert_eq!(idle_step(1, Some(base), base), IdleStep::Demote);
     }
 
     #[test]
