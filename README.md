@@ -14,6 +14,7 @@ A desktop app for Windows and macOS — a compact always-on-top widget that list
 - **Focus on the task** — once Claude resumes after a question, the row shows your original request, not the *yes* you typed.
 - **Context usage** — each row shows how full the model's context is, colored green → amber → red as it fills, so you can tell at a glance whether `/compact` is due.
 - **History window** — a recap of the work so far: your prompts and Claude's reply to each, with session boundaries marked.
+- **Work intensity** — a separate window charting how hard your agents have been working over time, by day or by week, from your 5-hour usage history.
 
 ---
 

@@ -1,6 +1,6 @@
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
-import type { AgentSession, Config, SetupState, UsageLimits } from './types'
+import type { AgentSession, Config, SetupState, UsageLimits, WeekChart } from './types'
 
 export function getSessions(): Promise<AgentSession[]> {
   return invoke<AgentSession[]>('get_sessions')
@@ -16,6 +16,16 @@ export function getUsageLimits(): Promise<UsageLimits> {
 
 export function refreshUsageLimits(): Promise<boolean> {
   return invoke<boolean>('refresh_usage_limits')
+}
+
+// `weekOffset` is relative to the current local week: 0 = this week, -1 = last.
+export function getUsageIntensityWeek(weekOffset: number): Promise<WeekChart> {
+  return invoke<WeekChart>('get_usage_intensity_week', { weekOffset })
+}
+
+// Every week from the current one back to the oldest record, newest first.
+export function getUsageIntensityWeeks(): Promise<WeekChart[]> {
+  return invoke<WeekChart[]>('get_usage_intensity_weeks')
 }
 
 export function applyAutoResize(physicalHeight: number): Promise<void> {

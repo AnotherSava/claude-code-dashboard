@@ -63,6 +63,10 @@ You can also surface a limit right on the tray icon, via the tray's **Tray usage
 
 When the badge is on, the tray icon also gains a red border the moment any session's context usage crosses a threshold you set — an at-a-glance warning that an agent is filling its context, right in the tray. See [Settings](settings) for the threshold.
 
+## Work intensity
+
+A separate window — opened from the tray's **Work intensity** item — charts how hard your agents have been working over time, drawn from the same 5-hour usage data the limit bars track. Each bar covers a short slice of time and grows taller and warmer the more of the 5-hour limit was burned in it, with a reference line marking the pace that would use up the whole limit in five hours straight; anything past twice that pace is flagged red. A **Days** view lays out one week as seven rows, one per day; a **Weeks** view gives one row per week and scrolls back through your history. Each view also totals the active time and how much of the quota it used.
+
 ## Multi-device sync
 
 Run the dashboard on more than one computer and each one can show the sessions from all of them. Sessions from another device appear in the same list with a small badge carrying that device's name, with everything a local row has — live status, the task in view, the context usage, and the History window recap. Renaming a remote row changes the name on the device where you renamed it, while alerts for a session fire only on the device it runs on, so you never get the same ping twice. When a device goes offline, its rows disappear from the other dashboards shortly after.

@@ -121,6 +121,8 @@ pub fn run() {
             commands::get_config,
             commands::get_usage_limits,
             commands::refresh_usage_limits,
+            commands::get_usage_intensity_week,
+            commands::get_usage_intensity_weeks,
             commands::apply_auto_resize,
             commands::frontend_log,
             commands::hide_window,
@@ -329,6 +331,11 @@ pub fn run() {
                         // About is informational — keep it alive across opens
                         // so we don't pay the webview cold-start each time the
                         // user picks Help → About.
+                        api.prevent_close();
+                        let _ = window.hide();
+                    }
+                    "intensity" => {
+                        // Keep the chart webview warm across closes, like about.
                         api.prevent_close();
                         let _ = window.hide();
                     }

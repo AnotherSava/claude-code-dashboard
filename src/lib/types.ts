@@ -78,6 +78,32 @@ export interface SetupState {
   has_history: boolean
 }
 
+// One 10-minute bar of the work-intensity chart. `intensity` is the percent of
+// the 5h limit consumed in the slot (>= 0); `has_data` distinguishes genuine
+// idle (true, 0) from a gap where the app was closed (false). See the Rust
+// `WeekBucket` / `build_week_chart` — these mirror its serialized shape.
+export interface WeekBucket {
+  intensity: number
+  has_data: boolean
+}
+
+// Per-day roll-up shown to the right of each day row. `active_minutes` counts
+// 10-min buckets with work; `weekly_pct` is the day's share of the 7-day quota.
+export interface DaySummary {
+  active_minutes: number
+  weekly_pct: number
+}
+
+export interface WeekChart {
+  week_start_ms: number
+  week_end_ms: number
+  buckets: WeekBucket[]
+  days: DaySummary[]
+  data_min_ms: number | null
+  data_max_ms: number | null
+  full_intensity: number
+}
+
 export const stateLabel: Record<Status, string> = {
   idle: 'IDLE',
   working: 'WORK',

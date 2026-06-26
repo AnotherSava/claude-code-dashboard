@@ -29,6 +29,7 @@ const MENU_TRAY_BADGE_7D_LIGHT: &str = "tray_badge_7d_light";
 const MENU_TRAY_BADGE_5H_NUM: &str = "tray_badge_5h_num";
 const MENU_TRAY_BADGE_7D_NUM: &str = "tray_badge_7d_num";
 const MENU_OPEN_DATA_DIR: &str = "open_data_dir";
+const MENU_OPEN_INTENSITY: &str = "open_intensity";
 const MENU_HELP_ABOUT: &str = "help_about";
 const MENU_HELP_INSTRUCTIONS: &str = "help_instructions";
 const MENU_QUIT: &str = "quit";
@@ -146,6 +147,7 @@ pub fn setup(app: &AppHandle) -> tauri::Result<()> {
         .build()?;
 
     let open_data_dir = MenuItem::with_id(app, MENU_OPEN_DATA_DIR, "Open config/logs location", true, None::<&str>)?;
+    let open_intensity = MenuItem::with_id(app, MENU_OPEN_INTENSITY, "Work intensity", true, None::<&str>)?;
     let help_about = MenuItem::with_id(app, MENU_HELP_ABOUT, "About", true, None::<&str>)?;
     let help_instructions = MenuItem::with_id(app, MENU_HELP_INSTRUCTIONS, "Connect instructions", true, None::<&str>)?;
     let help_submenu = SubmenuBuilder::new(app, "Help")
@@ -166,6 +168,7 @@ pub fn setup(app: &AppHandle) -> tauri::Result<()> {
             &hist_font_submenu,
             &tray_badge_submenu,
             &PredefinedMenuItem::separator(app)?,
+            &open_intensity,
             &open_data_dir,
             &PredefinedMenuItem::separator(app)?,
             &help_submenu,
@@ -246,6 +249,7 @@ fn handle_menu_event(app: &AppHandle, id: &str) {
         MENU_TRAY_BADGE_5H_NUM => select_tray_badge(app, TrayBadge::FiveHourNumber),
         MENU_TRAY_BADGE_7D_NUM => select_tray_badge(app, TrayBadge::SevenDayNumber),
         MENU_OPEN_DATA_DIR => open_data_dir(app),
+        MENU_OPEN_INTENSITY => show_intensity(app),
         MENU_HELP_ABOUT => show_about(app),
         MENU_HELP_INSTRUCTIONS => show_setup_instructions(app),
         MENU_QUIT => {
@@ -470,6 +474,13 @@ fn show_setup_instructions(app: &AppHandle) {
 
 fn show_about(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("about") {
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+}
+
+fn show_intensity(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("intensity") {
         let _ = window.show();
         let _ = window.set_focus();
     }

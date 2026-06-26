@@ -51,6 +51,17 @@
         "acceptFirstMouse": true,
         "alwaysOnTop": true,
         "theme": "Dark"
+      },
+      {
+        "label": "intensity",
+        "title": "Work intensity",
+        "width": 1000,
+        "height": 560,
+        "decorations": true,
+        "resizable": true,
+        "visible": false,
+        "acceptFirstMouse": true,
+        "theme": "Dark"
       }
     ],
     "security": {

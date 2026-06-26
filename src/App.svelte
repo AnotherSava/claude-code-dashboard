@@ -4,6 +4,7 @@
   import SetupPanel from './lib/components/SetupPanel.svelte'
   import HistoryApp from './HistoryApp.svelte'
   import AboutApp from './AboutApp.svelte'
+  import IntensityApp from './IntensityApp.svelte'
   import LimitBar from './lib/components/LimitBar.svelte'
   import {
     applyAutoResize,
@@ -26,6 +27,7 @@
 
   let historyMode = $state(false)
   let aboutMode = $state(false)
+  let intensityMode = $state(false)
   let sessions = $state<AgentSession[]>([])
   let config = $state<Config | null>(null)
   let usage = $state<UsageLimits | null>(null)
@@ -179,6 +181,10 @@
           aboutMode = true
           return
         }
+        if (label === 'intensity') {
+          intensityMode = true
+          return
+        }
         // Attach before show_window below: the mount-time getSetupState() can
         // win the race against the backend managing PromptHistoryStore and latch
         // has_history=false (flashing the onboarding panel on a configured
@@ -230,10 +236,11 @@
         await new Promise<void>((resolve) =>
           requestAnimationFrame(() => requestAnimationFrame(() => resolve()))
         )
-        // Only the main widget auto-reveals on mount. History and About
-        // windows are shown on demand (history click / Help → About) — the
-        // initial visibility comes from `visible: false` in tauri.conf.json.
-        if (!historyMode && !aboutMode) {
+        // Only the main widget auto-reveals on mount. History, About and the
+        // intensity chart are shown on demand (history click / Help → About /
+        // tray → Work intensity) — initial visibility comes from
+        // `visible: false` in tauri.conf.json.
+        if (!historyMode && !aboutMode && !intensityMode) {
           try {
             await showWindow()
           } catch (err) {
@@ -287,6 +294,8 @@
   <HistoryApp />
 {:else if aboutMode}
   <AboutApp />
+{:else if intensityMode}
+  <IntensityApp />
 {:else}
 <div class="widget" bind:this={widgetEl}>
   <header data-tauri-drag-region>

@@ -48,6 +48,68 @@ pub fn refresh_usage_limits(state: State<UsageLimitsState>) -> bool {
     state.request_refresh()
 }
 
+/// Resolve the start of a week in **local time** (Monday 00:00) as ms-epoch.
+/// `week_offset` is relative to the current local week: `0` = this week, `-1` =
+/// last week, etc. Keeping week alignment here (vs. the client) means the pure,
+/// tz-free `build_week_chart` never has to know about timezones.
+///
+/// DST caveat: the bucket grid is a fixed 7×24×6 layout, so a week containing a
+/// clock change is off by ±1h in its final bucket. Acceptable for a personal
+/// dashboard.
+fn local_week_start_ms(week_offset: i32) -> Result<i64, String> {
+    use chrono::{Datelike, Duration, Local, TimeZone};
+    let today = Local::now().date_naive();
+    let monday = today - Duration::days(today.weekday().num_days_from_monday() as i64);
+    let target_monday = monday + Duration::weeks(week_offset as i64);
+    let naive_midnight = target_monday.and_hms_opt(0, 0, 0).ok_or("invalid week start")?;
+    let dt = Local
+        .from_local_datetime(&naive_midnight)
+        .earliest()
+        .or_else(|| Local.from_local_datetime(&naive_midnight).latest())
+        .ok_or("could not resolve local week start")?;
+    Ok(dt.timestamp_millis())
+}
+
+/// Build the work-intensity chart for one week (see `local_week_start_ms`).
+#[tauri::command]
+pub fn get_usage_intensity_week(week_offset: i32, app: AppHandle) -> Result<crate::usage_history::WeekChart, String> {
+    let week_start_ms = local_week_start_ms(week_offset)?;
+    let store = app
+        .try_state::<crate::usage_history::UsageHistoryStore>()
+        .ok_or("usage history store unavailable")?;
+    let records = store.read_all();
+    Ok(crate::usage_history::build_week_chart(&records, week_start_ms))
+}
+
+/// Build a chart for every week from the current one back to the week that holds
+/// the oldest record, newest first. Powers the "by week" overview (one row per
+/// week). Reads the history once and reuses it across weeks.
+#[tauri::command]
+pub fn get_usage_intensity_weeks(app: AppHandle) -> Result<Vec<crate::usage_history::WeekChart>, String> {
+    let store = app
+        .try_state::<crate::usage_history::UsageHistoryStore>()
+        .ok_or("usage history store unavailable")?;
+    let records = store.read_all();
+    let Some(first) = records.first() else {
+        return Ok(Vec::new());
+    };
+    let data_min = first.ts;
+    let mut weeks = Vec::new();
+    let mut offset = 0;
+    loop {
+        let week_start_ms = local_week_start_ms(offset)?;
+        weeks.push(crate::usage_history::build_week_chart(&records, week_start_ms));
+        if week_start_ms <= data_min {
+            break; // this week already covers the oldest record
+        }
+        offset -= 1;
+        if offset < -520 {
+            break; // ~10-year safety cap against an absurd clock
+        }
+    }
+    Ok(weeks)
+}
+
 #[tauri::command]
 pub fn apply_auto_resize(physical_height: f64, app: AppHandle) {
     let Some(window) = app.get_webview_window("main") else {
