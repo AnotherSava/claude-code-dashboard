@@ -29,10 +29,12 @@ use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::Notify;
 
-use crate::commands::{emit_sessions_updated_remote, now_ms};
+use crate::commands::{emit_sessions_updated_remote, emit_usage_limits_updated, now_ms};
 use crate::config::ConfigState;
 use crate::remote_history::RemoteHistoryStore;
+use crate::remote_usage::RemoteUsageStore;
 use crate::state::{merge_dialog_entries, AgentSession, AppState, DialogEntry, RemoteDevice};
+use crate::usage_history::{UsageHistoryRecord, UsageHistoryStore};
 
 /// Coalesce window after a state change before pushing.
 const DEBOUNCE_MS: u64 = 300;
@@ -67,6 +69,15 @@ pub struct SyncPush {
     #[serde(default)]
     pub delta_from: i64,
     pub sessions: Vec<SessionSync>,
+    /// Usage-limit samples newer than the peer's usage watermark. A global
+    /// (non-session) timeline of Anthropic 5h/7d polls; the receiver stores
+    /// them per-device (`RemoteUsageStore`) and unions them into the
+    /// Work-intensity chart to fill the windows its own app wasn't running.
+    /// `serde(default)` keeps heartbeat/legacy pushes (no usage) valid, and is
+    /// carried on the first drain chunk only — never on the dialog-backlog
+    /// follow-ups.
+    #[serde(default)]
+    pub usage_delta: Vec<UsageHistoryRecord>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -184,6 +195,16 @@ async fn post_sync(
             store.save_device(&push.device_name, &sessions);
         }
     }
+    // Usage samples are a global timeline (not per-session): merge them into
+    // this device's per-peer remote-usage store. Sits after the same-/empty-
+    // device-name guard above, so a device never stores its own records.
+    if !push.usage_delta.is_empty() {
+        if let Some(usage_store) = app.try_state::<RemoteUsageStore>() {
+            usage_store.merge_device(&push.device_name, &push.usage_delta);
+            // Nudge an open Work-intensity window to re-fetch the merged chart.
+            emit_usage_limits_updated(&app);
+        }
+    }
     emit_sessions_updated_remote(&app);
     StatusCode::NO_CONTENT
 }
@@ -297,11 +318,20 @@ fn build_push_chunk(device_name: &str, listen_port: u16, sessions: &[AgentSessio
                 SessionSync { session: meta, dialog_delta }
             })
             .collect(),
+        // Usage records ride on the first chunk only; push_all sets them.
+        usage_delta: Vec::new(),
     };
     PushChunk { push, ack_watermark: if drained { capture - WATERMARK_MARGIN_MS } else { last_included }, drained }
 }
 
-async fn push_all(app: &AppHandle, client: &reqwest::Client, watermarks: &mut HashMap<String, i64>) {
+/// Local usage samples newer than `watermark`, in ascending `ts` order (the
+/// store already returns them sorted). Pure so the watermark selection is
+/// unit-testable without an `AppHandle`.
+fn usage_delta_since(records: &[UsageHistoryRecord], watermark: i64) -> Vec<UsageHistoryRecord> {
+    records.iter().filter(|r| r.ts > watermark).cloned().collect()
+}
+
+async fn push_all(app: &AppHandle, client: &reqwest::Client, watermarks: &mut HashMap<String, i64>, usage_watermarks: &mut HashMap<String, i64>) {
     let Some(cfg_state) = app.try_state::<ConfigState>() else {
         return;
     };
@@ -321,22 +351,40 @@ async fn push_all(app: &AppHandle, client: &reqwest::Client, watermarks: &mut Ha
     // sessions are never re-broadcast.
     let capture = now_ms();
     let sessions = state.snapshot();
+    // Local usage samples to share; peers union them into their intensity
+    // chart to fill the windows their own app wasn't running. Read once per
+    // cycle, filtered per peer against that peer's usage watermark.
+    let usage = app.try_state::<UsageHistoryStore>().map(|s| s.read_all()).unwrap_or_default();
     // Cycle breadcrumb: push cadence should never silently stop while peers
     // are configured — if the failure logs go quiet, this shows whether the
     // pusher loop itself is still alive.
     tracing::trace!(peers = cfg.sync.peers.len(), sessions = sessions.len(), "sync push cycle");
     for peer in &cfg.sync.peers {
         let url = format!("{}/api/sync", peer.trim_end_matches('/'));
+        let usage_delta = usage_delta_since(&usage, usage_watermarks.get(peer).copied().unwrap_or(0));
+        let usage_max = usage_delta.last().map(|r| r.ts);
+        // Usage rides the first chunk only — the dialog-backlog follow-ups
+        // carry an empty usage_delta so it isn't resent within one cycle.
+        let mut usage_sent = false;
         // Drain loop: each acknowledged chunk advances the watermark and the
         // next chunk follows immediately, so a peer that was offline catches
         // up within one cycle — but the full backlog is only ever built and
         // sent once the peer has proven reachable, one bounded POST at a time.
         loop {
             let watermark = watermarks.get(peer).copied().unwrap_or(0);
-            let chunk = build_push_chunk(&cfg.sync.device_name, cfg.sync.listen_port, &sessions, watermark, capture, DELTA_BUDGET_BYTES);
+            let mut chunk = build_push_chunk(&cfg.sync.device_name, cfg.sync.listen_port, &sessions, watermark, capture, DELTA_BUDGET_BYTES);
+            if !usage_sent {
+                chunk.push.usage_delta = usage_delta.clone();
+            }
             match client.post(&url).bearer_auth(&token).json(&chunk.push).send().await {
                 Ok(resp) if resp.status().is_success() => {
                     watermarks.insert(peer.clone(), chunk.ack_watermark);
+                    if !usage_sent {
+                        if let Some(max) = usage_max {
+                            usage_watermarks.insert(peer.clone(), max);
+                        }
+                        usage_sent = true;
+                    }
                     if chunk.drained {
                         break;
                     }
@@ -367,6 +415,7 @@ pub fn spawn_pusher(app: AppHandle, dirty: Arc<Notify>) {
             .build()
             .expect("reqwest client");
         let mut watermarks: HashMap<String, i64> = HashMap::new();
+        let mut usage_watermarks: HashMap<String, i64> = HashMap::new();
         loop {
             tokio::select! {
                 _ = dirty.notified() => {
@@ -374,7 +423,7 @@ pub fn spawn_pusher(app: AppHandle, dirty: Arc<Notify>) {
                 }
                 _ = tokio::time::sleep(Duration::from_secs(HEARTBEAT_SECS)) => {}
             }
-            push_all(&app, &client, &mut watermarks).await;
+            push_all(&app, &client, &mut watermarks, &mut usage_watermarks).await;
         }
     });
 }
@@ -716,6 +765,24 @@ mod tests {
         let chunk = build_push_chunk("desktop", 9078, &sessions, 50, 1000, 8);
         assert!(chunk.drained);
         assert!(chunk.push.sessions[0].dialog_delta.is_empty(), "metadata-only heartbeat");
+    }
+
+    // -------- usage_delta_since --------
+
+    fn usage(ts: i64) -> UsageHistoryRecord {
+        UsageHistoryRecord { ts, five_hour_pct: Some(1.0), five_hour_resets_at: None, seven_day_pct: None, seven_day_resets_at: None }
+    }
+
+    #[test]
+    fn usage_delta_since_selects_strictly_newer() {
+        let records = [usage(10), usage(20), usage(30)];
+        let delta = usage_delta_since(&records, 20);
+        assert_eq!(delta.iter().map(|r| r.ts).collect::<Vec<_>>(), vec![30], "watermark is exclusive");
+
+        let all = usage_delta_since(&records, 0);
+        assert_eq!(all.len(), 3, "zero watermark sends everything");
+
+        assert!(usage_delta_since(&records, 30).is_empty(), "nothing past the newest");
     }
 
     // -------- resolve_fetch_target --------

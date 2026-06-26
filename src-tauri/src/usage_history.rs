@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 /// time-series processing (each JSONL line is effectively a named-column
 /// CSV row). Percentages are stored raw as the API returns them (0..100,
 /// unclamped) — graphing code decides how to normalize.
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct UsageHistoryRecord {
     /// Poll timestamp, ms since epoch.
     pub ts: i64,

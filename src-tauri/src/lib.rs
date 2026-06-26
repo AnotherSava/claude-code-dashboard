@@ -14,6 +14,7 @@ mod logging;
 mod notifications;
 mod prompt_history;
 mod remote_history;
+mod remote_usage;
 mod setup;
 mod state;
 mod sync;
@@ -187,6 +188,10 @@ pub fn run() {
 
             app.manage(usage_history::UsageHistoryStore::new(
                 app_data.join("usage_history.jsonl"),
+            ));
+
+            app.manage(remote_usage::RemoteUsageStore::new(
+                app_data.join("remote_usage"),
             ));
 
             let config_path = app_data.join("config.json");

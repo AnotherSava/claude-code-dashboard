@@ -47,7 +47,7 @@ When `sync.listen` is on (and `sync.token` set), a second listener binds **all i
 
 ### `POST /api/sync`
 
-A peer pushes its local sessions. The body is a full snapshot of the sender's session *metadata* (a session absent from the snapshot is removed on the receiver) plus per-session `dialog_delta` — only the dialog entries changed since that peer's last acknowledged push, since full dialogs run to hundreds of KB:
+A peer pushes its local sessions. The body is a full snapshot of the sender's session *metadata* (a session absent from the snapshot is removed on the receiver) plus per-session `dialog_delta` — only the dialog entries changed since that peer's last acknowledged push, since full dialogs run to hundreds of KB — plus a top-level `usage_delta` of usage-limit samples (the account-wide 5h/7d poll timeline) the receiver stores per-device and unions into its Work-intensity chart:
 
 ```json
 {
@@ -56,7 +56,8 @@ A peer pushes its local sessions. The body is a full snapshot of the sender's se
   "delta_from": 1780789975389,
   "sessions": [
     { "session": { ...AgentSession, "dialog": [] }, "dialog_delta": [ ...DialogEntry ] }
-  ]
+  ],
+  "usage_delta": [ ...UsageHistoryRecord ]
 }
 ```
 

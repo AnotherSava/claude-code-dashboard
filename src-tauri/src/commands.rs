@@ -68,14 +68,30 @@ fn local_week_start_ms(week_offset: i32) -> Result<i64, String> {
     Ok(dt.timestamp_millis())
 }
 
+/// Local usage samples unioned with every synced peer's, sorted ascending by
+/// `ts`. The 5h/7d counter is account-wide, so a peer's polls during the
+/// windows this device's app was closed describe the same timeline — merging
+/// them fills the Work-intensity chart's gaps (`build_week_chart` walks the
+/// combined timeline and clamps each step to a non-negative delta, so the
+/// extra interleaved points are harmless where coverage overlaps). Tolerant of
+/// either store being absent.
+fn merged_usage_records(app: &AppHandle) -> Vec<crate::usage_history::UsageHistoryRecord> {
+    let mut records = app
+        .try_state::<crate::usage_history::UsageHistoryStore>()
+        .map(|s| s.read_all())
+        .unwrap_or_default();
+    if let Some(remote) = app.try_state::<crate::remote_usage::RemoteUsageStore>() {
+        records.extend(remote.all_records());
+    }
+    records.sort_by_key(|r| r.ts);
+    records
+}
+
 /// Build the work-intensity chart for one week (see `local_week_start_ms`).
 #[tauri::command]
 pub fn get_usage_intensity_week(week_offset: i32, app: AppHandle) -> Result<crate::usage_history::WeekChart, String> {
     let week_start_ms = local_week_start_ms(week_offset)?;
-    let store = app
-        .try_state::<crate::usage_history::UsageHistoryStore>()
-        .ok_or("usage history store unavailable")?;
-    let records = store.read_all();
+    let records = merged_usage_records(&app);
     Ok(crate::usage_history::build_week_chart(&records, week_start_ms))
 }
 
@@ -84,10 +100,7 @@ pub fn get_usage_intensity_week(week_offset: i32, app: AppHandle) -> Result<crat
 /// week). Reads the history once and reuses it across weeks.
 #[tauri::command]
 pub fn get_usage_intensity_weeks(app: AppHandle) -> Result<Vec<crate::usage_history::WeekChart>, String> {
-    let store = app
-        .try_state::<crate::usage_history::UsageHistoryStore>()
-        .ok_or("usage history store unavailable")?;
-    let records = store.read_all();
+    let records = merged_usage_records(&app);
     let Some(first) = records.first() else {
         return Ok(Vec::new());
     };
