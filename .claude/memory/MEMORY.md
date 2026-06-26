@@ -31,3 +31,4 @@
 - [Startup session restore infeasible](startup_session_restore_infeasible.md) — can't tell closed from idle-open sessions; Claude doesn't hold transcript open; don't re-attempt
 - [Preview tray rendering via PNG test](debug_preview_tray_rendering.md) — throwaway #[ignore] test + png dev-dep renders tray_badge fns to scratchpad PNGs; view, then remove
 - [5h resets_at jitters ±1min](usage_five_hour_resets_at_jitter.md) — never use five_hour_resets_at as a reset signal; detect reset by pct drop, intensity = max(0, Δpct)
+- [Context-alert tracking not persisted](context_alert_outstanding_not_persisted.md) — context_outstanding is in-memory; app restart orphans Telegram alerts (known, deliberately unfixed); grep decision=context_alert/context_dismiss
