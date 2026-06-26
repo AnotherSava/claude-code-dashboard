@@ -75,26 +75,27 @@ pub fn build_context_message(session: &AgentSession, window_tokens: &HashMap<Str
     Some(format!("[{}] context {}% ({}/{})", session.id, pct.round() as u32, tokens_k(tokens), tokens_k(max)))
 }
 
-/// Edge-triggered selection of sessions that newly crossed `threshold_percent`
-/// of context this tick. `fired` holds the ids already alerted and still above
-/// the threshold; it is rewritten each call to the currently-over set, so a
-/// session re-arms once its usage drops below (or its window/model becomes
-/// unknown, or it vanishes). A `threshold_percent <= 0` disables the feature
-/// and clears `fired`.
-pub fn context_alerts_due<'a>(
+/// Reconcile context-usage alerts against the currently-over set, mirroring the
+/// per-state notification lifecycle: an alert is *sent* when a session first
+/// crosses `threshold_percent` of its context window, and *dismissed* (the
+/// Telegram message deleted) once it's no longer over — because usage dropped
+/// back below (a new task / `/clear`), the session vanished, or its window/model
+/// became unknown. `outstanding` maps a session id to the handle of its live
+/// alert message. Returns `(to_dismiss, to_send)`: ids whose message should be
+/// deleted (still present in `outstanding` — the caller removes them), and
+/// sessions a fresh alert should be sent for. `threshold_percent <= 0` disables
+/// the feature, so everything outstanding is dismissed.
+pub fn context_reconcile<'a>(
     threshold_percent: f32,
     sessions: &'a [AgentSession],
     window_tokens: &HashMap<String, u64>,
-    fired: &mut HashSet<String>,
-) -> Vec<&'a AgentSession> {
-    if threshold_percent <= 0.0 {
-        fired.clear();
-        return Vec::new();
-    }
-    let is_over = |s: &AgentSession| context_percent(s, window_tokens).is_some_and(|p| p >= threshold_percent);
-    let due: Vec<&AgentSession> = sessions.iter().filter(|s| is_over(s) && !fired.contains(&s.id)).collect();
-    *fired = sessions.iter().filter(|s| is_over(s)).map(|s| s.id.clone()).collect();
-    due
+    outstanding: &HashMap<String, String>,
+) -> (Vec<String>, Vec<&'a AgentSession>) {
+    let is_over = |s: &AgentSession| threshold_percent > 0.0 && context_percent(s, window_tokens).is_some_and(|p| p >= threshold_percent);
+    let over_ids: HashSet<&str> = sessions.iter().filter(|s| is_over(s)).map(|s| s.id.as_str()).collect();
+    let to_dismiss: Vec<String> = outstanding.keys().filter(|id| !over_ids.contains(id.as_str())).cloned().collect();
+    let to_send: Vec<&AgentSession> = sessions.iter().filter(|s| is_over(s) && !outstanding.contains_key(&s.id)).collect();
+    (to_dismiss, to_send)
 }
 
 /// Decide whether a state in `rule` is due to fire, given how long it has been
@@ -118,6 +119,27 @@ pub fn fire_reason(rule: &StateNotify, time_in_state_ms: u64, idle_ms: Option<u6
     reaction_due.then_some("reaction")
 }
 
+/// Revoke a batch of outstanding notifications and forget them: for each id,
+/// delete its message via `Notifier::dismiss` (logging but tolerating failure)
+/// and drop it from `outstanding`. Shared by both reconcilers — the per-state
+/// one ([`reconcile`]) and the context-usage one ([`context_reconcile`]) — which
+/// differ only in *which* entries go stale and in how the handle is stored
+/// (hence the `handle_of` accessor over a generic value type).
+pub async fn dismiss_and_forget<V>(
+    notifier: &dyn Notifier,
+    outstanding: &mut HashMap<String, V>,
+    ids: impl IntoIterator<Item = String>,
+    handle_of: impl Fn(&V) -> &str,
+) {
+    for id in ids {
+        let Some(entry) = outstanding.remove(&id) else { continue };
+        let handle = handle_of(&entry).to_string();
+        if let Err(e) = notifier.dismiss(&handle).await {
+            tracing::debug!(channel = notifier.channel_name(), id = %id, handle = %handle, ?e, "dismiss failed");
+        }
+    }
+}
+
 pub async fn reconcile(
     notifier: &dyn Notifier,
     sessions: &[AgentSession],
@@ -127,7 +149,7 @@ pub async fn reconcile(
 ) {
     let rules = notifier.state_rules();
 
-    let stale: Vec<(String, Outstanding)> = outstanding
+    let stale: Vec<String> = outstanding
         .iter()
         .filter(|(id, o)| {
             sessions
@@ -135,19 +157,9 @@ pub async fn reconcile(
                 .find(|s| &s.id == *id)
                 .map_or(true, |s| s.status != o.for_status)
         })
-        .map(|(k, v)| (k.clone(), v.clone()))
+        .map(|(k, _)| k.clone())
         .collect();
-    for (id, o) in stale {
-        if let Err(e) = notifier.dismiss(&o.handle).await {
-            tracing::debug!(
-                channel = notifier.channel_name(),
-                handle = %o.handle,
-                ?e,
-                "dismiss failed"
-            );
-        }
-        outstanding.remove(&id);
-    }
+    dismiss_and_forget(notifier, outstanding, stale, |o| o.handle.as_str()).await;
 
     for s in sessions {
         if outstanding.contains_key(&s.id) {
@@ -190,7 +202,9 @@ impl NotificationManager {
         tauri::async_runtime::spawn(async move {
             let telegram = Arc::new(TelegramNotifier::new());
             let mut outstanding: HashMap<String, Outstanding> = HashMap::new();
-            let mut context_fired: HashSet<String> = HashSet::new();
+            // Live context-usage alerts: session id -> Telegram message handle,
+            // so the message can be deleted once usage drops back below.
+            let mut context_outstanding: HashMap<String, String> = HashMap::new();
             let mut ticker = tokio::time::interval(Duration::from_secs(1));
             // First tick fires immediately; skip it so startup doesn't see
             // stale state before AppState is populated.
@@ -213,15 +227,17 @@ impl NotificationManager {
 
                 let outcome = telegram.sync_config(tg_cfg);
                 if matches!(outcome, SyncOutcome::CredsChanged | SyncOutcome::Disabled)
-                    && !outstanding.is_empty()
+                    && (!outstanding.is_empty() || !context_outstanding.is_empty())
                 {
                     tracing::warn!(
                         channel = "telegram",
                         reason = ?outcome,
                         count = outstanding.len(),
-                        "credentials changed or disabled; dropping outstanding map without deleting"
+                        context_count = context_outstanding.len(),
+                        "credentials changed or disabled; dropping outstanding maps without deleting"
                     );
                     outstanding.clear();
+                    context_outstanding.clear();
                 }
 
                 if telegram.is_enabled() {
@@ -235,13 +251,17 @@ impl NotificationManager {
                     .await;
 
                     let threshold = tg_cfg.and_then(|c| c.context_alert_percent).unwrap_or(0.0);
-                    let due = context_alerts_due(threshold, &sessions, &cfg.context_window_tokens, &mut context_fired);
-                    for s in due {
+                    let (to_dismiss, to_send) = context_reconcile(threshold, &sessions, &cfg.context_window_tokens, &context_outstanding);
+                    // Delete alerts whose session dropped back below the threshold
+                    // (or vanished) — same revoke path as per-state notifications.
+                    dismiss_and_forget(telegram.as_ref() as &dyn Notifier, &mut context_outstanding, to_dismiss, |h| h.as_str()).await;
+                    for s in to_send {
                         let Some(text) = build_context_message(s, &cfg.context_window_tokens) else { continue };
-                        if let Err(e) = telegram.send_raw(&text).await {
-                            tracing::warn!(channel = "telegram", id = %s.id, ?e, "context alert send failed");
-                            // Re-arm so the next tick retries this session.
-                            context_fired.remove(&s.id);
+                        match telegram.send_raw(&text).await {
+                            // Track the handle so we can delete it when usage drops.
+                            Ok(handle) => { context_outstanding.insert(s.id.clone(), handle); }
+                            // Not tracked → the next tick retries this session.
+                            Err(e) => tracing::warn!(channel = "telegram", id = %s.id, ?e, "context alert send failed"),
                         }
                     }
                 }
@@ -602,73 +622,98 @@ mod tests {
         assert_eq!(window_for("claude-opus-4-8", &z), Some(200_000));
     }
 
+    /// Apply a reconcile result to the outstanding map the way the manager loop
+    /// does: drop dismissed ids, register a fake handle for each sent session.
+    fn apply(outstanding: &mut HashMap<String, String>, to_dismiss: Vec<String>, to_send: Vec<&AgentSession>) {
+        for id in to_dismiss {
+            outstanding.remove(&id);
+        }
+        for s in to_send {
+            outstanding.insert(s.id.clone(), format!("h-{}", s.id));
+        }
+    }
+
+    fn sent_ids(to_send: &[&AgentSession]) -> Vec<String> {
+        to_send.iter().map(|s| s.id.clone()).collect()
+    }
+
     #[test]
-    fn context_alert_fires_once_then_dedups_until_drop() {
+    fn context_alert_fires_once_then_dismisses_on_drop() {
         let w = windows();
-        let mut fired = HashSet::new();
-        // 80% threshold, session at 90% — fires.
+        let mut out = HashMap::new();
+        // 80% threshold, session at 90% — sends, no dismissals.
         let over = vec![ctx_session("s", "m", 180_000)];
-        let due = context_alerts_due(80.0, &over, &w, &mut fired);
-        assert_eq!(due.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(), vec!["s"]);
-        // Still over next tick — no re-fire.
-        let due = context_alerts_due(80.0, &over, &w, &mut fired);
-        assert!(due.is_empty());
-        // Drops below (new task / clear) — re-arms.
+        let (dismiss, send) = context_reconcile(80.0, &over, &w, &out);
+        assert_eq!(sent_ids(&send), vec!["s".to_string()]);
+        assert!(dismiss.is_empty());
+        apply(&mut out, dismiss, send);
+        // Still over next tick — no re-send, no dismiss.
+        let (dismiss, send) = context_reconcile(80.0, &over, &w, &out);
+        assert!(send.is_empty() && dismiss.is_empty());
+        // Drops below (new task / clear) — the live alert is dismissed.
         let under = vec![ctx_session("s", "m", 20_000)];
-        let due = context_alerts_due(80.0, &under, &w, &mut fired);
-        assert!(due.is_empty());
-        assert!(fired.is_empty(), "re-armed");
-        // Crosses again — fires again.
-        let due = context_alerts_due(80.0, &over, &w, &mut fired);
-        assert_eq!(due.len(), 1);
+        let (dismiss, send) = context_reconcile(80.0, &under, &w, &out);
+        assert_eq!(dismiss, vec!["s".to_string()], "drop below threshold deletes the message");
+        assert!(send.is_empty());
+        apply(&mut out, dismiss, send);
+        assert!(out.is_empty(), "re-armed");
+        // Crosses again — sends again.
+        let (_, send) = context_reconcile(80.0, &over, &w, &out);
+        assert_eq!(sent_ids(&send), vec!["s".to_string()]);
     }
 
     #[test]
     fn context_alert_fires_at_exact_threshold() {
         let w = windows();
-        let mut fired = HashSet::new();
+        let out = HashMap::new();
         let s = vec![ctx_session("s", "m", 160_000)]; // exactly 80%
-        assert_eq!(context_alerts_due(80.0, &s, &w, &mut fired).len(), 1);
+        let (_, send) = context_reconcile(80.0, &s, &w, &out);
+        assert_eq!(send.len(), 1);
     }
 
     #[test]
     fn context_alert_below_threshold_is_silent() {
         let w = windows();
-        let mut fired = HashSet::new();
+        let out = HashMap::new();
         let s = vec![ctx_session("s", "m", 100_000)]; // 50%
-        assert!(context_alerts_due(80.0, &s, &w, &mut fired).is_empty());
-        assert!(fired.is_empty());
+        let (dismiss, send) = context_reconcile(80.0, &s, &w, &out);
+        assert!(send.is_empty() && dismiss.is_empty());
     }
 
     #[test]
-    fn context_alert_disabled_clears_fired() {
+    fn context_alert_disabled_dismisses_outstanding() {
         let w = windows();
-        let mut fired: HashSet<String> = ["s".to_string()].into_iter().collect();
+        let out: HashMap<String, String> = [("s".to_string(), "h-s".to_string())].into_iter().collect();
         let s = vec![ctx_session("s", "m", 180_000)];
-        assert!(context_alerts_due(0.0, &s, &w, &mut fired).is_empty());
-        assert!(fired.is_empty(), "disabled threshold clears tracking");
+        // Threshold 0 disables: the live alert is dismissed even though usage
+        // is still high, and nothing new is sent.
+        let (dismiss, send) = context_reconcile(0.0, &s, &w, &out);
+        assert_eq!(dismiss, vec!["s".to_string()]);
+        assert!(send.is_empty());
     }
 
     #[test]
-    fn context_alert_rearms_when_session_vanishes() {
+    fn context_alert_dismisses_when_session_vanishes() {
         let w = windows();
-        let mut fired = HashSet::new();
+        let mut out = HashMap::new();
         let over = vec![ctx_session("s", "m", 180_000)];
-        assert_eq!(context_alerts_due(80.0, &over, &w, &mut fired).len(), 1);
-        // Session gone from snapshot — fired must not retain it.
+        let (dismiss, send) = context_reconcile(80.0, &over, &w, &out);
+        apply(&mut out, dismiss, send);
+        // Session gone from snapshot — its alert is dismissed.
         let none: Vec<AgentSession> = vec![];
-        assert!(context_alerts_due(80.0, &none, &w, &mut fired).is_empty());
-        assert!(fired.is_empty());
+        let (dismiss, send) = context_reconcile(80.0, &none, &w, &out);
+        assert_eq!(dismiss, vec!["s".to_string()]);
+        assert!(send.is_empty());
     }
 
     #[test]
     fn context_alert_ignores_uncomputable_sessions() {
         let w = windows();
-        let mut fired = HashSet::new();
+        let out = HashMap::new();
         // No model and no tokens — never alerts, never tracked.
         let s = vec![session("s", Status::Working, 0)];
-        assert!(context_alerts_due(80.0, &s, &w, &mut fired).is_empty());
-        assert!(fired.is_empty());
+        let (dismiss, send) = context_reconcile(80.0, &s, &w, &out);
+        assert!(send.is_empty() && dismiss.is_empty());
     }
 
     #[test]

@@ -19,7 +19,21 @@ use tauri::image::Image;
 use tauri::{AppHandle, Manager};
 
 use crate::config::{ConfigState, TrayBadge};
+use crate::notifications::context_percent;
+use crate::state::AppState;
 use crate::usage_limits::{UsageLimits, UsageLimitsState, UsageStatus};
+
+/// Red used for the context-over-threshold alert border.
+const ALERT_BORDER_COLOR: [u8; 3] = [220, 38, 38];
+
+/// App-icon body geometry as fractions of the rendered size, measured from the
+/// 512px source icon (opaque content box x[64,447] y[10,501], corner r≈36): a
+/// centered *portrait* rounded rect. The alert border is a rounded-rect stroke
+/// matched to this outline, [`ALERT_OUTSET`] outside it.
+const ICON_HALF_W: f32 = 0.374;
+const ICON_HALF_H: f32 = 0.480;
+const ICON_RADIUS: f32 = 0.070;
+const ALERT_OUTSET: f32 = 0.020;
 
 /// Bundled badge font — Bebas Neue (SIL Open Font License; see
 /// `assets/fonts/OFL.txt`). Tall and condensed so two digits reach full height
@@ -266,10 +280,45 @@ fn light_state(pct: u32) -> usize {
     (pct * 6 / 100).min(6) as usize
 }
 
+/// Draw the red context-usage alert border onto a `size`x`size` RGBA buffer: a
+/// rounded-rect stroke matched to the app icon's outline (see [`ICON_HALF_W`])
+/// and outset slightly, with the top/bottom segments 1px thinner than the sides
+/// (the icon is portrait, so an equal-thickness frame reads heavy top/bottom).
+/// A cheap parametric SDF pass — no per-pixel neighborhood scan. Composited over
+/// whatever the badge already drew.
+fn draw_alert_border(buf: &mut [u8], size: usize) {
+    let n = size as f32;
+    let c = n / 2.0;
+    let half_w = (ICON_HALF_W + ALERT_OUTSET) * n;
+    let half_h = (ICON_HALF_H + ALERT_OUTSET) * n;
+    let radius = ICON_RADIUS * n;
+    let thick_lr = (0.09 * n).max(1.5);
+    let thick_tb = (thick_lr - 1.0).max(0.5);
+    let inner_w = half_w - thick_lr;
+    let inner_h = half_h - thick_tb;
+    let inner_r = (radius - thick_lr.min(thick_tb)).max(0.0);
+    for y in 0..size {
+        for x in 0..size {
+            let px = x as f32 + 0.5 - c;
+            let py = y as f32 + 0.5 - c;
+            let d_out = rounded_rect_sdf(px, py, half_w, half_h, radius);
+            let d_in = rounded_rect_sdf(px, py, inner_w, inner_h, inner_r);
+            // Inside the outer outline AND outside the inner one = the ring,
+            // with ~1px anti-aliasing on each boundary.
+            let cov = (0.5 - d_out).clamp(0.0, 1.0).min((0.5 + d_in).clamp(0.0, 1.0));
+            if cov > 0.0 {
+                let p = (y * size + x) * 4;
+                over(&mut buf[p..p + 4], ALERT_BORDER_COLOR, (cov * 255.0).round() as u8);
+            }
+        }
+    }
+}
+
 /// Render the traffic-light badge: recolor the app icon's three lights to the
 /// state for `pct`, keeping the housing. The `*Number` modes reuse this for the
-/// all-red 100% state. Drawn at the OS tray pixel size.
-fn render_light_badge(base: &Image, pct: u32, size: usize) -> Image<'static> {
+/// all-red 100% state. When `alert` is set, the icon's white outer border is
+/// recolored red as the context-usage warning. Drawn at the OS tray pixel size.
+fn render_light_badge(base: &Image, pct: u32, size: usize, alert: bool) -> Image<'static> {
     let levels = LIGHT_LEVELS[light_state(pct)];
     let bw = base.width() as usize;
     let bh = base.height() as usize;
@@ -298,8 +347,81 @@ fn render_light_badge(base: &Image, pct: u32, size: usize) -> Image<'static> {
         }
     }
 
-    let small = area_downscale(&buf, bw, bh, size, size);
+    // Draw the alert border after downscaling so it lands at the tray pixel
+    // size (its stroke matches the icon outline at that size).
+    let mut small = area_downscale(&buf, bw, bh, size, size);
+    if alert {
+        draw_alert_border(&mut small, size);
+    }
     Image::new_owned(small, size as u32, size as u32)
+}
+
+/// Fit the plain app icon to the tray size, optionally drawing the red
+/// context-usage alert border around it. Used when a badge mode is active but
+/// there's no usable usage reading to draw a light or number for.
+fn render_plain_icon(base: &Image, size: usize, alert: bool) -> Image<'static> {
+    let mut small = area_downscale(base.rgba(), base.width() as usize, base.height() as usize, size, size);
+    if alert {
+        draw_alert_border(&mut small, size);
+    }
+    Image::new_owned(small, size as u32, size as u32)
+}
+
+/// Signed distance from point (`px`, `py`) to a rounded rectangle centered at
+/// the origin with half-extents (`hx`, `hy`) and corner radius `r`. Negative
+/// inside, positive outside, zero on the edge.
+fn rounded_rect_sdf(px: f32, py: f32, hx: f32, hy: f32, r: f32) -> f32 {
+    let qx = px.abs() - (hx - r);
+    let qy = py.abs() - (hy - r);
+    let outside = (qx.max(0.0).powi(2) + qy.max(0.0).powi(2)).sqrt();
+    let inside = qx.max(qy).min(0.0);
+    outside + inside - r
+}
+
+/// Paint a slightly-rounded red border just inside the perimeter of a
+/// `size`x`size` RGBA buffer — the context-usage-over-threshold alert for the
+/// *number* modes, which have no icon outline to trace (the light/icon modes
+/// draw the icon-matched border via [`draw_alert_border`] instead).
+fn overlay_alert_border(buf: &mut [u8], size: usize) {
+    let n = size as f32;
+    let center = n / 2.0;
+    let half = center - 0.5; // outer edge sits ~0.5px from the image border
+    let radius = (n * 0.18).round().max(2.0);
+    let thickness = (n * 0.10).round().max(2.0);
+    for y in 0..size {
+        for x in 0..size {
+            let px = x as f32 + 0.5 - center;
+            let py = y as f32 + 0.5 - center;
+            let d = rounded_rect_sdf(px, py, half, half, radius);
+            // Ring band -thickness..=0, with ~1px anti-aliasing on each edge.
+            let band = (-d).min(d + thickness);
+            let cov = (band + 0.5).clamp(0.0, 1.0);
+            if cov > 0.0 {
+                let p = (y * size + x) * 4;
+                over(&mut buf[p..p + 4], ALERT_BORDER_COLOR, (cov * 255.0).round() as u8);
+            }
+        }
+    }
+}
+
+/// Copy of `img` (which must be `size`x`size`) with the alert border painted on.
+fn with_alert_border(img: Image, size: usize) -> Image<'static> {
+    let mut buf = img.rgba().to_vec();
+    overlay_alert_border(&mut buf, size);
+    Image::new_owned(buf, size as u32, size as u32)
+}
+
+/// Whether the context-usage alert border should be drawn: a badge style is
+/// active and at least one local session has reached `threshold` percent of its
+/// model's context window. `None`/`0` threshold or a `None` badge → never.
+fn context_alert_active(app: &AppHandle, badge: TrayBadge, threshold: Option<f32>, window_tokens: &std::collections::HashMap<String, u64>) -> bool {
+    let Some(threshold) = threshold.filter(|t| *t > 0.0) else { return false };
+    if badge == TrayBadge::None {
+        return false;
+    }
+    app.try_state::<AppState>().is_some_and(|st| {
+        st.snapshot().iter().any(|s| context_percent(s, window_tokens).is_some_and(|p| p >= threshold))
+    })
 }
 
 /// Badge text for a sub-100% percentage: always two digits, zero-padded ("09"),
@@ -354,10 +476,11 @@ pub fn refresh(app: &AppHandle) {
     let Some(base) = app.default_window_icon().cloned() else {
         return;
     };
-    let badge = app
+    let config = app
         .try_state::<ConfigState>()
-        .map(|c| c.snapshot().tray_badge)
+        .map(|c| c.snapshot())
         .unwrap_or_default();
+    let badge = config.tray_badge;
     let usage = app
         .try_state::<UsageLimitsState>()
         .map(|s| s.snapshot())
@@ -365,25 +488,23 @@ pub fn refresh(app: &AppHandle) {
 
     let _ = tray.set_tooltip(Some(tooltip(&usage)));
     let size = target_icon_px(app);
-    match badge_percent(badge, &usage) {
+    // A red alert is drawn when an agent's context usage is over the threshold:
+    // the icon-bearing styles (light, >=100% fallback, plain-icon fallback)
+    // recolor the icon's own white border red; the number style frames the
+    // digits with a drawn red border.
+    let alert = context_alert_active(app, badge, config.tray_context_alert_percent, &config.context_window_tokens);
+    let img = match badge_percent(badge, &usage) {
+        // Light modes recolor the traffic light. Number modes draw the
+        // percentage, but a maxed (>=100%) bucket shows the all-red light
+        // instead of a number.
+        Some(pct) if badge.is_light() || pct >= 100 => render_light_badge(&base, pct, size, alert),
         Some(pct) => {
-            // Light modes recolor the traffic light. Number modes draw the
-            // percentage, but a maxed (>=100%) bucket shows the all-red light
-            // instead of a number.
-            let img = if badge.is_light() || pct >= 100 {
-                render_light_badge(&base, pct, size)
-            } else {
-                render_badge(&badge_text(pct), urgency_color(pct), size)
-            };
-            let _ = tray.set_icon(Some(img));
+            let number = render_badge(&badge_text(pct), urgency_color(pct), size);
+            if alert { with_alert_border(number, size) } else { number }
         }
-        None => {
-            // Fit the plain icon to the tray size ourselves rather than handing
-            // the OS an oversized bitmap to blur down.
-            let fitted = area_downscale(base.rgba(), base.width() as usize, base.height() as usize, size, size);
-            let _ = tray.set_icon(Some(Image::new_owned(fitted, size as u32, size as u32)));
-        }
-    }
+        None => render_plain_icon(&base, size, alert),
+    };
+    let _ = tray.set_icon(Some(img));
 }
 
 #[cfg(test)]
@@ -497,22 +618,77 @@ mod tests {
         let base = Image::new_owned([lit, lit, lit].concat(), 1, 3);
 
         // State 0 (pct 0): all green.
-        let g = render_light_badge(&base, 0, 3);
+        let g = render_light_badge(&base, 0, 3, false);
         for row in g.rgba().chunks_exact(4).take(3) {
             assert_eq!(&row[0..3], &LEVEL_COLORS[0]);
         }
         // State 6 (pct 100): all red.
-        let r = render_light_badge(&base, 100, 3);
+        let r = render_light_badge(&base, 100, 3, false);
         for row in r.rgba().chunks_exact(4).take(3) {
             assert_eq!(&row[0..3], &LEVEL_COLORS[2]);
         }
         // State 1 (pct 20): top amber, middle + bottom green. Output is 3x3, so
         // rows start at byte 0 (top), 12 (middle), 24 (bottom).
-        let s1 = render_light_badge(&base, 20, 3);
+        let s1 = render_light_badge(&base, 20, 3, false);
         let px = s1.rgba();
         assert_eq!(&px[0..3], &LEVEL_COLORS[1], "top -> amber");
         assert_eq!(&px[12..15], &LEVEL_COLORS[0], "middle -> green");
         assert_eq!(&px[24..27], &LEVEL_COLORS[0], "bottom -> green");
+    }
+
+    #[test]
+    fn alert_border_traces_icon_outline_not_the_image_frame() {
+        // The stroke matches the icon's portrait outline, outset slightly — so
+        // it sits inboard of the image edge, leaves the core clear, and the
+        // image corners (outside the outline) stay transparent.
+        let size = 32;
+        let mut buf = vec![0u8; size * size * 4];
+        draw_alert_border(&mut buf, size);
+        let at = |x: usize, y: usize| { let p = (y * size + x) * 4; [buf[p], buf[p + 1], buf[p + 2], buf[p + 3]] };
+        assert_eq!(at(16, 16)[3], 0, "core inside the ring stays clear");
+        assert_eq!(&at(5, 16)[..3], &ALERT_BORDER_COLOR, "left stroke is the alert red");
+        assert!(at(5, 16)[3] > 0, "left stroke is opaque");
+        assert_eq!(at(0, 0)[3], 0, "image corner (outside the outset outline) stays clear");
+    }
+
+    #[test]
+    fn render_light_badge_alert_draws_border_keeps_core() {
+        // A uniform dark base (no lit bulbs): alert adds the red border, the
+        // core is untouched, and without alert there's no red.
+        let base = Image::new_owned([20u8, 20, 24, 255].repeat(32 * 32), 32, 32);
+        let plain = render_light_badge(&base, 0, 32, false);
+        let alert = render_light_badge(&base, 0, 32, true);
+        let at = |img: &Image, x: usize, y: usize| { let i = (y * 32 + x) * 4; let r = img.rgba(); [r[i], r[i + 1], r[i + 2]] };
+        assert_ne!(at(&plain, 5, 16), ALERT_BORDER_COLOR, "no border without alert");
+        assert_eq!(at(&alert, 5, 16), ALERT_BORDER_COLOR, "alert draws the red border on the left stroke");
+        assert_eq!(at(&alert, 16, 16), at(&plain, 16, 16), "core unchanged by the border");
+    }
+
+    #[test]
+    fn alert_border_paints_red_perimeter_and_leaves_center_clear() {
+        let size = 24;
+        let mut buf = vec![0u8; size * size * 4]; // fully transparent
+        overlay_alert_border(&mut buf, size);
+        // A pixel one row in from the top edge, mid-width, lands in the ring.
+        let edge = (1 * size + size / 2) * 4;
+        assert_eq!(&buf[edge..edge + 3], &ALERT_BORDER_COLOR, "border is the alert red");
+        assert_eq!(buf[edge + 3], 255, "border pixel is opaque");
+        // The center stays transparent — the border only frames the perimeter.
+        let center = ((size / 2) * size + size / 2) * 4;
+        assert_eq!(buf[center + 3], 0, "center untouched by the border");
+    }
+
+    #[test]
+    fn alert_border_composites_over_an_opaque_icon() {
+        // An all-opaque-white buffer: the border repaints its ring red but
+        // leaves the interior white.
+        let size = 24;
+        let mut buf = vec![255u8; size * size * 4];
+        overlay_alert_border(&mut buf, size);
+        let edge = (1 * size + size / 2) * 4;
+        assert_eq!(&buf[edge..edge + 3], &ALERT_BORDER_COLOR);
+        let center = ((size / 2) * size + size / 2) * 4;
+        assert_eq!(&buf[center..center + 4], &[255, 255, 255, 255], "interior stays the icon color");
     }
 
     #[test]

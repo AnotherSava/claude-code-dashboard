@@ -525,6 +525,9 @@ pub fn emit_sessions_updated(app: &AppHandle) {
     // pid bookkeeping.
     let local: Vec<AgentSession> = sessions.iter().filter(|s| s.origin.is_none()).cloned().collect();
     crate::terminal_title::sync(app, &local);
+    // Per-session context usage feeds the tray's context-alert border, so this
+    // emit chokepoint also keeps the tray icon in step as token counts change.
+    crate::tray_badge::refresh(app);
     let _ = app.emit("sessions_updated", sessions);
     // ...and it doubles again as the sync-push trigger: the pusher debounces
     // pokes and ships *local* sessions to peers. Remote-driven changes must go

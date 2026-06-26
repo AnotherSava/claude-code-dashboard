@@ -87,6 +87,13 @@ pub struct Config {
     /// Read by `tray_badge::refresh`; the tray's "Tray usage badge" submenu
     /// writes it. The hover tooltip always shows both buckets regardless.
     pub tray_badge: TrayBadge,
+    /// Paint a red rounded border on the tray icon when at least one local
+    /// session's context usage reaches this percent of its model's window — an
+    /// at-a-glance "an agent is filling its context" warning that overlays
+    /// whichever badge style is active. `null`/`0` disables it; the border
+    /// never shows when `tray_badge` is `None` (no badge to frame). Read by
+    /// `tray_badge::refresh`.
+    pub tray_context_alert_percent: Option<f32>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -209,9 +216,11 @@ pub struct TelegramConfig {
     /// Context-usage alert: fire a one-shot message when a session's
     /// `input_tokens` over its model's window (longest-prefix lookup in
     /// `context_window_tokens`) crosses this percent.
-    /// `null` or `0` disables it. Edge-triggered — it fires once on crossing
-    /// and re-arms only after usage drops back below the threshold (a new
-    /// task or `/clear` resets the token count).
+    /// `null` or `0` disables it. The alert follows the same lifecycle as the
+    /// per-state notifications: it fires once on crossing, then the message is
+    /// deleted once usage drops back below the threshold (a new task or `/clear`
+    /// resets the token count), the session vanishes, or the feature is turned
+    /// off — and it re-arms after a drop so a later crossing alerts again.
     pub context_alert_percent: Option<f32>,
 }
 
@@ -294,6 +303,7 @@ impl Default for Config {
             detect_cancelled_turns: true,
             sync: SyncConfig::default(),
             tray_badge: TrayBadge::None,
+            tray_context_alert_percent: Some(80.0),
         }
     }
 }
@@ -534,6 +544,16 @@ mod tests {
         assert_eq!(light.tray_badge, TrayBadge::FiveHourLight);
         let num: Config = serde_json::from_str(r#"{ "tray_badge": "seven_day_number" }"#).unwrap();
         assert_eq!(num.tray_badge, TrayBadge::SevenDayNumber);
+    }
+
+    #[test]
+    fn tray_context_alert_percent_defaults_and_parses() {
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(cfg.tray_context_alert_percent, Some(80.0), "default survives an empty config");
+        let set: Config = serde_json::from_str(r#"{ "tray_context_alert_percent": 70 }"#).unwrap();
+        assert_eq!(set.tray_context_alert_percent, Some(70.0));
+        let off: Config = serde_json::from_str(r#"{ "tray_context_alert_percent": null }"#).unwrap();
+        assert_eq!(off.tray_context_alert_percent, None);
     }
 
     #[test]

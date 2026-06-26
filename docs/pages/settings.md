@@ -115,7 +115,7 @@ The `notifications` block controls alerts when a session needs you. Set it to `n
   - `afk_window_ms` — alert once you've been away from the keyboard/mouse this long *and* haven't touched the machine since the state began. This is the "you stepped away and missed it" trigger: if you were at the machine when it happened, it stays silent (you saw it). Omit it to disable the away-detection for that state.
   - `reaction_window_ms` — alert once the state has lasted this long regardless of whether you're present — the backstop for something you need to act on but haven't. Omit it for no backstop.
   - A state with neither window set, or a missing state key, never alerts. By default `done` is away-only (no backstop — a finished task you saw needs no nag), while `awaiting` and `error` also carry a reaction backstop.
-- `context_alert_percent` — send a one-off message when a session's context usage crosses this percent of the active model's window (the same percentage that colors the token counter). It fires once on crossing and re-arms only after usage drops back below — so a new task or `/clear` lets it alert again. `null` or `0` turns it off.
+- `context_alert_percent` — send a message when a session's context usage crosses this percent of the active model's window (the same percentage that colors the token counter). It fires once on crossing, and — like the question/state alerts — the message is deleted automatically once usage drops back below (a new task or `/clear`), so the chat only shows context warnings that are still current. It re-arms after a drop, so a later crossing alerts again. `null` or `0` turns it off.
 
 ### Token coloring
 
@@ -135,6 +135,7 @@ For the full classification logic see [Classification](development/classificatio
 - `limit_bar_segments` — number of segments in the 5-hour / 7-day usage bars; higher is finer-grained.
 - `usage_limits_poll_interval_seconds` — how often to poll Anthropic for usage. Clamped to a 60-second minimum.
 - `tray_badge` — show a usage limit on the tray icon. Values: `"none"`; `"five_hour_light"` / `"seven_day_light"` (recolor the traffic-light icon by usage); `"five_hour_number"` / `"seven_day_number"` (show the percentage, all-red light at 100%). The hover tooltip always shows both figures. Set it from the tray's **Tray usage badge** submenu.
+- `tray_context_alert_percent` — turn the tray icon's border red when any session's context usage reaches this percent of its model's window — an at-a-glance "an agent is filling its context" warning. The light modes draw a red border around the traffic-light icon; the number modes draw a red frame around the digits. `null` or `0` turns it off, and it never shows when `tray_badge` is `"none"` (there's no badge to frame).
 
 ### Multi-device sync
 
