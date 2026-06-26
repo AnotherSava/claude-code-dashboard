@@ -29,3 +29,4 @@
 - [Diagnose state via widget.jsonl](debug_state_transitions_via_widget_jsonl.md) — run /investigate <agent> to reconstruct state + decision chain; or grep the "decision"-tagged lines; don't theorize
 - [Tray badge deferred work](tray_badge_deferred.md) — macOS contrast on number modes + live DPI re-render not done; config.tray_badge set in config/local.json
 - [Startup session restore infeasible](startup_session_restore_infeasible.md) — can't tell closed from idle-open sessions; Claude doesn't hold transcript open; don't re-attempt
+- [Preview tray rendering via PNG test](debug_preview_tray_rendering.md) — throwaway #[ignore] test + png dev-dep renders tray_badge fns to scratchpad PNGs; view, then remove
