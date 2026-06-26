@@ -22,20 +22,30 @@
 //!
 //! The screen alone isn't enough: queuing a *second* prompt while a turn is
 //! still running grows the input box, which can scroll the "esc to interrupt"
-//! footer past the [`TAIL_LINES`] window and make a busy turn read as idle. So
-//! a demote is corroborated against the transcript — when the idle streak
-//! begins we latch the transcript file's mtime, and any write past that
-//! baseline means the turn is still alive (re-arm, don't demote). Only an
-//! unbroken idle streak over a *quiet* transcript demotes; an unreadable
-//! transcript is treated as "can't confirm" and never demotes.
+//! footer past the [`TAIL_LINES`] window and make a busy turn read as idle. Two
+//! corroborations guard against that. First, a *pending queued prompt* is
+//! detected directly: Claude Code writes a `queue-operation` transcript record
+//! (`enqueue` when the user queues a prompt mid-turn, `remove` when it is later
+//! dequeued to run), so an outstanding `enqueue` means the input box is occupied
+//! and the bordered "idle prompt" reading is spurious — [`has_pending_queued_command`]
+//! suppresses the demote outright while one is live. Second, even with no queued
+//! prompt, a demote is corroborated against the transcript mtime — when the idle
+//! streak begins we latch the file's mtime, and any write past that baseline
+//! means the turn is still alive (re-arm, don't demote). Only an unbroken idle
+//! streak over a *quiet*, unqueued transcript demotes; an unreadable transcript
+//! is treated as "can't confirm" and never demotes.
 //!
 //! Windows-only: reading a console's screen buffer is a Win32 facility with no
 //! macOS equivalent. [`crate::terminal_title::read_console_screen`] returns
 //! `None` off-Windows, so the loop never demotes there.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
+
+use serde_json::Value;
 
 use tauri::{AppHandle, Manager};
 
@@ -97,6 +107,55 @@ fn classify(screen: &str) -> Screen {
 /// stat'd (missing, permission, or off a path the watcher isn't tracking).
 fn transcript_mtime(path: PathBuf) -> Option<SystemTime> {
     std::fs::metadata(&path).and_then(|m| m.modified()).ok()
+}
+
+/// Bytes of transcript tail scanned for queue operations. A still-pending
+/// `enqueue` was written during the current (running) turn, so it sits among the
+/// newest records — the tail is enough, and far cheaper than reading a multi-MB
+/// transcript on every demote check.
+const QUEUE_SCAN_TAIL_BYTES: u64 = 64 * 1024;
+
+/// True when the transcript shows a user prompt currently sitting queued in the
+/// input box — an `enqueue` queue-operation with no matching `remove` yet. While
+/// one is outstanding the input box is occupied, so the bordered-input "idle
+/// prompt" the screen classifier keys on is really a *busy* turn whose "esc to
+/// interrupt" footer scrolled off the tail. Reading the file tail (not the whole
+/// transcript) suffices. Any read failure → `false`; the mtime guard downstream
+/// still backstops, so this never causes a demote on its own.
+fn has_pending_queued_command(path: &Path) -> bool {
+    let Ok(mut file) = File::open(path) else { return false };
+    let Ok(len) = file.metadata().map(|m| m.len()) else { return false };
+    if file.seek(SeekFrom::Start(len.saturating_sub(QUEUE_SCAN_TAIL_BYTES))).is_err() {
+        return false;
+    }
+    let mut buf = Vec::new();
+    if file.read_to_end(&mut buf).is_err() {
+        return false;
+    }
+    // Lossy decode so a tail cut landing mid-codepoint can't error the whole
+    // read (the truncated leading line just fails to parse and is skipped).
+    queued_pending(&String::from_utf8_lossy(&buf))
+}
+
+/// Pure net-pending decision over a transcript tail: more `enqueue` than
+/// `remove` queue-operation records means a prompt is still queued. Matched
+/// structurally (a parsed `queue-operation` record), so prose mentioning the
+/// words can't trip it, and a truncated leading line from the tail cut simply
+/// fails to parse and is skipped.
+fn queued_pending(tail: &str) -> bool {
+    let mut net: i32 = 0;
+    for line in tail.lines() {
+        let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
+        if v.get("type").and_then(|t| t.as_str()) != Some("queue-operation") {
+            continue;
+        }
+        match v.get("operation").and_then(|o| o.as_str()) {
+            Some("enqueue") => net += 1,
+            Some("remove") => net -= 1,
+            _ => {}
+        }
+    }
+    net > 0
 }
 
 /// What one idle screen read resolves to, once corroborated against the
@@ -172,10 +231,20 @@ pub fn spawn(app: AppHandle) {
                 };
                 match classify(&screen) {
                     Screen::Idle => {
+                        let path = registry.current_path(&s.id);
+                        // A queued prompt occupies the input box, so its border
+                        // reads as the idle prompt while the turn is still alive
+                        // (the "esc to interrupt" footer scrolled off the tail).
+                        // Suppress the demote outright while one is pending.
+                        if path.as_deref().map(has_pending_queued_command).unwrap_or(false) {
+                            idle_streak.remove(&s.id);
+                            suspect_mtime.remove(&s.id);
+                            continue;
+                        }
                         // Corroborate the idle-looking screen against the
                         // transcript. With no readable transcript we can't prove
                         // the turn ended, so stay fail-safe and never demote.
-                        let Some(mtime) = registry.current_path(&s.id).and_then(transcript_mtime) else {
+                        let Some(mtime) = path.and_then(transcript_mtime) else {
                             idle_streak.remove(&s.id);
                             suspect_mtime.remove(&s.id);
                             continue;
@@ -283,6 +352,49 @@ mod tests {
         // the streak reaches IDLE_STREAK_TO_DEMOTE.
         let base = SystemTime::UNIX_EPOCH;
         assert_eq!(idle_step(1, Some(base), base), IdleStep::Demote);
+    }
+
+    fn queue_op(operation: &str) -> String {
+        format!(r#"{{"type":"queue-operation","operation":"{operation}","sessionId":"s"}}"#)
+    }
+
+    #[test]
+    fn outstanding_enqueue_is_pending() {
+        // The user queued a prompt mid-turn and it hasn't been dequeued yet.
+        let tail = [queue_op("enqueue")].join("\n");
+        assert!(queued_pending(&tail));
+    }
+
+    #[test]
+    fn enqueue_then_remove_is_not_pending() {
+        // The queued prompt was dequeued to run → input box empty again.
+        let tail = [queue_op("enqueue"), queue_op("remove")].join("\n");
+        assert!(!queued_pending(&tail));
+    }
+
+    #[test]
+    fn lone_remove_from_truncated_tail_is_not_pending() {
+        // The matching enqueue scrolled above the tail window; a lone remove
+        // means that prompt was consumed — net negative must read not-pending.
+        let tail = [queue_op("remove")].join("\n");
+        assert!(!queued_pending(&tail));
+    }
+
+    #[test]
+    fn two_queued_one_consumed_is_still_pending() {
+        let tail = [queue_op("enqueue"), queue_op("enqueue"), queue_op("remove")].join("\n");
+        assert!(queued_pending(&tail));
+    }
+
+    #[test]
+    fn no_queue_ops_is_not_pending() {
+        let tail = [
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"working"}]}}"#.to_string(),
+            "a prompt mentioning the words enqueue and queue-operation in prose".to_string(),
+            "{ truncated leading line".to_string(),
+        ]
+        .join("\n");
+        assert!(!queued_pending(&tail));
     }
 
     #[test]
