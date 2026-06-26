@@ -110,6 +110,16 @@ pub struct AgentSession {
     pub origin: Option<String>,
 }
 
+impl AgentSession {
+    /// Name to show the user in notifications and titles: the custom display
+    /// name if one is set, else the chat_id. `display_name` is only populated
+    /// off the `CustomNamesStore` (see [`crate::custom_names::CustomNamesStore::apply`]),
+    /// so this reads the chat_id anywhere that overlay hasn't been applied.
+    pub fn display_label(&self) -> &str {
+        self.display_name.as_deref().unwrap_or(&self.id)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct SetInput {
     pub id: String,

@@ -5,6 +5,7 @@ use std::time::Duration;
 use tauri::{AppHandle, Manager};
 
 use crate::config::{ConfigState, StateNotify};
+use crate::custom_names::CustomNamesStore;
 use crate::state::{AgentSession, AppState, Status};
 use crate::telegram::{SyncOutcome, TelegramNotifier};
 
@@ -35,10 +36,11 @@ pub fn status_key(s: Status) -> &'static str {
 
 pub fn build_message_text(session: &AgentSession) -> String {
     let status = status_key(session.status);
+    let name = session.display_label();
     if session.label.trim().is_empty() {
-        format!("[{}] {}", session.id, status)
+        format!("[{}] {}", name, status)
     } else {
-        format!("[{}] {}\n{}", session.id, status, session.label)
+        format!("[{}] {}\n{}", name, status, session.label)
     }
 }
 
@@ -72,7 +74,7 @@ pub fn build_context_message(session: &AgentSession, window_tokens: &HashMap<Str
     let pct = context_percent(session, window_tokens)?;
     let tokens = session.input_tokens?;
     let max = window_for(session.model.as_ref()?, window_tokens)?;
-    Some(format!("[{}] context {}% ({}/{})", session.id, pct.round() as u32, tokens_k(tokens), tokens_k(max)))
+    Some(format!("[{}] context {}% ({}/{})", session.display_label(), pct.round() as u32, tokens_k(tokens), tokens_k(max)))
 }
 
 /// Reconcile context-usage alerts against the currently-over set, mirroring the
@@ -218,7 +220,14 @@ impl NotificationManager {
                 let Some(cfg_state) = app.try_state::<ConfigState>() else { continue };
                 let Some(app_state) = app.try_state::<AppState>() else { continue };
                 let cfg = cfg_state.snapshot();
-                let sessions = app_state.snapshot();
+                // Local sessions only (notifications stay remote-blind), with the
+                // custom-name overlay applied so a renamed agent's notification
+                // text matches the dashboard. Same resolution as the emit-time
+                // `resolved_snapshot`.
+                let mut sessions = app_state.snapshot();
+                if let Some(names) = app.try_state::<CustomNamesStore>() {
+                    names.apply(&mut sessions);
+                }
 
                 let tg_cfg = cfg
                     .notifications
@@ -254,12 +263,40 @@ impl NotificationManager {
                     let (to_dismiss, to_send) = context_reconcile(threshold, &sessions, &cfg.context_window_tokens, &context_outstanding);
                     // Delete alerts whose session dropped back below the threshold
                     // (or vanished) — same revoke path as per-state notifications.
+                    // Logged per id (greppable `decision`) so the alert lifecycle is
+                    // reconstructable from widget.jsonl like every other state
+                    // decision; the reason distinguishes a usage drop (session still
+                    // present) from a clear/end (session gone).
+                    for id in &to_dismiss {
+                        tracing::debug!(
+                            channel = "telegram",
+                            id = %id,
+                            decision = "context_dismiss",
+                            reason = if sessions.iter().any(|s| &s.id == id) {
+                                "context dropped below threshold"
+                            } else {
+                                "session cleared or ended"
+                            },
+                            "context alert dismissed"
+                        );
+                    }
                     dismiss_and_forget(telegram.as_ref() as &dyn Notifier, &mut context_outstanding, to_dismiss, |h| h.as_str()).await;
                     for s in to_send {
                         let Some(text) = build_context_message(s, &cfg.context_window_tokens) else { continue };
                         match telegram.send_raw(&text).await {
                             // Track the handle so we can delete it when usage drops.
-                            Ok(handle) => { context_outstanding.insert(s.id.clone(), handle); }
+                            Ok(handle) => {
+                                tracing::debug!(
+                                    channel = "telegram",
+                                    id = %s.id,
+                                    decision = "context_alert",
+                                    percent = context_percent(s, &cfg.context_window_tokens).unwrap_or(0.0),
+                                    threshold,
+                                    reason = "context usage crossed alert threshold",
+                                    "context alert sent"
+                                );
+                                context_outstanding.insert(s.id.clone(), handle);
+                            }
                             // Not tracked → the next tick retries this session.
                             Err(e) => tracing::warn!(channel = "telegram", id = %s.id, ?e, "context alert send failed"),
                         }
@@ -575,6 +612,13 @@ mod tests {
     }
 
     #[test]
+    fn message_text_uses_custom_display_name_when_set() {
+        let mut s = session("proj", Status::Awaiting, 0);
+        s.display_name = Some("printlab".into());
+        assert_eq!(build_message_text(&s), "[printlab] awaiting");
+    }
+
+    #[test]
     fn message_text_treats_whitespace_only_label_as_empty() {
         let mut s = session("proj", Status::Done, 0);
         s.label = "   ".into();
@@ -724,5 +768,16 @@ mod tests {
             Some("[proj] context 72% (144k/200k)")
         );
         assert_eq!(build_context_message(&session("proj", Status::Working, 0), &w), None);
+    }
+
+    #[test]
+    fn context_message_uses_custom_display_name_when_set() {
+        let w = windows();
+        let mut s = ctx_session("proj", "m", 144_000);
+        s.display_name = Some("printlab".into());
+        assert_eq!(
+            build_context_message(&s, &w).as_deref(),
+            Some("[printlab] context 72% (144k/200k)")
+        );
     }
 }

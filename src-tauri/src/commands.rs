@@ -21,9 +21,7 @@ fn resolved_snapshot(app: &AppHandle) -> Vec<AgentSession> {
     let mut sessions = state.snapshot();
     sessions.extend(state.remote_snapshot());
     if let Some(names) = app.try_state::<CustomNamesStore>() {
-        for s in &mut sessions {
-            s.display_name = names.get(&s.id);
-        }
+        names.apply(&mut sessions);
     }
     sessions
 }

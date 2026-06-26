@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
+use crate::state::AgentSession;
+
 /// User-assigned display names, keyed by `chat_id` (the cwd-derived row id).
 /// Overrides the chat_id shown in the dashboard. Keyed by chat_id so a name
 /// persists across different Claude sessions for the same project. Stored in
@@ -34,6 +36,17 @@ impl CustomNamesStore {
 
     pub fn get(&self, chat_id: &str) -> Option<String> {
         self.data.lock().unwrap().get(chat_id).cloned()
+    }
+
+    /// Overlay custom display names onto a batch of sessions (each keyed by its
+    /// `id`/chat_id). The single resolution point shared by the emit-time
+    /// snapshot (`commands::resolved_snapshot`) and the notification path, so a
+    /// renamed agent reads the same in the dashboard and in Telegram.
+    pub fn apply(&self, sessions: &mut [AgentSession]) {
+        let data = self.data.lock().unwrap();
+        for s in sessions {
+            s.display_name = data.get(&s.id).cloned();
+        }
     }
 
     /// Sets or, when `name` is empty/whitespace, clears the display name for
