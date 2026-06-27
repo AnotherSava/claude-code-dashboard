@@ -5,7 +5,7 @@
 //! transcript question-detection. The `integrations/claude_hook.py` shim is a
 //! pure transport layer — it hands payloads to this module via `/api/event`.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use serde_json::Value;
 
@@ -99,16 +99,6 @@ pub fn dispatch(event: &str, payload: &Value, cfg: &Config) -> AdapterOutput {
         _ => None,
     };
 
-    // Mark states the `classify` arms derive by scanning transcript text via
-    // `is_a_question` — `Stop` (always) and `Notification`/`SessionStart` of
-    // subtype `idle_prompt`. Because `Stop` fires before the final assistant
-    // turn flushes, that scan can read stale (prior-turn) text; the flag lets
-    // the watcher overturn the resulting `Blocked`/`Done` once the real text
-    // lands. Every other event is an authoritative tool/lifecycle signal.
-    let from_transcript_scan = event == "Stop"
-        || (matches!(event, "Notification" | "SessionStart")
-            && payload.get("notification_type").and_then(|v| v.as_str()) == Some("idle_prompt"));
-
     AdapterOutput::Set {
         input: SetInput {
             id: chat_id,
@@ -118,7 +108,6 @@ pub fn dispatch(event: &str, payload: &Value, cfg: &Config) -> AdapterOutput {
             model: None,
             input_tokens: None,
             dialog_entry,
-            from_transcript_scan,
         },
         transcript_path,
         reason,
@@ -195,25 +184,54 @@ fn classify(
     classify_detailed(event, payload, rules).map(|c| (c.status, c.label))
 }
 
-/// Classify a turn-ending event (`Stop` / idle prompt) by inspecting the final
-/// assistant text: `Blocked "has a question"` if it reads as a hand-back, else
-/// `Done`. `kind` prefixes the decision-log reason ("turn ended" / "idle
-/// prompt"). Shared so both arms detect the question and snippet identically.
-fn classify_turn_end(transcript_path: Option<&str>, rules: QuestionRules, kind: &str) -> Classification {
-    let Some(path) = transcript_path else {
-        return Classification::new(Status::Done, None, format!("{kind}; no transcript path in payload"));
-    };
-    let Some(text) = last_assistant_text(Path::new(path)) else {
-        return Classification::new(Status::Done, None, format!("{kind}; no assistant text flushed to transcript yet"));
-    };
-    if let Some(rule) = question_reason(&text, rules) {
+/// Classify the `Stop` hook straight from its payload — authoritative, no
+/// transcript read. Claude Code carries the final assistant text as
+/// `last_assistant_message` ("Text content of the last assistant message before
+/// stopping. Avoids the need to read and parse the transcript file.") and the
+/// in-flight background work as `background_tasks` (an array, empty/absent when
+/// nothing is running). Precedence: a hand-back question → `Blocked`; else
+/// background work still running → `Waiting` ("looks done but isn't"); else
+/// `Done`. This replaces the old transcript-scan path and the after-the-fact
+/// `Stop`-was-stale corrections, which existed only because the hook used to
+/// fire before the final turn flushed to JSONL.
+fn classify_stop(payload: &Value, rules: QuestionRules) -> Classification {
+    let final_text = payload
+        .get("last_assistant_message")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    if let Some(text) = final_text {
+        if let Some(rule) = question_reason(text, rules) {
+            return Classification::new(
+                Status::Blocked,
+                Some("has a question".into()),
+                format!("turn ended on a question [{rule}]: \"{}\"", evidence_snippet(text)),
+            );
+        }
+    }
+
+    // `background_tasks` is present (and non-empty) only while background work is
+    // in flight — the signal for the "main turn settled but subagents are still
+    // running" Waiting state, set here at Stop time instead of scraped from the
+    // transcript's `pendingBackgroundAgentCount`. Label is left unset so the
+    // working task label is preserved while the row waits.
+    let background_pending = payload
+        .get("background_tasks")
+        .and_then(|v| v.as_array())
+        .filter(|tasks| !tasks.is_empty());
+    if let Some(tasks) = background_pending {
         return Classification::new(
-            Status::Blocked,
-            Some("has a question".into()),
-            format!("{kind} on a question [{rule}]: \"{}\"", evidence_snippet(&text)),
+            Status::Waiting,
+            None,
+            format!("turn ended with {} background task(s) still in flight → waiting", tasks.len()),
         );
     }
-    Classification::new(Status::Done, None, format!("{kind}; final message is not a question: \"{}\"", evidence_snippet(&text)))
+
+    match final_text {
+        Some(text) => Classification::new(Status::Done, None, format!("turn ended; final message is not a question: \"{}\"", evidence_snippet(text))),
+        None => Classification::new(Status::Done, None, "turn ended; no final assistant message in payload"),
+    }
 }
 
 fn classify_detailed(
@@ -221,11 +239,6 @@ fn classify_detailed(
     payload: &Value,
     rules: QuestionRules,
 ) -> Option<Classification> {
-    let transcript_path = payload
-        .get("transcript_path")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.trim().is_empty());
-
     match event {
         "UserPromptSubmit" => {
             let prompt = payload.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
@@ -254,7 +267,7 @@ fn classify_detailed(
                 Some(Classification::new(Status::Working, Some(clean_prompt(prompt)), "slash command invoked (early Working signal)"))
             }
         }
-        "Stop" => Some(classify_turn_end(transcript_path, rules, "turn ended")),
+        "Stop" => Some(classify_stop(payload, rules)),
         "PreToolUse" => {
             let tool_name = payload.get("tool_name").and_then(|v| v.as_str()).unwrap_or("");
             if !USER_GATING_TOOLS.contains(&tool_name) {
@@ -276,8 +289,15 @@ fn classify_detailed(
             if notif_type.is_empty() && message.trim().is_empty() {
                 return Some(Classification::new(Status::Idle, None, format!("{event} with no notification payload → idle")));
             }
+            // `idle_prompt` (Claude sitting at the idle input prompt ~60s after a
+            // turn) is ignored: `Stop` already settled the row authoritatively
+            // from its payload, so re-deriving the verdict from the transcript
+            // here is pure redundancy — and `idle_prompt` is a flaky fixed timer
+            // we can't lean on (often doesn't fire, never for `AskUserQuestion`).
+            // A blanket settle is also wrong: a pending plain-text question sits
+            // at the same idle prompt and must stay `Blocked`.
             if notif_type == "idle_prompt" {
-                return Some(classify_turn_end(transcript_path, rules, "idle prompt"));
+                return None;
             }
             let label = notification_label(notif_type, message);
             let cleaned = clean_prompt(&label);
@@ -387,48 +407,6 @@ fn clean_prompt(text: &str) -> String {
     collapsed.trim().to_string()
 }
 
-/// Walk the transcript JSONL and return the latest non-empty assistant text
-/// block. Returns `None` when the file is missing or contains no assistant
-/// content.
-fn last_assistant_text(path: &Path) -> Option<String> {
-    let contents = std::fs::read_to_string(path).ok()?;
-    let mut last_text = String::new();
-    for line in contents.lines() {
-        let Ok(value) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        let Some(msg) = value.get("message").filter(|v| v.is_object()) else {
-            continue;
-        };
-        if msg.get("role").and_then(|v| v.as_str()) != Some("assistant") {
-            continue;
-        }
-        match msg.get("content") {
-            Some(Value::String(s)) => {
-                let trimmed = s.trim();
-                if !trimmed.is_empty() {
-                    last_text = trimmed.to_string();
-                }
-            }
-            Some(Value::Array(blocks)) => {
-                for block in blocks {
-                    if block.get("type").and_then(|v| v.as_str()) != Some("text") {
-                        continue;
-                    }
-                    if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
-                        let trimmed = text.trim();
-                        if !trimmed.is_empty() {
-                            last_text = trimmed.to_string();
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    if last_text.is_empty() { None } else { Some(last_text) }
-}
-
 /// Phrases that signal the agent has handed control back to the user — asking
 /// permission, or asking a direct second-person question. Empirically derived
 /// from real assistant messages — only patterns that actually appeared are
@@ -504,6 +482,11 @@ fn opens_with_benign_offer(sentence: &str, benign_openers: &[String]) -> bool {
 /// question); the last paragraph issues a hand-back request for input
 /// (`Paste …` / `Please provide …` / `Confirm …`); or the last paragraph
 /// *opens* with a question that a concluding statement then follows.
+///
+/// Test-only wrapper over [`question_reason`] — production code calls
+/// `question_reason` directly (it needs the matched-rule string for the decision
+/// log). Kept `#[cfg(test)]` for the extensive question-detection unit tests.
+#[cfg(test)]
 pub(crate) fn is_a_question(text: &str, rules: QuestionRules) -> bool {
     question_reason(text, rules).is_some()
 }
@@ -686,7 +669,7 @@ fn strip_trailing_options(text: &str) -> &str {
 mod tests {
     use super::*;
     use serde_json::json;
-    use std::io::Write;
+    use std::path::Path;
 
     fn cfg_with(projects_root: Option<&str>, benign_closers: &[&str]) -> Config {
         let mut cfg = Config::default();
@@ -702,34 +685,6 @@ mod tests {
     /// closer-suffix tests read the same as before the openers were added.
     fn with_closers(closers: &[String]) -> QuestionRules<'_> {
         QuestionRules { closers, openers: &[] }
-    }
-
-    fn write_transcript(lines: &[Value]) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "claude_code_dashboard_claude_adapter_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("transcript.jsonl");
-        let mut f = std::fs::File::create(&path).unwrap();
-        for v in lines {
-            writeln!(f, "{}", serde_json::to_string(v).unwrap()).unwrap();
-        }
-        path
-    }
-
-    fn assistant_text(text: &str) -> Value {
-        json!({
-            "type": "assistant",
-            "message": {
-                "role": "assistant",
-                "content": [{"type": "text", "text": text}]
-            }
-        })
     }
 
     // ----- derive_chat_id -----
@@ -876,33 +831,64 @@ mod tests {
         assert_eq!(label, None);
     }
 
-    // ----- classify: Stop -----
+    // ----- classify: Stop (from the `last_assistant_message` + `background_tasks` payload) -----
 
     #[test]
-    fn stop_without_transcript_is_done() {
+    fn stop_without_final_message_is_done() {
+        // No `last_assistant_message` in the payload (e.g. a turn that ended on
+        // tool use with no final text) → Done.
         let (status, label) = classify("Stop", &json!({}), NO_RULES).unwrap();
         assert_eq!(status, Status::Done);
         assert_eq!(label, None);
     }
 
     #[test]
-    fn stop_with_question_ending_is_blocked() {
-        let t = write_transcript(&[assistant_text("Should I proceed?")]);
-        let p = json!({"transcript_path": t.to_string_lossy()});
+    fn stop_with_question_final_message_is_blocked() {
+        let p = json!({"last_assistant_message": "Should I proceed?"});
         let (status, label) = classify("Stop", &p, NO_RULES).unwrap();
         assert_eq!(status, Status::Blocked);
         assert_eq!(label.as_deref(), Some("has a question"));
-        let _ = std::fs::remove_dir_all(t.parent().unwrap());
     }
 
     #[test]
-    fn stop_without_question_ending_is_done() {
-        let t = write_transcript(&[assistant_text("All tests passing.")]);
-        let p = json!({"transcript_path": t.to_string_lossy()});
+    fn stop_with_statement_final_message_is_done() {
+        let p = json!({"last_assistant_message": "All tests passing."});
         let (status, label) = classify("Stop", &p, NO_RULES).unwrap();
         assert_eq!(status, Status::Done);
         assert_eq!(label, None);
-        let _ = std::fs::remove_dir_all(t.parent().unwrap());
+    }
+
+    #[test]
+    fn stop_with_in_flight_background_tasks_is_waiting() {
+        // Background work still running when the main turn settles → Waiting,
+        // with no label so the prior task label is preserved.
+        let p = json!({
+            "last_assistant_message": "Kicked off the batch.",
+            "background_tasks": [{"id": "1", "type": "shell", "status": "running", "description": "build"}]
+        });
+        let (status, label) = classify("Stop", &p, NO_RULES).unwrap();
+        assert_eq!(status, Status::Waiting);
+        assert_eq!(label, None);
+    }
+
+    #[test]
+    fn stop_with_empty_background_tasks_array_is_done() {
+        let p = json!({"last_assistant_message": "Done.", "background_tasks": []});
+        let (status, _) = classify("Stop", &p, NO_RULES).unwrap();
+        assert_eq!(status, Status::Done);
+    }
+
+    #[test]
+    fn stop_question_takes_precedence_over_background_tasks() {
+        // A hand-back question wins over Waiting — the user needs to act, even
+        // while background work continues.
+        let p = json!({
+            "last_assistant_message": "Should I deploy?",
+            "background_tasks": [{"id": "1", "type": "shell", "status": "running"}]
+        });
+        let (status, label) = classify("Stop", &p, NO_RULES).unwrap();
+        assert_eq!(status, Status::Blocked);
+        assert_eq!(label.as_deref(), Some("has a question"));
     }
 
     // ----- classify: Notification -----
@@ -926,29 +912,11 @@ mod tests {
     }
 
     #[test]
-    fn notification_idle_prompt_with_question_is_blocked() {
-        let t = write_transcript(&[assistant_text("What would you like me to do next?")]);
-        let p = json!({
-            "notification_type": "idle_prompt",
-            "transcript_path": t.to_string_lossy(),
-        });
-        let (status, label) = classify("Notification", &p, NO_RULES).unwrap();
-        assert_eq!(status, Status::Blocked);
-        assert_eq!(label.as_deref(), Some("has a question"));
-        let _ = std::fs::remove_dir_all(t.parent().unwrap());
-    }
-
-    #[test]
-    fn notification_idle_prompt_without_question_is_done() {
-        let t = write_transcript(&[assistant_text("All set.")]);
-        let p = json!({
-            "notification_type": "idle_prompt",
-            "transcript_path": t.to_string_lossy(),
-        });
-        let (status, label) = classify("Notification", &p, NO_RULES).unwrap();
-        assert_eq!(status, Status::Done);
-        assert_eq!(label, None);
-        let _ = std::fs::remove_dir_all(t.parent().unwrap());
+    fn notification_idle_prompt_is_ignored() {
+        // `idle_prompt` is no longer classified — `Stop` already settled the row,
+        // so the redundant (and flaky) transcript re-scan was removed.
+        let p = json!({"notification_type": "idle_prompt"});
+        assert!(classify("Notification", &p, NO_RULES).is_none());
     }
 
     #[test]
@@ -1016,52 +984,6 @@ mod tests {
     #[test]
     fn unknown_event_returns_none() {
         assert!(classify("PreToolUse", &json!({}), NO_RULES).is_none());
-    }
-
-    // ----- last_assistant_text -----
-
-    #[test]
-    fn missing_file_returns_none() {
-        assert!(last_assistant_text(Path::new("/definitely/missing/transcript.jsonl")).is_none());
-    }
-
-    #[test]
-    fn last_assistant_text_skips_user_entries() {
-        let path = write_transcript(&[
-            assistant_text("First answer?"),
-            json!({"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": "follow"}]}}),
-            assistant_text("Ok, done."),
-        ]);
-        assert_eq!(last_assistant_text(&path).as_deref(), Some("Ok, done."));
-        let _ = std::fs::remove_dir_all(path.parent().unwrap());
-    }
-
-    #[test]
-    fn last_assistant_text_ignores_empty_blocks() {
-        let path = write_transcript(&[assistant_text("Real question?"), assistant_text("   ")]);
-        assert_eq!(last_assistant_text(&path).as_deref(), Some("Real question?"));
-        let _ = std::fs::remove_dir_all(path.parent().unwrap());
-    }
-
-    #[test]
-    fn last_assistant_text_skips_malformed_lines() {
-        let dir = std::env::temp_dir().join(format!(
-            "claude_code_dashboard_claude_adapter_malformed_{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("transcript.jsonl");
-        let mut f = std::fs::File::create(&path).unwrap();
-        writeln!(f, "not json").unwrap();
-        writeln!(
-            f,
-            "{}",
-            serde_json::to_string(&assistant_text("Proceed?")).unwrap()
-        )
-        .unwrap();
-        drop(f);
-        assert_eq!(last_assistant_text(&path).as_deref(), Some("Proceed?"));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ----- question_reason / evidence_snippet (decision-log evidence) -----

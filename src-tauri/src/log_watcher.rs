@@ -29,12 +29,6 @@ pub struct InferredState {
     /// The newest state-bearing entry is an Esc-cancel interrupt marker — the
     /// turn ended with no hook. Drives a `Working`→`Idle` demotion.
     pub ended: bool,
-    /// Background subagents still running at the latest turn boundary (from the
-    /// newest `turn_duration` record's `pendingBackgroundAgentCount`). Non-zero
-    /// means the main turn's `Stop` settled the row to `Done` while work
-    /// continues — `infer_state` forces `state = Working` so the promote-only
-    /// watcher holds the row there until the final (zero-pending) turn's `Stop`.
-    pub pending_background: u64,
 }
 
 /// Walk JSONL lines newest-first and derive current state, last-known model,
@@ -42,24 +36,13 @@ pub struct InferredState {
 pub fn infer_state(lines: &[&str]) -> Option<InferredState> {
     let mut result = InferredState::default();
     let mut saw_conversational = false;
-    let mut saw_turn_duration = false;
 
     for line in lines.iter().rev() {
         let entry: TranscriptEntry = match serde_json::from_str(line) {
             Ok(e) => e,
             Err(_) => continue,
         };
-        // `turn_duration` is the last record Claude Code writes at each turn
-        // boundary, carrying `pendingBackgroundAgentCount` only when background
-        // subagents are still in flight. Walking newest-first, the first one we
-        // hit is the current count; lock onto it so a stale older turn's count
-        // can't leak through. (Claude-Code-version-specific field — absent on
-        // versions that don't emit it, leaving `pending_background` at 0.)
         if entry.entry_type == "system" {
-            if !saw_turn_duration && !entry.is_sidechain && entry.subtype.as_deref() == Some("turn_duration") {
-                saw_turn_duration = true;
-                result.pending_background = entry.pending_background_agent_count.unwrap_or(0);
-            }
             continue;
         }
         if entry.entry_type != "user" && entry.entry_type != "assistant" {
@@ -102,7 +85,12 @@ pub fn infer_state(lines: &[&str]) -> Option<InferredState> {
             }
         }
 
-        if result.state.is_none() {
+        // Sidechain (Task subagent / background-agent) entries run in their own
+        // context and never determine the main row's state — skipping them keeps
+        // background work from flipping a `Waiting` row (set at `Stop` time from
+        // the hook's `background_tasks`) back to `Working`. Model/tokens are
+        // already main-session-only above.
+        if result.state.is_none() && !entry.is_sidechain {
             let has_tool_use = content.iter().any(|b| b.block_type == "tool_use");
             let has_tool_result = content.iter().any(|b| b.block_type == "tool_result");
             let has_text = content.iter().any(|b| {
@@ -133,19 +121,6 @@ pub fn infer_state(lines: &[&str]) -> Option<InferredState> {
         if result.state.is_some() && result.model.is_some() && result.input_tokens.is_some() {
             break;
         }
-    }
-
-    // Background subagents are still running. An *active* main turn (real tool
-    // use just now) stays `Working`; a turn that already resolved to `Done`/idle
-    // with agents still pending becomes `Waiting` — the row is alive only because
-    // of background work. Either way the promote-only watcher carries the row back
-    // from a too-early `Stop`; the final (zero-pending) turn's `Stop` settles
-    // `Done` naturally. Don't override an Esc-cancel (no pending background work).
-    if result.pending_background >= 1 && !result.ended {
-        result.state = Some(match result.state {
-            Some(Status::Working) => Status::Working,
-            _ => Status::Waiting,
-        });
     }
 
     if !saw_conversational
@@ -276,14 +251,6 @@ struct TranscriptEntry {
     entry_type: String,
     #[serde(default, rename = "isSidechain")]
     is_sidechain: bool,
-    /// Discriminator on `system`-type entries (e.g. `"turn_duration"`,
-    /// `"stop_hook_summary"`). Absent on conversational entries.
-    #[serde(default)]
-    subtype: Option<String>,
-    /// Present on a `turn_duration` system entry only while background subagents
-    /// are still running after the turn — the count of in-flight agents.
-    #[serde(default, rename = "pendingBackgroundAgentCount")]
-    pending_background_agent_count: Option<u64>,
     message: Option<TranscriptMessage>,
     attachment: Option<TranscriptAttachment>,
 }
@@ -504,43 +471,6 @@ async fn drain(app: &AppHandle, chat_id: &str, path: &Path, state: &Arc<Mutex<Dr
     apply_and_emit(app, chat_id, &update, text_entries);
 }
 
-/// What a freshly-flushed transcript update says about the question-vs-done
-/// verdict the `Stop` hook had to guess before the final turn flushed.
-#[derive(Debug, PartialEq, Eq)]
-enum FlushedVerdict {
-    /// The settled final assistant turn reads as a question — correct a `Done`
-    /// row up to `Blocked` (`AppState::promote_done_to_blocked`).
-    Question,
-    /// The settled final assistant turn reads as a plain statement — correct a
-    /// scan-derived `Blocked` row back down to `Done`
-    /// (`AppState::demote_scanned_blocked_to_done`).
-    Statement,
-}
-
-/// Classify a freshly-flushed update, or `None` when it carries no verdict.
-/// A verdict exists only when `infer_state` yielded `Done` (the newest
-/// conversational entry is a *completed* assistant text turn, not a tool
-/// call or an in-flight turn) and that turn has text — exactly the moment the
-/// final assistant text lands, which the `Stop` hook fired too early to read.
-/// Kept pure (no app/config handles) so the decision is unit-testable; the
-/// caller supplies `benign_closers` from config and routes the verdict to the
-/// matching `AppState` correction.
-fn flushed_turn_verdict(
-    update: &InferredState,
-    text_entries: &[(DialogRole, String)],
-    rules: crate::adapters::claude::QuestionRules,
-) -> Option<FlushedVerdict> {
-    if !matches!(update.state, Some(Status::Done)) {
-        return None;
-    }
-    let (_, text) = text_entries.iter().rev().find(|(role, _)| *role == DialogRole::Assistant)?;
-    Some(if crate::adapters::claude::is_a_question(text, rules) {
-        FlushedVerdict::Question
-    } else {
-        FlushedVerdict::Statement
-    })
-}
-
 fn apply_and_emit(app: &AppHandle, chat_id: &str, update: &InferredState, text_entries: Vec<(DialogRole, String)>) {
     let Some(app_state) = app.try_state::<AppState>() else {
         return;
@@ -564,15 +494,6 @@ fn apply_and_emit(app: &AppHandle, chat_id: &str, update: &InferredState, text_e
             chat_id,
             decision = "resume_working",
             reason = "transcript shows new activity (tool call or user turn) after a pause; promoted to Working",
-            "decision"
-        );
-    } else if prior_status != Status::Waiting && new_status == Status::Waiting {
-        // The main turn settled (Done) but background subagents are still running —
-        // the row is held on the distinct Waiting state rather than a forced Working.
-        tracing::debug!(
-            chat_id,
-            decision = "enter_waiting",
-            reason = %format!("main turn settled but {} background agent(s) still running; held on Waiting", update.pending_background),
             "decision"
         );
     }
@@ -599,46 +520,6 @@ fn apply_and_emit(app: &AppHandle, chat_id: &str, update: &InferredState, text_e
         );
     }
     let demoted = reverted_to.is_some();
-    // The `Stop` hook settles a finished turn before its final assistant text
-    // flushes to JSONL, so it can read the *prior* turn and stamp the wrong
-    // question-vs-done verdict. Now that the text has flushed, correct it both
-    // ways: a real question that `Stop` called `Done` → `Blocked`; a plain
-    // statement that `Stop` (reading a prior question) called `Blocked` →
-    // `Done`. The demote is gated inside `AppState` on the scan-derived flag so
-    // a tool-gated `Blocked` is never touched. Runs before `apply_text_entries`
-    // so the appended assistant entry is stamped with the corrected status.
-    let last_assistant = text_entries
-        .iter()
-        .rev()
-        .find(|(role, _)| *role == DialogRole::Assistant)
-        .map(|(_, t)| crate::adapters::claude::evidence_snippet(t))
-        .unwrap_or_default();
-    let cfg = app.try_state::<ConfigState>().map(|c| c.snapshot()).unwrap_or_default();
-    let corrected = match flushed_turn_verdict(
-        update,
-        &text_entries,
-        crate::adapters::claude::QuestionRules::from_config(&cfg),
-    ) {
-        Some(FlushedVerdict::Question) if app_state.promote_done_to_blocked(chat_id, now) => {
-            tracing::debug!(
-                chat_id,
-                decision = "correct_to_blocked",
-                reason = %format!("flushed final assistant turn reads as a question (Stop fired before it landed and settled Done): \"{last_assistant}\""),
-                "decision"
-            );
-            true
-        }
-        Some(FlushedVerdict::Statement) if app_state.demote_scanned_blocked_to_done(chat_id, now) => {
-            tracing::debug!(
-                chat_id,
-                decision = "correct_to_done",
-                reason = %format!("flushed final assistant turn reads as a statement (Stop had read a stale prior question and settled Blocked): \"{last_assistant}\""),
-                "decision"
-            );
-            true
-        }
-        _ => false,
-    };
     let dialog_changed = if !text_entries.is_empty() {
         app_state.apply_text_entries(chat_id, &text_entries, now)
     } else {
@@ -654,7 +535,7 @@ fn apply_and_emit(app: &AppHandle, chat_id: &str, update: &InferredState, text_e
             h.save_to_disk();
         }
     }
-    if metric_changed || dialog_changed || demoted || corrected {
+    if metric_changed || dialog_changed || demoted {
         emit_sessions_updated(app);
     }
 }
@@ -803,67 +684,32 @@ mod tests {
         assert_eq!(r.state, Some(Status::Working));
     }
 
-    // -------- background-agent (turn_duration) tests --------
+    // -------- turn_duration / sidechain skipping --------
+    // The `Waiting` state is now set at `Stop` time from the hook's
+    // `background_tasks` payload (see `adapters::claude::classify_stop`), not
+    // inferred from the transcript's `pendingBackgroundAgentCount`. `infer_state`
+    // just skips `turn_duration` system records and sidechain entries so neither
+    // can disturb the main row's state.
 
     #[test]
-    fn pending_background_yields_waiting_over_done() {
-        // The main turn ended (assistant text → Done), but a trailing
-        // turn_duration reports 4 background agents still running. The row is held
-        // on the distinct Waiting state — alive only because of background work.
-        let lines = [assistant_text("Batch B done."), turn_duration(Some(4))];
-        let r = infer_state(&refs(&lines)).unwrap();
-        assert_eq!(r.pending_background, 4);
-        assert_eq!(r.state, Some(Status::Waiting));
-    }
-
-    #[test]
-    fn active_turn_with_pending_stays_working() {
-        // Real tool use just now AND agents pending → the main turn is genuinely
-        // active, so it stays Working (not Waiting).
+    fn active_turn_with_trailing_turn_duration_stays_working() {
+        // Real tool use just now, with a trailing turn_duration system record →
+        // the system record is skipped and the main turn stays Working.
         let lines = [assistant_tool_use(), turn_duration(Some(2))];
         assert_eq!(infer_state(&refs(&lines)).unwrap().state, Some(Status::Working));
     }
 
     #[test]
-    fn zero_pending_turn_duration_leaves_done() {
-        // The final turn writes a turn_duration with no count → background work
-        // is finished → the assistant-text Done verdict stands.
+    fn trailing_turn_duration_does_not_disturb_done() {
+        // A turn_duration flushed after the final assistant text is a system
+        // record → skipped, so the assistant-text Done verdict stands.
         let lines = [assistant_text("All batches in."), turn_duration(None)];
-        let r = infer_state(&refs(&lines)).unwrap();
-        assert_eq!(r.pending_background, 0);
-        assert_eq!(r.state, Some(Status::Done));
+        assert_eq!(infer_state(&refs(&lines)).unwrap().state, Some(Status::Done));
     }
 
     #[test]
-    fn newest_turn_duration_wins_over_stale_pending() {
-        // An earlier turn had agents pending; the latest turn closed them out
-        // (no count). Walking newest-first must lock onto the latest → Done.
-        let lines = [
-            assistant_text("kicked off agents"),
-            turn_duration(Some(2)),
-            assistant_text("all agents reported in"),
-            turn_duration(None),
-        ];
-        let r = infer_state(&refs(&lines)).unwrap();
-        assert_eq!(r.pending_background, 0);
-        assert_eq!(r.state, Some(Status::Done));
-    }
-
-    #[test]
-    fn pending_background_alone_yields_waiting() {
-        // The turn_duration can flush in its own write, separate from the
-        // assistant text — a chunk with no conversational entry still resolves to
-        // Waiting (no active main turn, agents pending), rather than None.
-        let lines = [turn_duration(Some(1))];
-        let r = infer_state(&refs(&lines)).unwrap();
-        assert_eq!(r.pending_background, 1);
-        assert_eq!(r.state, Some(Status::Waiting));
-    }
-
-    #[test]
-    fn interrupt_marker_not_overridden_by_stale_pending() {
-        // An Esc-cancel must still demote even if an older turn_duration carried
-        // a pending count — a cancelled turn has no live background work.
+    fn interrupt_marker_not_overridden_by_turn_duration() {
+        // An Esc-cancel must still demote even with an older turn_duration present.
         let lines = [
             turn_duration(Some(2)),
             assistant_tool_use(),
@@ -875,18 +721,18 @@ mod tests {
     }
 
     #[test]
-    fn sidechain_turn_duration_is_ignored() {
-        // Defensive: a turn_duration flagged isSidechain isn't the main session's
-        // boundary and must not drive the row.
-        let sidechain_td = json!({
-            "type": "system", "subtype": "turn_duration",
-            "isSidechain": true, "pendingBackgroundAgentCount": 3
+    fn sidechain_activity_does_not_set_state() {
+        // Background / Task subagent (sidechain) tool use after the main turn's
+        // Done text must not flip the row to Working — the main Done text wins, so
+        // a Waiting row (set at Stop from background_tasks) is left alone by the
+        // watcher's promote-only update.
+        let sidechain_tool = json!({
+            "type": "assistant", "isSidechain": true,
+            "message": { "role": "assistant", "content": [{ "type": "tool_use", "name": "Read" }] }
         })
         .to_string();
-        let lines = [assistant_text("done"), sidechain_td];
-        let r = infer_state(&refs(&lines)).unwrap();
-        assert_eq!(r.pending_background, 0);
-        assert_eq!(r.state, Some(Status::Done));
+        let lines = [assistant_text("Batch B done."), sidechain_tool];
+        assert_eq!(infer_state(&refs(&lines)).unwrap().state, Some(Status::Done));
     }
 
     // -------- extract_text_entries tests --------
@@ -1130,7 +976,6 @@ mod tests {
             id: "s".into(),
             status,
             status_before_working: Status::Idle,
-            status_from_transcript_scan: false,
             label: String::new(),
             original_prompt: None,
             task_started_at: 0,
@@ -1195,63 +1040,6 @@ mod tests {
         assert_eq!(s.status, Status::Working);
     }
 
-    fn done() -> InferredState {
-        InferredState { state: Some(Status::Done), ..Default::default() }
-    }
-
-    use crate::adapters::claude::QuestionRules;
-    /// No config-driven openers/closers — the bare heuristics only.
-    const NO_RULES: QuestionRules = QuestionRules { closers: &[], openers: &[] };
-
-    #[test]
-    fn flushed_verdict_is_question_when_done_and_last_assistant_is_a_question() {
-        let entries = vec![(DialogRole::Assistant, "Should I proceed?".to_string())];
-        assert_eq!(flushed_turn_verdict(&done(), &entries, NO_RULES), Some(FlushedVerdict::Question));
-    }
-
-    #[test]
-    fn flushed_verdict_is_statement_when_done_and_last_assistant_is_not_a_question() {
-        let entries = vec![(DialogRole::Assistant, "All tests pass.".to_string())];
-        assert_eq!(flushed_turn_verdict(&done(), &entries, NO_RULES), Some(FlushedVerdict::Statement));
-    }
-
-    #[test]
-    fn flushed_verdict_is_none_when_state_is_not_done() {
-        // Mid-turn the row is Working; a transient assistant text ending in `?`
-        // must yield no verdict — only a settled Done turn is corrected.
-        let working = InferredState { state: Some(Status::Working), ..Default::default() };
-        let entries = vec![(DialogRole::Assistant, "Should I proceed?".to_string())];
-        assert_eq!(flushed_turn_verdict(&working, &entries, NO_RULES), None);
-    }
-
-    #[test]
-    fn flushed_verdict_is_none_when_no_assistant_entry() {
-        let entries = vec![(DialogRole::User, "hi".to_string())];
-        assert_eq!(flushed_turn_verdict(&done(), &entries, NO_RULES), None);
-    }
-
-    #[test]
-    fn flushed_verdict_decided_by_newest_assistant_entry() {
-        // A user reply may separate two assistant turns in one flush; the newest
-        // assistant text decides — here the last turn is a plain statement, so
-        // the verdict is Statement even though an earlier turn was a question.
-        let entries = vec![
-            (DialogRole::Assistant, "Should I proceed?".to_string()),
-            (DialogRole::User, "yes".to_string()),
-            (DialogRole::Assistant, "Done, no question here.".to_string()),
-        ];
-        assert_eq!(flushed_turn_verdict(&done(), &entries, NO_RULES), Some(FlushedVerdict::Statement));
-    }
-
-    #[test]
-    fn flushed_verdict_respects_benign_closers() {
-        // A benign closer isn't a real question → Statement, not Question.
-        let entries = vec![(DialogRole::Assistant, "What's next?".to_string())];
-        let benign = vec!["What's next?".to_string()];
-        let rules = QuestionRules { closers: &benign, openers: &[] };
-        assert_eq!(flushed_turn_verdict(&done(), &entries, rules), Some(FlushedVerdict::Statement));
-    }
-
     #[test]
     fn merge_updates_model_and_tokens_even_when_state_unchanged() {
         let mut s = make_session(Status::Working);
@@ -1262,7 +1050,6 @@ mod tests {
                 model: Some("claude-opus-4-7".into()),
                 input_tokens: Some(42_100),
                 ended: false,
-                pending_background: 0,
             },
             500,
         );
@@ -1283,7 +1070,6 @@ mod tests {
                 model: Some("claude-opus-4-7".into()),
                 input_tokens: Some(100),
                 ended: false,
-                pending_background: 0,
             },
             500,
         );

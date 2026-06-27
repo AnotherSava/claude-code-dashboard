@@ -388,7 +388,6 @@ mod tests {
             id: id.to_string(),
             status,
             status_before_working: Status::Idle,
-            status_from_transcript_scan: false,
             label: String::new(),
             original_prompt: None,
             task_started_at: 0,

@@ -546,7 +546,6 @@ mod tests {
             id: id.to_string(),
             status: Status::Working,
             status_before_working: Status::Idle,
-            status_from_transcript_scan: false,
             label: "label".into(),
             original_prompt: None,
             task_started_at: 0,

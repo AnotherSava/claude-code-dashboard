@@ -8,10 +8,11 @@ pub enum Status {
     #[default]
     Idle,
     Working,
-    /// Held active by background subagents after the main turn already settled —
-    /// "looks done but isn't". Watcher-driven only (`log_watcher` forces it over a
-    /// Done verdict when `pendingBackgroundAgentCount > 0`); no lifecycle hook
-    /// produces it. Rendered light-blue as "WAIT".
+    /// Held active by background work after the main turn already settled —
+    /// "looks done but isn't". Set at `Stop` time from the hook's
+    /// `background_tasks` payload (see `adapters::claude::classify_stop`); the
+    /// next turn's `Stop` (empty `background_tasks`) settles it to `Done`.
+    /// Rendered light-blue as "WAIT".
     Waiting,
     /// Blocked on the user: a question, a tool-permission prompt, or an MCP
     /// elicitation. Rendered amber as "BLOCK". (Formerly `Blocked`.)
@@ -79,19 +80,6 @@ pub struct AgentSession {
     /// Internal bookkeeping — never serialized to the frontend / sync / disk.
     #[serde(skip)]
     pub status_before_working: Status,
-    /// True when the current status was produced by the Claude adapter's
-    /// transcript question-scan (the `Stop` / `idle_prompt` `is_a_question`
-    /// path) rather than by an authoritative tool-gating signal
-    /// (`AskUserQuestion`, `PermissionRequest`, …). Because `Stop` fires before
-    /// the final assistant turn flushes to JSONL, that scan can read the prior
-    /// turn's text and stamp the wrong question-vs-done verdict; this flag tells
-    /// the transcript watcher which `Blocked` rows it may overturn once the
-    /// real text lands (`demote_scanned_blocked_to_done`) and which it must
-    /// leave alone. Only ever set `true` for those scan-derived states, so a
-    /// tool-gated `Blocked` is never demoted. Internal bookkeeping — never
-    /// serialized to the frontend / sync / disk.
-    #[serde(skip)]
-    pub status_from_transcript_scan: bool,
     pub label: String,
     pub original_prompt: Option<String>,
     #[serde(default)]
@@ -136,9 +124,6 @@ pub struct SetInput {
     pub model: Option<String>,
     pub input_tokens: Option<u64>,
     pub dialog_entry: Option<PendingDialogEntry>,
-    /// Set by the adapter for states derived from the transcript question-scan
-    /// (`Stop`, `idle_prompt`); copied onto [`AgentSession::status_from_transcript_scan`].
-    pub from_transcript_scan: bool,
 }
 
 /// True when `label` (after trim, case-insensitive) matches one of the
@@ -280,7 +265,6 @@ impl AppState {
             }
 
             existing.status = input.status;
-            existing.status_from_transcript_scan = input.from_transcript_scan;
             existing.label = new_label;
             existing.original_prompt = new_original_prompt;
             if let Some(src) = input.source {
@@ -373,7 +357,6 @@ impl AppState {
                 id: input.id,
                 status: input.status,
                 status_before_working: Status::Idle,
-                status_from_transcript_scan: input.from_transcript_scan,
                 label,
                 original_prompt,
                 task_started_at,
@@ -424,62 +407,6 @@ impl AppState {
         s.state_entered_at = now_ms;
         s.updated = now_ms;
         Some(s.status)
-    }
-
-    /// Correct a settled `Done` row to `Blocked` once the transcript reveals
-    /// its final assistant turn was a question. The `Stop` hook fires *before*
-    /// Claude flushes that final turn to JSONL, so it reads stale text and can't
-    /// tell a question-ending turn from a plain one — it defaults to `Done`. The
-    /// watcher sees the flushed text moments later and calls this to fix the one
-    /// case `Stop` was blind to. Restricted to `Done → Blocked`: a row still
-    /// `Working` is left for `Stop`/`UserPromptSubmit` to settle (so a transient
-    /// mid-turn assistant text block ending in `?` can't false-promote), and a
-    /// row that already moved on (e.g. the user sent the next prompt) is left
-    /// alone. Returns true if it acted.
-    pub fn promote_done_to_blocked(&self, id: &str, now_ms: i64) -> bool {
-        let mut sessions = self.sessions.lock().unwrap();
-        let Some(s) = sessions.iter_mut().find(|s| s.id == id) else {
-            return false;
-        };
-        if s.status != Status::Done {
-            return false;
-        }
-        s.status = Status::Blocked;
-        s.status_from_transcript_scan = true;
-        s.label = "has a question".into();
-        s.state_entered_at = now_ms;
-        s.updated = now_ms;
-        true
-    }
-
-    /// The mirror of [`Self::promote_done_to_blocked`]: correct a settled
-    /// `Blocked` back to `Done` once the flushed transcript shows the final
-    /// assistant turn was *not* a question. Same root cause — `Stop` fires
-    /// before the final turn flushes, so when a non-question turn ends right
-    /// after a question turn it reads the *prior* (question) text and wrongly
-    /// stamps `Blocked "has a question"`. Gated on
-    /// [`AgentSession::status_from_transcript_scan`], so only a scan-derived
-    /// `Blocked` is touched — a genuine tool-gated `Blocked` (`AskUserQuestion`,
-    /// `PermissionRequest`, …) is never demoted even though it shares the label.
-    /// The corrected `Done` shows the row's `original_prompt` (the stable task),
-    /// since the wrong `Blocked` clobbered the prior label. Stays
-    /// scan-derived so a later flush can correct it again. Returns true if it
-    /// acted.
-    pub fn demote_scanned_blocked_to_done(&self, id: &str, now_ms: i64) -> bool {
-        let mut sessions = self.sessions.lock().unwrap();
-        let Some(s) = sessions.iter_mut().find(|s| s.id == id) else {
-            return false;
-        };
-        if s.status != Status::Blocked || !s.status_from_transcript_scan {
-            return false;
-        }
-        s.status = Status::Done;
-        if let Some(prompt) = s.original_prompt.clone() {
-            s.label = prompt;
-        }
-        s.state_entered_at = now_ms;
-        s.updated = now_ms;
-        true
     }
 
     /// Mark a session-boundary in the in-memory dialog. Called when the
@@ -610,7 +537,6 @@ mod tests {
             model: None,
             input_tokens: None,
             dialog_entry: None,
-            from_transcript_scan: false,
         }
     }
 
@@ -623,14 +549,7 @@ mod tests {
             model: None,
             input_tokens: None,
             dialog_entry: None,
-            from_transcript_scan: false,
         }
-    }
-
-    /// A `set` whose status was derived from the transcript question-scan
-    /// (`Stop` / `idle_prompt`) — the only kind the watcher may overturn.
-    fn scan_set(id: &str, status: Status, label: &str) -> SetInput {
-        SetInput { from_transcript_scan: true, ..set(id, status, label) }
     }
 
     fn get<'a>(state: &'a AppState, id: &str) -> AgentSession {
@@ -687,77 +606,6 @@ mod tests {
         let state = AppState::new();
         state.apply_set(set("a", Status::Blocked, "run bash?"), 0, NO_CONTINUATIONS, None);
         assert_eq!(state.revert_cancelled_turn("a", 20_000), None);
-        assert_eq!(get(&state, "a").status, Status::Blocked);
-    }
-
-    #[test]
-    fn promote_done_to_blocked_corrects_a_settled_question_turn() {
-        // `Stop` settled the row to Done before the final assistant text flushed
-        // (so it couldn't see the trailing question); the watcher now corrects it.
-        let state = AppState::new();
-        state.apply_set(set("a", Status::Done, ""), 0, NO_CONTINUATIONS, None);
-        assert!(state.promote_done_to_blocked("a", 5_000));
-        let s = get(&state, "a");
-        assert_eq!(s.status, Status::Blocked);
-        assert_eq!(s.label, "has a question");
-        assert_eq!(s.state_entered_at, 5_000);
-        assert_eq!(s.updated, 5_000);
-    }
-
-    #[test]
-    fn promote_done_to_blocked_is_noop_when_not_done() {
-        // Mid-turn the row is Working; a transient assistant text block ending in
-        // `?` must not flip it — only a settled Done row is corrected.
-        let state = AppState::new();
-        state.apply_set(set("a", Status::Working, "fix the parser"), 0, NO_CONTINUATIONS, None);
-        assert!(!state.promote_done_to_blocked("a", 5_000));
-        assert_eq!(get(&state, "a").status, Status::Working);
-    }
-
-    #[test]
-    fn demote_scanned_blocked_corrects_a_stale_question_read() {
-        // `Stop` read the *prior* turn's question and stamped Blocked on a turn
-        // that actually ended on a statement; the watcher corrects it to Done,
-        // restoring the task label from original_prompt.
-        let state = AppState::new();
-        state.apply_set(set("a", Status::Working, "fix the parser"), 0, NO_CONTINUATIONS, None);
-        state.apply_set(scan_set("a", Status::Blocked, "has a question"), 10_000, NO_CONTINUATIONS, None);
-        assert_eq!(get(&state, "a").status, Status::Blocked);
-        assert!(state.demote_scanned_blocked_to_done("a", 20_000));
-        let s = get(&state, "a");
-        assert_eq!(s.status, Status::Done);
-        assert_eq!(s.label, "fix the parser", "label restored to the task");
-        assert_eq!(s.state_entered_at, 20_000);
-    }
-
-    #[test]
-    fn demote_scanned_blocked_leaves_tool_gated_blocked_alone() {
-        // The safety-critical case: a real tool gate (not scan-derived) shares
-        // the "has a question" label but must never be demoted.
-        let state = AppState::new();
-        state.apply_set(set("a", Status::Working, "fix the parser"), 0, NO_CONTINUATIONS, None);
-        state.apply_set(set("a", Status::Blocked, "needs approval: Bash"), 10_000, NO_CONTINUATIONS, None);
-        assert!(!state.demote_scanned_blocked_to_done("a", 20_000));
-        assert_eq!(get(&state, "a").status, Status::Blocked);
-    }
-
-    #[test]
-    fn demote_scanned_blocked_is_noop_when_not_blocked() {
-        let state = AppState::new();
-        state.apply_set(scan_set("a", Status::Done, ""), 0, NO_CONTINUATIONS, None);
-        assert!(!state.demote_scanned_blocked_to_done("a", 5_000));
-        assert_eq!(get(&state, "a").status, Status::Done);
-    }
-
-    #[test]
-    fn tool_gate_clears_the_scan_flag_so_a_later_demote_is_blocked() {
-        // A scan-derived Blocked that's then overwritten by a tool gate must
-        // lose its scan provenance, so the watcher can no longer demote it.
-        let state = AppState::new();
-        state.apply_set(set("a", Status::Working, "task"), 0, NO_CONTINUATIONS, None);
-        state.apply_set(scan_set("a", Status::Blocked, "has a question"), 1_000, NO_CONTINUATIONS, None);
-        state.apply_set(set("a", Status::Blocked, "needs approval: tool"), 2_000, NO_CONTINUATIONS, None);
-        assert!(!state.demote_scanned_blocked_to_done("a", 3_000));
         assert_eq!(get(&state, "a").status, Status::Blocked);
     }
 
@@ -915,7 +763,6 @@ mod tests {
                 model: Some("claude-opus-4-7".into()),
                 input_tokens: Some(50_000),
                 dialog_entry: None,
-                from_transcript_scan: false,
             },
             1000,
             NO_CONTINUATIONS,
@@ -1090,7 +937,6 @@ mod tests {
                 role: DialogRole::User,
                 text: label.to_string(),
             }),
-            from_transcript_scan: false,
         }
     }
 
@@ -1106,7 +952,6 @@ mod tests {
                 role: DialogRole::Assistant,
                 text: agent_text.to_string(),
             }),
-            from_transcript_scan: false,
         }
     }
 
@@ -1254,7 +1099,6 @@ mod tests {
             id: "a".into(),
             status: Status::Done,
             status_before_working: Status::Idle,
-            status_from_transcript_scan: false,
             label: String::new(),
             original_prompt: None,
             task_started_at: 0,
@@ -1464,7 +1308,6 @@ mod tests {
             id: id.to_string(),
             status: Status::Working,
             status_before_working: Status::Idle,
-            status_from_transcript_scan: false,
             label: String::new(),
             original_prompt: None,
             task_started_at: 0,
