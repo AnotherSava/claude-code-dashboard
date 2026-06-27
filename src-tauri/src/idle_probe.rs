@@ -104,13 +104,42 @@ fn classify(screen: &str) -> Screen {
     let lines: Vec<&str> = screen.lines().filter(|l| !l.trim().is_empty()).collect();
     let start = lines.len().saturating_sub(TAIL_LINES);
     let tail = lines[start..].join("\n");
-    if BUSY_MARKERS.iter().any(|m| tail.contains(m)) || has_active_timer(&tail) {
+    if BUSY_MARKERS.iter().any(|m| tail.contains(m)) || has_active_spinner(&tail) || has_active_timer(&tail) {
         Screen::Busy
     } else if tail.contains(PROMPT_BORDER) {
         Screen::Idle
     } else {
         Screen::Unknown
     }
+}
+
+/// Claude Code's animated spinner glyphs — the star/sparkle cycle shown while a
+/// turn is generating. The idle *summary* line reuses one too ("✻ Cooked for 2m
+/// 19s"), so the glyph alone isn't enough; [`has_active_spinner`] also requires
+/// the "…" ellipsis, which only the live spinner carries.
+///
+/// Deliberately ONLY the star/sparkle glyphs — punctuation like `·` / `*` / `∗`
+/// was tried and removed: those start ordinary prose/bullet/separator lines, so a
+/// post-cancel screen whose tail held a response line such as "* foo …" misread
+/// as an active spinner and wedged the row in `Working`.
+const SPINNER_GLYPHS: &[char] = &['✶', '✷', '✸', '✹', '✺', '✻', '✼', '✽', '✢', '✳', '✦'];
+
+/// True if the tail shows Claude's *active* spinner — a line that begins (after
+/// indentation) with a [`SPINNER_GLYPHS`] glyph and carries the "…" ellipsis,
+/// e.g. "✽ Wrangling…". This is the earliest "still working" signal: it renders
+/// from the very first frame of a turn, *before* the running clock or "esc to
+/// interrupt" appear — the start-of-turn window where idle_probe used to misread
+/// the screen as idle and revert a just-submitted turn straight back out of
+/// `Working`. It also survives the user typing a follow-up. A genuine Esc-cancel
+/// removes the spinner (leaving the bare "Cooked for …" summary, which has no
+/// ellipsis), so this never suppresses real cancel detection. Supersedes
+/// [`has_active_timer`] for the spinner line; the clock check stays as a fallback
+/// for any spinner glyph not in the set above.
+fn has_active_spinner(tail: &str) -> bool {
+    tail.lines().any(|line| {
+        let t = line.trim_start();
+        t.starts_with(SPINNER_GLYPHS) && t.contains('…')
+    })
 }
 
 /// True if the tail shows the spinner's running clock — "(49s", "(2m 3s",
@@ -385,6 +414,28 @@ mod tests {
         // Generating screen also has the input-box border — busy must win.
         let screen = format!("{b}\n❯\n{b}\n esc to interrupt", b = PROMPT_BORDER);
         assert_eq!(classify(&screen), Screen::Busy);
+    }
+
+    #[test]
+    fn start_of_turn_spinner_is_busy() {
+        // Captured live: the first ~2s of a turn show the spinner with no clock
+        // and no "esc to interrupt" yet — only "✽ Wrangling…". Must read Busy or
+        // idle_probe false-reverts the row right after UserPromptSubmit.
+        let screen = format!(
+            "✻ Churned for 5m 48s\n❯ 2\n✽ Wrangling…\n{b}\n❯\n{b}\n  ⏵⏵ auto mode on (shift+tab to cycle)",
+            b = PROMPT_BORDER
+        );
+        assert_eq!(classify(&screen), Screen::Busy);
+    }
+
+    #[test]
+    fn active_spinner_distinguished_from_idle_summary() {
+        assert!(has_active_spinner("✽ Wrangling…"));
+        assert!(has_active_spinner("✶ Smooshing… (49s · ↓ 1.4k tokens)"));
+        assert!(has_active_spinner("  ✻ Pondering…")); // indented
+        assert!(!has_active_spinner("✻ Churned for 5m 48s")); // summary: glyph but no …
+        assert!(!has_active_spinner("some prose with an ellipsis … in it")); // no leading glyph
+        assert!(!has_active_spinner("❯ 2")); // input line
     }
 
     #[test]
