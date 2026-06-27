@@ -35,6 +35,17 @@
 //! streak over a *quiet*, unqueued transcript demotes; an unreadable transcript
 //! is treated as "can't confirm" and never demotes.
 //!
+//! One more guard covers the *start* of a turn rather than its middle: for the
+//! first [`WORKING_GRACE_MS`] after a row enters `Working`, the probe doesn't
+//! demote at all. Right after a `UserPromptSubmit` (notably answering a pending
+//! question) the new turn hasn't rendered its spinner or written the transcript
+//! yet, so its screen reads as the idle prompt over a quiet transcript — the
+//! same picture as an instant cancel. Without the grace, that bounced a
+//! legitimately-answered row straight back to its pre-prompt `Blocked`, where it
+//! stuck (the probe is demote-only) until the transcript finally advanced. The
+//! grace waits for the spinner to appear (→ `Screen::Busy`); a real instant
+//! cancel still reverts, just after the delay.
+//!
 //! Windows-only: reading a console's screen buffer is a Win32 facility with no
 //! macOS equivalent. [`crate::terminal_title::read_console_screen`] returns
 //! `None` off-Windows, so the loop never demotes there.
@@ -91,6 +102,18 @@ const IDLE_STREAK_TO_DEMOTE: u32 = 2;
 /// demote on an instant cancel; each tick only reads consoles for rows that
 /// are actually `Working`, so an idle dashboard does no console work.
 const POLL: Duration = Duration::from_secs(1);
+
+/// How long a row must have been `Working` before the probe may revert it.
+/// Right after a `UserPromptSubmit` the new turn hasn't rendered its spinner or
+/// written to the transcript yet, so the screen still shows the idle prompt over
+/// a quiet transcript — indistinguishable from an instant Esc-cancel, which
+/// otherwise bounces a legitimately-answered row straight back to its pre-prompt
+/// status (the real bug this guards). Waiting out this window lets the spinner
+/// appear (→ `Screen::Busy`, no demote); a genuine instant cancel still reverts,
+/// just after this delay. Anchored to `state_entered_at`, so it's an absolute
+/// floor that idle reads can't reset — robust even when the screen looks idle
+/// for the whole start-of-turn window.
+const WORKING_GRACE_MS: i64 = 5_000;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Screen {
@@ -279,6 +302,13 @@ fn idle_step(prior_streak: u32, baseline: Option<SystemTime>, mtime: SystemTime)
     }
 }
 
+/// True while a `Working` row is still inside its start-of-turn grace window and
+/// must not be demoted yet (see [`WORKING_GRACE_MS`]). `saturating_sub` keeps a
+/// future/skewed `state_entered_at` reading as "just entered".
+fn within_start_grace(now_ms: i64, state_entered_at: i64) -> bool {
+    now_ms.saturating_sub(state_entered_at) < WORKING_GRACE_MS
+}
+
 pub fn spawn(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
         // chat_id → consecutive idle reads.
@@ -314,6 +344,17 @@ pub fn spawn(app: AppHandle) {
             suspect_mtime.retain(|id, _| idle_streak.contains_key(id));
 
             for s in sessions.iter().filter(|s| s.status == Status::Working) {
+                // A just-started turn hasn't rendered its spinner or written to
+                // the transcript yet, so its screen reads as the idle prompt over
+                // a quiet transcript — the same picture as an instant Esc-cancel.
+                // Hold off until the start-of-turn grace elapses (by then the
+                // spinner is up → Busy), so answering a question can't be misread
+                // as a cancel and bounced back to the pre-prompt status.
+                if within_start_grace(now_ms(), s.state_entered_at) {
+                    idle_streak.remove(&s.id);
+                    suspect_mtime.remove(&s.id);
+                    continue;
+                }
                 let candidates = titles.candidates(&s.id);
                 if candidates.is_empty() {
                     continue;
@@ -501,6 +542,19 @@ mod tests {
         // the streak reaches IDLE_STREAK_TO_DEMOTE.
         let base = SystemTime::UNIX_EPOCH;
         assert_eq!(idle_step(1, Some(base), base), IdleStep::Demote);
+    }
+
+    #[test]
+    fn start_grace_holds_then_expires() {
+        // A freshly-Working row (just answered a question) is protected from the
+        // demote for WORKING_GRACE_MS, then becomes eligible — so the spinner has
+        // time to appear before the probe can revert it.
+        let entered = 1_000_000;
+        assert!(within_start_grace(entered, entered), "same instant is in grace");
+        assert!(within_start_grace(entered + WORKING_GRACE_MS - 1, entered), "just under the window");
+        assert!(!within_start_grace(entered + WORKING_GRACE_MS, entered), "window elapsed → eligible");
+        assert!(!within_start_grace(entered + 60_000, entered), "long-running turn is eligible");
+        assert!(within_start_grace(entered - 500, entered), "clock skew reads as just-entered");
     }
 
     fn queue_op(operation: &str) -> String {
