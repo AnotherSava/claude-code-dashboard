@@ -26,6 +26,7 @@
 - [Auto-resize DPI drift](debug_auto_resize_dpi_drift.md) — mixed-DPI multi-monitor needed to repro; widget.jsonl dpr≠scale + xy march = resize loop; fix = send physical px
 - [Auto-resize children-sum race](debug_auto_resize_children_race.md) — stuck scrollbar (window < content); summing .list children raced Svelte reconciliation, desired one row short; fix = measure non-stretching .list-inner + ResizeObserver
 - [Terminal promote-to-Working unsafe](terminal_promote_to_working_unsafe.md) — reverted; esc-to-interrupt strands rows; use UserPromptExpansion hook; idle_probe stays demote-only
+- [idle_probe screen criteria are TUI-sensitive](idle_probe_screen_criteria_tui_sensitive.md) — typing strips "esc to interrupt"; spinner clock is the busy signal; re-validate flapping via decision=idle_probe_screen capture
 - [Diagnose state via widget.jsonl](debug_state_transitions_via_widget_jsonl.md) — run /investigate <agent> to reconstruct state + decision chain; or grep the "decision"-tagged lines; don't theorize
 - [Tray badge deferred work](tray_badge_deferred.md) — macOS contrast on number modes + live DPI re-render not done; config.tray_badge set in config/local.json
 - [Startup session restore infeasible](startup_session_restore_infeasible.md) — can't tell closed from idle-open sessions; Claude doesn't hold transcript open; don't re-attempt
