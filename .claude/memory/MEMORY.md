@@ -33,4 +33,5 @@
 - [Preview tray rendering via PNG test](debug_preview_tray_rendering.md) — throwaway #[ignore] test + png dev-dep renders tray_badge fns to scratchpad PNGs; view, then remove
 - [5h resets_at jitters ±1min](usage_five_hour_resets_at_jitter.md) — never use five_hour_resets_at as a reset signal; detect reset by pct drop, intensity = max(0, Δpct)
 - [Context-alert tracking not persisted](context_alert_outstanding_not_persisted.md) — context_outstanding is in-memory; app restart orphans Telegram alerts (known, deliberately unfixed); grep decision=context_alert/context_dismiss
+- [Hook research findings](hooks_research_findings.md) — adopted Stop.last_assistant_message + background_tasks (removed correction machinery + pendingBackgroundAgentCount scrape); rejected idle_prompt/PostToolUse/MessageDisplay; no token data in hooks; latest-version-only
 - [Doppler secret storage](doppler_secret_storage.md) — bot_token/chat_id/sync token live in Doppler project `claude-code-dashboard`/`dev`; deploy renders local.template.json → local.json then wipes it; no plaintext secrets at rest
