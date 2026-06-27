@@ -143,7 +143,7 @@
     session.input_tokens !== null ? formatTokens(session.input_tokens) : '',
   )
   const tokColor = $derived(tokenColor(session, config))
-  const shouldPulse = $derived(session.status === 'awaiting' || session.status === 'error')
+  const shouldPulse = $derived(session.status === 'blocked' || session.status === 'error')
 
   function formatClock(ms: number): string {
     if (!ms) return ' --:--'
@@ -355,7 +355,11 @@
     background: #1e40af;
     color: #bfdbfe;
   }
-  .state-awaiting {
+  .state-waiting {
+    background: #0284c7;
+    color: #e0f2fe;
+  }
+  .state-blocked {
     background: #b45309;
     color: #fde68a;
   }

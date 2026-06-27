@@ -40,14 +40,14 @@ The adapter recognizes six event names. Anything else returns `Ignore` and the w
 |---                 |---                                                                                  |---                                                             |
 | `SessionStart`     | `idle` (no fields) — otherwise treated like `Notification`                          | Used to seed an empty row before any user activity.            |
 | `UserPromptSubmit` | `working`                                                                           | Label is the cleaned prompt; blank prompt → label `None`.      |
-| `Notification`     | `awaiting` (default) — `done` if `notification_type == "idle_prompt"` with no question | See the notification-type table below.                      |
-| `PreToolUse`       | `awaiting` for `AskUserQuestion` / `ExitPlanMode` only; other tools ignored         | Label: `"has a question"` for `AskUserQuestion`, `"plan approval"` for `ExitPlanMode`. The matcher in `~/.claude/settings.json` should restrict the hook to these two tools (see [Installation → Wire the Claude Code hook](../install#2-wire-the-claude-code-hook)) — Claude Code buffers the `tool_use` block until the user answers, so the JSONL transcript can't carry the signal in flight. |
-| `Stop`             | `done` — flips to `awaiting` if last assistant turn contains a question (see [detection rules](#transcript-question-detection)) | Question check ignores configured benign closers. `Stop` fires *before* the final assistant turn flushes to JSONL, so it classifies from the **prior** turn's text and can be wrong either way — missing a trailing question (→ wrong `done`) or, when a statement turn follows a question turn, reading the stale question (→ wrong `awaiting`). The transcript watcher corrects both once the real text lands (see [data flow](data-flow)). |
+| `Notification`     | `blocked` (default) — `done` if `notification_type == "idle_prompt"` with no question | See the notification-type table below.                      |
+| `PreToolUse`       | `blocked` for `AskUserQuestion` / `ExitPlanMode` only; other tools ignored         | Label: `"has a question"` for `AskUserQuestion`, `"plan approval"` for `ExitPlanMode`. The matcher in `~/.claude/settings.json` should restrict the hook to these two tools (see [Installation → Wire the Claude Code hook](../install#2-wire-the-claude-code-hook)) — Claude Code buffers the `tool_use` block until the user answers, so the JSONL transcript can't carry the signal in flight. |
+| `Stop`             | `done` — flips to `blocked` if last assistant turn contains a question (see [detection rules](#transcript-question-detection)) | Question check ignores configured benign closers. `Stop` fires *before* the final assistant turn flushes to JSONL, so it classifies from the **prior** turn's text and can be wrong either way — missing a trailing question (→ wrong `done`) or, when a statement turn follows a question turn, reading the stale question (→ wrong `blocked`). The transcript watcher corrects both once the real text lands (see [data flow](data-flow)). |
 | `SessionEnd`       | emits `Clear` (removes the row)                                                     | Bypasses status classification entirely.                       |
 
 `SessionStart` and `Notification` share a code path because Claude Code occasionally emits notifications under either name; the dispatcher merges them.
 
-`PostToolUse` is intentionally ignored. Once the user answers an `AskUserQuestion` / `ExitPlanMode`, the next `UserPromptSubmit` or the transcript watcher carries the row out of `awaiting`.
+`PostToolUse` is intentionally ignored. Once the user answers an `AskUserQuestion` / `ExitPlanMode`, the next `UserPromptSubmit` or the transcript watcher carries the row out of `blocked`.
 
 ### Notification subtypes
 
@@ -55,10 +55,10 @@ The adapter recognizes six event names. Anything else returns `Ignore` and the w
 
 | `notification_type`  | Status                                                       | Label                                                |
 |---                   |---                                                           |---                                                   |
-| `permission_prompt`  | `awaiting`                                                   | `"needs approval: <tool>"` — `<tool>` is the text after `"use "` in the message; falls back to `"tool"` if the marker is absent. |
-| `plan_approval`      | `awaiting`                                                   | `"plan approval"` (fixed)                            |
-| `idle_prompt`        | `awaiting` if transcript ends with `?` (non-benign), else `done` | `"has a question"` when flipped, else `None`     |
-| anything else        | `awaiting`                                                   | cleaned `payload.message`, truncated to 60 chars     |
+| `permission_prompt`  | `blocked`                                                   | `"needs approval: <tool>"` — `<tool>` is the text after `"use "` in the message; falls back to `"tool"` if the marker is absent. |
+| `plan_approval`      | `blocked`                                                   | `"plan approval"` (fixed)                            |
+| `idle_prompt`        | `blocked` if transcript ends with `?` (non-benign), else `done` | `"has a question"` when flipped, else `None`     |
+| anything else        | `blocked`                                                   | cleaned `payload.message`, truncated to 60 chars     |
 | empty type, empty message | `idle`                                                  | `None`                                               |
 
 The 60-char truncation counts **characters, not bytes**, so multi-byte glyphs (emoji, CJK) are never split mid-codepoint.
@@ -78,7 +78,7 @@ Other Unicode passes through untouched — accents, emoji, CJK, math symbols. Th
 
 ## Transcript question detection
 
-`Stop` and `Notification` (subtype `idle_prompt`) need to decide whether the agent is genuinely done or is actually waiting for an answer. The transcript watcher (`log_watcher.rs`) is a third caller: it reuses `is_a_question` to re-judge the verdict once the final assistant turn flushes to JSONL — the case `Stop` fires too early to read — and corrects the row **both ways** (`done → awaiting` for a missed question, `awaiting → done` for a stale-read one). The watcher's demote is gated on a provenance flag (`status_from_transcript_scan`) so it only overturns `awaiting` rows that came from this scan, never a tool-gating `awaiting` (see [data flow](data-flow)). The flow has two helpers:
+`Stop` and `Notification` (subtype `idle_prompt`) need to decide whether the agent is genuinely done or is actually waiting for an answer. The transcript watcher (`log_watcher.rs`) is a third caller: it reuses `is_a_question` to re-judge the verdict once the final assistant turn flushes to JSONL — the case `Stop` fires too early to read — and corrects the row **both ways** (`done → blocked` for a missed question, `blocked → done` for a stale-read one). The watcher's demote is gated on a provenance flag (`status_from_transcript_scan`) so it only overturns `blocked` rows that came from this scan, never a tool-gating `blocked` (see [data flow](data-flow)). The flow has two helpers:
 
 **`last_assistant_text(path)`** — walks the JSONL transcript at `payload.transcript_path`:
 
@@ -95,7 +95,7 @@ Other Unicode passes through untouched — accents, emoji, CJK, math symbols. Th
 **Path 1 — trailing `?`:**
 
 1. If `text` (after trim) ends with `)`, peel off one trailing `(...)` group **only when** the substring before the matching `(` ends with `?`. This handles option lists like `"Save these? (all / numbers / none)"` → `"Save these?"`. Other trailing parens (e.g. `"Look at this code (foo.py)"`) are left alone — there's no `?` before them, so the text falls through unchanged.
-2. After that strip, if the text ends with `?`, two filters can skip this path. First, `Config::benign_closers` — case-insensitive suffix match (default `"What's next?"`); a hit skips. Second, `Config::benign_openers` — case-insensitive prefix match against the **final sentence** (default `"anything"`); a sign-off like `"Anything you'd like to look at?"` opens with a benign offer word and so skips. Both exist because Claude often signs off with a polite question that isn't a real ask — flipping to `awaiting` on every `What's next?` or `Anything else?` would be noise. An embedded real ask isn't lost: it's still caught downstream by the permission-seeking path (Path 2), so `"Anything else, or shall I commit?"` stays `awaiting`.
+2. After that strip, if the text ends with `?`, two filters can skip this path. First, `Config::benign_closers` — case-insensitive suffix match (default `"What's next?"`); a hit skips. Second, `Config::benign_openers` — case-insensitive prefix match against the **final sentence** (default `"anything"`); a sign-off like `"Anything you'd like to look at?"` opens with a benign offer word and so skips. Both exist because Claude often signs off with a polite question that isn't a real ask — flipping to `blocked` on every `What's next?` or `Anything else?` would be noise. An embedded real ask isn't lost: it's still caught downstream by the permission-seeking path (Path 2), so `"Anything else, or shall I commit?"` stays `blocked`.
 
 **Path 2 — hand-back phrase in last paragraph:**
 
@@ -136,13 +136,14 @@ Failure modes are silent: a missing transcript file returns `None` from `last_as
 
 ## Decision log
 
-Every status-affecting decision is written to `widget.jsonl` (the same tracing sink `logging.rs` owns) as a structured line carrying a stable `decision` field and a human `reason`, keyed by the resolved `chat_id`. The reason for a question verdict names which detection path fired and quotes a snippet of the assistant text, so "why is this row `awaiting`?" is answerable from the log alone — no transcript or source reading.
+Every status-affecting decision is written to `widget.jsonl` (the same tracing sink `logging.rs` owns) as a structured line carrying a stable `decision` field and a human `reason`, keyed by the resolved `chat_id`. The reason for a question verdict names which detection path fired and quotes a snippet of the assistant text, so "why is this row `blocked`?" is answerable from the log alone — no transcript or source reading.
 
 | `decision`                            | Emitted from              | Meaning                                                                                                                                                                      |
 |---                                    |---                        |---                                                                                                                                                                          |
 | `classify`                            | `http_server` (`event -> set`) | A hook event set the row's status. For `Stop` / idle prompts the `reason` reads `<kind> on a question [<rule>]: "<snippet>"` or `<kind>; final message is not a question: "<snippet>"`, where `<kind>` is `turn ended` or `idle prompt`. |
-| `resume_working`                      | `log_watcher`             | The transcript watcher saw new activity (a tool call or user turn) after a pause and promoted the row back to `working` — the path that clears a stale `awaiting` once the user answers an `AskUserQuestion`. |
-| `correct_to_awaiting` / `correct_to_done` | `log_watcher`         | The watcher re-judged the final assistant turn once it flushed, fixing a verdict `Stop` made too early (see [transcript question detection](#transcript-question-detection)). |
+| `resume_working`                      | `log_watcher`             | The transcript watcher saw new activity (a tool call or user turn) after a pause and promoted the row back to `working` — the path that clears a stale `blocked` once the user answers an `AskUserQuestion`. |
+| `enter_waiting`                        | `log_watcher`             | The main turn settled (`done`) but `pendingBackgroundAgentCount > 0`, so the row is held on the `waiting` state (light-blue WAIT) until the agents finish. |
+| `correct_to_blocked` / `correct_to_done` | `log_watcher`         | The watcher re-judged the final assistant turn once it flushed, fixing a verdict `Stop` made too early (see [transcript question detection](#transcript-question-detection)). |
 | `revert_cancelled`                    | `log_watcher` / `idle_probe` | An Esc-cancelled turn (no lifecycle hook) reverted to its pre-prompt status — the `status` field records where it landed.                                              |
 | `apply_set`                           | `state.rs`                | The state-machine transition: `prior_status` → `new_status`, plus `task_boundary` and `continuation_suppressed`.                                                            |
 | `session_clear` / `compact_boundary`  | `http_server`             | Session removed / context-compaction history separator inserted.                                                                                                            |

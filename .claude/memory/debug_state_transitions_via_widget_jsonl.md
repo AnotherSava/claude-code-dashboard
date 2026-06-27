@@ -12,7 +12,7 @@ Fastest path — the project-local `investigate` skill reconstructs an agent's c
     /investigate <agent>     # or: python3 .claude/skills/investigate/investigate.py <agent>
     /investigate             # no name → lists active sessions to choose from
 
-Decision codes: `classify` (adapter event→status; the question path's reason carries the matched `question_reason` rule + an `evidence_snippet` of the assistant text, so "why Awaiting?" needs no transcript), `resume_working` / `correct_to_awaiting` / `correct_to_done` / `revert_cancelled` (watcher + `idle_probe` corrections; `revert_cancelled` logs the reverted-to status), `apply_set` (the `state.rs` transition: `prior_status`, `task_boundary`, `continuation_suppressed`), `session_clear` / `compact_boundary`.
+Decision codes: `classify` (adapter event→status; the question path's reason carries the matched `question_reason` rule + an `evidence_snippet` of the assistant text, so "why Blocked?" needs no transcript), `resume_working` / `enter_waiting` / `correct_to_blocked` / `correct_to_done` / `revert_cancelled` (watcher + `idle_probe` corrections; `enter_waiting` = the background-agents `Waiting` state; `revert_cancelled` logs the reverted-to status), `apply_set` (the `state.rs` transition: `prior_status`, `task_boundary`, `continuation_suppressed`), `session_clear` / `compact_boundary`.
 
 Manual grep when you want the raw lines:
 

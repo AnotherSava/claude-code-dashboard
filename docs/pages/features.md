@@ -18,20 +18,21 @@ Each Claude Code session becomes one row. The row's `id` is *initially* derived 
 The row's status badge tracks the agent in real time:
 
 - **WORK** — Claude is working on your task. Timer accumulates total time spent working on the same prompt across approval cycles.
-- **WAIT** — Claude is blocked on you. The row shows the agent's current question or permission request.
+- **WAIT** — the main turn finished but background subagents Claude spawned are still running, so the row stays active (light-blue) rather than dropping to DONE while work continues.
+- **BLOCK** — Claude is blocked on you. The row shows the agent's current question or permission request.
 - **IDLE** — the session is alive but not actively working. A task you cancel with Esc usually settles here too: cancelling sends no event of its own, but the dashboard notices the turn ended and settles the row back on its own — to idle, or back to a question it was waiting on (on by default, see [Settings](settings#behavior)).
 - **DONE** — Claude finished the task and isn't waiting on you. Timer shows time since it finished.
 - **ERROR** — the hook reported an error; the row shows the error text.
 
-Each badge is color-coded, and WAIT and ERROR pulse to draw your eye when a session needs attention.
+Each badge is color-coded, and BLOCK and ERROR pulse to draw your eye when a session needs attention.
 
 ## Color terminal tabs
 
-Each session's status is mirrored onto the terminal tab it runs in, as a colored circle next to the session name — 🔵 working, 🟠 waiting on you, 🟢 done, 🔴 error. A glance at your terminal tabs shows which session needs attention, even without the widget on screen. The title updates the moment the status changes and clears when the session ends. On by default; the tray's **Color terminal tabs** toggle turns it off.
+Each session's status is mirrored onto the terminal tab it runs in, as a colored circle next to the session name — 🔵 working (also background-agent WAIT), 🟠 blocked on you, 🟢 done, 🔴 error. A glance at your terminal tabs shows which session needs attention, even without the widget on screen. The title updates the moment the status changes and clears when the session ends. On by default; the tray's **Color terminal tabs** toggle turns it off.
 
 ## Focus on the task
 
-While Claude is blocked on you (WAIT), the row shows the question or approval request, so you know what it needs. Once you answer and Claude resumes (WORK), the row goes back to showing your **original request** rather than the *yes* you typed — so a quick approval or a *continue* never replaces your task on screen. The work timer pauses during WAIT — replaced by a timer counting how long Claude has been blocked on you — and resumes once the agent continues working on the task. A new top-level prompt after DONE / IDLE starts a fresh task.
+While Claude is blocked on you (BLOCK), the row shows the question or approval request, so you know what it needs. Once you answer and Claude resumes (WORK), the row goes back to showing your **original request** rather than the *yes* you typed — so a quick approval or a *continue* never replaces your task on screen. The work timer pauses during BLOCK — replaced by a timer counting how long Claude has been blocked on you — and resumes once the agent continues working on the task. A new top-level prompt after DONE / IDLE starts a fresh task.
 
 For the full state machine and the rules that pick between the current text and the original request, see [Sticky labels](development/sticky-labels) in the Development section.
 

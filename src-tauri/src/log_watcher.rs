@@ -135,12 +135,17 @@ pub fn infer_state(lines: &[&str]) -> Option<InferredState> {
         }
     }
 
-    // Background subagents are still running after the main turn's `Stop` settled
-    // the row to `Done`. Force `Working` so the promote-only watcher carries the
-    // row back; the final (zero-pending) turn's `Stop` settles `Done` naturally.
-    // Don't override an Esc-cancel: a cancelled turn has no pending background work.
+    // Background subagents are still running. An *active* main turn (real tool
+    // use just now) stays `Working`; a turn that already resolved to `Done`/idle
+    // with agents still pending becomes `Waiting` — the row is alive only because
+    // of background work. Either way the promote-only watcher carries the row back
+    // from a too-early `Stop`; the final (zero-pending) turn's `Stop` settles
+    // `Done` naturally. Don't override an Esc-cancel (no pending background work).
     if result.pending_background >= 1 && !result.ended {
-        result.state = Some(Status::Working);
+        result.state = Some(match result.state {
+            Some(Status::Working) => Status::Working,
+            _ => Status::Waiting,
+        });
     }
 
     if !saw_conversational
@@ -223,7 +228,7 @@ pub fn split_complete(leftover: &str, chunk: &str) -> (Vec<String>, String) {
 
 /// Upgrade-only merge policy. Watcher can set status to `working`, and can
 /// update model / input_tokens. It cannot set terminal states (done, idle,
-/// awaiting, error) — those are hook-authoritative. Returns true if anything
+/// blocked, error) — those are hook-authoritative. Returns true if anything
 /// actually changed.
 pub fn apply_watcher_update(
     session: &mut AgentSession,
@@ -231,12 +236,19 @@ pub fn apply_watcher_update(
     now_ms: i64,
 ) -> bool {
     let mut changed = false;
-    if let Some(Status::Working) = update.state {
-        if session.status != Status::Working {
-            session.status = Status::Working;
+    // The watcher drives the two transcript-derived *active* states. `Working` is
+    // a pure promote (carry a too-early `Stop` back). `Waiting` is the "main turn
+    // done, background agents still running" state and may move a row off
+    // `Working` — but only when the turn genuinely resolved Done with agents
+    // pending (see `infer_state`), never on a stale read. Done/Idle/Blocked come
+    // from lifecycle hooks, so the watcher leaves them alone.
+    match update.state {
+        Some(s @ (Status::Working | Status::Waiting)) if session.status != s => {
+            session.status = s;
             session.state_entered_at = now_ms;
             changed = true;
         }
+        _ => {}
     }
     if let Some(ref m) = update.model {
         if session.model.as_ref() != Some(m) {
@@ -415,7 +427,7 @@ async fn watch_loop(app: AppHandle, chat_id: String, path: PathBuf) {
 /// A brand-new project's transcript dir doesn't exist yet at SessionStart —
 /// Claude Code creates it lazily when it writes the first turn. Watching a
 /// missing dir fails permanently (no retry), which strands the session: the
-/// watcher is the only thing that promotes Awaiting -> Working mid-turn, so a
+/// watcher is the only thing that promotes Blocked -> Working mid-turn, so a
 /// post-question resume never clears. Pre-create the dir (idempotent; it's the
 /// exact dir Claude is about to use) so the watch always attaches.
 fn ensure_watch_dir(dir: &Path) {
@@ -497,11 +509,11 @@ async fn drain(app: &AppHandle, chat_id: &str, path: &Path, state: &Arc<Mutex<Dr
 #[derive(Debug, PartialEq, Eq)]
 enum FlushedVerdict {
     /// The settled final assistant turn reads as a question — correct a `Done`
-    /// row up to `Awaiting` (`AppState::promote_done_to_awaiting`).
+    /// row up to `Blocked` (`AppState::promote_done_to_blocked`).
     Question,
     /// The settled final assistant turn reads as a plain statement — correct a
-    /// scan-derived `Awaiting` row back down to `Done`
-    /// (`AppState::demote_scanned_awaiting_to_done`).
+    /// scan-derived `Blocked` row back down to `Done`
+    /// (`AppState::demote_scanned_blocked_to_done`).
     Statement,
 }
 
@@ -534,31 +546,35 @@ fn apply_and_emit(app: &AppHandle, chat_id: &str, update: &InferredState, text_e
         return;
     };
     let now = now_ms();
-    let (metric_changed, resumed_working) = {
+    let (metric_changed, prior_status, new_status) = {
         let mut sessions = app_state.sessions.lock().unwrap();
         match sessions.iter_mut().find(|s| s.id == chat_id) {
             Some(session) => {
                 let prior = session.status;
                 let changed = apply_watcher_update(session, update, now);
-                (changed, prior != Status::Working && session.status == Status::Working)
+                (changed, prior, session.status)
             }
-            None => (false, false),
+            None => (false, Status::Idle, Status::Idle),
         }
     };
-    if resumed_working {
-        // The only path that carries a row back to Working without a lifecycle
-        // hook — e.g. the user answered an AskUserQuestion and the agent resumed,
-        // or (below) the main turn's Stop settled Done while background subagents
-        // keep running.
-        let reason = if update.pending_background >= 1 {
-            format!(
-                "{} background agent(s) still running after the main turn's Stop settled Done; held on Working",
-                update.pending_background
-            )
-        } else {
-            "transcript shows new activity (tool call or user turn) after a pause; promoted to Working".to_string()
-        };
-        tracing::debug!(chat_id, decision = "resume_working", reason = %reason, "decision");
+    if prior_status != Status::Working && new_status == Status::Working {
+        // Carried a row back to Working without a lifecycle hook — e.g. the user
+        // answered an AskUserQuestion and the agent resumed.
+        tracing::debug!(
+            chat_id,
+            decision = "resume_working",
+            reason = "transcript shows new activity (tool call or user turn) after a pause; promoted to Working",
+            "decision"
+        );
+    } else if prior_status != Status::Waiting && new_status == Status::Waiting {
+        // The main turn settled (Done) but background subagents are still running —
+        // the row is held on the distinct Waiting state rather than a forced Working.
+        tracing::debug!(
+            chat_id,
+            decision = "enter_waiting",
+            reason = %format!("main turn settled but {} background agent(s) still running; held on Waiting", update.pending_background),
+            "decision"
+        );
     }
     // The turn was cancelled with Esc (no lifecycle hook). Settle the row back
     // to its pre-prompt status — unless the user opted out. Gated here rather
@@ -586,10 +602,10 @@ fn apply_and_emit(app: &AppHandle, chat_id: &str, update: &InferredState, text_e
     // The `Stop` hook settles a finished turn before its final assistant text
     // flushes to JSONL, so it can read the *prior* turn and stamp the wrong
     // question-vs-done verdict. Now that the text has flushed, correct it both
-    // ways: a real question that `Stop` called `Done` → `Awaiting`; a plain
-    // statement that `Stop` (reading a prior question) called `Awaiting` →
+    // ways: a real question that `Stop` called `Done` → `Blocked`; a plain
+    // statement that `Stop` (reading a prior question) called `Blocked` →
     // `Done`. The demote is gated inside `AppState` on the scan-derived flag so
-    // a tool-gated `Awaiting` is never touched. Runs before `apply_text_entries`
+    // a tool-gated `Blocked` is never touched. Runs before `apply_text_entries`
     // so the appended assistant entry is stamped with the corrected status.
     let last_assistant = text_entries
         .iter()
@@ -603,20 +619,20 @@ fn apply_and_emit(app: &AppHandle, chat_id: &str, update: &InferredState, text_e
         &text_entries,
         crate::adapters::claude::QuestionRules::from_config(&cfg),
     ) {
-        Some(FlushedVerdict::Question) if app_state.promote_done_to_awaiting(chat_id, now) => {
+        Some(FlushedVerdict::Question) if app_state.promote_done_to_blocked(chat_id, now) => {
             tracing::debug!(
                 chat_id,
-                decision = "correct_to_awaiting",
+                decision = "correct_to_blocked",
                 reason = %format!("flushed final assistant turn reads as a question (Stop fired before it landed and settled Done): \"{last_assistant}\""),
                 "decision"
             );
             true
         }
-        Some(FlushedVerdict::Statement) if app_state.demote_scanned_awaiting_to_done(chat_id, now) => {
+        Some(FlushedVerdict::Statement) if app_state.demote_scanned_blocked_to_done(chat_id, now) => {
             tracing::debug!(
                 chat_id,
                 decision = "correct_to_done",
-                reason = %format!("flushed final assistant turn reads as a statement (Stop had read a stale prior question and settled Awaiting): \"{last_assistant}\""),
+                reason = %format!("flushed final assistant turn reads as a statement (Stop had read a stale prior question and settled Blocked): \"{last_assistant}\""),
                 "decision"
             );
             true
@@ -790,14 +806,22 @@ mod tests {
     // -------- background-agent (turn_duration) tests --------
 
     #[test]
-    fn pending_background_forces_working_over_done() {
+    fn pending_background_yields_waiting_over_done() {
         // The main turn ended (assistant text → Done), but a trailing
-        // turn_duration reports 4 background agents still running. The row must
-        // be held on Working, not allowed to settle Done.
+        // turn_duration reports 4 background agents still running. The row is held
+        // on the distinct Waiting state — alive only because of background work.
         let lines = [assistant_text("Batch B done."), turn_duration(Some(4))];
         let r = infer_state(&refs(&lines)).unwrap();
         assert_eq!(r.pending_background, 4);
-        assert_eq!(r.state, Some(Status::Working));
+        assert_eq!(r.state, Some(Status::Waiting));
+    }
+
+    #[test]
+    fn active_turn_with_pending_stays_working() {
+        // Real tool use just now AND agents pending → the main turn is genuinely
+        // active, so it stays Working (not Waiting).
+        let lines = [assistant_tool_use(), turn_duration(Some(2))];
+        assert_eq!(infer_state(&refs(&lines)).unwrap().state, Some(Status::Working));
     }
 
     #[test]
@@ -826,14 +850,14 @@ mod tests {
     }
 
     #[test]
-    fn pending_background_alone_yields_working() {
+    fn pending_background_alone_yields_waiting() {
         // The turn_duration can flush in its own write, separate from the
-        // assistant text — a chunk with no conversational entry must still
-        // promote the row (rather than returning None).
+        // assistant text — a chunk with no conversational entry still resolves to
+        // Waiting (no active main turn, agents pending), rather than None.
         let lines = [turn_duration(Some(1))];
         let r = infer_state(&refs(&lines)).unwrap();
         assert_eq!(r.pending_background, 1);
-        assert_eq!(r.state, Some(Status::Working));
+        assert_eq!(r.state, Some(Status::Waiting));
     }
 
     #[test]
@@ -1148,15 +1172,15 @@ mod tests {
     }
 
     #[test]
-    fn merge_does_not_override_awaiting() {
-        let mut s = make_session(Status::Awaiting);
+    fn merge_does_not_override_blocked() {
+        let mut s = make_session(Status::Blocked);
         let changed = apply_watcher_update(
             &mut s,
             &InferredState { state: Some(Status::Done), ..Default::default() },
             1000,
         );
         assert!(!changed);
-        assert_eq!(s.status, Status::Awaiting);
+        assert_eq!(s.status, Status::Blocked);
     }
 
     #[test]
@@ -1270,7 +1294,7 @@ mod tests {
     fn ensure_watch_dir_creates_missing_nested_dir() {
         // Regression: a brand-new project's transcript dir doesn't exist at
         // SessionStart, and watching a missing dir fails permanently — stranding
-        // the session on Awaiting. ensure_watch_dir must create it first.
+        // the session on Blocked. ensure_watch_dir must create it first.
         let base = std::env::temp_dir().join(format!(
             "ccd-watch-{}-{}",
             std::process::id(),

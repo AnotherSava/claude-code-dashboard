@@ -47,7 +47,7 @@ export const mockSessions: AgentSession[] = [
   },
   {
     id: 'auth-service',
-    status: 'awaiting',
+    status: 'blocked',
     label: 'Can I run bash: pytest -xvs tests/test_auth.py?',
     original_prompt: 'Add pytest coverage for auth module',
     task_started_at: now - 5 * min,
@@ -55,7 +55,7 @@ export const mockSessions: AgentSession[] = [
       { role: 'user', text: 'fix flaky login redirect test', timestamp: now - 18 * min, status: 'working', task_start: true },
       { role: 'assistant', text: 'Fixed the race condition in the redirect handler.', timestamp: now - 12 * min, status: 'done', task_start: false },
       { role: 'user', text: 'Add pytest coverage for auth module', timestamp: now - 5 * min, status: 'working', task_start: true },
-      { role: 'assistant', text: 'Can I run bash: pytest -xvs tests/test_auth.py?', timestamp: now - 45 * s, status: 'awaiting', task_start: false },
+      { role: 'assistant', text: 'Can I run bash: pytest -xvs tests/test_auth.py?', timestamp: now - 45 * s, status: 'blocked', task_start: false },
     ],
     source: 'claude-code',
     model: 'claude-sonnet-4-6',
@@ -72,7 +72,7 @@ export const mockSessions: AgentSession[] = [
     task_started_at: now - 9 * min,
     dialog: [
       { role: 'user', text: 'Refactor payment processor to use Stripe v2 API', timestamp: now - 9 * min, status: 'working', task_start: true },
-      { role: 'assistant', text: 'Should I update the webhook handler too?', timestamp: now - 2 * min, status: 'awaiting', task_start: false },
+      { role: 'assistant', text: 'Should I update the webhook handler too?', timestamp: now - 2 * min, status: 'blocked', task_start: false },
       { role: 'user', text: 'yes', timestamp: now - 15 * s, status: 'working', task_start: false },
     ],
     source: 'claude-code',

@@ -1,4 +1,4 @@
-export type Status = 'idle' | 'working' | 'awaiting' | 'done' | 'error'
+export type Status = 'idle' | 'working' | 'waiting' | 'blocked' | 'done' | 'error'
 
 export type DialogRole = 'user' | 'assistant' | 'separator'
 
@@ -107,13 +107,14 @@ export interface WeekChart {
 export const stateLabel: Record<Status, string> = {
   idle: 'IDLE',
   working: 'WORK',
-  awaiting: 'WAIT',
+  waiting: 'WAIT',
+  blocked: 'BLOCK',
   done: 'DONE',
   error: 'ERROR',
 }
 
 export function displayLabel(session: AgentSession): string {
-  if (session.status === 'awaiting' || session.status === 'error') return session.label
+  if (session.status === 'blocked' || session.status === 'error') return session.label
   return session.original_prompt ?? session.label
 }
 

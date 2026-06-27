@@ -1,6 +1,6 @@
 ---
 name: investigate
-description: Explain why a tracked dashboard agent/session is in its current state (WORK/WAIT/DONE/ERROR/IDLE) using the backend's permanent decision log — no transcript or source reading needed. TRIGGER when the user asks "why is <agent> in WAIT/WORK/...", "why does <agent> show <state>", "investigate <agent>", or wants the reason behind a session's status. Takes an agent name as input, or lists the current sessions to choose from when none is given.
+description: Explain why a tracked dashboard agent/session is in its current state (WORK/WAIT/BLOCK/DONE/ERROR/IDLE) using the backend's permanent decision log — no transcript or source reading needed. TRIGGER when the user asks "why is <agent> in WAIT/WORK/BLOCK/...", "why does <agent> show <state>", "investigate <agent>", or wants the reason behind a session's status. Takes an agent name as input, or lists the current sessions to choose from when none is given.
 ---
 
 # Investigate agent state
@@ -33,8 +33,10 @@ or `id`), and a `reason`:
   verdict: `turn ended on a question [<rule>]: "<snippet>"` or `… is not a question: "<snippet>"`.
 - `resume_working` — the transcript watcher saw new activity (a tool call or
   user turn) after a pause and promoted the row back to Working. This is the
-  path that clears a stale WAIT once the user answers an `AskUserQuestion`.
-- `correct_to_awaiting` / `correct_to_done` — the watcher re-judged the final
+  path that clears a stale BLOCK once the user answers an `AskUserQuestion`.
+- `enter_waiting` — the main turn settled but background subagents are still
+  running, so the row is held on WAIT (light-blue) rather than going Done.
+- `correct_to_blocked` / `correct_to_done` — the watcher re-judged the final
   assistant turn once it flushed to disk, fixing a verdict `Stop` made too early.
 - `revert_cancelled` — an Esc-cancelled turn (no lifecycle hook) reverted to its
   pre-prompt status (`status` field = where it landed).
@@ -70,11 +72,12 @@ decision that set it (with its reason), and the recent decision timeline.
 Translate the trail into a plain-language answer:
 
 - **Why it's in this state**: quote the `reason` of the setting decision. For a
-  WAIT, that's almost always a `classify` with a question rule (the agent ended
+  BLOCK, that's almost always a `classify` with a question rule (the agent ended
   its turn asking something) or a tool gate (`AskUserQuestion` / permission
-  dialog), or a `revert_cancelled` landing back on `Awaiting`.
-- **Whether it's correct or stuck**: a WAIT whose newest decision is the
-  question/gate that caused it is genuinely waiting on the user. A WAIT that the
+  dialog), or a `revert_cancelled` landing back on `Blocked`. A WAIT is an
+  `enter_waiting` — background agents still running after the turn settled.
+- **Whether it's correct or stuck**: a BLOCK whose newest decision is the
+  question/gate that caused it is genuinely waiting on the user. A BLOCK that the
   user has already answered should show a later `resume_working` or
   `correct_to_done`; if it doesn't, that's the bug to dig into.
 - Keep it short. Lead with the state and the one-line reason; include the

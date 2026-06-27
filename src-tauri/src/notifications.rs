@@ -28,7 +28,10 @@ pub fn status_key(s: Status) -> &'static str {
     match s {
         Status::Idle => "idle",
         Status::Working => "working",
-        Status::Awaiting => "awaiting",
+        // `Waiting` (background agents) is passive — no config key, so it never
+        // fires (like `working`/`idle`).
+        Status::Waiting => "waiting",
+        Status::Blocked => "blocked",
         Status::Done => "done",
         Status::Error => "error",
     }
@@ -403,21 +406,21 @@ mod tests {
 
     #[tokio::test]
     async fn sends_when_threshold_elapsed_and_no_outstanding() {
-        let m = Mock::with(&[("awaiting", 60_000)]);
+        let m = Mock::with(&[("blocked", 60_000)]);
         let mut out = HashMap::new();
-        let sessions = vec![session("s1", Status::Awaiting, 0)];
+        let sessions = vec![session("s1", Status::Blocked, 0)];
         reconcile(m.as_ref(), &sessions, &mut out, 60_000, None).await;
         assert_eq!(out.len(), 1);
-        assert_eq!(out["s1"].for_status, Status::Awaiting);
+        assert_eq!(out["s1"].for_status, Status::Blocked);
         assert_eq!(out["s1"].handle, "h1");
         assert!(matches!(m.events()[0], Event::Send { .. }));
     }
 
     #[tokio::test]
     async fn does_not_send_before_threshold() {
-        let m = Mock::with(&[("awaiting", 60_000)]);
+        let m = Mock::with(&[("blocked", 60_000)]);
         let mut out = HashMap::new();
-        let sessions = vec![session("s1", Status::Awaiting, 0)];
+        let sessions = vec![session("s1", Status::Blocked, 0)];
         reconcile(m.as_ref(), &sessions, &mut out, 59_999, None).await;
         assert!(out.is_empty());
         assert!(m.events().is_empty());
@@ -425,13 +428,13 @@ mod tests {
 
     #[tokio::test]
     async fn noop_when_outstanding_matches_current_state() {
-        let m = Mock::with(&[("awaiting", 60_000)]);
+        let m = Mock::with(&[("blocked", 60_000)]);
         let mut out = HashMap::new();
         out.insert(
             "s1".to_string(),
-            Outstanding { handle: "h1".into(), for_status: Status::Awaiting, },
+            Outstanding { handle: "h1".into(), for_status: Status::Blocked, },
         );
-        let sessions = vec![session("s1", Status::Awaiting, 0)];
+        let sessions = vec![session("s1", Status::Blocked, 0)];
         reconcile(m.as_ref(), &sessions, &mut out, 120_000, None).await;
         assert_eq!(out.len(), 1);
         assert!(m.events().is_empty(), "no events when nothing changes");
@@ -439,11 +442,11 @@ mod tests {
 
     #[tokio::test]
     async fn dismisses_when_session_transitions_to_different_state() {
-        let m = Mock::with(&[("awaiting", 60_000)]);
+        let m = Mock::with(&[("blocked", 60_000)]);
         let mut out = HashMap::new();
         out.insert(
             "s1".to_string(),
-            Outstanding { handle: "h9".into(), for_status: Status::Awaiting, },
+            Outstanding { handle: "h9".into(), for_status: Status::Blocked, },
         );
         let sessions = vec![session("s1", Status::Working, 100_000)];
         reconcile(m.as_ref(), &sessions, &mut out, 120_000, None).await;
@@ -455,11 +458,11 @@ mod tests {
     async fn dismisses_when_session_vanishes_from_snapshot() {
         // This is the "user clicked × on the widget row" path — session
         // disappears entirely from AppState::snapshot().
-        let m = Mock::with(&[("awaiting", 60_000)]);
+        let m = Mock::with(&[("blocked", 60_000)]);
         let mut out = HashMap::new();
         out.insert(
             "s1".to_string(),
-            Outstanding { handle: "h7".into(), for_status: Status::Awaiting, },
+            Outstanding { handle: "h7".into(), for_status: Status::Blocked, },
         );
         let sessions: Vec<AgentSession> = vec![];
         reconcile(m.as_ref(), &sessions, &mut out, 120_000, None).await;
@@ -470,7 +473,7 @@ mod tests {
     #[tokio::test]
     async fn session_vanishes_mid_threshold_is_noop() {
         // User clicks × 30s into a 60s threshold; no outstanding exists yet.
-        let m = Mock::with(&[("awaiting", 60_000)]);
+        let m = Mock::with(&[("blocked", 60_000)]);
         let mut out = HashMap::new();
         let sessions: Vec<AgentSession> = vec![];
         reconcile(m.as_ref(), &sessions, &mut out, 30_000, None).await;
@@ -480,9 +483,9 @@ mod tests {
 
     #[tokio::test]
     async fn threshold_zero_means_silent() {
-        let m = Mock::with(&[("awaiting", 0)]);
+        let m = Mock::with(&[("blocked", 0)]);
         let mut out = HashMap::new();
-        let sessions = vec![session("s1", Status::Awaiting, 0)];
+        let sessions = vec![session("s1", Status::Blocked, 0)];
         reconcile(m.as_ref(), &sessions, &mut out, 1_000_000, None).await;
         assert!(out.is_empty());
         assert!(m.events().is_empty());
@@ -492,7 +495,7 @@ mod tests {
     async fn missing_threshold_key_means_silent() {
         let m = Mock::with(&[("error", 60_000)]);
         let mut out = HashMap::new();
-        let sessions = vec![session("s1", Status::Awaiting, 0)];
+        let sessions = vec![session("s1", Status::Blocked, 0)];
         reconcile(m.as_ref(), &sessions, &mut out, 1_000_000, None).await;
         assert!(out.is_empty());
         assert!(m.events().is_empty());
@@ -500,10 +503,10 @@ mod tests {
 
     #[tokio::test]
     async fn send_failure_leaves_no_outstanding_so_next_tick_retries() {
-        let m = Mock::with(&[("awaiting", 60_000)]);
+        let m = Mock::with(&[("blocked", 60_000)]);
         *m.send_err.lock().unwrap() = true;
         let mut out = HashMap::new();
-        let sessions = vec![session("s1", Status::Awaiting, 0)];
+        let sessions = vec![session("s1", Status::Blocked, 0)];
         reconcile(m.as_ref(), &sessions, &mut out, 60_000, None).await;
         assert!(out.is_empty(), "failed send must not populate outstanding");
     }
@@ -590,32 +593,32 @@ mod tests {
     fn status_key_is_exhaustive() {
         assert_eq!(status_key(Status::Idle), "idle");
         assert_eq!(status_key(Status::Working), "working");
-        assert_eq!(status_key(Status::Awaiting), "awaiting");
+        assert_eq!(status_key(Status::Blocked), "blocked");
         assert_eq!(status_key(Status::Done), "done");
         assert_eq!(status_key(Status::Error), "error");
     }
 
     #[test]
     fn message_text_omits_label_line_when_empty() {
-        let s = session("proj", Status::Awaiting, 0);
-        assert_eq!(build_message_text(&s), "[proj] awaiting");
+        let s = session("proj", Status::Blocked, 0);
+        assert_eq!(build_message_text(&s), "[proj] blocked");
     }
 
     #[test]
     fn message_text_includes_label_when_present() {
-        let mut s = session("proj", Status::Awaiting, 0);
+        let mut s = session("proj", Status::Blocked, 0);
         s.label = "Can I run bash: pytest?".into();
         assert_eq!(
             build_message_text(&s),
-            "[proj] awaiting\nCan I run bash: pytest?"
+            "[proj] blocked\nCan I run bash: pytest?"
         );
     }
 
     #[test]
     fn message_text_uses_custom_display_name_when_set() {
-        let mut s = session("proj", Status::Awaiting, 0);
+        let mut s = session("proj", Status::Blocked, 0);
         s.display_name = Some("printlab".into());
-        assert_eq!(build_message_text(&s), "[printlab] awaiting");
+        assert_eq!(build_message_text(&s), "[printlab] blocked");
     }
 
     #[test]

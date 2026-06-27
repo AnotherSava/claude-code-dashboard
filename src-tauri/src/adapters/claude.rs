@@ -27,7 +27,7 @@ pub(crate) fn is_system_injected(prompt: &str) -> bool {
     prompt.starts_with("<task-notification>")
 }
 
-fn awaiting_label_for(tool_name: &str) -> &'static str {
+fn blocked_label_for(tool_name: &str) -> &'static str {
     match tool_name {
         "ExitPlanMode" => "plan approval",
         _ => "has a question",
@@ -46,7 +46,7 @@ fn awaiting_label_for(tool_name: &str) -> &'static str {
 /// user), and `PreCompact` (context boundary → history separator) fill gaps the
 /// lifecycle events leave.
 /// `PostToolUse` is intentionally ignored — once the user answers, the
-/// transcript watcher (and eventually `Stop`) carry the row out of `Awaiting`.
+/// transcript watcher (and eventually `Stop`) carry the row out of `Blocked`.
 pub fn dispatch(event: &str, payload: &Value, cfg: &Config) -> AdapterOutput {
     let cwd = payload.get("cwd").and_then(|v| v.as_str());
     let projects_root = cfg.projects_root.as_deref();
@@ -103,7 +103,7 @@ pub fn dispatch(event: &str, payload: &Value, cfg: &Config) -> AdapterOutput {
     // `is_a_question` — `Stop` (always) and `Notification`/`SessionStart` of
     // subtype `idle_prompt`. Because `Stop` fires before the final assistant
     // turn flushes, that scan can read stale (prior-turn) text; the flag lets
-    // the watcher overturn the resulting `Awaiting`/`Done` once the real text
+    // the watcher overturn the resulting `Blocked`/`Done` once the real text
     // lands. Every other event is an authoritative tool/lifecycle signal.
     let from_transcript_scan = event == "Stop"
         || (matches!(event, "Notification" | "SessionStart")
@@ -196,7 +196,7 @@ fn classify(
 }
 
 /// Classify a turn-ending event (`Stop` / idle prompt) by inspecting the final
-/// assistant text: `Awaiting "has a question"` if it reads as a hand-back, else
+/// assistant text: `Blocked "has a question"` if it reads as a hand-back, else
 /// `Done`. `kind` prefixes the decision-log reason ("turn ended" / "idle
 /// prompt"). Shared so both arms detect the question and snippet identically.
 fn classify_turn_end(transcript_path: Option<&str>, rules: QuestionRules, kind: &str) -> Classification {
@@ -208,7 +208,7 @@ fn classify_turn_end(transcript_path: Option<&str>, rules: QuestionRules, kind: 
     };
     if let Some(rule) = question_reason(&text, rules) {
         return Classification::new(
-            Status::Awaiting,
+            Status::Blocked,
             Some("has a question".into()),
             format!("{kind} on a question [{rule}]: \"{}\"", evidence_snippet(&text)),
         );
@@ -261,8 +261,8 @@ fn classify_detailed(
                 return None;
             }
             Some(Classification::new(
-                Status::Awaiting,
-                Some(awaiting_label_for(tool_name).into()),
+                Status::Blocked,
+                Some(blocked_label_for(tool_name).into()),
                 format!("{tool_name} tool gated the turn on the user (buffered until answered)"),
             ))
         }
@@ -282,11 +282,11 @@ fn classify_detailed(
             let label = notification_label(notif_type, message);
             let cleaned = clean_prompt(&label);
             if cleaned.is_empty() {
-                Some(Classification::new(Status::Awaiting, None, format!("notification [{notif_type}] blocked on user")))
+                Some(Classification::new(Status::Blocked, None, format!("notification [{notif_type}] blocked on user")))
             } else {
                 // chars — not bytes — so multi-byte glyphs don't split mid-codepoint
                 let truncated: String = cleaned.chars().take(60).collect();
-                Some(Classification::new(Status::Awaiting, Some(truncated), format!("notification [{notif_type}] blocked on user")))
+                Some(Classification::new(Status::Blocked, Some(truncated), format!("notification [{notif_type}] blocked on user")))
             }
         }
         "StopFailure" => {
@@ -317,7 +317,7 @@ fn classify_detailed(
                 .filter(|s| !s.is_empty())
                 .unwrap_or("tool");
             Some(Classification::new(
-                Status::Awaiting,
+                Status::Blocked,
                 Some(format!("needs approval: {}", tool)),
                 format!("tool-permission dialog for {tool}; blocked on user"),
             ))
@@ -334,7 +334,7 @@ fn classify_detailed(
                 .map(|s| s.chars().take(60).collect::<String>())
                 .filter(|s| !s.is_empty());
             Some(Classification::new(
-                Status::Awaiting,
+                Status::Blocked,
                 Some(msg.unwrap_or_else(|| "needs your input".into())),
                 "MCP tool requested input; blocked on user",
             ))
@@ -886,11 +886,11 @@ mod tests {
     }
 
     #[test]
-    fn stop_with_question_ending_is_awaiting() {
+    fn stop_with_question_ending_is_blocked() {
         let t = write_transcript(&[assistant_text("Should I proceed?")]);
         let p = json!({"transcript_path": t.to_string_lossy()});
         let (status, label) = classify("Stop", &p, NO_RULES).unwrap();
-        assert_eq!(status, Status::Awaiting);
+        assert_eq!(status, Status::Blocked);
         assert_eq!(label.as_deref(), Some("has a question"));
         let _ = std::fs::remove_dir_all(t.parent().unwrap());
     }
@@ -914,7 +914,7 @@ mod tests {
             "message": "Claude needs your permission to use Bash"
         });
         let (status, label) = classify("Notification", &p, NO_RULES).unwrap();
-        assert_eq!(status, Status::Awaiting);
+        assert_eq!(status, Status::Blocked);
         assert_eq!(label.as_deref(), Some("needs approval: Bash"));
     }
 
@@ -926,14 +926,14 @@ mod tests {
     }
 
     #[test]
-    fn notification_idle_prompt_with_question_is_awaiting() {
+    fn notification_idle_prompt_with_question_is_blocked() {
         let t = write_transcript(&[assistant_text("What would you like me to do next?")]);
         let p = json!({
             "notification_type": "idle_prompt",
             "transcript_path": t.to_string_lossy(),
         });
         let (status, label) = classify("Notification", &p, NO_RULES).unwrap();
-        assert_eq!(status, Status::Awaiting);
+        assert_eq!(status, Status::Blocked);
         assert_eq!(label.as_deref(), Some("has a question"));
         let _ = std::fs::remove_dir_all(t.parent().unwrap());
     }
@@ -952,10 +952,10 @@ mod tests {
     }
 
     #[test]
-    fn notification_without_type_but_with_message_is_awaiting() {
+    fn notification_without_type_but_with_message_is_blocked() {
         let p = json!({"message": "Claude needs your attention"});
         let (status, label) = classify("Notification", &p, NO_RULES).unwrap();
-        assert_eq!(status, Status::Awaiting);
+        assert_eq!(status, Status::Blocked);
         assert_eq!(label.as_deref(), Some("Claude needs your attention"));
     }
 
@@ -976,18 +976,18 @@ mod tests {
     // ----- classify: PreToolUse -----
 
     #[test]
-    fn pre_tool_use_ask_user_question_is_awaiting_with_question_label() {
+    fn pre_tool_use_ask_user_question_is_blocked_with_question_label() {
         let p = json!({"tool_name": "AskUserQuestion", "tool_input": {"questions": [{"question": "?"}]}});
         let (status, label) = classify("PreToolUse", &p, NO_RULES).unwrap();
-        assert_eq!(status, Status::Awaiting);
+        assert_eq!(status, Status::Blocked);
         assert_eq!(label.as_deref(), Some("has a question"));
     }
 
     #[test]
-    fn pre_tool_use_exit_plan_mode_is_awaiting_with_plan_label() {
+    fn pre_tool_use_exit_plan_mode_is_blocked_with_plan_label() {
         let p = json!({"tool_name": "ExitPlanMode", "tool_input": {"plan": "..."}});
         let (status, label) = classify("PreToolUse", &p, NO_RULES).unwrap();
-        assert_eq!(status, Status::Awaiting);
+        assert_eq!(status, Status::Blocked);
         assert_eq!(label.as_deref(), Some("plan approval"));
     }
 
@@ -1118,7 +1118,7 @@ mod tests {
     #[test]
     fn is_a_question_bold_wrapped_question_is_detected() {
         // Regression: a final "**Push?**" must read as a question. The trailing
-        // "**" used to hide the "?" so the row went Done instead of Awaiting.
+        // "**" used to hide the "?" so the row went Done instead of Blocked.
         assert!(is_a_question(
             "Remote was in sync, so this will fast-forward cleanly.\n\n**Push?**",
             NO_RULES
@@ -1279,7 +1279,7 @@ mod tests {
     fn permission_seeking_save_prompt_with_trailing_clause() {
         // The /reflect and /commit skills close with "Save this/these? (...)"
         // menus a trailing clause can follow, so the text doesn't end with "?".
-        // The "save this?"/"save these?" phrasing flips it to awaiting.
+        // The "save this?"/"save these?" phrasing flips it to blocked.
         assert!(is_a_question(
             "Save this? (all / 1 / none) — then I'll run /commit.",
             NO_RULES
@@ -1291,7 +1291,7 @@ mod tests {
     }
 
     #[test]
-    fn permission_seeking_save_without_question_mark_is_not_awaiting() {
+    fn permission_seeking_save_without_question_mark_is_not_blocked() {
         // The "?" is baked into the phrase, so a declarative "save this ..."
         // must not match — only the literal "save this?" question does.
         assert!(!is_a_question(
@@ -1301,7 +1301,7 @@ mod tests {
     }
 
     #[test]
-    fn directed_question_mid_paragraph_is_awaiting() {
+    fn directed_question_mid_paragraph_is_blocked() {
         // Direct second-person questions whose paragraph continues past the "?".
         for text in [
             "Can you reopen the history and confirm the line is there? If not, I'll dig in.",
@@ -1314,7 +1314,7 @@ mod tests {
     }
 
     #[test]
-    fn confirm_prompt_with_question_not_last_is_awaiting() {
+    fn confirm_prompt_with_question_not_last_is_blocked() {
         // Approval prompt whose "?" is followed by a plan/tail — the exact
         // shape of the release skill's "Confirm vX? On approval I'll …".
         assert!(is_a_question(
@@ -1332,21 +1332,21 @@ mod tests {
     }
 
     #[test]
-    fn paste_request_is_awaiting() {
+    fn paste_request_is_blocked() {
         // A sentence-initial "Paste ..." imperative means the agent is waiting.
         assert!(is_a_question("Paste the tableinfos output and I'll finish arena.", NO_RULES));
         assert!(is_a_question("Looks good. Paste whatever it prints.", NO_RULES));
     }
 
     #[test]
-    fn paste_mention_mid_sentence_is_not_awaiting() {
+    fn paste_mention_mid_sentence_is_not_blocked() {
         // Only a sentence-initial imperative counts — a mention does not.
         assert!(!is_a_question("You can paste this into the terminal later. All set.", NO_RULES));
         assert!(!is_a_question("I'll paste the result here once it's done.", NO_RULES));
     }
 
     #[test]
-    fn please_provide_request_is_awaiting() {
+    fn please_provide_request_is_blocked() {
         // A sentence-initial "Please provide ..." imperative hands back to the user.
         assert!(is_a_question(
             "Please provide the model group (e.g. `other`, `inserts`) and the model name.",
@@ -1356,7 +1356,7 @@ mod tests {
     }
 
     #[test]
-    fn confirm_request_without_question_mark_is_awaiting() {
+    fn confirm_request_without_question_mark_is_blocked() {
         // A sentence-initial "Confirm ..." imperative hands back even without a `?`.
         assert!(is_a_question("Confirm to tag v1.2.0, or request edits.", NO_RULES));
         assert!(is_a_question(
@@ -1368,7 +1368,7 @@ mod tests {
     }
 
     #[test]
-    fn please_note_is_not_awaiting() {
+    fn please_note_is_not_blocked() {
         // Informational "Please ..." openers must not register as hand-backs.
         assert!(!is_a_question("Please note the migration runs on next launch.", NO_RULES));
         assert!(!is_a_question("Done. Please see the updated README for details.", NO_RULES));
@@ -1524,7 +1524,7 @@ mod tests {
         let p = json!({ "cwd": "d:/projects/demo", "tool_name": "Bash" });
         match dispatch("PermissionRequest", &p, &cfg) {
             AdapterOutput::Set { input, .. } => {
-                assert_eq!(input.status, Status::Awaiting);
+                assert_eq!(input.status, Status::Blocked);
                 assert_eq!(input.label.as_deref(), Some("needs approval: Bash"));
             }
             _ => panic!("expected Set"),
@@ -1537,7 +1537,7 @@ mod tests {
         let p = json!({ "cwd": "d:/projects/demo", "message": "Pick a branch" });
         match dispatch("Elicitation", &p, &cfg) {
             AdapterOutput::Set { input, .. } => {
-                assert_eq!(input.status, Status::Awaiting);
+                assert_eq!(input.status, Status::Blocked);
                 assert_eq!(input.label.as_deref(), Some("Pick a branch"));
             }
             _ => panic!("expected Set"),

@@ -8,7 +8,14 @@ pub enum Status {
     #[default]
     Idle,
     Working,
-    Awaiting,
+    /// Held active by background subagents after the main turn already settled —
+    /// "looks done but isn't". Watcher-driven only (`log_watcher` forces it over a
+    /// Done verdict when `pendingBackgroundAgentCount > 0`); no lifecycle hook
+    /// produces it. Rendered light-blue as "WAIT".
+    Waiting,
+    /// Blocked on the user: a question, a tool-permission prompt, or an MCP
+    /// elicitation. Rendered amber as "BLOCK". (Formerly `Blocked`.)
+    Blocked,
     Done,
     Error,
 }
@@ -67,7 +74,7 @@ pub struct AgentSession {
     /// began — captured by `apply_set` on every non-Working → Working
     /// transition. A turn cancelled with Esc (no `Stop` hook) reverts here
     /// rather than collapsing to `Idle`, so an aborted reply to a pending
-    /// question leaves the row in the `Awaiting` state the question put it in
+    /// question leaves the row in the `Blocked` state the question put it in
     /// (the next real answer is then an approval-cycle reply, not a new task).
     /// Internal bookkeeping — never serialized to the frontend / sync / disk.
     #[serde(skip)]
@@ -78,10 +85,10 @@ pub struct AgentSession {
     /// (`AskUserQuestion`, `PermissionRequest`, …). Because `Stop` fires before
     /// the final assistant turn flushes to JSONL, that scan can read the prior
     /// turn's text and stamp the wrong question-vs-done verdict; this flag tells
-    /// the transcript watcher which `Awaiting` rows it may overturn once the
-    /// real text lands (`demote_scanned_awaiting_to_done`) and which it must
+    /// the transcript watcher which `Blocked` rows it may overturn once the
+    /// real text lands (`demote_scanned_blocked_to_done`) and which it must
     /// leave alone. Only ever set `true` for those scan-derived states, so a
-    /// tool-gated `Awaiting` is never demoted. Internal bookkeeping — never
+    /// tool-gated `Blocked` is never demoted. Internal bookkeeping — never
     /// serialized to the frontend / sync / disk.
     #[serde(skip)]
     pub status_from_transcript_scan: bool,
@@ -217,7 +224,7 @@ impl AppState {
 
             let raw_task_boundary = matches!(
                 prior,
-                Status::Done | Status::Idle | Status::Working
+                Status::Done | Status::Idle | Status::Working | Status::Waiting
             ) && input.status == Status::Working;
             let is_continuation = raw_task_boundary
                 && input
@@ -234,7 +241,7 @@ impl AppState {
             // Remember where to revert if this turn is cancelled with Esc. Only
             // capture on a real entry into Working (not Working → Working), so
             // the snapshot is always a genuine pre-prompt status — typically the
-            // `Awaiting` of a question the user is mid-answer to.
+            // `Blocked` of a question the user is mid-answer to.
             if input.status == Status::Working && prior != Status::Working {
                 existing.status_before_working = prior;
             }
@@ -397,7 +404,7 @@ impl AppState {
     /// would stay `Working` forever (and the watcher's own `infer_state` would
     /// otherwise re-promote the marker as user input). The cancelled turn
     /// produced nothing, so the row should look as if the prompt never landed:
-    /// a reply aborted mid-question reverts to `Awaiting`, so the user's real
+    /// a reply aborted mid-question reverts to `Blocked`, so the user's real
     /// answer is an approval-cycle reply (no task boundary) instead of a fresh
     /// task that clobbers `original_prompt`. No-op unless still `Working`, so a
     /// turn that already moved on is left alone. Mirrors `apply_set`'s
@@ -419,17 +426,17 @@ impl AppState {
         Some(s.status)
     }
 
-    /// Correct a settled `Done` row to `Awaiting` once the transcript reveals
+    /// Correct a settled `Done` row to `Blocked` once the transcript reveals
     /// its final assistant turn was a question. The `Stop` hook fires *before*
     /// Claude flushes that final turn to JSONL, so it reads stale text and can't
     /// tell a question-ending turn from a plain one — it defaults to `Done`. The
     /// watcher sees the flushed text moments later and calls this to fix the one
-    /// case `Stop` was blind to. Restricted to `Done → Awaiting`: a row still
+    /// case `Stop` was blind to. Restricted to `Done → Blocked`: a row still
     /// `Working` is left for `Stop`/`UserPromptSubmit` to settle (so a transient
     /// mid-turn assistant text block ending in `?` can't false-promote), and a
     /// row that already moved on (e.g. the user sent the next prompt) is left
     /// alone. Returns true if it acted.
-    pub fn promote_done_to_awaiting(&self, id: &str, now_ms: i64) -> bool {
+    pub fn promote_done_to_blocked(&self, id: &str, now_ms: i64) -> bool {
         let mut sessions = self.sessions.lock().unwrap();
         let Some(s) = sessions.iter_mut().find(|s| s.id == id) else {
             return false;
@@ -437,7 +444,7 @@ impl AppState {
         if s.status != Status::Done {
             return false;
         }
-        s.status = Status::Awaiting;
+        s.status = Status::Blocked;
         s.status_from_transcript_scan = true;
         s.label = "has a question".into();
         s.state_entered_at = now_ms;
@@ -445,25 +452,25 @@ impl AppState {
         true
     }
 
-    /// The mirror of [`Self::promote_done_to_awaiting`]: correct a settled
-    /// `Awaiting` back to `Done` once the flushed transcript shows the final
+    /// The mirror of [`Self::promote_done_to_blocked`]: correct a settled
+    /// `Blocked` back to `Done` once the flushed transcript shows the final
     /// assistant turn was *not* a question. Same root cause — `Stop` fires
     /// before the final turn flushes, so when a non-question turn ends right
     /// after a question turn it reads the *prior* (question) text and wrongly
-    /// stamps `Awaiting "has a question"`. Gated on
+    /// stamps `Blocked "has a question"`. Gated on
     /// [`AgentSession::status_from_transcript_scan`], so only a scan-derived
-    /// `Awaiting` is touched — a genuine tool-gated `Awaiting` (`AskUserQuestion`,
+    /// `Blocked` is touched — a genuine tool-gated `Blocked` (`AskUserQuestion`,
     /// `PermissionRequest`, …) is never demoted even though it shares the label.
     /// The corrected `Done` shows the row's `original_prompt` (the stable task),
-    /// since the wrong `Awaiting` clobbered the prior label. Stays
+    /// since the wrong `Blocked` clobbered the prior label. Stays
     /// scan-derived so a later flush can correct it again. Returns true if it
     /// acted.
-    pub fn demote_scanned_awaiting_to_done(&self, id: &str, now_ms: i64) -> bool {
+    pub fn demote_scanned_blocked_to_done(&self, id: &str, now_ms: i64) -> bool {
         let mut sessions = self.sessions.lock().unwrap();
         let Some(s) = sessions.iter_mut().find(|s| s.id == id) else {
             return false;
         };
-        if s.status != Status::Awaiting || !s.status_from_transcript_scan {
+        if s.status != Status::Blocked || !s.status_from_transcript_scan {
             return false;
         }
         s.status = Status::Done;
@@ -652,23 +659,23 @@ mod tests {
     }
 
     #[test]
-    fn revert_cancelled_turn_restores_awaiting_after_aborted_reply() {
-        // The reported bug: agent asks a question (Awaiting), the user submits a
+    fn revert_cancelled_turn_restores_blocked_after_aborted_reply() {
+        // The reported bug: agent asks a question (Blocked), the user submits a
         // reply (Working) then cancels it with Esc. The row must revert to
-        // Awaiting — not Idle — so the user's *real* answer is an approval-cycle
-        // reply (Awaiting → Working, no boundary) and original_prompt survives.
+        // Blocked — not Idle — so the user's *real* answer is an approval-cycle
+        // reply (Blocked → Working, no boundary) and original_prompt survives.
         let state = AppState::new();
         state.apply_set(set("a", Status::Working, "fix the parser"), 0, NO_CONTINUATIONS, None);
-        state.apply_set(set("a", Status::Awaiting, "Push?"), 10_000, NO_CONTINUATIONS, None);
-        // User submits a typo'd reply, which enters Working from Awaiting...
+        state.apply_set(set("a", Status::Blocked, "Push?"), 10_000, NO_CONTINUATIONS, None);
+        // User submits a typo'd reply, which enters Working from Blocked...
         state.apply_set(set("a", Status::Working, "ny"), 12_000, NO_CONTINUATIONS, None);
         // ...then cancels it with Esc (no Stop hook) — idle_probe / the watcher
         // calls revert_cancelled_turn.
-        assert_eq!(state.revert_cancelled_turn("a", 13_000), Some(Status::Awaiting));
+        assert_eq!(state.revert_cancelled_turn("a", 13_000), Some(Status::Blocked));
         let reverted = get(&state, "a");
-        assert_eq!(reverted.status, Status::Awaiting, "cancelled reply reverts to the pending question");
+        assert_eq!(reverted.status, Status::Blocked, "cancelled reply reverts to the pending question");
 
-        // The real answer now lands from Awaiting — an approval cycle, not a task
+        // The real answer now lands from Blocked — an approval cycle, not a task
         // boundary — so the task is preserved even without a continuation match.
         state.apply_set(set("a", Status::Working, "y"), 14_000, NO_CONTINUATIONS, None);
         let answered = get(&state, "a");
@@ -678,45 +685,45 @@ mod tests {
     #[test]
     fn revert_cancelled_turn_is_noop_when_not_working() {
         let state = AppState::new();
-        state.apply_set(set("a", Status::Awaiting, "run bash?"), 0, NO_CONTINUATIONS, None);
+        state.apply_set(set("a", Status::Blocked, "run bash?"), 0, NO_CONTINUATIONS, None);
         assert_eq!(state.revert_cancelled_turn("a", 20_000), None);
-        assert_eq!(get(&state, "a").status, Status::Awaiting);
+        assert_eq!(get(&state, "a").status, Status::Blocked);
     }
 
     #[test]
-    fn promote_done_to_awaiting_corrects_a_settled_question_turn() {
+    fn promote_done_to_blocked_corrects_a_settled_question_turn() {
         // `Stop` settled the row to Done before the final assistant text flushed
         // (so it couldn't see the trailing question); the watcher now corrects it.
         let state = AppState::new();
         state.apply_set(set("a", Status::Done, ""), 0, NO_CONTINUATIONS, None);
-        assert!(state.promote_done_to_awaiting("a", 5_000));
+        assert!(state.promote_done_to_blocked("a", 5_000));
         let s = get(&state, "a");
-        assert_eq!(s.status, Status::Awaiting);
+        assert_eq!(s.status, Status::Blocked);
         assert_eq!(s.label, "has a question");
         assert_eq!(s.state_entered_at, 5_000);
         assert_eq!(s.updated, 5_000);
     }
 
     #[test]
-    fn promote_done_to_awaiting_is_noop_when_not_done() {
+    fn promote_done_to_blocked_is_noop_when_not_done() {
         // Mid-turn the row is Working; a transient assistant text block ending in
         // `?` must not flip it — only a settled Done row is corrected.
         let state = AppState::new();
         state.apply_set(set("a", Status::Working, "fix the parser"), 0, NO_CONTINUATIONS, None);
-        assert!(!state.promote_done_to_awaiting("a", 5_000));
+        assert!(!state.promote_done_to_blocked("a", 5_000));
         assert_eq!(get(&state, "a").status, Status::Working);
     }
 
     #[test]
-    fn demote_scanned_awaiting_corrects_a_stale_question_read() {
-        // `Stop` read the *prior* turn's question and stamped Awaiting on a turn
+    fn demote_scanned_blocked_corrects_a_stale_question_read() {
+        // `Stop` read the *prior* turn's question and stamped Blocked on a turn
         // that actually ended on a statement; the watcher corrects it to Done,
         // restoring the task label from original_prompt.
         let state = AppState::new();
         state.apply_set(set("a", Status::Working, "fix the parser"), 0, NO_CONTINUATIONS, None);
-        state.apply_set(scan_set("a", Status::Awaiting, "has a question"), 10_000, NO_CONTINUATIONS, None);
-        assert_eq!(get(&state, "a").status, Status::Awaiting);
-        assert!(state.demote_scanned_awaiting_to_done("a", 20_000));
+        state.apply_set(scan_set("a", Status::Blocked, "has a question"), 10_000, NO_CONTINUATIONS, None);
+        assert_eq!(get(&state, "a").status, Status::Blocked);
+        assert!(state.demote_scanned_blocked_to_done("a", 20_000));
         let s = get(&state, "a");
         assert_eq!(s.status, Status::Done);
         assert_eq!(s.label, "fix the parser", "label restored to the task");
@@ -724,34 +731,34 @@ mod tests {
     }
 
     #[test]
-    fn demote_scanned_awaiting_leaves_tool_gated_awaiting_alone() {
+    fn demote_scanned_blocked_leaves_tool_gated_blocked_alone() {
         // The safety-critical case: a real tool gate (not scan-derived) shares
         // the "has a question" label but must never be demoted.
         let state = AppState::new();
         state.apply_set(set("a", Status::Working, "fix the parser"), 0, NO_CONTINUATIONS, None);
-        state.apply_set(set("a", Status::Awaiting, "needs approval: Bash"), 10_000, NO_CONTINUATIONS, None);
-        assert!(!state.demote_scanned_awaiting_to_done("a", 20_000));
-        assert_eq!(get(&state, "a").status, Status::Awaiting);
+        state.apply_set(set("a", Status::Blocked, "needs approval: Bash"), 10_000, NO_CONTINUATIONS, None);
+        assert!(!state.demote_scanned_blocked_to_done("a", 20_000));
+        assert_eq!(get(&state, "a").status, Status::Blocked);
     }
 
     #[test]
-    fn demote_scanned_awaiting_is_noop_when_not_awaiting() {
+    fn demote_scanned_blocked_is_noop_when_not_blocked() {
         let state = AppState::new();
         state.apply_set(scan_set("a", Status::Done, ""), 0, NO_CONTINUATIONS, None);
-        assert!(!state.demote_scanned_awaiting_to_done("a", 5_000));
+        assert!(!state.demote_scanned_blocked_to_done("a", 5_000));
         assert_eq!(get(&state, "a").status, Status::Done);
     }
 
     #[test]
     fn tool_gate_clears_the_scan_flag_so_a_later_demote_is_blocked() {
-        // A scan-derived Awaiting that's then overwritten by a tool gate must
+        // A scan-derived Blocked that's then overwritten by a tool gate must
         // lose its scan provenance, so the watcher can no longer demote it.
         let state = AppState::new();
         state.apply_set(set("a", Status::Working, "task"), 0, NO_CONTINUATIONS, None);
-        state.apply_set(scan_set("a", Status::Awaiting, "has a question"), 1_000, NO_CONTINUATIONS, None);
-        state.apply_set(set("a", Status::Awaiting, "needs approval: tool"), 2_000, NO_CONTINUATIONS, None);
-        assert!(!state.demote_scanned_awaiting_to_done("a", 3_000));
-        assert_eq!(get(&state, "a").status, Status::Awaiting);
+        state.apply_set(scan_set("a", Status::Blocked, "has a question"), 1_000, NO_CONTINUATIONS, None);
+        state.apply_set(set("a", Status::Blocked, "needs approval: tool"), 2_000, NO_CONTINUATIONS, None);
+        assert!(!state.demote_scanned_blocked_to_done("a", 3_000));
+        assert_eq!(get(&state, "a").status, Status::Blocked);
     }
 
     #[test]
@@ -779,9 +786,9 @@ mod tests {
         // Initial working: task starts
         state.apply_set(set("a", Status::Working, "fix foo.py"), 0, NO_CONTINUATIONS, None);
         // Claude asks for approval after 30s
-        state.apply_set(set("a", Status::Awaiting, "run bash?"), 30_000, NO_CONTINUATIONS, None);
+        state.apply_set(set("a", Status::Blocked, "run bash?"), 30_000, NO_CONTINUATIONS, None);
         let mid = get(&state, "a");
-        assert_eq!(mid.status, Status::Awaiting);
+        assert_eq!(mid.status, Status::Blocked);
         assert_eq!(mid.original_prompt.as_deref(), Some("fix foo.py"));
         assert_eq!(mid.working_accumulated_ms, 30_000);
         assert_eq!(mid.state_entered_at, 30_000);
@@ -846,12 +853,12 @@ mod tests {
 
     #[test]
     fn same_non_working_status_update_keeps_state_entered_at() {
-        // For non-Working same-status updates (e.g. successive Awaiting events
+        // For non-Working same-status updates (e.g. successive Blocked events
         // refining the question), state_entered_at must not bounce. Working →
         // Working is now a task boundary on purpose — see the cancellation tests.
         let state = AppState::new();
-        state.apply_set(set("a", Status::Awaiting, "ask"), 0, NO_CONTINUATIONS, None);
-        state.apply_set(set("a", Status::Awaiting, "ask"), 5_000, NO_CONTINUATIONS, None);
+        state.apply_set(set("a", Status::Blocked, "ask"), 0, NO_CONTINUATIONS, None);
+        state.apply_set(set("a", Status::Blocked, "ask"), 5_000, NO_CONTINUATIONS, None);
         let s = get(&state, "a");
         assert_eq!(s.state_entered_at, 0, "state_entered_at must not reset within the same non-Working status");
     }
@@ -923,10 +930,10 @@ mod tests {
     fn missing_label_preserves_prior_label() {
         let state = AppState::new();
         state.apply_set(set("a", Status::Working, "fix foo.py"), 0, NO_CONTINUATIONS, None);
-        state.apply_set(set_no_label("a", Status::Awaiting), 5_000, NO_CONTINUATIONS, None);
+        state.apply_set(set_no_label("a", Status::Blocked), 5_000, NO_CONTINUATIONS, None);
         let s = get(&state, "a");
         assert_eq!(s.label, "fix foo.py", "label must survive a set with no label field");
-        assert_eq!(s.status, Status::Awaiting);
+        assert_eq!(s.status, Status::Blocked);
     }
 
     #[test]
@@ -972,7 +979,7 @@ mod tests {
     fn default_affirmations_do_not_clobber_task_after_done() {
         // End-to-end guard against the recurring "row shows 'y' as the task"
         // bug: an approval reply can arrive when the row is Done or Idle rather
-        // than Awaiting — e.g. the user cancelled a mis-typed reply with Esc
+        // than Blocked — e.g. the user cancelled a mis-typed reply with Esc
         // (idle_probe correctly demotes to Idle), then typed the real "y". From
         // Done/Idle that "y" would be a task boundary; with the default
         // continuation list it must preserve original_prompt instead.
@@ -1031,7 +1038,7 @@ mod tests {
     fn approval_cycle_preserves_task_started_at() {
         let state = AppState::new();
         state.apply_set(set("a", Status::Working, "fix foo"), 0, NO_CONTINUATIONS, None);
-        state.apply_set(set("a", Status::Awaiting, "permission?"), 5_000, NO_CONTINUATIONS, None);
+        state.apply_set(set("a", Status::Blocked, "permission?"), 5_000, NO_CONTINUATIONS, None);
         state.apply_set(set("a", Status::Working, "yes"), 6_000, NO_CONTINUATIONS, None);
         let s = get(&state, "a");
         assert_eq!(s.original_prompt.as_deref(), Some("fix foo"));
@@ -1228,7 +1235,7 @@ mod tests {
         let state = AppState::new();
         let changed = state.apply_set(set_with_dialog("a", Status::Working, "fix foo"), 0, NO_CONTINUATIONS, None);
         assert!(changed);
-        let not_changed = state.apply_set(set("a", Status::Awaiting, "question?"), 1_000, NO_CONTINUATIONS, None);
+        let not_changed = state.apply_set(set("a", Status::Blocked, "question?"), 1_000, NO_CONTINUATIONS, None);
         assert!(!not_changed);
     }
 
@@ -1380,11 +1387,11 @@ mod tests {
     fn continuation_only_applies_to_task_boundary_transitions() {
         let state = AppState::new();
         let cont: Vec<String> = vec!["go".into()];
-        // Existing approval cycle: awaiting → working with label "go".
+        // Existing approval cycle: blocked → working with label "go".
         // This isn't a task boundary regardless of the continuation list,
         // so the rule is a no-op here — original_prompt is still pinned.
         state.apply_set(set("a", Status::Working, "fix foo.py"), 0, &cont, None);
-        state.apply_set(set("a", Status::Awaiting, "permission?"), 1000, &cont, None);
+        state.apply_set(set("a", Status::Blocked, "permission?"), 1000, &cont, None);
         state.apply_set(set("a", Status::Working, "go"), 2000, &cont, None);
         let s = get(&state, "a");
         assert_eq!(s.original_prompt.as_deref(), Some("fix foo.py"));

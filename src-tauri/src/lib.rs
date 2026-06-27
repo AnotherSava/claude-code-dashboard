@@ -448,7 +448,7 @@ fn seed_dev_sessions(app: &tauri::AppHandle) {
     state.apply_set(
         SetInput {
             id: "auth-service".into(),
-            status: Status::Awaiting,
+            status: Status::Blocked,
             label: Some("Can I run bash: pytest -xvs tests/test_auth.py?".into()),
             source: None,
             model: None,

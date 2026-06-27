@@ -19,7 +19,7 @@ import sys
 from collections import defaultdict, deque
 
 # Status -> the chip label the dashboard shows.
-CHIP = {"Working": "WORK", "Awaiting": "WAIT", "Done": "DONE", "Idle": "IDLE", "Error": "ERROR"}
+CHIP = {"Working": "WORK", "Waiting": "WAIT", "Blocked": "BLOCK", "Done": "DONE", "Idle": "IDLE", "Error": "ERROR"}
 
 # Per-agent rolling window of decisions kept in memory (newest-biased).
 TRAIL = 60
@@ -51,8 +51,10 @@ def status_from(fields):
         return fields.get("new_status")
     if d == "resume_working":
         return "Working"
-    if d == "correct_to_awaiting":
-        return "Awaiting"
+    if d == "enter_waiting":
+        return "Waiting"
+    if d == "correct_to_blocked":
+        return "Blocked"
     if d == "correct_to_done":
         return "Done"
     if d == "revert_cancelled":

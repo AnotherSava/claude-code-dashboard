@@ -131,7 +131,7 @@ mod tests {
         let prev = session("prior", Some("original"));
         let (label, op) = select(
             Some(&prev),
-            &input(Status::Awaiting, Some("new label")),
+            &input(Status::Blocked, Some("new label")),
             false,
         );
         assert_eq!(label, "new label");
@@ -141,7 +141,7 @@ mod tests {
     #[test]
     fn existing_non_boundary_without_label_preserves_both() {
         let prev = session("prior", Some("original"));
-        let (label, op) = select(Some(&prev), &input(Status::Awaiting, None), false);
+        let (label, op) = select(Some(&prev), &input(Status::Blocked, None), false);
         assert_eq!(label, "prior");
         assert_eq!(op.as_deref(), Some("original"));
     }

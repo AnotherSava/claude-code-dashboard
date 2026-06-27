@@ -237,21 +237,21 @@ mod tests {
     #[test]
     fn sync_sets_credentials_and_rules() {
         let n = TelegramNotifier::new();
-        let c = cfg(Some("t"), Some("c"), &[("awaiting", 60_000)]);
+        let c = cfg(Some("t"), Some("c"), &[("blocked", 60_000)]);
         assert_eq!(n.sync_config(Some(&c)), SyncOutcome::CredsChanged);
         assert!(n.is_enabled());
-        assert_eq!(n.state_rules().get("awaiting").and_then(|s| s.reaction_window_ms), Some(60_000));
+        assert_eq!(n.state_rules().get("blocked").and_then(|s| s.reaction_window_ms), Some(60_000));
     }
 
     #[test]
     fn sync_unchanged_when_same_creds() {
         let n = TelegramNotifier::new();
-        let c = cfg(Some("t"), Some("c"), &[("awaiting", 60_000)]);
+        let c = cfg(Some("t"), Some("c"), &[("blocked", 60_000)]);
         let _ = n.sync_config(Some(&c));
         // rule change alone is not a credential change
-        let c2 = cfg(Some("t"), Some("c"), &[("awaiting", 120_000)]);
+        let c2 = cfg(Some("t"), Some("c"), &[("blocked", 120_000)]);
         assert_eq!(n.sync_config(Some(&c2)), SyncOutcome::Unchanged);
-        assert_eq!(n.state_rules().get("awaiting").and_then(|s| s.reaction_window_ms), Some(120_000));
+        assert_eq!(n.state_rules().get("blocked").and_then(|s| s.reaction_window_ms), Some(120_000));
     }
 
     #[test]

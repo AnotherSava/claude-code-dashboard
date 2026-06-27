@@ -102,7 +102,7 @@ async fn post_event(
             // Permanent decision record: why this row landed in this state. The
             // `decision` field makes it greppable (the `investigate` skill reads
             // these), and `reason` carries the matched question-rule + a text
-            // snippet so "why is it Awaiting?" is answerable without the
+            // snippet so "why is it Blocked?" is answerable without the
             // transcript or the code. Keyed by the resolved chat_id.
             tracing::debug!(
                 client = %req.client,

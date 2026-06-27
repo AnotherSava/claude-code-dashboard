@@ -27,7 +27,7 @@ use crate::state::{AgentSession, Status};
 /// retitle the console on launch, and we have no notification when they do —
 /// so a cached title older than this is re-pushed on the next sync. During
 /// Working the transcript watcher emits constantly, so the title self-heals
-/// within seconds; quiet states (awaiting/done) spawn nothing that clobbers.
+/// within seconds; quiet states (blocked/done) spawn nothing that clobbers.
 const REASSERT_MS: i64 = 5_000;
 
 /// Managed state: which console pids belong to each chat_id, and the last
@@ -83,7 +83,10 @@ fn circle(status: Status) -> &'static str {
     match status {
         Status::Idle => "⚪",
         Status::Working => "🔵",
-        Status::Awaiting => "🟠",
+        // No light-blue circle emoji exists, so `Waiting` shares the blue circle
+        // with `Working` here; the dashboard pill carries the lighter shade.
+        Status::Waiting => "🔵",
+        Status::Blocked => "🟠",
         Status::Done => "🟢",
         Status::Error => "🔴",
     }
@@ -316,7 +319,7 @@ mod tests {
     #[test]
     fn circle_covers_every_status() {
         assert_eq!(circle(Status::Working), "🔵");
-        assert_eq!(circle(Status::Awaiting), "🟠");
+        assert_eq!(circle(Status::Blocked), "🟠");
         assert_eq!(circle(Status::Done), "🟢");
         assert_eq!(circle(Status::Error), "🔴");
         assert_eq!(circle(Status::Idle), "⚪");
