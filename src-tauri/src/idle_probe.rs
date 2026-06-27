@@ -56,10 +56,20 @@ use crate::state::{AppState, Status};
 use crate::terminal_title::{read_console_screen, TerminalTitles};
 
 /// Substrings that mean the session is occupied. `esc to interrupt` is shown
-/// the whole time the model generates; `Do you want to` is the body of every
-/// tool-permission prompt (allow / edit / proceed), during which the row stays
-/// `Working` with no spinner.
-const BUSY_MARKERS: &[&str] = &["esc to interrupt", "Do you want to"];
+/// while the model generates *and the input box is empty*; `Do you want to` is
+/// the body of every tool-permission prompt (allow / edit / proceed), during
+/// which the row stays `Working` with no spinner. `to navigate` / `Esc to
+/// cancel` are the footer of a selection menu (AskUserQuestion / ExitPlanMode),
+/// which is blocked-on-user, not idle — it has the input-box border but no
+/// spinner, so without these it would misread as the idle prompt and risk a
+/// false demote of a still-`Working` row.
+///
+/// Note `esc to interrupt` is **not** sufficient on its own: the moment the user
+/// starts typing a prompt mid-turn, Claude Code strips that hint off the spinner
+/// line (captured live — see [`has_active_timer`]), leaving only the spinner's
+/// running clock. So the clock is the second, composition-proof busy signal.
+const BUSY_MARKERS: &[&str] =
+    &["esc to interrupt", "Do you want to", "to navigate", "Esc to cancel"];
 
 /// The input box is framed by a long horizontal rule. A run of this many `─`
 /// (U+2500) in the tail is the positive anchor that we're looking at Claude's
@@ -94,12 +104,65 @@ fn classify(screen: &str) -> Screen {
     let lines: Vec<&str> = screen.lines().filter(|l| !l.trim().is_empty()).collect();
     let start = lines.len().saturating_sub(TAIL_LINES);
     let tail = lines[start..].join("\n");
-    if BUSY_MARKERS.iter().any(|m| tail.contains(m)) {
+    if BUSY_MARKERS.iter().any(|m| tail.contains(m)) || has_active_timer(&tail) {
         Screen::Busy
     } else if tail.contains(PROMPT_BORDER) {
         Screen::Idle
     } else {
         Screen::Unknown
+    }
+}
+
+/// True if the tail shows the spinner's running clock — "(49s", "(2m 3s",
+/// "(1h 2m 3s" — which Claude Code prints the whole time it is generating. This
+/// is the composition-proof busy signal: when the user starts typing a prompt
+/// mid-turn the "esc to interrupt" hint is stripped off the spinner line, but
+/// the clock stays, so a genuinely-working screen no longer reads as idle.
+/// Detected structurally (an open-paren immediately followed by an elapsed-time
+/// token) so ordinary parenthesised prose like "(3 items)" can't trip it.
+fn has_active_timer(tail: &str) -> bool {
+    let mut rest = tail;
+    while let Some(p) = rest.find('(') {
+        if elapsed_after(&rest[p + 1..]) {
+            return true;
+        }
+        rest = &rest[p + 1..];
+    }
+    false
+}
+
+/// True if `s` *begins* with an elapsed-time token: one or more `<digits><unit>`
+/// groups (unit ∈ h/m/s) joined by single spaces — "49s", "2m 3s", "1h 2m 3s".
+/// A digit run not closed by a unit (e.g. "3 items") fails.
+fn elapsed_after(s: &str) -> bool {
+    let mut chars = s.chars().peekable();
+    let mut groups = 0u32;
+    loop {
+        let mut saw_digit = false;
+        while matches!(chars.peek(), Some(c) if c.is_ascii_digit()) {
+            chars.next();
+            saw_digit = true;
+        }
+        if !saw_digit {
+            return false;
+        }
+        match chars.peek() {
+            Some('h') | Some('m') | Some('s') => {
+                chars.next();
+                groups += 1;
+            }
+            _ => return false,
+        }
+        // Continue only when a single space separates a further digit group.
+        if chars.peek() == Some(&' ') {
+            let mut after_space = chars.clone();
+            after_space.next();
+            if matches!(after_space.peek(), Some(c) if c.is_ascii_digit()) {
+                chars.next(); // consume the space, parse the next group
+                continue;
+            }
+        }
+        return groups >= 1;
     }
 }
 
@@ -322,6 +385,41 @@ mod tests {
         // Generating screen also has the input-box border — busy must win.
         let screen = format!("{b}\n❯\n{b}\n esc to interrupt", b = PROMPT_BORDER);
         assert_eq!(classify(&screen), Screen::Busy);
+    }
+
+    #[test]
+    fn typing_strips_esc_hint_but_clock_keeps_busy() {
+        // Captured live: composing a prompt mid-turn removes "esc to interrupt"
+        // from the spinner line, but its "(49s · ↓ 1.4k tokens)" clock stays.
+        // Must read Busy on the clock alone, or the row false-demotes to idle.
+        let screen = format!(
+            "✶ Smooshing… (49s · ↓ 1.4k tokens)\n{b}\n❯ I see one thing - when I start typing\n{b}\n  ⏵⏵ auto mode on (shift+tab to cycle)",
+            b = PROMPT_BORDER
+        );
+        assert_eq!(classify(&screen), Screen::Busy);
+    }
+
+    #[test]
+    fn selection_menu_is_busy_not_idle() {
+        // AskUserQuestion / ExitPlanMode menu: has the input-box border but no
+        // spinner and no "esc to interrupt" — it's blocked-on-user, not idle, so
+        // it must not let a still-Working row false-demote. Captured live.
+        let screen = format!(
+            "How should I handle this?\n❯ 1. Option A\n  2. Option B\n{b}\nEnter to select · ↑/↓ to navigate · Esc to cancel",
+            b = PROMPT_BORDER
+        );
+        assert_eq!(classify(&screen), Screen::Busy);
+    }
+
+    #[test]
+    fn elapsed_clock_forms_match_only_real_timers() {
+        assert!(has_active_timer("✶ Smooshing… (49s · ↓ 1.4k tokens)"));
+        assert!(has_active_timer("(2m 3s · ↑ 200 tokens)"));
+        assert!(has_active_timer("(1h 2m 3s)"));
+        assert!(!has_active_timer("✻ Cooked for 2m 19s")); // summary: no paren
+        assert!(!has_active_timer("(3 items) selected")); // digit then space, no unit
+        assert!(!has_active_timer("(see line 12s)")); // paren not followed by a digit
+        assert!(!has_active_timer("no parens here at all"));
     }
 
     #[test]
