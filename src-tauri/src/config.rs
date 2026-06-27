@@ -87,12 +87,19 @@ pub struct Config {
     /// Read by `tray_badge::refresh`; the tray's "Tray usage badge" submenu
     /// writes it. The hover tooltip always shows both buckets regardless.
     pub tray_badge: TrayBadge,
-    /// Paint a red rounded border on the tray icon when at least one local
-    /// session's context usage reaches this percent of its model's window — an
-    /// at-a-glance "an agent is filling its context" warning that overlays
-    /// whichever badge style is active. `null`/`0` disables it; the border
-    /// never shows when `tray_badge` is `None` (no badge to frame). Read by
-    /// `tray_badge::refresh`.
+    /// Whether the tray icon flags high context usage at all — the user toggle
+    /// behind the "Show high context usage" tray checkbox (on by default). When
+    /// off, no alert is drawn regardless of `tray_context_alert_percent`, which
+    /// is preserved so re-enabling restores the same threshold.
+    pub tray_context_alert_enabled: bool,
+    /// The threshold for the high-context-usage alert: when enabled and at least
+    /// one local session's context usage reaches this percent of its model's
+    /// window, the tray icon flags it — an at-a-glance "an agent is filling its
+    /// context" warning that overlays whichever badge style is active (the
+    /// icon-bearing styles recolor the icon's border red; the number styles draw
+    /// the digits over a red background). `null`/`0` disables it; the alert never
+    /// shows when `tray_badge` is `None` (no badge to frame), nor when
+    /// `tray_context_alert_enabled` is off. Read by `tray_badge::refresh`.
     pub tray_context_alert_percent: Option<f32>,
 }
 
@@ -303,6 +310,7 @@ impl Default for Config {
             detect_cancelled_turns: true,
             sync: SyncConfig::default(),
             tray_badge: TrayBadge::None,
+            tray_context_alert_enabled: true,
             tray_context_alert_percent: Some(80.0),
         }
     }
@@ -554,6 +562,14 @@ mod tests {
         assert_eq!(set.tray_context_alert_percent, Some(70.0));
         let off: Config = serde_json::from_str(r#"{ "tray_context_alert_percent": null }"#).unwrap();
         assert_eq!(off.tray_context_alert_percent, None);
+    }
+
+    #[test]
+    fn tray_context_alert_enabled_defaults_on_and_parses() {
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert!(cfg.tray_context_alert_enabled, "checked by default");
+        let off: Config = serde_json::from_str(r#"{ "tray_context_alert_enabled": false }"#).unwrap();
+        assert!(!off.tray_context_alert_enabled);
     }
 
     #[test]

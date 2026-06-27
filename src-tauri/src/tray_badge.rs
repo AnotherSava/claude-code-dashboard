@@ -23,8 +23,13 @@ use crate::notifications::context_percent;
 use crate::state::AppState;
 use crate::usage_limits::{UsageLimits, UsageLimitsState, UsageStatus};
 
-/// Red used for the context-over-threshold alert border.
+/// Red used for the context-over-threshold alert: the icon-mode border stroke
+/// and the number-mode background fill.
 const ALERT_BORDER_COLOR: [u8; 3] = [220, 38, 38];
+
+/// Digit color drawn over the number-mode alert background — white for contrast
+/// against the red fill.
+const ALERT_TEXT_COLOR: [u8; 3] = [255, 255, 255];
 
 /// App-icon body geometry as fractions of the rendered size, measured from the
 /// 512px source icon (opaque content box x[64,447] y[10,501], corner r≈36): a
@@ -378,24 +383,22 @@ fn rounded_rect_sdf(px: f32, py: f32, hx: f32, hy: f32, r: f32) -> f32 {
     outside + inside - r
 }
 
-/// Paint a slightly-rounded red border just inside the perimeter of a
-/// `size`x`size` RGBA buffer — the context-usage-over-threshold alert for the
-/// *number* modes, which have no icon outline to trace (the light/icon modes
-/// draw the icon-matched border via [`draw_alert_border`] instead).
-fn overlay_alert_border(buf: &mut [u8], size: usize) {
+/// Fill a slightly-rounded red plate over a `size`x`size` RGBA buffer — the
+/// context-usage-over-threshold alert background for the *number* modes, which
+/// have no icon outline to trace (the light/icon modes recolor the icon's own
+/// border via [`draw_alert_border`] instead). The digits are drawn on top.
+fn fill_alert_background(buf: &mut [u8], size: usize) {
     let n = size as f32;
     let center = n / 2.0;
     let half = center - 0.5; // outer edge sits ~0.5px from the image border
     let radius = (n * 0.18).round().max(2.0);
-    let thickness = (n * 0.10).round().max(2.0);
     for y in 0..size {
         for x in 0..size {
             let px = x as f32 + 0.5 - center;
             let py = y as f32 + 0.5 - center;
             let d = rounded_rect_sdf(px, py, half, half, radius);
-            // Ring band -thickness..=0, with ~1px anti-aliasing on each edge.
-            let band = (-d).min(d + thickness);
-            let cov = (band + 0.5).clamp(0.0, 1.0);
+            // Inside the rounded rect, with ~1px anti-aliasing on the edge.
+            let cov = (0.5 - d).clamp(0.0, 1.0);
             if cov > 0.0 {
                 let p = (y * size + x) * 4;
                 over(&mut buf[p..p + 4], ALERT_BORDER_COLOR, (cov * 255.0).round() as u8);
@@ -404,17 +407,29 @@ fn overlay_alert_border(buf: &mut [u8], size: usize) {
     }
 }
 
-/// Copy of `img` (which must be `size`x`size`) with the alert border painted on.
-fn with_alert_border(img: Image, size: usize) -> Image<'static> {
-    let mut buf = img.rgba().to_vec();
-    overlay_alert_border(&mut buf, size);
+/// Render the number badge over the red alert background: a filled rounded-rect
+/// in the alert red with the digits drawn on top in white. The number-mode
+/// context-usage-over-threshold alert — a filled plate reads more clearly at
+/// tray size than a thin ring around the digits.
+fn render_badge_alert(text: &str, size: usize) -> Image<'static> {
+    let mut buf = vec![0u8; size * size * 4];
+    fill_alert_background(&mut buf, size);
+    let cov = text_coverage(text, size);
+    for i in 0..size * size {
+        let p = i * 4;
+        over(&mut buf[p..p + 4], ALERT_TEXT_COLOR, cov[i]);
+    }
     Image::new_owned(buf, size as u32, size as u32)
 }
 
-/// Whether the context-usage alert border should be drawn: a badge style is
-/// active and at least one local session has reached `threshold` percent of its
-/// model's context window. `None`/`0` threshold or a `None` badge → never.
-fn context_alert_active(app: &AppHandle, badge: TrayBadge, threshold: Option<f32>, window_tokens: &std::collections::HashMap<String, u64>) -> bool {
+/// Whether the context-usage alert should be drawn: the feature is enabled, a
+/// badge style is active, and at least one local session has reached `threshold`
+/// percent of its model's context window. Disabled, a `None`/`0` threshold, or a
+/// `None` badge → never.
+fn context_alert_active(app: &AppHandle, badge: TrayBadge, enabled: bool, threshold: Option<f32>, window_tokens: &std::collections::HashMap<String, u64>) -> bool {
+    if !enabled {
+        return false;
+    }
     let Some(threshold) = threshold.filter(|t| *t > 0.0) else { return false };
     if badge == TrayBadge::None {
         return false;
@@ -490,18 +505,16 @@ pub fn refresh(app: &AppHandle) {
     let size = target_icon_px(app);
     // A red alert is drawn when an agent's context usage is over the threshold:
     // the icon-bearing styles (light, >=100% fallback, plain-icon fallback)
-    // recolor the icon's own white border red; the number style frames the
-    // digits with a drawn red border.
-    let alert = context_alert_active(app, badge, config.tray_context_alert_percent, &config.context_window_tokens);
+    // recolor the icon's own white border red; the number style draws the
+    // digits over a red background plate.
+    let alert = context_alert_active(app, badge, config.tray_context_alert_enabled, config.tray_context_alert_percent, &config.context_window_tokens);
     let img = match badge_percent(badge, &usage) {
         // Light modes recolor the traffic light. Number modes draw the
         // percentage, but a maxed (>=100%) bucket shows the all-red light
         // instead of a number.
         Some(pct) if badge.is_light() || pct >= 100 => render_light_badge(&base, pct, size, alert),
-        Some(pct) => {
-            let number = render_badge(&badge_text(pct), urgency_color(pct), size);
-            if alert { with_alert_border(number, size) } else { number }
-        }
+        Some(pct) if alert => render_badge_alert(&badge_text(pct), size),
+        Some(pct) => render_badge(&badge_text(pct), urgency_color(pct), size),
         None => render_plain_icon(&base, size, alert),
     };
     let _ = tray.set_icon(Some(img));
@@ -665,30 +678,19 @@ mod tests {
     }
 
     #[test]
-    fn alert_border_paints_red_perimeter_and_leaves_center_clear() {
+    fn alert_background_fills_red_plate_behind_white_digits() {
         let size = 24;
-        let mut buf = vec![0u8; size * size * 4]; // fully transparent
-        overlay_alert_border(&mut buf, size);
-        // A pixel one row in from the top edge, mid-width, lands in the ring.
-        let edge = (1 * size + size / 2) * 4;
-        assert_eq!(&buf[edge..edge + 3], &ALERT_BORDER_COLOR, "border is the alert red");
-        assert_eq!(buf[edge + 3], 255, "border pixel is opaque");
-        // The center stays transparent — the border only frames the perimeter.
-        let center = ((size / 2) * size + size / 2) * 4;
-        assert_eq!(buf[center + 3], 0, "center untouched by the border");
-    }
-
-    #[test]
-    fn alert_border_composites_over_an_opaque_icon() {
-        // An all-opaque-white buffer: the border repaints its ring red but
-        // leaves the interior white.
-        let size = 24;
-        let mut buf = vec![255u8; size * size * 4];
-        overlay_alert_border(&mut buf, size);
-        let edge = (1 * size + size / 2) * 4;
-        assert_eq!(&buf[edge..edge + 3], &ALERT_BORDER_COLOR);
-        let center = ((size / 2) * size + size / 2) * 4;
-        assert_eq!(&buf[center..center + 4], &[255, 255, 255, 255], "interior stays the icon color");
+        let img = render_badge_alert("85", size);
+        let rgba = img.rgba();
+        // The plate fills the rounded rect in opaque alert red (the margins
+        // around the digits are plate-only).
+        let has_red_plate = rgba.chunks_exact(4).any(|p| p[..3] == ALERT_BORDER_COLOR && p[3] == 255);
+        assert!(has_red_plate, "background is an opaque alert-red plate");
+        // The digits are drawn in white over the plate.
+        let has_white = rgba.chunks_exact(4).any(|p| p[0] == 255 && p[1] == 255 && p[2] == 255 && p[3] == 255);
+        assert!(has_white, "digits are drawn in white over the red plate");
+        // The image corner sits outside the rounded rect and stays transparent.
+        assert_eq!(rgba[3], 0, "image corner outside the plate stays transparent");
     }
 
     #[test]

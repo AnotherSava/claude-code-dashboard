@@ -26,6 +26,7 @@ Right-click the tray icon for the controls you reach for most:
 - **Auto-resize** — fit the window height to its content, growing upward or downward.
 - **History font size** — pick one of five sizes for the history window.
 - **Tray usage badge** — show the 5-hour or 7-day usage on the tray icon, as the recolored traffic light or a number (or none).
+- **Show high context usage** — flag a session that's filling its context window on the tray icon (on by default). Has no visible effect unless a tray usage badge is on.
 - **Open config/logs location** — open the app data folder.
 - **Quit** — close the widget.
 
@@ -39,6 +40,8 @@ Every field is optional — omit one and the built-in default applies. A complet
   "history_font_size": "regular",
   "auto_resize": "none",
   "tray_badge": "none",
+  "tray_context_alert_enabled": true,
+  "tray_context_alert_percent": 80,
   "terminal_titles": true,
   "detect_cancelled_turns": true,
   "save_window_position": true,
@@ -135,7 +138,8 @@ For the full classification logic see [Classification](development/classificatio
 - `limit_bar_segments` — number of segments in the 5-hour / 7-day usage bars; higher is finer-grained.
 - `usage_limits_poll_interval_seconds` — how often to poll Anthropic for usage. Clamped to a 60-second minimum.
 - `tray_badge` — show a usage limit on the tray icon. Values: `"none"`; `"five_hour_light"` / `"seven_day_light"` (recolor the traffic-light icon by usage); `"five_hour_number"` / `"seven_day_number"` (show the percentage, all-red light at 100%). The hover tooltip always shows both figures. Set it from the tray's **Tray usage badge** submenu.
-- `tray_context_alert_percent` — turn the tray icon's border red when any session's context usage reaches this percent of its model's window — an at-a-glance "an agent is filling its context" warning. The light modes draw a red border around the traffic-light icon; the number modes draw a red frame around the digits. `null` or `0` turns it off, and it never shows when `tray_badge` is `"none"` (there's no badge to frame).
+- `tray_context_alert_enabled` — whether the tray icon flags high context usage at all (the **Show high context usage** tray checkbox; on by default). Turning it off keeps `tray_context_alert_percent` intact, so re-checking it restores the same threshold.
+- `tray_context_alert_percent` — flag the tray icon when any session's context usage reaches this percent of its model's window — an at-a-glance "an agent is filling its context" warning. The light modes draw a red border around the traffic-light icon; the number modes draw the digits over a red background. `null` or `0` turns it off, and it never shows when `tray_badge` is `"none"` (there's no badge to frame) or when **Show high context usage** is unchecked.
 
 ### Multi-device sync
 

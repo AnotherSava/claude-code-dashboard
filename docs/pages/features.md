@@ -62,7 +62,7 @@ The header shows two bars tracking your Anthropic usage against the rolling 5-ho
 
 You can also surface a limit right on the tray icon, via the tray's **Tray usage badge** submenu — for the 5-hour or 7-day bucket, in one of two styles: **lights** recolor the dashboard's traffic-light icon, its three lamps stepping from green through amber to red as the bucket fills; or **number** shows the percentage itself, switching to the all-red light at 100%. Either way the icon's hover tooltip shows both figures. Off by default.
 
-When the badge is on, the tray icon also gains a red border the moment any session's context usage crosses a threshold you set — an at-a-glance warning that an agent is filling its context, right in the tray. See [Settings](settings) for the threshold.
+When the badge is on, the tray icon also flags the moment any session's context usage crosses a threshold you set — an at-a-glance warning that an agent is filling its context, right in the tray. The light styles gain a red border; the number style draws the digits over a red background. It's on by default — the tray's **Show high context usage** checkbox turns it off. See [Settings](settings) for the threshold.
 
 ## Work intensity
 
