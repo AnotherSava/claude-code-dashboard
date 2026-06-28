@@ -63,8 +63,6 @@ pub struct PersistedSession {
     pub original_prompt: Option<String>,
     #[serde(default)]
     pub task_started_at: i64,
-    #[serde(default)]
-    pub last_input_tokens: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -323,21 +321,6 @@ impl AppState {
             };
             let mut dialog = r.dialog;
 
-            let is_new_session = !dialog.is_empty()
-                && match (r.last_input_tokens, input.input_tokens) {
-                    (Some(prev), Some(cur)) => cur < prev / 2,
-                    _ => false,
-                };
-            if is_new_session {
-                dialog.push(DialogEntry {
-                    role: DialogRole::Separator,
-                    text: String::new(),
-                    timestamp: now_ms,
-                    status: Status::Idle,
-                    task_start: false,
-                });
-            }
-
             let has_new_entry = if let Some(pending) = dialog_entry {
                 let task_start = pending.role == DialogRole::User;
                 dialog.push(DialogEntry {
@@ -409,13 +392,10 @@ impl AppState {
         Some(s.status)
     }
 
-    /// Mark a session-boundary in the in-memory dialog. Called when the
-    /// hook reports a transcript_path different from the one we're already
-    /// watching for this chat_id — Claude Code's `/clear` keeps the cwd
-    /// (so the dashboard chat_id is unchanged) but rotates the JSONL file.
-    /// The "new" branch of `apply_set` handles the same boundary at
-    /// app-restart time via `last_input_tokens`; this covers the case where
-    /// the dashboard is already running and the session stays in memory.
+    /// Mark a session-boundary in the in-memory dialog. Called on the
+    /// authoritative boundary signals — `SessionEnd` (before `/clear` removes
+    /// the row) and `PreCompact` (context compaction) — to append a history
+    /// separator without resurrecting the prior task onto the next turn.
     pub fn mark_session_boundary(&self, id: &str, now_ms: i64) -> bool {
         let mut sessions = self.sessions.lock().unwrap();
         let Some(session) = sessions.iter_mut().find(|s| s.id == id) else {
@@ -1021,7 +1001,6 @@ mod tests {
             ],
             original_prompt: Some("old task".into()),
             task_started_at: 100,
-            last_input_tokens: None,
         };
         state.apply_set(set("a", Status::Done, "done"), 1_000, NO_CONTINUATIONS, Some(restored));
         let s = get(&state, "a");
@@ -1045,7 +1024,6 @@ mod tests {
             ],
             original_prompt: Some("old task".into()),
             task_started_at: 100,
-            last_input_tokens: None,
         };
         state.apply_set(set_no_label("a", Status::Idle), 1_000, NO_CONTINUATIONS, Some(restored));
         let s = get(&state, "a");
@@ -1067,7 +1045,6 @@ mod tests {
             ],
             original_prompt: Some("old task".into()),
             task_started_at: 100,
-            last_input_tokens: None,
         };
         state.apply_set(set("a", Status::Working, "new task"), 2_000, NO_CONTINUATIONS, Some(restored));
         let s = get(&state, "a");

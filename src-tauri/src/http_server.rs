@@ -127,19 +127,8 @@ async fn post_event(
             let restored = history.as_ref().and_then(|h| h.get(&chat_id));
             let now = now_ms();
             let watcher = app.try_state::<WatcherRegistry>();
-            let session_rotated = match (&transcript_path, watcher.as_ref()) {
-                (Some(new_path), Some(reg)) => reg
-                    .current_path(&chat_id)
-                    .is_some_and(|old| old != *new_path),
-                _ => false,
-            };
-            let boundary_changed = if session_rotated {
-                state.mark_session_boundary(&chat_id, now)
-            } else {
-                false
-            };
             let set_changed = state.apply_set(input, now, &cfg.continuation_prompts, restored);
-            if boundary_changed || set_changed {
+            if set_changed {
                 if let Some(ref h) = history {
                     let sessions = state.sessions.lock().unwrap();
                     if let Some(s) = sessions.iter().find(|s| s.id == chat_id) {

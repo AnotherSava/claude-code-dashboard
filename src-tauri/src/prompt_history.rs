@@ -49,7 +49,6 @@ impl PromptHistoryStore {
                 dialog: session.dialog.clone(),
                 original_prompt: session.original_prompt.clone(),
                 task_started_at: session.task_started_at,
-                last_input_tokens: session.input_tokens,
             },
         );
     }
@@ -99,7 +98,6 @@ mod tests {
                     dialog: vec![entry],
                     original_prompt: Some("fix foo".into()),
                     task_started_at: 1000,
-                    last_input_tokens: None,
                 },
             );
         }
