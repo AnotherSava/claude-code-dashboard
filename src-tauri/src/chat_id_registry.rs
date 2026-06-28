@@ -64,15 +64,28 @@ impl ChatIdRegistry {
 
     fn save_to_disk(&self) {
         let data = self.data.lock().unwrap();
-        match serde_json::to_string_pretty(&*data) {
-            Ok(json) => {
-                if let Err(e) = std::fs::write(&self.path, json) {
-                    tracing::warn!(?e, path = %self.path.display(), "failed to write chat id registry");
-                }
-            }
+        let json = match serde_json::to_string_pretty(&*data) {
+            Ok(json) => json,
             Err(e) => {
                 tracing::warn!(?e, "failed to serialize chat id registry");
+                return;
             }
+        };
+        // Atomic write: write a sibling temp file, then rename it over the
+        // target. rename is atomic on the same filesystem, so a crash or a
+        // concurrent reader never sees the truncated file a plain `fs::write`
+        // would leave mid-write — a torn file reloads as empty (`unwrap_or_default`)
+        // and silently drops every session→chat_id lock. The mutex is held
+        // through the rename so overlapping saves stay totally ordered; the last
+        // to finish reflects the latest map.
+        let tmp = self.path.with_extension("tmp");
+        if let Err(e) = std::fs::write(&tmp, json.as_bytes()) {
+            tracing::warn!(?e, path = %tmp.display(), "failed to write chat id registry");
+            return;
+        }
+        if let Err(e) = std::fs::rename(&tmp, &self.path) {
+            tracing::warn!(?e, path = %self.path.display(), "failed to persist chat id registry");
+            let _ = std::fs::remove_file(&tmp);
         }
     }
 }
@@ -118,6 +131,18 @@ mod tests {
         let r = registry();
         assert_eq!(r.resolve("", "data"), "data");
         assert!(r.data.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn resolve_persists_across_reload_with_no_temp_left() {
+        let r = registry();
+        let path = r.path.clone();
+        r.resolve("s1", "assistant");
+        // A fresh registry on the same path sees the atomically-written mapping.
+        let r2 = ChatIdRegistry::new(path.clone());
+        assert_eq!(r2.resolve("s1", "other"), "assistant", "persisted lock survives reload");
+        // The temp file is renamed away, never left behind.
+        assert!(!path.with_extension("tmp").exists(), "no temp file leaked");
     }
 
     #[test]
