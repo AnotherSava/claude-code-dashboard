@@ -83,9 +83,11 @@ fn circle(status: Status) -> &'static str {
     match status {
         Status::Idle => "⚪",
         Status::Working => "🔵",
-        // No light-blue circle emoji exists, so `Waiting` shares the blue circle
-        // with `Working` here; the dashboard pill carries the lighter shade.
-        Status::Waiting => "🔵",
+        // No light-blue *circle* emoji exists, so `Waiting` uses the lighter,
+        // azure blue diamond — distinct from `Working`'s navy circle in both hue
+        // and shape, mirroring the dashboard pill's lighter shade as closely as
+        // the emoji palette allows.
+        Status::Waiting => "🔷",
         Status::Blocked => "🟠",
         Status::Done => "🟢",
         Status::Error => "🔴",
@@ -319,6 +321,9 @@ mod tests {
     #[test]
     fn circle_covers_every_status() {
         assert_eq!(circle(Status::Working), "🔵");
+        // Waiting must stay distinct from Working — not the shared blue circle.
+        assert_eq!(circle(Status::Waiting), "🔷");
+        assert_ne!(circle(Status::Waiting), circle(Status::Working));
         assert_eq!(circle(Status::Blocked), "🟠");
         assert_eq!(circle(Status::Done), "🟢");
         assert_eq!(circle(Status::Error), "🔴");
