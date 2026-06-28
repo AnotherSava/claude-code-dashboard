@@ -19,7 +19,7 @@ such phrase in `prompt_history.json` is a pure offer, never a real ask.
 **How to apply:** The opener check only skips the bare-`?` path — an embedded real
 ask still fires via the permission-seeking path, so "Anything else, or shall I
 commit?" still WAITs (caught by "shall i"). Closers diverge here on purpose: a
-benign **closer** (default `["What's next?", "or are you good?"]`) excuses its
+benign **closer** (default `["What's next?", "or are you good?", "or leave it?"]`) excuses its
 *whole closing sentence* (it's dropped before the permission-seeking / hand-back
 paths run), so "Want me to drive a browser check, or are you good?" stays DONE
 even though it opens with "Want me to". A real ask in an *earlier* sentence still

@@ -1219,6 +1219,15 @@ mod tests {
         assert!(!is_a_question(text, QuestionRules::from_config(&cfg)));
     }
 
+    #[test]
+    fn leave_it_closer_default_config() {
+        // "…, or leave it?" is an offer-to-do-next sign-off, not a hand-back —
+        // the default closer list excuses the whole offer sentence ("want to").
+        let cfg = Config::default();
+        let text = "Want to pick that up now, or leave it?";
+        assert!(!is_a_question(text, QuestionRules::from_config(&cfg)));
+    }
+
     // ----- benign openers (offer questions) -----
 
     fn with_openers(openers: &[String]) -> QuestionRules<'_> {
