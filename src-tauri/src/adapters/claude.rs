@@ -511,29 +511,46 @@ pub(crate) fn is_a_question(text: &str, rules: QuestionRules) -> bool {
 pub(crate) fn question_reason(text: &str, rules: QuestionRules) -> Option<&'static str> {
     let plain = strip_markdown(text);
     let effective = strip_trailing_options(&plain);
-    if effective.ends_with('?') {
+    let is_benign_closer = {
         let lower = effective.to_lowercase();
-        let is_benign_closer = rules.closers.iter().any(|c| {
-            !c.is_empty() && lower.ends_with(&c.to_lowercase())
-        });
+        rules.closers.iter().any(|c| !c.is_empty() && lower.ends_with(&c.to_lowercase()))
+    };
+    if effective.ends_with('?') {
         let is_benign_offer = opens_with_benign_offer(final_sentence(effective), rules.openers);
         if !is_benign_closer && !is_benign_offer {
             return Some("text ends with '?'");
         }
     }
-    if has_permission_seeking_question(&plain) {
+    // A benign closer is an optional sign-off ("…, or are you good?"): excuse its
+    // whole closing sentence so a permission-seeking phrase *inside* it ("Want me
+    // to …, or are you good?") reads as part of the offer, not a hand-back. A real
+    // ask in an *earlier* sentence still awaits, so scan with that sentence removed.
+    let scan = if is_benign_closer { strip_final_sentence(&plain) } else { plain.clone() };
+    if has_permission_seeking_question(&scan) {
         return Some("permission-seeking phrase before a '?'");
     }
-    if has_handback_request(&plain) {
+    if has_handback_request(&scan) {
         return Some("sentence-initial hand-back request");
     }
-    if last_paragraph_opens_with_question(&plain, rules) {
+    if last_paragraph_opens_with_question(&scan, rules) {
         return Some("last paragraph opens with a question");
     }
-    if handback_before_trailing_outro(&plain, rules) {
+    if handback_before_trailing_outro(&scan, rules) {
         return Some("hand-back question before a trailing outro");
     }
     None
+}
+
+/// Return `text` with its final sentence dropped — everything up to and including
+/// the sentence terminator that precedes the last sentence. Used to excuse a
+/// benign closing sentence while still scanning the rest for a genuine hand-back.
+/// Returns empty when the text is a single sentence (nothing precedes it).
+fn strip_final_sentence(text: &str) -> String {
+    let trimmed = text.trim_end_matches(|c: char| matches!(c, '.' | '!' | '?' | '\n' | '\r' | ' ' | '\t'));
+    match trimmed.rfind(|c: char| matches!(c, '.' | '!' | '?' | '\n')) {
+        Some(idx) => trimmed[..=idx].to_string(),
+        None => String::new(),
+    }
 }
 
 /// A short single-line tail of assistant text for the decision log. The
@@ -1166,6 +1183,40 @@ mod tests {
     fn is_a_question_non_matching_closer_still_awaits() {
         let closers = vec!["What's next?".to_string()];
         assert!(is_a_question("Which option do you prefer?", with_closers(&closers)));
+    }
+
+    #[test]
+    fn is_a_question_are_you_good_closer_is_not_a_question() {
+        // Real printlab corpus: an "or are you good?" sign-off excuses the whole
+        // closing sentence even though it opens with "Want me to" — the offer is
+        // optional, so the row settles Done rather than Blocked.
+        let closers = vec!["or are you good?".to_string()];
+        for text in [
+            "or are you good?",
+            "Want me to drive a quick browser check on a real multi-object 3MF, or are you good?",
+        ] {
+            assert!(!is_a_question(text, with_closers(&closers)), "text: {}", text);
+        }
+    }
+
+    #[test]
+    fn benign_closer_does_not_suppress_earlier_ask() {
+        // The closer only excuses its own closing sentence; a genuine ask in an
+        // earlier sentence still awaits.
+        let closers = vec!["or are you good?".to_string()];
+        assert!(is_a_question(
+            "Should I delete the backup first? Or are you good?",
+            with_closers(&closers)
+        ));
+    }
+
+    #[test]
+    fn are_you_good_closer_default_config() {
+        // Shipped default closer list includes "or are you good?", so a fresh
+        // config treats the sign-off as Done without any user tuning.
+        let cfg = Config::default();
+        let text = "Want me to run the lint pass, or are you good?";
+        assert!(!is_a_question(text, QuestionRules::from_config(&cfg)));
     }
 
     // ----- benign openers (offer questions) -----

@@ -18,8 +18,13 @@ such phrase in `prompt_history.json` is a pure offer, never a real ask.
 
 **How to apply:** The opener check only skips the bare-`?` path — an embedded real
 ask still fires via the permission-seeking path, so "Anything else, or shall I
-commit?" still WAITs (caught by "shall i"). Don't try to "simplify" openers and
-closers into one list or re-derive on the frontend — they're deliberately
-distinct (prefix vs suffix), like the [[feedback_frontend_question_detector_lenient]]
-split. Validate any change to this against `prompt_history.json` per
+commit?" still WAITs (caught by "shall i"). Closers diverge here on purpose: a
+benign **closer** (default `["What's next?", "or are you good?"]`) excuses its
+*whole closing sentence* (it's dropped before the permission-seeking / hand-back
+paths run), so "Want me to drive a browser check, or are you good?" stays DONE
+even though it opens with "Want me to". A real ask in an *earlier* sentence still
+WAITs ("Should I delete the backup first? Or are you good?"). Don't try to
+"simplify" openers and closers into one list or re-derive on the frontend —
+they're deliberately distinct (prefix-skips-Path-1 vs suffix-excuses-its-sentence),
+like the [[feedback_frontend_question_detector_lenient]] split. Validate any change to this against `prompt_history.json` per
 [[feedback_validate_detection_against_history]].
