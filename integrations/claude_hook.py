@@ -19,6 +19,7 @@ Install in `~/.claude/settings.json`:
         "StopFailure":         [{"hooks": [{"type": "command", "command": "python <repo>/integrations/claude_hook.py"}]}],
         "PermissionRequest":   [{"hooks": [{"type": "command", "command": "python <repo>/integrations/claude_hook.py"}]}],
         "Elicitation":         [{"hooks": [{"type": "command", "command": "python <repo>/integrations/claude_hook.py"}]}],
+        "ElicitationResult":   [{"hooks": [{"type": "command", "command": "python <repo>/integrations/claude_hook.py"}]}],
         "PreCompact":          [{"hooks": [{"type": "command", "command": "python <repo>/integrations/claude_hook.py"}]}],
         "SessionEnd":          [{"hooks": [{"type": "command", "command": "python <repo>/integrations/claude_hook.py"}]}],
         "PreToolUse":          [{"matcher": "^(AskUserQuestion|ExitPlanMode)$", "hooks": [{"type": "command", "command": "python <repo>/integrations/claude_hook.py"}]}]
@@ -26,7 +27,8 @@ Install in `~/.claude/settings.json`:
     }
 
 `StopFailure` (turn ended on an API error → ERROR), `PermissionRequest` and
-`Elicitation` (blocked on the user → WAIT), and `PreCompact` (context
+`Elicitation` (blocked on the user → WAIT), `ElicitationResult` (the user
+answered the MCP prompt → resume Working), and `PreCompact` (context
 compaction → a history separator) cover gaps the core lifecycle events leave.
 
 The `PreToolUse` matcher restricts the hook to user-gating tools whose

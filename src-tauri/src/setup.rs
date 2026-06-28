@@ -52,6 +52,7 @@ pub fn build_settings_snippet(hook_path_for_command: &str) -> String {
     "StopFailure":         [{{"hooks": [{{"type": "command", "command": "{cmd}"}}]}}],
     "PermissionRequest":   [{{"hooks": [{{"type": "command", "command": "{cmd}"}}]}}],
     "Elicitation":         [{{"hooks": [{{"type": "command", "command": "{cmd}"}}]}}],
+    "ElicitationResult":   [{{"hooks": [{{"type": "command", "command": "{cmd}"}}]}}],
     "PreCompact":          [{{"hooks": [{{"type": "command", "command": "{cmd}"}}]}}],
     "SessionEnd":          [{{"hooks": [{{"type": "command", "command": "{cmd}"}}]}}],
     "PreToolUse": [{{

@@ -38,8 +38,10 @@ fn blocked_label_for(tool_name: &str) -> &'static str {
 ///
 /// Known events: `UserPromptSubmit`, `UserPromptExpansion`, `Stop`,
 /// `StopFailure`, `SessionStart`, `Notification`, `PreToolUse`,
-/// `PermissionRequest`, `Elicitation`, `PreCompact`, `SessionEnd`. Unknown
-/// events → [`AdapterOutput::Ignore`]. `UserPromptExpansion` is the early signal
+/// `PermissionRequest`, `Elicitation`, `ElicitationResult`, `PreCompact`,
+/// `SessionEnd`. Unknown events → [`AdapterOutput::Ignore`].
+/// `ElicitationResult` is the authoritative unblock for an `Elicitation` (user
+/// answered the MCP prompt → resume `Working`). `UserPromptExpansion` is the early signal
 /// a slash command fires before its context-gathering, so a skill launch shows
 /// Working at once instead of after the gathering when `UserPromptSubmit` lands.
 /// `StopFailure` (API error), `PermissionRequest`/`Elicitation` (blocked on the
@@ -359,6 +361,17 @@ fn classify_detailed(
                 "MCP tool requested input; blocked on user",
             ))
         }
+        "ElicitationResult" => {
+            // The user answered the MCP elicitation that `Elicitation` marked the
+            // row `Blocked` for — the authoritative unblock, fired the moment the
+            // response is submitted. Carry the row back to `Working` immediately
+            // instead of waiting for the transcript watcher to infer the resume.
+            // `Blocked` → `Working` is a non-boundary, so the underlying task
+            // label, `original_prompt`, and working accumulator are preserved
+            // (and `status_before_working` captures `Blocked`, so an Esc-cancel of
+            // the resumed turn reverts to the prompt). No label of its own.
+            Some(Classification::new(Status::Working, None, "user answered the MCP elicitation; resuming"))
+        }
         _ => None,
     }
 }
@@ -517,6 +530,9 @@ pub(crate) fn question_reason(text: &str, rules: QuestionRules) -> Option<&'stat
     if last_paragraph_opens_with_question(&plain, rules) {
         return Some("last paragraph opens with a question");
     }
+    if handback_before_trailing_outro(&plain, rules) {
+        return Some("hand-back question before a trailing outro");
+    }
     None
 }
 
@@ -546,13 +562,11 @@ fn strip_markdown(text: &str) -> String {
         .collect()
 }
 
-/// Check the last paragraph for a permission-seeking phrase. A phrase ending in
-/// `?` matches as-is; the rest must be followed by a `?` later in the paragraph.
-/// Catches questions embedded mid-paragraph like "Want me to add that? The
-/// plan: ..." where the response continues after the question.
-fn has_permission_seeking_question(text: &str) -> bool {
-    let last_para = last_paragraph(text);
-    let lower = last_para.to_lowercase();
+/// True when `paragraph` carries a permission-seeking phrase positioned before a
+/// later `?` (or a phrase that bakes in its own `?`). Shared by the last-paragraph
+/// check and the trailing-outro look-back.
+fn permission_seeking_in(paragraph: &str) -> bool {
+    let lower = paragraph.to_lowercase();
     PERMISSION_SEEKING.iter().any(|phrase| {
         if let Some(phrase_start) = lower.find(phrase) {
             let after_phrase = &lower[phrase_start + phrase.len()..];
@@ -561,6 +575,55 @@ fn has_permission_seeking_question(text: &str) -> bool {
             false
         }
     })
+}
+
+/// Check the last paragraph for a permission-seeking phrase. A phrase ending in
+/// `?` matches as-is; the rest must be followed by a `?` later in the paragraph.
+/// Catches questions embedded mid-paragraph like "Want me to add that? The
+/// plan: ..." where the response continues after the question.
+fn has_permission_seeking_question(text: &str) -> bool {
+    permission_seeking_in(last_paragraph(text))
+}
+
+/// Forward-reference connectives that open a *trailing outro* paragraph — the
+/// agent stating what it will do once the user answers the hand-back question in
+/// the paragraph just above ("…leave them as historical record?\n\nThen I'll
+/// `/commit`."). The single-last-paragraph checks miss that question because it
+/// isn't in the final paragraph. Gating the look-back on these openers (trailing
+/// space, so `once` alone doesn't match) keeps a self-answered rhetorical
+/// question ("Want me to fix it?\n\nI went ahead and fixed it.") — whose trailing
+/// paragraph reports completed work and opens with none of these — correctly Done.
+const TRAILING_OUTRO_OPENERS: &[&str] = &[
+    "then i'll ",
+    "then i can ",
+    "once you ",
+    "on approval",
+    "after you ",
+];
+
+/// True when the paragraph *before* a trailing outro paragraph reads as a
+/// hand-back — it ends in `?` (benign closers / offers still excused) or carries
+/// a permission-seeking phrase before a `?`. Catches the "question?\n\nThen I'll
+/// …" shape the single-last-paragraph checks miss, without disturbing the
+/// self-answered case the outro-opener gate excludes.
+fn handback_before_trailing_outro(text: &str, rules: QuestionRules) -> bool {
+    let mut paras = text.rsplit("\n\n").map(str::trim).filter(|p| !p.is_empty());
+    let Some(last) = paras.next() else { return false };
+    let lower_last = last.to_lowercase();
+    if !TRAILING_OUTRO_OPENERS.iter().any(|o| lower_last.starts_with(o)) {
+        return false;
+    }
+    let Some(prev) = paras.next() else { return false };
+    let effective = strip_trailing_options(prev);
+    if effective.ends_with('?') {
+        let lower = effective.to_lowercase();
+        let benign = rules.closers.iter().any(|c| !c.is_empty() && lower.ends_with(&c.to_lowercase()))
+            || opens_with_benign_offer(final_sentence(effective), rules.openers);
+        if !benign {
+            return true;
+        }
+    }
+    permission_seeking_in(prev)
 }
 
 /// Sentence-initial imperative openers that hand control back to the user — the
@@ -1393,6 +1456,52 @@ mod tests {
         ));
     }
 
+    // ----- hand-back question before a trailing outro -----
+
+    #[test]
+    fn handback_question_before_trailing_outro_is_a_question() {
+        // The real corpus miss: a hand-back whose question sits one paragraph up,
+        // trailed by a standalone "Then I'll …" outro. The single-last-paragraph
+        // checks miss it because the final paragraph is the outro, not the question.
+        assert!(is_a_question(
+            "## One thing left — your call\n\nWant me to (a) sweep all the notes, (b) just fix the 2 stale ones, or (c) leave them as historical record?\n\nThen I'll /commit — which closes the last memo.",
+            NO_RULES
+        ));
+        // Minimal shapes, both outro openers.
+        assert!(is_a_question("Should I use the cached value?\n\nThen I'll run the tests.", NO_RULES));
+        assert!(is_a_question("Want me to proceed?\n\nOnce you confirm I'll push.", NO_RULES));
+    }
+
+    #[test]
+    fn self_answered_question_before_outro_stays_done() {
+        // The trailing paragraph reports completed work and opens with none of the
+        // outro connectives, so the rhetorical question two paragraphs up must NOT
+        // flip the row to a question. (Same fixture as the last-paragraph guard.)
+        assert!(!is_a_question(
+            "Want me to fix it?\n\nI went ahead and fixed it. All tests pass.",
+            NO_RULES
+        ));
+    }
+
+    #[test]
+    fn trailing_outro_without_a_question_above_stays_done() {
+        // A "Then I'll …" outro after a plain statement is not a hand-back.
+        assert!(!is_a_question(
+            "The refactor is complete and lint is clean.\n\nThen I'll move on to the tests.",
+            NO_RULES
+        ));
+    }
+
+    #[test]
+    fn benign_closer_before_outro_stays_done() {
+        // A benign closer two paragraphs up is still excused even with an outro.
+        let closers = vec!["What's next?".to_string()];
+        assert!(!is_a_question(
+            "Everything is deployed.\n\nWhat's next?\n\nThen I'll wait for your call.",
+            with_closers(&closers)
+        ));
+    }
+
     // ----- dispatch: integration -----
 
     #[test]
@@ -1461,6 +1570,21 @@ mod tests {
             AdapterOutput::Set { input, .. } => {
                 assert_eq!(input.status, Status::Blocked);
                 assert_eq!(input.label.as_deref(), Some("Pick a branch"));
+            }
+            _ => panic!("expected Set"),
+        }
+    }
+
+    #[test]
+    fn dispatch_elicitation_result_resumes_working() {
+        // The user answered the MCP prompt — the row leaves Blocked for Working
+        // with no label of its own (the task label is preserved downstream).
+        let cfg = cfg_with(Some("d:/projects"), &[]);
+        let p = json!({ "cwd": "d:/projects/demo", "tool_name": "ask", "user_response": {"branch": "main"} });
+        match dispatch("ElicitationResult", &p, &cfg) {
+            AdapterOutput::Set { input, .. } => {
+                assert_eq!(input.status, Status::Working);
+                assert_eq!(input.label, None);
             }
             _ => panic!("expected Set"),
         }
