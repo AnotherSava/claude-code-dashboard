@@ -1,5 +1,5 @@
 //! Mirror each session's live status onto its terminal tab title as
-//! "<colored circle> <name>" (e.g. "🔵 ai-dashboard").
+//! "<status glyph> <name>" (e.g. "🔵 ai-dashboard").
 //!
 //! The dashboard is a GUI process with no handle into any terminal, so it
 //! reaches the session's terminal through the pid candidates the hook
@@ -78,17 +78,20 @@ impl TerminalTitles {
 #[cfg(windows)]
 static ATTACH_LOCK: Mutex<()> = Mutex::new(());
 
-fn circle(status: Status) -> &'static str {
+fn status_glyph(status: Status) -> &'static str {
     // Mirrors the status pill colors in SessionItem.svelte.
     match status {
         Status::Idle => "⚪",
         Status::Working => "🔵",
-        // No light-blue *circle* emoji exists, so `Waiting` uses the lighter,
-        // azure blue diamond — distinct from `Working`'s navy circle in both hue
-        // and shape, mirroring the dashboard pill's lighter shade as closely as
-        // the emoji palette allows.
-        Status::Waiting => "🔷",
-        Status::Blocked => "🟠",
+        // No light-blue *circle* emoji exists to mirror the dashboard pill, so
+        // `Waiting` (main turn settled, background work still running) uses an
+        // hourglass — its "still going, hang on" semantics separate it cleanly
+        // from `Working`'s blue circle.
+        Status::Waiting => "⏳",
+        // Not a circle: the orange and red circles read too alike in a tab, so
+        // `Blocked` (waiting on the user) uses a raised hand — its "stop, your
+        // turn" semantics also separate it cleanly from `Error`'s red circle.
+        Status::Blocked => "✋",
         Status::Done => "🟢",
         Status::Error => "🔴",
     }
@@ -139,7 +142,7 @@ pub fn sync(app: &AppHandle, sessions: &[AgentSession]) {
             continue;
         };
         let name = s.display_name.as_deref().unwrap_or(&s.id);
-        let title = format!("{} {}", circle(s.status), name);
+        let title = format!("{} {}", status_glyph(s.status), name);
         if let Some((prev, at)) = last.get(&s.id) {
             if *prev == title && now - at < REASSERT_MS {
                 continue;
@@ -319,15 +322,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn circle_covers_every_status() {
-        assert_eq!(circle(Status::Working), "🔵");
+    fn status_glyph_covers_every_status() {
+        assert_eq!(status_glyph(Status::Working), "🔵");
         // Waiting must stay distinct from Working — not the shared blue circle.
-        assert_eq!(circle(Status::Waiting), "🔷");
-        assert_ne!(circle(Status::Waiting), circle(Status::Working));
-        assert_eq!(circle(Status::Blocked), "🟠");
-        assert_eq!(circle(Status::Done), "🟢");
-        assert_eq!(circle(Status::Error), "🔴");
-        assert_eq!(circle(Status::Idle), "⚪");
+        assert_eq!(status_glyph(Status::Waiting), "⏳");
+        assert_ne!(status_glyph(Status::Waiting), status_glyph(Status::Working));
+        // Blocked must stay distinct from Error — the orange/red circles read
+        // too alike, so Blocked is a raised hand, not a circle.
+        assert_eq!(status_glyph(Status::Blocked), "✋");
+        assert_ne!(status_glyph(Status::Blocked), status_glyph(Status::Error));
+        assert_eq!(status_glyph(Status::Done), "🟢");
+        assert_eq!(status_glyph(Status::Error), "🔴");
+        assert_eq!(status_glyph(Status::Idle), "⚪");
     }
 
     fn candidates(t: &TerminalTitles, id: &str) -> Vec<u32> {
