@@ -1228,6 +1228,36 @@ mod tests {
         assert!(!is_a_question(text, QuestionRules::from_config(&cfg)));
     }
 
+    #[test]
+    fn leave_it_parked_closer_default_config() {
+        // "…, or leave it parked?" is the same offer-to-do-next sign-off as
+        // "or leave it?" but with a trailing word, so it needs its own closer —
+        // the default list excuses the whole offer sentence.
+        let cfg = Config::default();
+        let text = "Want me to pick that up next, or leave it parked?";
+        assert!(!is_a_question(text, QuestionRules::from_config(&cfg)));
+    }
+
+    #[test]
+    fn leave_that_to_you_closer_default_config() {
+        // "…, or leave that to you?" hands the choice back as a sign-off, not an
+        // open question — the default closer list excuses the whole offer sentence.
+        let cfg = Config::default();
+        let text = "Want me to deploy so the running widget gets the new default, or leave that to you?";
+        assert!(!is_a_question(text, QuestionRules::from_config(&cfg)));
+    }
+
+    #[test]
+    fn check_it_yourself_closer_default_config() {
+        // "…, or are you set to check it yourself?" offers the user the out of
+        // handling it — a sign-off, not a hand-back. The opener is the
+        // permission-seeking "Want me to …", so only the closer (which strips the
+        // whole closing sentence) can excuse it; a benign opener wouldn't.
+        let cfg = Config::default();
+        let text = "Want me to pull up /admin/imports in the browser to eyeball it, or are you set to check it yourself?";
+        assert!(!is_a_question(text, QuestionRules::from_config(&cfg)));
+    }
+
     // ----- benign openers (offer questions) -----
 
     fn with_openers(openers: &[String]) -> QuestionRules<'_> {
