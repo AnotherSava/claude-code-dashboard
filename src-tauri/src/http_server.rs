@@ -45,11 +45,19 @@ struct EventRequest {
     event: String,
     #[serde(default)]
     payload: serde_json::Value,
-    /// Windows: pids attached to the hook's console (includes the long-lived
-    /// Claude Code process) — `terminal_title` uses them to set the terminal
-    /// tab title. Absent on macOS and from pre-field hooks.
+    /// Candidate pids the session's terminal is reachable through — the hook's
+    /// console process list plus its ancestor chain (so the long-lived Claude
+    /// Code process is included). `terminal_title` uses them to set the terminal
+    /// tab title. Sent on both Windows and macOS; absent only from pre-field hooks.
     #[serde(default)]
     console_pids: Vec<u32>,
+    /// Pid of the owning Claude Code process (`claude.exe` / `claude`), resolved
+    /// by the hook from its ancestor chain and reported fresh on every event.
+    /// `liveness_reaper` checks it to remove a row whose session exited without a
+    /// `SessionEnd`. `None` when the hook couldn't identify it (e.g. a node-based
+    /// install) or from pre-field hooks.
+    #[serde(default)]
+    agent_pid: Option<u32>,
 }
 
 async fn post_event(
@@ -113,6 +121,7 @@ async fn post_event(
                 label = ?input.label,
                 reason = %reason,
                 console_pids = ?req.console_pids,
+                agent_pid = ?req.agent_pid,
                 "event -> set"
             );
             let chat_id = input.id.clone();
@@ -122,6 +131,14 @@ async fn post_event(
             // manual removal) the title is blanked and the pids forgotten.
             if let Some(titles) = app.try_state::<crate::terminal_title::TerminalTitles>() {
                 titles.register(&chat_id, &req.console_pids);
+            }
+            // Record the owning Claude pid so `liveness_reaper` can detect a
+            // session that exits without a SessionEnd. Overwrite each event so a
+            // same-cwd restart's new pid supersedes a now-dead one.
+            if let Some(pid) = req.agent_pid {
+                if let Some(pids) = app.try_state::<crate::liveness::AgentPids>() {
+                    pids.set(&chat_id, pid);
+                }
             }
             let history = app.try_state::<PromptHistoryStore>();
             let restored = history.as_ref().and_then(|h| h.get(&chat_id));
@@ -154,30 +171,15 @@ async fn post_event(
                 reason = "session ended; row removed",
                 "event -> clear"
             );
-            // Mark a boundary on the existing dialog before destroying the
-            // in-memory session. Claude `/clear` fires SessionEnd → SessionStart,
-            // so the path-rotation check in the Set branch can't help (the
-            // watcher is gone by the time SessionStart arrives). Appending the
-            // separator to the persisted dialog lets the next SessionStart's
-            // "new" branch restore a dialog that already ends with the
-            // separator — so the upcoming UserPromptSubmit lands after it.
-            let now = now_ms();
-            let history = app.try_state::<PromptHistoryStore>();
-            if state.mark_session_boundary(&id, now) {
-                if let Some(ref h) = history {
-                    let sessions = state.sessions.lock().unwrap();
-                    if let Some(s) = sessions.iter().find(|s| s.id == id) {
-                        h.save_session(s);
-                    }
-                    drop(sessions);
-                    h.save_to_disk();
-                }
-            }
-            state.apply_clear(&id);
-            if let Some(reg) = app.try_state::<WatcherRegistry>() {
-                reg.stop(&id);
-            }
-            emit_sessions_updated(&app);
+            // Remove the row through the shared helper — the same path the
+            // liveness reaper uses, so the two can't drift. It appends a history
+            // separator before dropping the in-memory session: Claude `/clear`
+            // fires SessionEnd → SessionStart, so persisting a dialog that ends
+            // with the separator lets the next SessionStart's "new" branch
+            // restore it and land the upcoming UserPromptSubmit after the
+            // boundary. `None` = remove unconditionally (this is the
+            // authoritative end signal, not a speculative reap).
+            crate::commands::remove_session(&app, &id, None, now_ms());
         }
         AdapterOutput::Boundary { id } => {
             tracing::debug!(

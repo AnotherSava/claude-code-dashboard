@@ -53,6 +53,92 @@ import urllib.request
 DEFAULT_URL = "http://127.0.0.1:9077"
 
 
+def _is_claude_image(name: str) -> bool:
+    """True if `name` is the Claude Code executable: basename, case-insensitive,
+    stem (sans .exe) == 'claude'. Matches claude.exe / claude / a full path to
+    either; rejects node.exe, node, etc. — a node-based install won't resolve."""
+    base = os.path.basename(name.strip().replace("\\", "/")).lower()
+    stem = base[:-4] if base.endswith(".exe") else base
+    return stem == "claude"
+
+
+def _win_proc_maps():
+    """(parents pid->ppid, images pid->exe name) from one Toolhelp snapshot.
+    Windows only; empty dicts on any failure. Shared by console_pids and
+    agent_pid so the snapshot walk lives in one place."""
+    import ctypes
+    from ctypes import wintypes
+
+    k32 = ctypes.windll.kernel32
+
+    class ProcessEntry32(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD),
+            ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+            ("th32ModuleID", wintypes.DWORD),
+            ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD),
+            ("pcPriClassBase", ctypes.c_long),
+            ("dwFlags", wintypes.DWORD),
+            ("szExeFile", ctypes.c_char * 260),
+        ]
+
+    parents, images = {}, {}
+    k32.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
+    snapshot = k32.CreateToolhelp32Snapshot(0x2, 0)  # TH32CS_SNAPPROCESS
+    if snapshot and snapshot != ctypes.c_void_p(-1).value:
+        entry = ProcessEntry32()
+        entry.dwSize = ctypes.sizeof(ProcessEntry32)
+        ok = k32.Process32First(ctypes.c_void_p(snapshot), ctypes.byref(entry))
+        while ok:
+            parents[entry.th32ProcessID] = entry.th32ParentProcessID
+            images[entry.th32ProcessID] = entry.szExeFile.decode("ascii", "replace")
+            ok = k32.Process32Next(ctypes.c_void_p(snapshot), ctypes.byref(entry))
+        k32.CloseHandle(ctypes.c_void_p(snapshot))
+    return parents, images
+
+
+def agent_pid():
+    """Pid of the owning Claude Code process (claude.exe / claude), found by
+    walking this hook's ancestor chain to the nearest claude image. Reported on
+    every event so the dashboard can detect a session that exited without a
+    SessionEnd — which Claude Code fails to deliver on exit / Ctrl-D / terminal
+    close — and remove the stranded row. None when not resolvable (e.g. a
+    node-based install whose image is node, not claude); the dashboard then keeps
+    today's behavior for that row."""
+    try:
+        if os.name == "nt":
+            parents, images = _win_proc_maps()
+            pid = os.getpid()
+            for _ in range(8):
+                pid = parents.get(pid)
+                if not pid:
+                    break
+                if _is_claude_image(images.get(pid, "")):
+                    return pid
+            return None
+        out = subprocess.run(["ps", "-axo", "pid=,ppid=,comm="], capture_output=True, text=True, timeout=2).stdout
+        parents, comms = {}, {}
+        for line in out.splitlines():
+            parts = line.split(None, 2)
+            if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
+                p = int(parts[0])
+                parents[p] = int(parts[1])
+                comms[p] = parts[2] if len(parts) == 3 else ""
+        pid = os.getpid()
+        for _ in range(8):
+            pid = parents.get(pid)
+            if not pid or pid <= 1:
+                break
+            if _is_claude_image(comms.get(pid, "")):
+                return pid
+        return None
+    except Exception:
+        return None
+
+
 def console_pids() -> list:
     """Candidate pids for the widget's terminal-tab-title writes.
 
@@ -100,7 +186,6 @@ def console_pids() -> list:
             return []
     try:
         import ctypes
-        from ctypes import wintypes
 
         k32 = ctypes.windll.kernel32
         me = os.getpid()
@@ -110,37 +195,13 @@ def console_pids() -> list:
         pids = [p for p in buf[: min(n, 64)] if p != me]
 
         # Ancestor chain via a Toolhelp snapshot (stdlib-only pid→ppid map).
-        class ProcessEntry32(ctypes.Structure):
-            _fields_ = [
-                ("dwSize", wintypes.DWORD),
-                ("cntUsage", wintypes.DWORD),
-                ("th32ProcessID", wintypes.DWORD),
-                ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
-                ("th32ModuleID", wintypes.DWORD),
-                ("cntThreads", wintypes.DWORD),
-                ("th32ParentProcessID", wintypes.DWORD),
-                ("pcPriClassBase", ctypes.c_long),
-                ("dwFlags", wintypes.DWORD),
-                ("szExeFile", ctypes.c_char * 260),
-            ]
-
-        k32.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
-        snapshot = k32.CreateToolhelp32Snapshot(0x2, 0)  # TH32CS_SNAPPROCESS
-        if snapshot and snapshot != ctypes.c_void_p(-1).value:
-            entry = ProcessEntry32()
-            entry.dwSize = ctypes.sizeof(ProcessEntry32)
-            parents = {}
-            ok = k32.Process32First(ctypes.c_void_p(snapshot), ctypes.byref(entry))
-            while ok:
-                parents[entry.th32ProcessID] = entry.th32ParentProcessID
-                ok = k32.Process32Next(ctypes.c_void_p(snapshot), ctypes.byref(entry))
-            k32.CloseHandle(ctypes.c_void_p(snapshot))
-            pid = me
-            for _ in range(6):
-                pid = parents.get(pid)
-                if not pid:
-                    break
-                pids.append(pid)
+        parents, _ = _win_proc_maps()
+        pid = me
+        for _ in range(6):
+            pid = parents.get(pid)
+            if not pid:
+                break
+            pids.append(pid)
 
         return list(dict.fromkeys(pids))
     except Exception:
@@ -163,7 +224,7 @@ def main() -> None:
     if not event:
         return
     url = os.environ.get("TAURI_DASHBOARD_URL", DEFAULT_URL).rstrip("/") + "/api/event"
-    body = {"client": "claude", "event": event, "payload": payload, "console_pids": console_pids()}
+    body = {"client": "claude", "event": event, "payload": payload, "console_pids": console_pids(), "agent_pid": agent_pid()}
     try:
         urllib.request.urlopen(
             urllib.request.Request(

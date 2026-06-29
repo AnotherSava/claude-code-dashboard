@@ -20,7 +20,8 @@ A second, separate listener serves the [multi-device sync](#sync-api) API when e
   "client": "claude",
   "event": "UserPromptSubmit",
   "payload": { ... raw agent payload ... },
-  "console_pids": [1234, 5678]
+  "console_pids": [1234, 5678],
+  "agent_pid": 4321
 }
 ```
 
@@ -28,6 +29,7 @@ A second, separate listener serves the [multi-device sync](#sync-api) API when e
 - `event` — the agent's own event name (for Claude Code this is the `hook_event_name` field from its hook payload: `SessionStart` / `UserPromptSubmit` / `Notification` / `Stop` / `SessionEnd`).
 - `payload` — opaque to the HTTP layer; forwarded verbatim to the adapter. The adapter knows what fields it cares about.
 - `console_pids` — optional. Candidate pids the hook gathered — its console's process list plus its ancestor chain on Windows, the ancestor chain alone on macOS; the widget reaches the terminal through one of them to set the tab title (console attach on Windows, controlling-tty OSC write on macOS — see [Features → color terminal tabs](../features#color-terminal-tabs)). Plays no part in classification.
+- `agent_pid` — optional. The pid of the owning Claude Code process, which the hook resolves from its ancestor chain (the nearest `claude` / `claude.exe` image). The widget tracks it so it can remove a row whose session exited without a `SessionEnd` (see [Features → live status](../features#live-status)). `null` when the hook can't identify it (e.g. a node-based install). Plays no part in classification.
 
 ## Payload interpretation
 

@@ -1,5 +1,6 @@
 use crate::config::{Config, ConfigState};
 use crate::custom_names::CustomNamesStore;
+use crate::log_watcher::WatcherRegistry;
 use crate::prompt_history::PromptHistoryStore;
 use crate::setup;
 use crate::state::{AgentSession, AppState};
@@ -578,6 +579,41 @@ pub fn set_chat_name(chat_id: String, name: String, app: AppHandle) {
         }
     }
     emit_sessions_updated(&app);
+}
+
+/// Remove a local session row exactly as a `SessionEnd` would — append a
+/// history separator, persist the final dialog, drop the in-memory row, stop its
+/// transcript watcher and owning-pid tracking, and emit. Shared by the
+/// `SessionEnd` Clear branch ([`crate::http_server`]) and the liveness reaper
+/// ([`crate::liveness_reaper`]) so the two removal paths can't drift apart.
+///
+/// `expect_updated`, when `Some`, makes the removal abort (returns `false`) if
+/// the row received a new event since it was observed — the reaper passes the
+/// row's last-seen `updated` to close the reap-vs-restart race; the Clear branch
+/// passes `None` (it is reacting to an authoritative event). Returns whether a
+/// row was actually removed.
+pub fn remove_session(app: &AppHandle, id: &str, expect_updated: Option<i64>, now: i64) -> bool {
+    let Some(state) = app.try_state::<AppState>() else {
+        return false;
+    };
+    let Some(removed) = state.take_session(id, expect_updated, now) else {
+        return false;
+    };
+    // Persist the final dialog (now ending in a separator) so the next
+    // SessionStart for this cwd restores history that already ends at the
+    // boundary — the same continuity `/clear` relies on.
+    if let Some(h) = app.try_state::<PromptHistoryStore>() {
+        h.save_session(&removed);
+        h.save_to_disk();
+    }
+    if let Some(reg) = app.try_state::<WatcherRegistry>() {
+        reg.stop(id);
+    }
+    if let Some(pids) = app.try_state::<crate::liveness::AgentPids>() {
+        pids.forget(id);
+    }
+    emit_sessions_updated(app);
+    true
 }
 
 pub fn now_ms() -> i64 {

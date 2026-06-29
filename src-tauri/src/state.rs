@@ -165,6 +165,28 @@ pub struct AppState {
     pub remote: Mutex<BTreeMap<String, RemoteDevice>>,
 }
 
+/// Append a session-boundary separator to a session's dialog in place. Returns
+/// whether one was added — skipped when the dialog is empty or already ends with
+/// a separator. Shared by [`AppState::mark_session_boundary`] and
+/// [`AppState::take_session`] so the boundary rule lives in exactly one place.
+fn append_boundary(session: &mut AgentSession, now_ms: i64) -> bool {
+    if session.dialog.is_empty() {
+        return false;
+    }
+    if session.dialog.last().is_some_and(|e| e.role == DialogRole::Separator) {
+        return false;
+    }
+    session.dialog.push(DialogEntry {
+        role: DialogRole::Separator,
+        text: String::new(),
+        timestamp: now_ms,
+        status: Status::Idle,
+        task_start: false,
+    });
+    session.updated = now_ms;
+    true
+}
+
 impl AppState {
     pub fn new() -> Self {
         Self::default()
@@ -357,9 +379,23 @@ impl AppState {
         }
     }
 
-    pub fn apply_clear(&self, id: &str) {
+    /// Remove a session and return it, after appending a session boundary to its
+    /// dialog (so a restored copy ends with a separator, exactly like `/clear`).
+    /// When `expect_updated` is `Some`, the removal is aborted (returns `None`)
+    /// if the row's `updated` no longer matches — used by the liveness reaper to
+    /// avoid deleting a row that received a new event between observation and
+    /// removal. The check, boundary append, and removal all happen under one
+    /// lock, so it is atomic against a concurrent hook event.
+    pub fn take_session(&self, id: &str, expect_updated: Option<i64>, now_ms: i64) -> Option<AgentSession> {
         let mut sessions = self.sessions.lock().unwrap();
-        sessions.retain(|s| s.id != id);
+        let pos = sessions.iter().position(|s| s.id == id)?;
+        if let Some(expected) = expect_updated {
+            if sessions[pos].updated != expected {
+                return None;
+            }
+        }
+        append_boundary(&mut sessions[pos], now_ms);
+        Some(sessions.remove(pos))
     }
 
     /// Revert a `Working` session whose turn was cancelled with Esc back to the
@@ -401,21 +437,7 @@ impl AppState {
         let Some(session) = sessions.iter_mut().find(|s| s.id == id) else {
             return false;
         };
-        if session.dialog.is_empty() {
-            return false;
-        }
-        if session.dialog.last().is_some_and(|e| e.role == DialogRole::Separator) {
-            return false;
-        }
-        session.dialog.push(DialogEntry {
-            role: DialogRole::Separator,
-            text: String::new(),
-            timestamp: now_ms,
-            status: Status::Idle,
-            task_start: false,
-        });
-        session.updated = now_ms;
-        true
+        append_boundary(session, now_ms)
     }
 
     /// Watcher-driven text capture. Processes transcript text entries in
@@ -721,13 +743,40 @@ mod tests {
     }
 
     #[test]
-    fn clear_removes_session() {
+    fn take_session_removes_and_returns_the_row() {
         let state = AppState::new();
         state.apply_set(set("a", Status::Working, "task"), 0, NO_CONTINUATIONS, None);
         state.apply_set(set("b", Status::Working, "other"), 0, NO_CONTINUATIONS, None);
-        state.apply_clear("a");
+        let removed = state.take_session("a", None, 0);
+        assert!(removed.is_some(), "the removed session is returned");
+        assert_eq!(removed.unwrap().id, "a");
         let ids: Vec<String> = state.snapshot().into_iter().map(|s| s.id).collect();
         assert_eq!(ids, vec!["b"]);
+    }
+
+    #[test]
+    fn take_session_aborts_when_updated_moved() {
+        // The reaper passes the last-seen `updated`; if an event bumped it
+        // between observation and removal, take_session must not delete the row.
+        let state = AppState::new();
+        state.apply_set(set("a", Status::Working, "task"), 0, NO_CONTINUATIONS, None);
+        let updated = get(&state, "a").updated;
+        assert!(state.take_session("a", Some(updated + 1), 0).is_none(), "stale expectation aborts");
+        assert_eq!(state.snapshot().len(), 1, "row survives a mismatched expectation");
+        assert!(state.take_session("a", Some(updated), 0).is_some(), "matching expectation removes");
+        assert!(state.snapshot().is_empty());
+    }
+
+    #[test]
+    fn take_session_appends_boundary_before_removing() {
+        // A removed dialog should end with a separator so a restored copy starts
+        // a clean task (same continuity /clear relies on).
+        let state = AppState::new();
+        let mut input = set("a", Status::Working, "task");
+        input.dialog_entry = Some(PendingDialogEntry { role: DialogRole::User, text: "task".into() });
+        state.apply_set(input, 0, NO_CONTINUATIONS, None);
+        let removed = state.take_session("a", None, 100).expect("removed");
+        assert_eq!(removed.dialog.last().map(|e| e.role), Some(DialogRole::Separator));
     }
 
     #[test]

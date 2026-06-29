@@ -44,6 +44,7 @@ Every field is optional — omit one and the built-in default applies. A complet
   "tray_context_alert_percent": 80,
   "terminal_titles": true,
   "detect_cancelled_turns": true,
+  "reap_exited_sessions": true,
   "save_window_position": true,
   "window_position": null,
   "history_window_position": null,
@@ -71,7 +72,7 @@ Every field is optional — omit one and the built-in default applies. A complet
     "claude-opus": 1000000,
     "claude": 200000
   },
-  "benign_closers": ["What's next?", "or are you good?", "or leave it?"],
+  "benign_closers": ["What's next?", "or are you good?", "or leave it?", "or leave it parked?", "or leave that to you?", "or are you set to check it yourself?"],
   "benign_openers": ["anything"],
   "continuation_prompts": ["go", "continue", "proceed", "yes", "y", "yeah", "yep", "yup", "ok", "okay", "sure", "go ahead", "do it"],
   "limit_bar_segments": 16,
@@ -108,6 +109,7 @@ Whether autostart is enabled isn't a config field — it lives in the OS launch 
 ### Behavior
 
 - `detect_cancelled_turns` — settle a working row back out of the working state when its turn was cancelled with Esc, returning it to wherever it was before that turn — a question it was waiting on, otherwise idle — so a cancelled reply doesn't get mistaken for a new task. Cancelling emits no event; the dashboard recognizes it from the conversation transcript, and on Windows also by noticing the terminal returned to its idle prompt (which catches an instant cancel that left nothing in the transcript). On by default. Turn it off to leave a cancelled row showing as working until the next prompt.
+- `reap_exited_sessions` — remove a session's row once you've quit it (typed `exit`, pressed Ctrl-D, or closed the terminal). Quitting that way doesn't reliably tell the dashboard the session ended, so the row would otherwise linger — often stuck showing "working" if you quit mid-turn. The dashboard removes it once it confirms the session's process is gone. On by default. Turn it off to keep rows until you clear them or restart the app.
 
 ### Notifications
 
@@ -127,7 +129,7 @@ The `notifications` block controls alerts when a session needs you. Set it to `n
 
 ### Prompt classification
 
-- `benign_closers` — polite trailing questions that end in `?` but shouldn't flip a finished row to WAIT. Matched case-insensitively as a suffix; a hit excuses the whole closing sentence, so an optional sign-off like "Want me to run the lint pass, or are you good?" stays DONE even though it opens with an offer. A genuine ask in an earlier sentence still waits. Defaults: `["What's next?", "or are you good?", "or leave it?"]`.
+- `benign_closers` — polite trailing questions that end in `?` but shouldn't flip a finished row to WAIT. Matched case-insensitively as a suffix; a hit excuses the whole closing sentence, so an optional sign-off like "Want me to run the lint pass, or are you good?" stays DONE even though it opens with an offer. A genuine ask in an earlier sentence still waits. Defaults: `["What's next?", "or are you good?", "or leave it?", "or leave it parked?", "or leave that to you?", "or are you set to check it yourself?"]`.
 - `benign_openers` — words that, when they open the final question, mark it an optional offer rather than a hand-back, so a sign-off like "Anything you'd like to look at?" stays DONE. Matched case-insensitively as a prefix of the last sentence. An embedded real ask still flips to WAIT, so "Anything else, or shall I commit?" still waits. Default: `["anything"]`.
 - `continuation_prompts` — short replies that mean *keep going* or *yes, go ahead* rather than a new task (the defaults cover `go` / `continue` / `proceed` plus approvals like `yes` / `y` / `ok` / `sure`), so the original prompt and work timer carry over instead of resetting. Matched exactly, case-insensitively, after trimming.
 

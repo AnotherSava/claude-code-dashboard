@@ -78,6 +78,13 @@ pub struct Config {
     /// (Windows-only backstop). Off keeps the row `Working` until the next
     /// prompt.
     pub detect_cancelled_turns: bool,
+    /// Remove a session's row once its owning Claude process has exited without
+    /// a `SessionEnd` — which Claude Code fails to deliver on `exit` / Ctrl-D /
+    /// terminal close (unlike `/clear`), stranding the row in its last state
+    /// (often `Working` if the user exited mid-turn). Read by `liveness_reaper`,
+    /// which removes the row only once the owning pid is positively confirmed
+    /// gone. Off keeps the stranded row until the next `/clear` or app restart.
+    pub reap_exited_sessions: bool,
     /// Multi-device session sync (see `sync.rs`). Disabled by default:
     /// `listen=false` and empty `peers` make every sync task a no-op.
     pub sync: SyncConfig,
@@ -294,7 +301,7 @@ impl Default for Config {
                 Threshold { percent: 60.0, color: "#c6a03c".into() },
                 Threshold { percent: 85.0, color: "#c64a4a".into() },
             ],
-            benign_closers: vec!["What's next?".into(), "or are you good?".into(), "or leave it?".into()],
+            benign_closers: vec!["What's next?".into(), "or are you good?".into(), "or leave it?".into(), "or leave it parked?".into(), "or leave that to you?".into(), "or are you set to check it yourself?".into()],
             benign_openers: vec!["anything".into()],
             projects_root: None,
             notifications: Some(NotificationsConfig::default()),
@@ -308,6 +315,7 @@ impl Default for Config {
             continuation_prompts: ["go", "continue", "proceed", "yes", "y", "yeah", "yep", "yup", "ok", "okay", "sure", "go ahead", "do it"].iter().map(|s| s.to_string()).collect(),
             terminal_titles: true,
             detect_cancelled_turns: true,
+            reap_exited_sessions: true,
             sync: SyncConfig::default(),
             tray_badge: TrayBadge::None,
             tray_context_alert_enabled: true,

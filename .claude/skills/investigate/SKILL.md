@@ -44,6 +44,11 @@ or `id`), and a `reason`:
   `task_boundary`, `continuation_suppressed`).
 - `session_clear` / `compact_boundary` — session removed / context-compaction
   separator inserted.
+- `reap_exited` — the liveness reaper removed the row because its owning Claude
+  process exited without a `SessionEnd` (e.g. you typed `exit` / closed the
+  terminal). Carries the dead `pid` and the `prior_status` the row last held.
+  This is a terminal decision: if it's the newest line, the row is gone on
+  purpose, not stuck.
 
 ## Workflow
 

@@ -9,6 +9,8 @@ mod http_server;
 mod idle;
 mod idle_probe;
 mod label_policy;
+mod liveness;
+mod liveness_reaper;
 mod log_watcher;
 mod logging;
 mod notifications;
@@ -116,6 +118,7 @@ pub fn run() {
         .manage(UsageLimitsState::new())
         .manage(commands::HistoryTarget(std::sync::Mutex::new(None)))
         .manage(terminal_title::TerminalTitles::new())
+        .manage(liveness::AgentPids::new())
         .manage(sync::SyncDirty(std::sync::Arc::new(tokio::sync::Notify::new())))
         .invoke_handler(tauri::generate_handler![
             commands::get_sessions,
@@ -291,6 +294,7 @@ pub fn run() {
             notifications::NotificationManager::spawn(app.handle().clone());
             UsageLimitsPoller::spawn(app.handle().clone());
             idle_probe::spawn(app.handle().clone());
+            liveness_reaper::spawn(app.handle().clone());
 
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
