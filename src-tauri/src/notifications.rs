@@ -37,13 +37,30 @@ pub fn status_key(s: Status) -> &'static str {
     }
 }
 
+/// The text the notification shows under the status line — mirroring the
+/// frontend's `primaryText` (`src/lib/types.ts`; keep the two in sync). For a
+/// row the user must act on (`blocked`/`error`) it's the current `label` (the
+/// question / approval request); otherwise it's the original task
+/// (`original_prompt`), falling back to `label`. Without this a `done` row that
+/// was previously `blocked` would carry its stale `Blocked` label (the
+/// `Stop`→Done event has no label, so `label_policy` preserves the old one), so
+/// the message read e.g. "done\nneeds approval: tool" while the dashboard row
+/// already showed the finished task.
+fn primary_text(session: &AgentSession) -> &str {
+    match session.status {
+        Status::Blocked | Status::Error => &session.label,
+        _ => session.original_prompt.as_deref().unwrap_or(&session.label),
+    }
+}
+
 pub fn build_message_text(session: &AgentSession) -> String {
     let status = status_key(session.status);
     let name = session.display_label();
-    if session.label.trim().is_empty() {
+    let text = primary_text(session);
+    if text.trim().is_empty() {
         format!("[{}] {}", name, status)
     } else {
-        format!("[{}] {}\n{}", name, status, session.label)
+        format!("[{}] {}\n{}", name, status, text)
     }
 }
 
@@ -625,6 +642,35 @@ mod tests {
         let mut s = session("proj", Status::Done, 0);
         s.label = "   ".into();
         assert_eq!(build_message_text(&s), "[proj] done");
+    }
+
+    #[test]
+    fn message_text_done_shows_task_not_stale_blocked_label() {
+        // A row that was Blocked ("needs approval: tool") then settled Done keeps
+        // that label (the Stop event carried none), but the done message must
+        // show the original task, mirroring the dashboard row — not the stale
+        // approval text that made the ping read "done\nneeds approval: tool".
+        let mut s = session("printlab", Status::Done, 0);
+        s.label = "needs approval: tool".into();
+        s.original_prompt = Some("add the print queue page".into());
+        assert_eq!(build_message_text(&s), "[printlab] done\nadd the print queue page");
+    }
+
+    #[test]
+    fn message_text_done_falls_back_to_label_without_original_prompt() {
+        // No original_prompt captured → fall back to the label so the line isn't lost.
+        let mut s = session("proj", Status::Done, 0);
+        s.label = "wrapped up the refactor".into();
+        assert_eq!(build_message_text(&s), "[proj] done\nwrapped up the refactor");
+    }
+
+    #[test]
+    fn message_text_blocked_still_shows_label_over_original_prompt() {
+        // For an actionable state the user wants the current question, not the task.
+        let mut s = session("proj", Status::Blocked, 0);
+        s.label = "Can I run bash: pytest?".into();
+        s.original_prompt = Some("add pytest coverage".into());
+        assert_eq!(build_message_text(&s), "[proj] blocked\nCan I run bash: pytest?");
     }
 
     fn ctx_session(id: &str, model: &str, tokens: u64) -> AgentSession {
