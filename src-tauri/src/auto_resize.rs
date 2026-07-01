@@ -36,18 +36,24 @@ pub fn apply(
         AutoResize::None => unreachable!(),
     };
 
-    // Clamp to the current monitor's work area (the region not covered by
+    // Clamp the resize to a monitor's work area (the region not covered by
     // the macOS Dock/menu bar or the Windows taskbar) on all four sides, so
     // the resize can never leave the window partially off-screen. Without
     // the bottom/right clamps, a window placed near a screen edge on first
     // launch — or one whose saved position was on a now-disconnected
     // monitor — would resize and stay where it was, with content cut off.
-    let bounds = window
-        .current_monitor()?
-        .as_ref()
-        .map(WorkAreaBounds::from_monitor)
-        .unwrap_or_else(WorkAreaBounds::unbounded);
+    // (Which monitor's work area, and why not `current_monitor()`, below.)
     let width_phys = size.width as i32;
+    // Clamp against the monitor the window actually occupies — the one its rect
+    // overlaps most — rather than `current_monitor()`. Near a mixed-DPI boundary
+    // `current_monitor()` misreports which display holds the window, and clamping
+    // the real position against the *other* monitor's work area teleported the
+    // window to a corner (observed: repeated jumps to (0,0) on the primary,
+    // dropping the widget on top of the foreground app — see
+    // debug_auto_resize_dpi_drift). Overlap selection leaves an on-screen window
+    // untouched; a window stranded off every monitor falls back to the primary
+    // so the clamp can still rescue it back onto the screen.
+    let bounds = clamp_bounds(window, pos.x, raw_y, width_phys, new_height_phys);
     let (new_x, new_y) = bounds.clamp(pos.x, raw_y, width_phys, new_height_phys);
 
     window.set_size(PhysicalSize::new(size.width, new_height_phys.max(1) as u32))?;
@@ -76,6 +82,32 @@ pub fn apply(
         "auto_resize::apply"
     );
     Ok(())
+}
+
+/// Pick the work-area bounds `auto_resize::apply` clamps against: the monitor
+/// the rect `(x, y, w, h)` overlaps most. When the rect overlaps no monitor
+/// (stranded on a since-disconnected display) fall back to the primary so the
+/// clamp still pulls it back on-screen; if even that is unavailable, stay
+/// unbounded (no clamp). Deliberately avoids `current_monitor()`, which
+/// misreports the holding monitor near a mixed-DPI boundary and drove the
+/// (0,0) teleport (see the `debug_auto_resize_dpi_drift` note).
+fn clamp_bounds(window: &WebviewWindow, x: i32, y: i32, w: i32, h: i32) -> WorkAreaBounds {
+    let areas: Vec<WorkAreaBounds> = window
+        .available_monitors()
+        .unwrap_or_default()
+        .iter()
+        .map(WorkAreaBounds::from_monitor)
+        .collect();
+    if let Some(bounds) = WorkAreaBounds::best_overlap(&areas, x, y, w, h) {
+        return bounds;
+    }
+    window
+        .primary_monitor()
+        .ok()
+        .flatten()
+        .as_ref()
+        .map(WorkAreaBounds::from_monitor)
+        .unwrap_or_else(WorkAreaBounds::unbounded)
 }
 
 /// Physical-pixel bounds of a monitor's work area, with a clamp helper that
@@ -121,6 +153,26 @@ impl WorkAreaBounds {
     /// virtual desktops can't overflow the multiply.
     pub(crate) fn intersection_area(&self, x: i32, y: i32, w: i32, h: i32) -> i64 {
         self.overlap_x(x, w) as i64 * self.overlap_y(y, h) as i64
+    }
+
+    /// Of the given monitor work areas, return the one the rect `(x, y, w, h)`
+    /// overlaps most, or `None` if the slice is empty or the rect overlaps none
+    /// of them. Lets the resize clamp target the monitor the window actually
+    /// sits on instead of trusting `current_monitor()` near a DPI boundary.
+    pub(crate) fn best_overlap(
+        areas: &[WorkAreaBounds],
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+    ) -> Option<WorkAreaBounds> {
+        areas
+            .iter()
+            .copied()
+            .map(|b| (b, b.intersection_area(x, y, w, h)))
+            .filter(|(_, area)| *area > 0)
+            .max_by_key(|(_, area)| *area)
+            .map(|(bounds, _)| bounds)
     }
 
     /// Clamp a top-left position so the rect `(x, y, w, h)` lies within the
@@ -409,5 +461,52 @@ mod tests {
         let b = screen_1440_900();
         // Fully inside: area is the whole rect.
         assert_eq!(b.intersection_area(500, 500, 840, 600), 840 * 600);
+    }
+
+    #[test]
+    fn best_overlap_picks_monitor_holding_the_window() {
+        // Primary 2560x1440 at the origin with a second monitor to its right
+        // (work area x=2560..5000). A window at x=4137 sits entirely on the
+        // right monitor: best_overlap must return it so the clamp is a no-op —
+        // clamping against the *primary* instead is what marched the widget to
+        // a corner near the DPI boundary.
+        let primary = WorkAreaBounds { left: 0, top: 0, right: 2560, bottom: 1440 };
+        let right = WorkAreaBounds { left: 2560, top: 0, right: 5000, bottom: 2000 };
+        let areas = [primary, right];
+        let picked = WorkAreaBounds::best_overlap(&areas, 4137, 1400, 630, 340).unwrap();
+        assert_eq!(
+            picked.clamp(4137, 1400, 630, 340),
+            (4137, 1400),
+            "clamp against the correct (right) monitor leaves the window put"
+        );
+        assert_ne!(
+            primary.clamp(4137, 1400, 630, 340),
+            (4137, 1400),
+            "clamp against the wrong (primary) monitor would move it — the bug"
+        );
+    }
+
+    #[test]
+    fn best_overlap_prefers_the_monitor_with_more_of_the_window() {
+        // Window straddling the seam but mostly on the right monitor.
+        let left = WorkAreaBounds { left: 0, top: 0, right: 2560, bottom: 1440 };
+        let right = WorkAreaBounds { left: 2560, top: 0, right: 5000, bottom: 1440 };
+        let areas = [left, right];
+        // x=2460..3100: 100px on the left monitor, 540px on the right.
+        let picked = WorkAreaBounds::best_overlap(&areas, 2460, 200, 640, 400).unwrap();
+        assert_eq!(picked.left, 2560, "chose the right monitor (larger overlap)");
+    }
+
+    #[test]
+    fn best_overlap_none_when_stranded_off_all_monitors() {
+        let primary = WorkAreaBounds { left: 0, top: 0, right: 2560, bottom: 1440 };
+        // Window fully to the right of every monitor (disconnected display) —
+        // no overlap, so apply() falls back to the primary for the rescue clamp.
+        assert!(WorkAreaBounds::best_overlap(&[primary], 6000, 500, 630, 340).is_none());
+    }
+
+    #[test]
+    fn best_overlap_none_for_empty_monitor_list() {
+        assert!(WorkAreaBounds::best_overlap(&[], 0, 0, 100, 100).is_none());
     }
 }

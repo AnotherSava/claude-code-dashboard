@@ -24,7 +24,7 @@
 - [Terminal-reading e2e](debug_terminal_reading_e2e.md) — bind synthetic Working session to real console pids (GetConsoleProcessList in PowerShell tool), POST direct to /api/event, end turn, bg-watch widget.jsonl
 - [Real-device sync pair](sync_device_pair.md) — CHROME ↔ Olegs-MacBook-Air.local:9078, token in each config/local.json; pingable-but-port-timeout Mac = asleep, not firewalled
 - [Sync pusher silence anomaly](sync_pusher_silence_anomaly.md) — ~5-min total pusher log-silence seen once; grep widget.jsonl for `sync push cycle` gaps on recurrence
-- [Auto-resize DPI drift](debug_auto_resize_dpi_drift.md) — mixed-DPI multi-monitor needed to repro; widget.jsonl dpr≠scale + xy march = resize loop; fix = send physical px
+- [Auto-resize DPI drift](debug_auto_resize_dpi_drift.md) — mixed-DPI multi-monitor; dpr≠scale + xy march = resize loop teleporting to (0,0); fix = clamp to overlapped monitor not current_monitor
 - [Auto-resize children-sum race](debug_auto_resize_children_race.md) — stuck scrollbar (window < content); summing .list children raced Svelte reconciliation, desired one row short; fix = measure non-stretching .list-inner + ResizeObserver
 - [Terminal promote-to-Working unsafe](terminal_promote_to_working_unsafe.md) — reverted; esc-to-interrupt strands rows; use UserPromptExpansion hook; idle_probe stays demote-only
 - [idle_probe screen criteria are TUI-sensitive](idle_probe_screen_criteria_tui_sensitive.md) — typing strips "esc to interrupt"; spinner clock is the busy signal; re-validate flapping via decision=idle_probe_screen capture
