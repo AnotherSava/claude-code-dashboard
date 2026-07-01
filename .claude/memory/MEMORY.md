@@ -37,3 +37,4 @@
 - [Context-alert tracking not persisted](context_alert_outstanding_not_persisted.md) — context_outstanding is in-memory; app restart orphans Telegram alerts (known, deliberately unfixed); grep decision=context_alert/context_dismiss
 - [Hook research findings](hooks_research_findings.md) — adopted Stop.last_assistant_message + background_tasks; rejected idle_prompt/PostToolUse/MessageDisplay; no token data in hooks; SessionEnd unreliable on exit → liveness reaper; latest-version-only
 - [Doppler secret storage](doppler_secret_storage.md) — bot_token/chat_id/sync token live in Doppler project `claude-code-dashboard`/`dev`; deploy renders local.template.json → local.json then wipes it; no plaintext secrets at rest
+- [Usage endpoint zeros both buckets after 5h cap](usage_endpoint_zeros_after_5h_cap.md) — after 5h hits 100%, OAuth usage API transiently returns 0/null for both buckets; empty/IDLE bars then = upstream artifact, self-corrects ≤10min; don't re-investigate
