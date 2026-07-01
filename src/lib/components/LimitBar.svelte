@@ -73,7 +73,7 @@
       if (resets) lines.push(resets)
       lines.push(`Anthropic API unreachable — last try ${formatAgo(n - u)}`)
     } else if (s === 'ok' && b) {
-      lines.push(resets ?? 'No active window', `updated ${formatAgo(n - u)}`)
+      lines.push(resets ?? 'No usage yet', `updated ${formatAgo(n - u)}`)
     }
     return lines.join('\n')
   }
