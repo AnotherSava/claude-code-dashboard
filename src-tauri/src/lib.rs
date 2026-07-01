@@ -7,7 +7,6 @@ mod config_watcher;
 mod custom_names;
 mod http_server;
 mod idle;
-mod idle_probe;
 mod label_policy;
 mod liveness;
 mod liveness_reaper;
@@ -166,6 +165,38 @@ pub fn run() {
             app.manage(frontend_logger);
             tracing::info!(version = env!("CARGO_PKG_VERSION"), "widget starting");
 
+            // Load and manage config FIRST — before the other stores and the
+            // window setup below — so a webview that invokes `get_config` early
+            // (it can run before most of setup) is far less likely to get back
+            // `Config::default()` (auto_resize 'none'), which the frontend would
+            // latch onto and stay stuck at, silently disabling auto-resize for
+            // the whole session. Managed as early as possible to shrink the race;
+            // the frontend also re-reads config once its mount round-trips prove
+            // the backend is up (see App.svelte), which closes it.
+            let config_path = app_data.join("config.json");
+            let config_state = ConfigState::new(config_path.clone());
+            // Ensure a config.json exists on first run so external editing
+            // works without further steps. The same first-run signal also
+            // bootstraps autostart on by default — users can opt out via
+            // the tray menu, and the choice lives in the OS (registry on
+            // Windows, LaunchAgent on macOS), so re-enabling here would
+            // fight the user on every launch.
+            if !config_path.exists() {
+                let _ = config_state.save_to_disk();
+                use tauri_plugin_autostart::ManagerExt;
+                let _ = app.autolaunch().enable();
+            }
+            // Resolve an empty sync.device_name once from the hostname so
+            // peers have a stable badge label; written back so the user can
+            // see and edit it in config.json.
+            if config_state.snapshot().sync.device_name.is_empty() {
+                config_state.with_mut(|c| c.sync.device_name = default_device_name());
+                let _ = config_state.save_to_disk();
+            }
+            let current_config = config_state.snapshot();
+            let server_port = current_config.server_port;
+            app.manage(config_state);
+
             let history_store =
                 prompt_history::PromptHistoryStore::new(app_data.join("prompt_history.json"));
             app.manage(history_store);
@@ -196,31 +227,6 @@ pub fn run() {
             app.manage(remote_usage::RemoteUsageStore::new(
                 app_data.join("remote_usage"),
             ));
-
-            let config_path = app_data.join("config.json");
-
-            let config_state = ConfigState::new(config_path.clone());
-            // Ensure a config.json exists on first run so external editing
-            // works without further steps. The same first-run signal also
-            // bootstraps autostart on by default — users can opt out via
-            // the tray menu, and the choice lives in the OS (registry on
-            // Windows, LaunchAgent on macOS), so re-enabling here would
-            // fight the user on every launch.
-            if !config_path.exists() {
-                let _ = config_state.save_to_disk();
-                use tauri_plugin_autostart::ManagerExt;
-                let _ = app.autolaunch().enable();
-            }
-            // Resolve an empty sync.device_name once from the hostname so
-            // peers have a stable badge label; written back so the user can
-            // see and edit it in config.json.
-            if config_state.snapshot().sync.device_name.is_empty() {
-                config_state.with_mut(|c| c.sync.device_name = default_device_name());
-                let _ = config_state.save_to_disk();
-            }
-            let current_config = config_state.snapshot();
-            let server_port = current_config.server_port;
-            app.manage(config_state);
 
             // "Open to tray": when the OS launched us at login and the user
             // picked the minimized mode, keep the main window in the tray by
@@ -270,6 +276,17 @@ pub fn run() {
                         tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
                         if matches!(window_for_timeout.is_visible(), Ok(false)) {
                             let _ = window_for_timeout.show();
+                            // We only get here because the frontend's own
+                            // `show_window` didn't run — and that call is what
+                            // re-pushes the authoritative config/setup to correct
+                            // the `get_config` mount race. Without mirroring it
+                            // here, a value lost to that race stays stuck for the
+                            // session — notably `auto_resize` defaulting to `None`,
+                            // which silently disables auto-resize and freezes the
+                            // window at its launch height (observed intermittently).
+                            let app = window_for_timeout.app_handle();
+                            commands::emit_config_updated(app);
+                            commands::emit_setup_state(app);
                         }
                     });
                 }
@@ -293,7 +310,6 @@ pub fn run() {
             config_watcher::spawn(app.handle().clone(), config_path);
             notifications::NotificationManager::spawn(app.handle().clone());
             UsageLimitsPoller::spawn(app.handle().clone());
-            idle_probe::spawn(app.handle().clone());
             liveness_reaper::spawn(app.handle().clone());
 
             let handle = app.handle().clone();

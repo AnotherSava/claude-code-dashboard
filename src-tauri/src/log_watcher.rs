@@ -335,10 +335,6 @@ impl WatcherRegistry {
             task.abort.abort();
         }
     }
-
-    pub fn current_path(&self, chat_id: &str) -> Option<PathBuf> {
-        self.entries.lock().unwrap().get(chat_id).map(|t| t.path.clone())
-    }
 }
 
 async fn watch_loop(app: AppHandle, chat_id: String, path: PathBuf) {
@@ -682,6 +678,32 @@ mod tests {
         let r = infer_state(&refs(&lines)).unwrap();
         assert!(!r.ended, "the newer entry is a real prompt, not a cancel");
         assert_eq!(r.state, Some(Status::Working));
+    }
+
+    #[test]
+    fn interrupt_marker_prefix_is_locked() {
+        // This exact transcript marker is now the *sole* Esc-cancel signal: the
+        // old idle_probe terminal-screen backstop was retired once real
+        // transcripts proved instant cancels DO write it (sub-second cases). Lock
+        // the prefix and its known variants so a Claude Code wording change can't
+        // silently disable cancel detection without failing a test.
+        assert_eq!(INTERRUPT_MARKER_PREFIX, "[Request interrupted by user");
+        assert!("[Request interrupted by user]".starts_with(INTERRUPT_MARKER_PREFIX));
+        assert!("[Request interrupted by user for tool use]".starts_with(INTERRUPT_MARKER_PREFIX));
+    }
+
+    #[test]
+    fn instant_cancel_marker_alone_flags_ended() {
+        // The instant Esc-cancel: a prompt is submitted then cancelled before the
+        // model emits anything, so the marker is the only entry with no preceding
+        // assistant output. Empirically Claude Code DOES write the marker for
+        // these (verified sub-second in real transcripts), which is why the
+        // watcher marker path fully replaces idle_probe's screen guess. This shape
+        // must flag `ended` and never read as a fresh Working prompt.
+        let lines = [user_text("[Request interrupted by user]")];
+        let r = infer_state(&refs(&lines)).unwrap();
+        assert!(r.ended, "a lone instant-cancel marker flags ended");
+        assert_ne!(r.state, Some(Status::Working), "must not read the marker as a fresh prompt");
     }
 
     // -------- turn_duration / sidechain skipping --------

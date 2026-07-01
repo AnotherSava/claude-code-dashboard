@@ -52,7 +52,7 @@ When a session is re-created from `prompt_history.json` — after an app restart
 
 ### Cancelled turns revert to the prior status
 
-A turn cancelled with Esc fires no lifecycle hook. The transcript watcher (the `[Request interrupted by user]` marker) and, on Windows, `idle_probe` (the terminal idle-prompt read) both call `state::revert_cancelled_turn`, which settles the row back to `AgentSession::status_before_working` — the status captured on the last non-`working` → `working` transition — rather than blanket `Idle`. The cancelled prompt produced nothing, so the row should look as if it never landed: a reply aborted mid-question reverts to `Blocked`, and the user's real answer is then a `blocked → working` approval-cycle reply (no task boundary), so `original_prompt` survives. Gated by `detect_cancelled_turns`.
+A turn cancelled with Esc fires no lifecycle hook. The transcript watcher (the `[Request interrupted by user]` marker) calls `state::revert_cancelled_turn`, which settles the row back to `AgentSession::status_before_working` — the status captured on the last non-`working` → `working` transition — rather than blanket `Idle`. The cancelled prompt produced nothing, so the row should look as if it never landed: a reply aborted mid-question reverts to `Blocked`, and the user's real answer is then a `blocked → working` approval-cycle reply (no task boundary), so `original_prompt` survives. Gated by `detect_cancelled_turns`.
 
 ### Continuation prompts
 

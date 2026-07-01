@@ -101,11 +101,11 @@ Incoming `usage_delta` records are merged per device into `RemoteUsageStore` (`r
 
 ## Path 6 — Exited-session reaper
 
-Claude Code's `SessionEnd` hook (Path 1's `Clear`) fires reliably on `/clear` but not on `exit` / Ctrl-D / closing the terminal, so a session quit that way never reaches the dashboard and its row strands — often in `working` if the quit happened mid-turn, which the `idle_probe` can't recover once the console is gone. `liveness_reaper` (`src-tauri/src/liveness_reaper.rs`) is the backstop.
+Claude Code's `SessionEnd` hook (Path 1's `Clear`) fires reliably on `/clear` but not on `exit` / Ctrl-D / closing the terminal, so a session quit that way never reaches the dashboard and its row strands — often in `working` if the quit happened mid-turn. `liveness_reaper` (`src-tauri/src/liveness_reaper.rs`) is the backstop.
 
 1. On every event, the hook resolves `agent_pid` — the owning Claude process, picked from its ancestor chain by image name — and the `Set` handler stores it per chat_id in `liveness::AgentPids` (overwrite, so a same-cwd restart's new pid supersedes a dead one).
 2. A 2 s-tick task takes one process enumeration (`liveness::process_images` — a Toolhelp32 snapshot on Windows, `ps` on macOS) and, for each local session, checks whether its `agent_pid` is still a live `claude` image. Liveness is image-confirmed, so pid reuse can't read as alive and an elevated Claude isn't misread as dead.
-3. A row is reaped only after its pid reads dead for `DEAD_STREAK_TO_REAP` consecutive ticks over an unchanged pid and a quiet `updated` — a still-alive (merely slow) session keeps its process alive and is never reaped, and a same-cwd restart restarts the count. Removal runs through the same `commands::remove_session` as Path 1's `Clear` (guarded by `updated` to abort the reap-vs-restart race) and logs `decision = "reap_exited"`. Gated by the `reap_exited_sessions` config flag (default on); cross-platform, unlike `idle_probe`.
+3. A row is reaped only after its pid reads dead for `DEAD_STREAK_TO_REAP` consecutive ticks over an unchanged pid and a quiet `updated` — a still-alive (merely slow) session keeps its process alive and is never reaped, and a same-cwd restart restarts the count. Removal runs through the same `commands::remove_session` as Path 1's `Clear` (guarded by `updated` to abort the reap-vs-restart race) and logs `decision = "reap_exited"`. Gated by the `reap_exited_sessions` config flag (default on); cross-platform.
 
 ## Sticky-label state machine
 

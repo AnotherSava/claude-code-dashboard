@@ -26,8 +26,9 @@
 - [Sync pusher silence anomaly](sync_pusher_silence_anomaly.md) — ~5-min total pusher log-silence seen once; grep widget.jsonl for `sync push cycle` gaps on recurrence
 - [Auto-resize DPI drift](debug_auto_resize_dpi_drift.md) — mixed-DPI multi-monitor; dpr≠scale + xy march = resize loop teleporting to (0,0); fix = clamp to overlapped monitor not current_monitor
 - [Auto-resize children-sum race](debug_auto_resize_children_race.md) — stuck scrollbar (window < content); summing .list children raced Svelte reconciliation, desired one row short; fix = measure non-stretching .list-inner + ResizeObserver
-- [Terminal promote-to-Working unsafe](terminal_promote_to_working_unsafe.md) — reverted; esc-to-interrupt strands rows; use UserPromptExpansion hook; idle_probe stays demote-only
-- [idle_probe screen criteria are TUI-sensitive](idle_probe_screen_criteria_tui_sensitive.md) — typing strips "esc to interrupt"; spinner clock is the busy signal; re-validate flapping via decision=idle_probe_screen capture
+- [Auto-resize config race → too tall](debug_auto_resize_config_race.md) — get_config mount race makes frontend auto_resize='none' → measure early-returns → window frozen; fix = manage ConfigState first in setup + one authoritative getConfig re-read at end of mount; beware multi-window log interleaving
+- [Terminal screen isn't a state signal](terminal_promote_to_working_unsafe.md) — both promote (strands rows) & demote (idle_probe, false-reverts slow silent turns) tried & removed; use hooks/markers
+- [idle_probe retired](idle_probe_screen_criteria_tui_sensitive.md) — screen-scrape removed 2026-07-01; instant Esc-cancels DO write the interrupt marker (verified), so the marker path is authoritative
 - [Diagnose state via widget.jsonl](debug_state_transitions_via_widget_jsonl.md) — run /investigate <agent> to reconstruct state + decision chain; or grep the "decision"-tagged lines; don't theorize
 - [Tray badge deferred work](tray_badge_deferred.md) — macOS contrast on number modes + live DPI re-render not done; config.tray_badge set in config/local.json
 - [Startup session restore infeasible](startup_session_restore_infeasible.md) — can't tell closed from idle-open sessions; Claude doesn't hold transcript open; don't re-attempt

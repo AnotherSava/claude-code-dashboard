@@ -69,13 +69,11 @@ pub struct Config {
     /// "<colored circle> <name>" (e.g. "🔵 ai-dashboard"). Read by
     /// `terminal_title::sync`; Windows-only today.
     pub terminal_titles: bool,
-    /// Demote a `Working` row to `Idle` when its turn was cancelled with Esc —
-    /// which emits no lifecycle hook. Two cooperating detectors, both gated by
-    /// this flag: `log_watcher` catches cancels of *active* work via the
-    /// "[Request interrupted by user]" transcript marker (cross-platform,
-    /// instant); `idle_probe` catches an *instant* cancel that wrote nothing to
-    /// the transcript by reading the terminal for Claude's idle prompt
-    /// (Windows-only backstop). Off keeps the row `Working` until the next
+    /// Revert a `Working` row to its pre-prompt status when its turn was
+    /// cancelled with Esc — which emits no lifecycle hook. Gated by this flag,
+    /// `log_watcher` detects the cancel from the "[Request interrupted by user]"
+    /// transcript marker (cross-platform), which Claude Code writes even for an
+    /// instant cancel with no output. Off keeps the row `Working` until the next
     /// prompt.
     pub detect_cancelled_turns: bool,
     /// Remove a session's row once its owning Claude process has exited without

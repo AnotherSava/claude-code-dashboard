@@ -401,9 +401,9 @@ impl AppState {
     /// Revert a `Working` session whose turn was cancelled with Esc back to the
     /// status it held *before* the turn started (`status_before_working`),
     /// rather than blanket-`Idle`. Called by the transcript watcher on the
-    /// "[Request interrupted by user]" marker and by `idle_probe` on the
-    /// instant-cancel — an Esc emits no lifecycle hook, so without this the row
-    /// would stay `Working` forever (and the watcher's own `infer_state` would
+    /// "[Request interrupted by user]" marker — an Esc emits no lifecycle hook,
+    /// so without this the row would stay `Working` forever (and the watcher's
+    /// own `infer_state` would
     /// otherwise re-promote the marker as user input). The cancelled turn
     /// produced nothing, so the row should look as if the prompt never landed:
     /// a reply aborted mid-question reverts to `Blocked`, so the user's real
@@ -590,8 +590,8 @@ mod tests {
         state.apply_set(set("a", Status::Blocked, "Push?"), 10_000, NO_CONTINUATIONS, None);
         // User submits a typo'd reply, which enters Working from Blocked...
         state.apply_set(set("a", Status::Working, "ny"), 12_000, NO_CONTINUATIONS, None);
-        // ...then cancels it with Esc (no Stop hook) — idle_probe / the watcher
-        // calls revert_cancelled_turn.
+        // ...then cancels it with Esc (no Stop hook) — the watcher calls
+        // revert_cancelled_turn on the interrupt marker.
         assert_eq!(state.revert_cancelled_turn("a", 13_000), Some(Status::Blocked));
         let reverted = get(&state, "a");
         assert_eq!(reverted.status, Status::Blocked, "cancelled reply reverts to the pending question");
@@ -856,7 +856,8 @@ mod tests {
         // End-to-end guard against the recurring "row shows 'y' as the task"
         // bug: an approval reply can arrive when the row is Done or Idle rather
         // than Blocked — e.g. the user cancelled a mis-typed reply with Esc
-        // (idle_probe correctly demotes to Idle), then typed the real "y". From
+        // (the watcher reverts the turn via the interrupt marker), then typed the
+        // real "y". From
         // Done/Idle that "y" would be a task boundary; with the default
         // continuation list it must preserve original_prompt instead.
         let cont = crate::config::Config::default().continuation_prompts;

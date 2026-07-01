@@ -4,8 +4,8 @@
 //! `SessionEnd` fires cleanly on `/clear`, but not reliably on `exit` / Ctrl-D /
 //! terminal close (see [`crate::liveness`] for the why). When it doesn't fire,
 //! the row is stranded — e.g. the user cancels a prompt with Esc and types
-//! `exit`, leaving the row wedged in `Working`. `idle_probe` can't recover that
-//! one either: it needs to read the terminal screen, but the console is gone.
+//! `exit` before the watcher settles it, leaving the row wedged in `Working`
+//! with its console already gone.
 //!
 //! This task is the backstop. Each tick it takes one process enumeration and,
 //! for every local session with a hook-reported owning pid ([`AgentPids`]),
@@ -19,10 +19,9 @@
 //! reaped row restores cleanly (with history) on its next start, and it is
 //! guarded by the row's `updated` to abort if an event lands mid-reap.
 //!
-//! Cross-platform (the enumeration in [`crate::liveness::process_images`] has a
-//! macOS implementation), unlike `idle_probe`'s Windows-only console read.
-//! Reaps rows in any state — matching SessionEnd, which removes the row
-//! regardless of what it last showed.
+//! Cross-platform: the enumeration in [`crate::liveness::process_images`] has a
+//! macOS implementation as well as Windows. Reaps rows in any state — matching
+//! SessionEnd, which removes the row regardless of what it last showed.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -35,7 +34,7 @@ use crate::liveness::{is_claude_image, process_images, AgentPids};
 use crate::state::AppState;
 
 /// Poll cadence. Reaping a vanished session is a backstop, not latency-critical,
-/// so this is slower than `idle_probe`'s 1s.
+/// so a slower 2s tick is fine.
 const POLL: Duration = Duration::from_secs(2);
 
 /// Consecutive confirmed-dead reads — over an unchanged owning pid and a quiet

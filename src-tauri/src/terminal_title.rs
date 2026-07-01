@@ -62,19 +62,11 @@ impl TerminalTitles {
         let merged: Vec<u32> = entry.iter().copied().filter(|p| pids.contains(p)).collect();
         *entry = if merged.is_empty() { pids.to_vec() } else { merged };
     }
-
-    /// The console-pid candidates currently tracked for `chat_id` (intersected
-    /// down to the long-lived processes). Empty if none reported yet. Used by
-    /// `idle_probe` to read the same console the title is written to.
-    pub fn candidates(&self, chat_id: &str) -> Vec<u32> {
-        self.pids.lock().unwrap().get(chat_id).cloned().unwrap_or_default()
-    }
 }
 
 /// A process can be attached to at most one console, so every
-/// free→attach→…→free dance — title writes (`push_title`) and screen reads
-/// (`read_console_screen`) alike — must hold this lock for its whole duration
-/// or two threads would corrupt each other's console attachment.
+/// free→attach→…→free dance in `push_title` must hold this lock for its whole
+/// duration or two threads would corrupt each other's console attachment.
 #[cfg(windows)]
 static ATTACH_LOCK: Mutex<()> = Mutex::new(());
 
@@ -201,94 +193,6 @@ fn push_title(candidates: &[u32], title: &str) -> bool {
         }
         ok
     }
-}
-
-/// Read the visible screen of the first reachable candidate's console as
-/// plaintext (one string per visible row, newline-joined), or `None` if no
-/// candidate could be attached and read. Same far-to-near attach rationale as
-/// `push_title`: the first successful attach is the user's real terminal, so
-/// we read that one and stop. Shares `ATTACH_LOCK` with `push_title` — both
-/// juggle this process's single console attachment.
-#[cfg(windows)]
-pub fn read_console_screen(candidates: &[u32]) -> Option<String> {
-    #[link(name = "kernel32")]
-    extern "system" {
-        fn FreeConsole() -> i32;
-        fn AttachConsole(pid: u32) -> i32;
-        fn GetConsoleWindow() -> isize;
-        fn CreateFileW(name: *const u16, access: u32, share: u32, sec: *const core::ffi::c_void, disposition: u32, flags: u32, template: isize) -> isize;
-        fn CloseHandle(h: isize) -> i32;
-        fn GetConsoleScreenBufferInfo(h: isize, info: *mut Csbi) -> i32;
-        fn ReadConsoleOutputCharacterW(h: isize, buf: *mut u16, len: u32, read_coord: u32, chars_read: *mut u32) -> i32;
-    }
-    const ATTACH_PARENT_PROCESS: u32 = u32::MAX;
-    const GENERIC_READ_WRITE: u32 = 0xC000_0000;
-    const FILE_SHARE_READ_WRITE: u32 = 0x0000_0003;
-    const OPEN_EXISTING: u32 = 3;
-    const INVALID_HANDLE: isize = -1;
-
-    // CONSOLE_SCREEN_BUFFER_INFO, field-for-field: two COORDs, a WORD, a
-    // SMALL_RECT, a COORD. `srWindow` is the visible viewport into a possibly
-    // taller scrollback buffer; we read only it.
-    #[repr(C)]
-    #[derive(Default)]
-    struct Csbi {
-        size_x: i16,
-        size_y: i16,
-        cursor_x: i16,
-        cursor_y: i16,
-        attributes: u16,
-        win_left: i16,
-        win_top: i16,
-        win_right: i16,
-        win_bottom: i16,
-        max_x: i16,
-        max_y: i16,
-    }
-
-    let _guard = ATTACH_LOCK.lock().unwrap();
-    let conout: Vec<u16> = "CONOUT$".encode_utf16().chain(std::iter::once(0)).collect();
-    unsafe {
-        let had_console = GetConsoleWindow() != 0;
-        let mut result = None;
-        for &pid in candidates.iter().rev() {
-            FreeConsole();
-            if AttachConsole(pid) == 0 {
-                continue;
-            }
-            // First attach succeeds on the real terminal; read it and stop
-            // (nearer consoles are invisible per-hook ones — no point reading).
-            let h = CreateFileW(conout.as_ptr(), GENERIC_READ_WRITE, FILE_SHARE_READ_WRITE, std::ptr::null(), OPEN_EXISTING, 0, 0);
-            if h != INVALID_HANDLE && h != 0 {
-                let mut info = Csbi::default();
-                if GetConsoleScreenBufferInfo(h, &mut info) != 0 && info.size_x > 0 {
-                    let width = info.size_x as u32;
-                    let mut lines: Vec<String> = Vec::new();
-                    let mut buf = vec![0u16; width as usize];
-                    for y in info.win_top..=info.win_bottom {
-                        let coord = ((y as u32) << 16) | (info.win_left as u32 & 0xFFFF);
-                        let mut read = 0u32;
-                        if ReadConsoleOutputCharacterW(h, buf.as_mut_ptr(), width, coord, &mut read) != 0 {
-                            lines.push(String::from_utf16_lossy(&buf[..read as usize]).trim_end().to_string());
-                        }
-                    }
-                    result = Some(lines.join("\n"));
-                }
-                CloseHandle(h);
-            }
-            break;
-        }
-        FreeConsole();
-        if had_console {
-            AttachConsole(ATTACH_PARENT_PROCESS);
-        }
-        result
-    }
-}
-
-#[cfg(not(windows))]
-pub fn read_console_screen(_candidates: &[u32]) -> Option<String> {
-    None
 }
 
 /// macOS/Linux: resolve the candidate's controlling tty via `ps -o tty=` and

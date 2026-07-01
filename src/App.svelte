@@ -224,6 +224,16 @@
         // cached snapshot may be stale. The 60s floor inside the backend
         // protects Anthropic from thrash on real reloads.
         refreshUsageLimits().catch((err) => console.error('mount refresh failed', err))
+        // Authoritative config re-read to close the get_config mount race: the
+        // getConfig() at the top of mount can beat setup()'s ConfigState
+        // management and return Config::default() (auto_resize 'none'), which
+        // would disable auto-resize for the session. By here the backend has
+        // answered several commands (config / sessions / usage / setup), so it is
+        // up — re-read once to correct any raced value. A single sequenced read,
+        // not a loop; placed before the finally so a stalled pre-show rAF can't
+        // skip it.
+        const authoritativeConfig = await getConfig()
+        if (authoritativeConfig) config = authoritativeConfig
       } catch (err) {
         frontendLog('error', 'init_failed', { error: String(err) }).catch(() => {})
         console.error('failed to initialize', err)
@@ -243,6 +253,13 @@
         if (!historyMode && !aboutMode && !intensityMode) {
           try {
             await showWindow()
+            // Take one measure now the window is visible and the DOM is committed
+            // (tick + two frames above) — the reactive measure can race ahead of
+            // the rows laying out, and nothing re-fires it if the list then stays
+            // put. The auto_resize='none' get_config race is closed by the
+            // authoritative re-read above; later session/usage updates refine the
+            // height.
+            scheduleMeasure()
           } catch (err) {
             console.error('failed to reveal window', err)
           }
