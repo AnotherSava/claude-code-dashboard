@@ -208,6 +208,7 @@ mod tests {
                 .map(|(k, v)| (k.to_string(), StateNotify { afk_window_ms: None, reaction_window_ms: Some(*v) }))
                 .collect(),
             context_alert_percent: None,
+            reading_speed_cps: None,
         }
     }
 

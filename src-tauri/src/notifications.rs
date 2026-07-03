@@ -6,8 +6,15 @@ use tauri::{AppHandle, Manager};
 
 use crate::config::{ConfigState, StateNotify};
 use crate::custom_names::CustomNamesStore;
-use crate::state::{AgentSession, AppState, Status};
+use crate::state::{AgentSession, AppState, DialogRole, Status};
 use crate::telegram::{SyncOutcome, TelegramNotifier};
+
+/// Upper bound on the reading-time delay [`reading_time_ms`] can add to a
+/// notification window, so an enormous message can't defer an actionable ping
+/// indefinitely. Sits comfortably above a realistic full-page answer (~3.5k
+/// chars at the default pace) so it bounds runaway walls of text without
+/// clipping the very case the reading delay exists to cover.
+const READING_CAP_MS: u64 = 360_000;
 
 #[derive(Clone, Debug)]
 pub struct Outstanding {
@@ -120,24 +127,72 @@ pub fn context_reconcile<'a>(
     (to_dismiss, to_send)
 }
 
-/// Decide whether a state in `rule` is due to fire, given how long it has been
-/// in that state and the system-wide input-idle time. Returns the reason it
-/// fired (for logging), or `None` if neither criterion is met.
+/// The on-screen text whose length sets how long the user needs to *read* before
+/// they could react — the basis for the reading-time delay ([`reading_time_ms`]).
 ///
-/// - **AFK** (`afk_window_ms`): the user is idle past the window *and* has not
-///   touched the machine since the state began (`idle >= time_in_state`, the
-///   "saw it" guard). Skipped when idle is unknown (presence can't be proven).
+/// - `blocked` / `done`: the full final assistant turn (the multi-paragraph
+///   answer or completion summary the user actually reads), taken from the last
+///   `Assistant` dialog entry. Falls back to `label` only when there is no
+///   assistant entry yet — a `PreToolUse` / permission `blocked` row, where
+///   `label` *is* the question. (A `Stop`→`Blocked` `label` is the fixed string
+///   `"has a question"`, so the dialog text is preferred over it.)
+/// - `error`: `label` (the short failure kind). A `StopFailure` turn emits no
+///   assistant text, so the last dialog entry is the *prior* successful turn —
+///   scaling off that would delay an actionable error ping by an irrelevant
+///   length, so `error` reads its own short label and stays snappy.
+fn read_burden_text(session: &AgentSession) -> &str {
+    if session.status == Status::Error {
+        return &session.label;
+    }
+    session
+        .dialog
+        .iter()
+        .rev()
+        .find(|e| e.role == DialogRole::Assistant)
+        .map(|e| e.text.as_str())
+        .filter(|t| !t.trim().is_empty())
+        .unwrap_or(&session.label)
+}
+
+/// Milliseconds to allow for *reading* `text` before a notification is due, at
+/// `speed_cps` characters/second, clamped to `cap_ms`. Added to both the AFK and
+/// reaction windows (see [`fire_reason`]) so a present user isn't pinged while
+/// still reading a long message. `speed_cps == 0` disables the scaling and an
+/// empty message reads as `0` — both reproduce the fixed-window behavior.
+pub fn reading_time_ms(text: &str, speed_cps: u64, cap_ms: u64) -> u64 {
+    if speed_cps == 0 {
+        return 0;
+    }
+    let chars = text.trim().chars().count() as u64;
+    (chars.saturating_mul(1000) / speed_cps).min(cap_ms)
+}
+
+/// Decide whether a state in `rule` is due to fire, given how long it has been
+/// in that state, the system-wide input-idle time, and the reading-time budget
+/// for its message ([`reading_time_ms`]). Returns the reason it fired (for
+/// logging), or `None` if neither criterion is met.
+///
+/// - **AFK** (`afk_window_ms`): the user is idle past the window *plus* the
+///   reading budget *and* has not touched the machine since the state began
+///   (`idle >= time_in_state`, the "saw it" guard). Skipped when idle is unknown
+///   (presence can't be proven). Adding `reading_ms` is what stops a present,
+///   silently-*reading* user — whose idle climbs in lockstep with time-in-state
+///   and so always satisfies the guard — from being pinged mid-read.
 /// - **Reaction** (`reaction_window_ms`): the state has outlasted the backstop
-///   regardless of presence.
+///   *plus* the reading budget, regardless of presence.
 ///
 /// Whichever trips first wins; AFK lets a notification fire sooner once the
-/// user has stepped away.
-pub fn fire_reason(rule: &StateNotify, time_in_state_ms: u64, idle_ms: Option<u64>) -> Option<&'static str> {
-    let afk_due = matches!((rule.afk_window_ms, idle_ms), (Some(afk), Some(idle)) if afk > 0 && idle >= afk && idle >= time_in_state_ms);
+/// user has stepped away. `reading_ms` is *added* (not a floor): the base window
+/// is the length-independent notice/decide/act budget, `reading_ms` the
+/// length-dependent time to consume the content, and they run in sequence. The
+/// `afk > 0` / `r > 0` gates run before the addition, so a disabled window is
+/// never resurrected by a long message.
+pub fn fire_reason(rule: &StateNotify, time_in_state_ms: u64, idle_ms: Option<u64>, reading_ms: u64) -> Option<&'static str> {
+    let afk_due = matches!((rule.afk_window_ms, idle_ms), (Some(afk), Some(idle)) if afk > 0 && idle >= afk.saturating_add(reading_ms) && idle >= time_in_state_ms);
     if afk_due {
         return Some("afk");
     }
-    let reaction_due = matches!(rule.reaction_window_ms, Some(r) if r > 0 && time_in_state_ms >= r);
+    let reaction_due = matches!(rule.reaction_window_ms, Some(r) if r > 0 && time_in_state_ms >= r.saturating_add(reading_ms));
     reaction_due.then_some("reaction")
 }
 
@@ -168,6 +223,7 @@ pub async fn reconcile(
     outstanding: &mut HashMap<String, Outstanding>,
     now_ms: i64,
     idle_ms: Option<u64>,
+    reading_speed_cps: u64,
 ) {
     let rules = notifier.state_rules();
 
@@ -190,7 +246,8 @@ pub async fn reconcile(
         let key = status_key(s.status);
         let Some(rule) = rules.get(key) else { continue };
         let time_in_state = (now_ms - s.state_entered_at).max(0) as u64;
-        let Some(reason) = fire_reason(rule, time_in_state, idle_ms) else { continue };
+        let reading_ms = reading_time_ms(read_burden_text(s), reading_speed_cps, READING_CAP_MS);
+        let Some(reason) = fire_reason(rule, time_in_state, idle_ms, reading_ms) else { continue };
         match notifier.send(s).await {
             Ok(handle) => {
                 tracing::debug!(
@@ -198,6 +255,7 @@ pub async fn reconcile(
                     id = %s.id,
                     status = key,
                     reason,
+                    reading_ms,
                     "notification fired"
                 );
                 outstanding.insert(
@@ -276,6 +334,7 @@ impl NotificationManager {
                         &mut outstanding,
                         now_ms(),
                         crate::idle::idle_ms(),
+                        tg_cfg.and_then(|c| c.reading_speed_cps).unwrap_or(0),
                     )
                     .await;
 
@@ -338,7 +397,7 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::{AgentSession, Status};
+    use crate::state::{AgentSession, DialogEntry, DialogRole, Status};
     use std::sync::Mutex;
 
     #[derive(Debug, Clone, PartialEq)]
@@ -420,12 +479,26 @@ mod tests {
         }
     }
 
+    /// A session carrying a final assistant message of `assistant_text` — the
+    /// text `read_burden_text` measures for the reading-time delay.
+    fn session_with_message(id: &str, status: Status, state_entered_at: i64, assistant_text: &str) -> AgentSession {
+        let mut s = session(id, status, state_entered_at);
+        s.dialog.push(DialogEntry {
+            role: DialogRole::Assistant,
+            text: assistant_text.to_string(),
+            timestamp: state_entered_at,
+            status,
+            task_start: false,
+        });
+        s
+    }
+
     #[tokio::test]
     async fn sends_when_threshold_elapsed_and_no_outstanding() {
         let m = Mock::with(&[("blocked", 60_000)]);
         let mut out = HashMap::new();
         let sessions = vec![session("s1", Status::Blocked, 0)];
-        reconcile(m.as_ref(), &sessions, &mut out, 60_000, None).await;
+        reconcile(m.as_ref(), &sessions, &mut out, 60_000, None, 0).await;
         assert_eq!(out.len(), 1);
         assert_eq!(out["s1"].for_status, Status::Blocked);
         assert_eq!(out["s1"].handle, "h1");
@@ -437,7 +510,7 @@ mod tests {
         let m = Mock::with(&[("blocked", 60_000)]);
         let mut out = HashMap::new();
         let sessions = vec![session("s1", Status::Blocked, 0)];
-        reconcile(m.as_ref(), &sessions, &mut out, 59_999, None).await;
+        reconcile(m.as_ref(), &sessions, &mut out, 59_999, None, 0).await;
         assert!(out.is_empty());
         assert!(m.events().is_empty());
     }
@@ -451,7 +524,7 @@ mod tests {
             Outstanding { handle: "h1".into(), for_status: Status::Blocked, },
         );
         let sessions = vec![session("s1", Status::Blocked, 0)];
-        reconcile(m.as_ref(), &sessions, &mut out, 120_000, None).await;
+        reconcile(m.as_ref(), &sessions, &mut out, 120_000, None, 0).await;
         assert_eq!(out.len(), 1);
         assert!(m.events().is_empty(), "no events when nothing changes");
     }
@@ -465,7 +538,7 @@ mod tests {
             Outstanding { handle: "h9".into(), for_status: Status::Blocked, },
         );
         let sessions = vec![session("s1", Status::Working, 100_000)];
-        reconcile(m.as_ref(), &sessions, &mut out, 120_000, None).await;
+        reconcile(m.as_ref(), &sessions, &mut out, 120_000, None, 0).await;
         assert!(out.is_empty());
         assert_eq!(m.events(), vec![Event::Dismiss { handle: "h9".into() }]);
     }
@@ -481,7 +554,7 @@ mod tests {
             Outstanding { handle: "h7".into(), for_status: Status::Blocked, },
         );
         let sessions: Vec<AgentSession> = vec![];
-        reconcile(m.as_ref(), &sessions, &mut out, 120_000, None).await;
+        reconcile(m.as_ref(), &sessions, &mut out, 120_000, None, 0).await;
         assert!(out.is_empty());
         assert_eq!(m.events(), vec![Event::Dismiss { handle: "h7".into() }]);
     }
@@ -492,7 +565,7 @@ mod tests {
         let m = Mock::with(&[("blocked", 60_000)]);
         let mut out = HashMap::new();
         let sessions: Vec<AgentSession> = vec![];
-        reconcile(m.as_ref(), &sessions, &mut out, 30_000, None).await;
+        reconcile(m.as_ref(), &sessions, &mut out, 30_000, None, 0).await;
         assert!(out.is_empty());
         assert!(m.events().is_empty());
     }
@@ -502,7 +575,7 @@ mod tests {
         let m = Mock::with(&[("blocked", 0)]);
         let mut out = HashMap::new();
         let sessions = vec![session("s1", Status::Blocked, 0)];
-        reconcile(m.as_ref(), &sessions, &mut out, 1_000_000, None).await;
+        reconcile(m.as_ref(), &sessions, &mut out, 1_000_000, None, 0).await;
         assert!(out.is_empty());
         assert!(m.events().is_empty());
     }
@@ -512,7 +585,7 @@ mod tests {
         let m = Mock::with(&[("error", 60_000)]);
         let mut out = HashMap::new();
         let sessions = vec![session("s1", Status::Blocked, 0)];
-        reconcile(m.as_ref(), &sessions, &mut out, 1_000_000, None).await;
+        reconcile(m.as_ref(), &sessions, &mut out, 1_000_000, None, 0).await;
         assert!(out.is_empty());
         assert!(m.events().is_empty());
     }
@@ -523,11 +596,13 @@ mod tests {
         *m.send_err.lock().unwrap() = true;
         let mut out = HashMap::new();
         let sessions = vec![session("s1", Status::Blocked, 0)];
-        reconcile(m.as_ref(), &sessions, &mut out, 60_000, None).await;
+        reconcile(m.as_ref(), &sessions, &mut out, 60_000, None, 0).await;
         assert!(out.is_empty(), "failed send must not populate outstanding");
     }
 
     // -------- fire_reason (per-state AFK + reaction rule) --------
+    // These pass reading_ms = 0 (scaling disabled), so they pin the base-window
+    // behavior; the reading-time cases live in the section further below.
 
     const AFK_ONLY: StateNotify = StateNotify { afk_window_ms: Some(60_000), reaction_window_ms: None };
     const BOTH: StateNotify = StateNotify { afk_window_ms: Some(60_000), reaction_window_ms: Some(120_000) };
@@ -535,14 +610,14 @@ mod tests {
     #[test]
     fn afk_fires_when_idle_past_window_and_no_input_since_state_began() {
         // 10s into the state, user idle 70s — away the whole time, fires.
-        assert_eq!(fire_reason(&AFK_ONLY, 10_000, Some(70_000)), Some("afk"));
+        assert_eq!(fire_reason(&AFK_ONLY, 10_000, Some(70_000), 0), Some("afk"));
     }
 
     #[test]
     fn afk_suppressed_when_user_active_since_state_began() {
         // Idle 30s but the state has lasted 50s → there was input 30s ago,
         // i.e. after the state began → "saw it", never fire via AFK.
-        assert_eq!(fire_reason(&AFK_ONLY, 50_000, Some(30_000)), None);
+        assert_eq!(fire_reason(&AFK_ONLY, 50_000, Some(30_000), 0), None);
     }
 
     #[test]
@@ -550,37 +625,131 @@ mod tests {
         // Discussion example: idle X/3 at T_state, X=60s. Fires at 2X/3 in,
         // when total idle first reaches X — not after a full X wait.
         // At 40s in, idle = 20s(before) + 40s = 60s → fires.
-        assert_eq!(fire_reason(&AFK_ONLY, 40_000, Some(60_000)), Some("afk"));
+        assert_eq!(fire_reason(&AFK_ONLY, 40_000, Some(60_000), 0), Some("afk"));
         // At 39s in, idle = 59s < 60s → not yet.
-        assert_eq!(fire_reason(&AFK_ONLY, 39_000, Some(59_000)), None);
+        assert_eq!(fire_reason(&AFK_ONLY, 39_000, Some(59_000), 0), None);
     }
 
     #[test]
     fn afk_skipped_when_idle_unknown() {
-        assert_eq!(fire_reason(&AFK_ONLY, 999_999, None), None);
+        assert_eq!(fire_reason(&AFK_ONLY, 999_999, None, 0), None);
     }
 
     #[test]
     fn reaction_backstop_fires_regardless_of_presence() {
         // User active (idle 0), but the reaction window has elapsed → fire.
-        assert_eq!(fire_reason(&BOTH, 120_000, Some(0)), Some("reaction"));
+        assert_eq!(fire_reason(&BOTH, 120_000, Some(0), 0), Some("reaction"));
         // Before the backstop and not AFK → nothing.
-        assert_eq!(fire_reason(&BOTH, 119_999, Some(0)), None);
+        assert_eq!(fire_reason(&BOTH, 119_999, Some(0), 0), None);
     }
 
     #[test]
     fn afk_wins_when_both_could_fire() {
         // AFK trips well before the 120s backstop.
-        assert_eq!(fire_reason(&BOTH, 65_000, Some(65_000)), Some("afk"));
+        assert_eq!(fire_reason(&BOTH, 65_000, Some(65_000), 0), Some("afk"));
     }
 
     #[test]
     fn no_windows_set_never_fires() {
         let none = StateNotify { afk_window_ms: None, reaction_window_ms: None };
-        assert_eq!(fire_reason(&none, 1_000_000, Some(1_000_000)), None);
+        assert_eq!(fire_reason(&none, 1_000_000, Some(1_000_000), 0), None);
         // Zero is treated as unset for both windows.
         let zeros = StateNotify { afk_window_ms: Some(0), reaction_window_ms: Some(0) };
-        assert_eq!(fire_reason(&zeros, 1_000_000, Some(1_000_000)), None);
+        assert_eq!(fire_reason(&zeros, 1_000_000, Some(1_000_000), 0), None);
+    }
+
+    // -------- reading-time scaling (reading_time_ms / read_burden_text / fire_reason) --------
+
+    #[test]
+    fn reading_time_ms_scales_by_char_count_and_caps() {
+        // 300 chars at 15 cps → 20s.
+        assert_eq!(reading_time_ms(&"x".repeat(300), 15, READING_CAP_MS), 20_000);
+        // Empty / whitespace-only → 0 (behaves as today).
+        assert_eq!(reading_time_ms("", 15, READING_CAP_MS), 0);
+        assert_eq!(reading_time_ms("   \n\t ", 15, READING_CAP_MS), 0);
+        // A wall of text saturates at the cap, never deferring a ping forever.
+        assert_eq!(reading_time_ms(&"x".repeat(1_000_000), 15, READING_CAP_MS), READING_CAP_MS);
+        // speed 0 disables the scaling regardless of length.
+        assert_eq!(reading_time_ms(&"x".repeat(9_000), 0, READING_CAP_MS), 0);
+    }
+
+    #[test]
+    fn read_burden_text_prefers_last_assistant_then_falls_back_to_label() {
+        // blocked/done: the full final assistant turn drives the burden.
+        let s = session_with_message("s", Status::Done, 0, "the full multi-paragraph answer");
+        assert_eq!(read_burden_text(&s), "the full multi-paragraph answer");
+        // No assistant entry (a PreToolUse/permission blocked row) → the label,
+        // which there IS the question.
+        let mut q = session("s", Status::Blocked, 0);
+        q.label = "Can I run bash: pytest?".into();
+        assert_eq!(read_burden_text(&q), "Can I run bash: pytest?");
+        // A whitespace-only assistant entry also falls back to the label.
+        let mut w = session_with_message("s", Status::Blocked, 0, "   ");
+        w.label = "has a question".into();
+        assert_eq!(read_burden_text(&w), "has a question");
+    }
+
+    #[test]
+    fn read_burden_text_error_uses_label_not_prior_turn() {
+        // A StopFailure Error row still holds the PRIOR successful turn's (long)
+        // assistant text, but the actionable content is the short failure kind in
+        // `label` — so error reads its label and isn't delayed by the old turn.
+        let mut s = session_with_message("s", Status::Error, 0, &"x".repeat(5_000));
+        s.label = "api error".into();
+        assert_eq!(read_burden_text(&s), "api error");
+    }
+
+    #[test]
+    fn fire_reason_afk_deferred_by_reading_budget() {
+        // 100s reading budget on top of the 60s AFK window → a present silent
+        // reader (idle == time_in_state) can't trip AFK until idle >= 160s.
+        assert_eq!(fire_reason(&AFK_ONLY, 90_000, Some(90_000), 100_000), None);
+        assert_eq!(fire_reason(&AFK_ONLY, 160_000, Some(160_000), 100_000), Some("afk"));
+    }
+
+    #[test]
+    fn fire_reason_reaction_backstop_deferred_by_reading_budget() {
+        // 60s reading budget pushes the 120s backstop out to 180s.
+        assert_eq!(fire_reason(&BOTH, 120_000, Some(0), 60_000), None);
+        assert_eq!(fire_reason(&BOTH, 180_000, Some(0), 60_000), Some("reaction"));
+    }
+
+    #[test]
+    fn fire_reason_reading_budget_never_resurrects_a_disabled_window() {
+        // AFK-only rule: no reaction window, so no length of message makes the
+        // backstop fire — the r > 0 gate runs before the reading_ms addition.
+        assert_eq!(fire_reason(&AFK_ONLY, 10_000_000, Some(0), 100_000), None);
+    }
+
+    #[tokio::test]
+    async fn reconcile_defers_afk_ping_while_reading_long_message() {
+        // done, AFK-only 60s. A 1500-char answer at 15 cps adds a 100s reading
+        // budget, so the AFK ping holds until idle >= 160s even though the "saw
+        // it" guard is satisfied the whole time (present, silent reader).
+        let m = Mock::with_rules(&[("done", AFK_ONLY)]);
+        let text = "x".repeat(1_500);
+        let sessions = vec![session_with_message("s1", Status::Done, 0, &text)];
+        let mut out = HashMap::new();
+        // 90s in, idle 90s: today this fires (idle > 60s); now suppressed mid-read.
+        reconcile(m.as_ref(), &sessions, &mut out, 90_000, Some(90_000), 15).await;
+        assert!(out.is_empty(), "present reader of a long message isn't pinged mid-read");
+        // 170s in, idle 170s: past the 60s + 100s budget → fires.
+        reconcile(m.as_ref(), &sessions, &mut out, 170_000, Some(170_000), 15).await;
+        assert_eq!(out.len(), 1, "fires once the reading budget elapses");
+    }
+
+    #[tokio::test]
+    async fn reconcile_error_ping_not_deferred_by_prior_long_turn() {
+        // Error row whose dialog still holds a 5000-char prior turn. Because error
+        // reads its short label, the reading budget is ~0 and the actionable
+        // backstop (60s) still fires promptly — not delayed toward the cap.
+        let m = Mock::with_rules(&[("error", StateNotify { afk_window_ms: Some(60_000), reaction_window_ms: Some(60_000) })]);
+        let mut s = session_with_message("s1", Status::Error, 0, &"x".repeat(5_000));
+        s.label = "api error".into();
+        let sessions = vec![s];
+        let mut out = HashMap::new();
+        reconcile(m.as_ref(), &sessions, &mut out, 61_000, Some(0), 15).await;
+        assert_eq!(out.len(), 1, "error backstop fires off its short label, not the stale long turn");
     }
 
     #[tokio::test]
@@ -589,7 +758,7 @@ mod tests {
         let mut out = HashMap::new();
         // Done for 10s, user idle 70s (away since before it finished).
         let sessions = vec![session("s1", Status::Done, 0)];
-        reconcile(m.as_ref(), &sessions, &mut out, 10_000, Some(70_000)).await;
+        reconcile(m.as_ref(), &sessions, &mut out, 10_000, Some(70_000), 0).await;
         assert_eq!(out.len(), 1, "AFK path fires done");
         assert_eq!(out["s1"].for_status, Status::Done);
     }
@@ -600,7 +769,7 @@ mod tests {
         let mut out = HashMap::new();
         // Done for 10s but user touched the machine 2s ago → saw it.
         let sessions = vec![session("s1", Status::Done, 0)];
-        reconcile(m.as_ref(), &sessions, &mut out, 10_000, Some(2_000)).await;
+        reconcile(m.as_ref(), &sessions, &mut out, 10_000, Some(2_000), 0).await;
         assert!(out.is_empty(), "present user => no done ping");
         assert!(m.events().is_empty());
     }

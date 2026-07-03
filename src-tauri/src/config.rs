@@ -234,6 +234,14 @@ pub struct TelegramConfig {
     /// resets the token count), the session vanishes, or the feature is turned
     /// off — and it re-arms after a drop so a later crossing alerts again.
     pub context_alert_percent: Option<f32>,
+    /// Reading pace, in characters per second, used to defer a notification by
+    /// how long the final assistant message takes to read. The reconciler adds
+    /// `chars / reading_speed_cps` (capped, see `notifications::READING_CAP_MS`)
+    /// to *both* the AFK and reaction windows, so a present user reading a long
+    /// answer isn't pinged mid-read while a one-line "push?" still fires at the
+    /// base delay. `null` or `0` disables the scaling (fixed windows, the
+    /// pre-feature behavior). Read by `notifications::reconcile`.
+    pub reading_speed_cps: Option<u64>,
 }
 
 impl Default for TelegramConfig {
@@ -253,6 +261,7 @@ impl Default for TelegramConfig {
             .into_iter()
             .collect(),
             context_alert_percent: Some(80.0),
+            reading_speed_cps: Some(10),
         }
     }
 }
@@ -423,6 +432,32 @@ mod tests {
             Some(80.0),
             "default context_alert_percent survives when caller only supplies creds"
         );
+        assert_eq!(
+            tg.reading_speed_cps,
+            Some(10),
+            "default reading_speed_cps survives when caller only supplies creds"
+        );
+    }
+
+    #[test]
+    fn reading_speed_cps_defaults_can_be_overridden_and_disabled() {
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            cfg.notifications.unwrap().telegram.unwrap().reading_speed_cps,
+            Some(10),
+            "default reading_speed_cps survives an empty config"
+        );
+        let set: Config = serde_json::from_str(
+            r#"{ "notifications": { "telegram": { "reading_speed_cps": 20 } } }"#,
+        )
+        .unwrap();
+        assert_eq!(set.notifications.unwrap().telegram.unwrap().reading_speed_cps, Some(20));
+        // null disables the scaling (fixed windows).
+        let off: Config = serde_json::from_str(
+            r#"{ "notifications": { "telegram": { "reading_speed_cps": null } } }"#,
+        )
+        .unwrap();
+        assert_eq!(off.notifications.unwrap().telegram.unwrap().reading_speed_cps, None);
     }
 
     #[test]

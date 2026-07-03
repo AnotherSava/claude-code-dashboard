@@ -60,7 +60,8 @@ Every field is optional — omit one and the built-in default applies. A complet
         "blocked": { "afk_window_ms": 60000, "reaction_window_ms": 120000 },
         "error":    { "afk_window_ms": 60000, "reaction_window_ms": 60000 }
       },
-      "context_alert_percent": 80
+      "context_alert_percent": 80,
+      "reading_speed_cps": 10
     }
   },
   "context_bar_thresholds": [
@@ -120,6 +121,7 @@ The `notifications` block controls alerts when a session needs you. Set it to `n
   - `afk_window_ms` — alert once you've been away from the keyboard/mouse this long *and* haven't touched the machine since the state began. This is the "you stepped away and missed it" trigger: if you were at the machine when it happened, it stays silent (you saw it). Omit it to disable the away-detection for that state.
   - `reaction_window_ms` — alert once the state has lasted this long regardless of whether you're present — the backstop for something you need to act on but haven't. Omit it for no backstop.
   - A state with neither window set, or a missing state key, never alerts. By default `done` is away-only (no backstop — a finished task you saw needs no nag), while `blocked` and `error` also carry a reaction backstop.
+- `reading_speed_cps` — your reading pace, in characters per second, used to hold a notification back by however long the agent's last message takes to read, on top of both windows above. A one-line "push?" is unaffected, but a page-full answer buys extra time so you aren't pinged while still reading it — reading a long reply looks the same as being away (neither touches the keyboard), and this tells the two apart. A wall of text is capped at six minutes of extra delay so an alert always arrives eventually. The default `10` (≈100 words/min) is deliberately generous — lower it (e.g. `8`) for even more grace on long replies, raise it (e.g. `20`) for snappier alerts. `null` or `0` turns the scaling off (the windows above apply as-is). `error` is exempt — it reacts to its short failure line, not the surrounding output — so error alerts stay prompt.
 - `context_alert_percent` — send a message when a session's context usage crosses this percent of the active model's window (the same percentage that colors the token counter). It fires once on crossing, and — like the question/state alerts — the message is deleted automatically once usage drops back below (a new task or `/clear`), so the chat only shows context warnings that are still current. It re-arms after a drop, so a later crossing alerts again. `null` or `0` turns it off.
 
 ### Token coloring
