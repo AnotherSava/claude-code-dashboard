@@ -1,4 +1,5 @@
 - [Check remote before fixing](feedback_check_remote_before_fixing.md) — deployed app often lags origin/main; git fetch + check log before reimplementing a fix that may already be merged
+- [Prefer generous notification timing](user_prefers_generous_timing.md) — default to the longer end on any notification/auto-dismiss/grace-period delay; reading_speed_cps default is 10 (≈100 wpm)
 - [Hook env var setup](hook_env_var_setup.md) — Claude Code hooks in ~/.claude/settings.json need $CLAUDE_AI_AGENT_DASHBOARD set to the repo root; silent failure when unset
 - [Frontend question detector is lenient](feedback_frontend_question_detector_lenient.md) — src/lib/dialog.ts intentionally diverges from Rust is_a_question; don't unify
 - [Benign openers for offer questions](benign_openers_offer_questions.md) — config benign_openers (prefix) keeps "Anything …?" sign-offs DONE; distinct from benign_closers (suffix), don't merge
@@ -27,6 +28,7 @@
 - [Auto-resize DPI drift](debug_auto_resize_dpi_drift.md) — mixed-DPI multi-monitor; dpr≠scale + xy march = resize loop teleporting to (0,0); fix = clamp to overlapped monitor not current_monitor
 - [Auto-resize children-sum race](debug_auto_resize_children_race.md) — stuck scrollbar (window < content); summing .list children raced Svelte reconciliation, desired one row short; fix = measure non-stretching .list-inner + ResizeObserver
 - [Auto-resize config race → too tall](debug_auto_resize_config_race.md) — get_config mount race makes frontend auto_resize='none' → measure early-returns → window frozen; fix = manage ConfigState first in setup + one authoritative getConfig re-read at end of mount; beware multi-window log interleaving
+- [Auto-resize display-disable collapse](debug_auto_resize_display_disable_collapse.md) — disabling the widget's monitor collapses it to a header sliver (innerHeight stuck ~18px); Windows swallows set_size mid-transition + resize-event burst ends; fix = frontend self-heal retry when innerHeight*2 < desired
 - [Terminal screen isn't a state signal](terminal_promote_to_working_unsafe.md) — both promote (strands rows) & demote (idle_probe, false-reverts slow silent turns) tried & removed; use hooks/markers
 - [idle_probe retired](idle_probe_screen_criteria_tui_sensitive.md) — screen-scrape removed 2026-07-01; instant Esc-cancels DO write the interrupt marker (verified), so the marker path is authoritative
 - [Diagnose state via widget.jsonl](debug_state_transitions_via_widget_jsonl.md) — run /investigate <agent> to reconstruct state + decision chain; or grep the "decision"-tagged lines; don't theorize

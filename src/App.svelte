@@ -61,10 +61,41 @@
   // just caused. (The DPI-mismatch loop itself is prevented by sizing in
   // physical px; see measureAndSend.)
   let suppressResizeUntil = 0
+  // Self-heal for the display-disable collapse: when a monitor holding the
+  // widget is disabled, Windows moves/shrinks the window and swallows the
+  // set_size we issue mid-transition (observed in widget.jsonl: innerHeight
+  // stuck at 18px while the content wanted 105+). The burst of 'resize' events
+  // that drove us here ends while the window is still a header-height sliver,
+  // so no further event re-fires a measure and it stays collapsed until some
+  // unrelated later trigger. These retries keep re-applying past the transition
+  // until the window reaches its content height, then self-cancel. Delays are
+  // measured from each retry; ~10s total spans a display/DPI transition without
+  // looping forever (the budget then falls back to event-driven re-measures).
+  const HEAL_DELAYS = [300, 700, 1500, 3000, 5000]
+  let healTimer: ReturnType<typeof setTimeout> | null = null
+  let healTries = 0
 
   function scheduleMeasure() {
     if (measureTimer !== null) clearTimeout(measureTimer)
     measureTimer = setTimeout(measureAndSend, 50)
+  }
+
+  function scheduleHeal() {
+    if (healTries >= HEAL_DELAYS.length) return // budget spent — fall back to event-driven re-measure
+    const delay = HEAL_DELAYS[healTries++]
+    if (healTimer !== null) clearTimeout(healTimer)
+    healTimer = setTimeout(() => {
+      healTimer = null
+      measureAndSend()
+    }, delay)
+  }
+
+  function cancelHeal() {
+    healTries = 0
+    if (healTimer !== null) {
+      clearTimeout(healTimer)
+      healTimer = null
+    }
   }
 
   // Re-measure whenever the rendered content height changes, even when no
@@ -119,13 +150,17 @@
     // clamp on a prior request, external resize) leave `lastSentHeight`
     // stale but `window.innerHeight` accurate, so this comparison catches
     // them where a request-based dedup wouldn't.
-    const overflowing = desired > window.innerHeight + 1
+    const vh = window.innerHeight
+    const overflowing = desired > vh + 1
     // For non-overflow cases, dedup against what we last requested. Crucial
     // for the OS-clamp scenario: if we asked for 87 but Windows enforced a
     // ~150 minimum, viewport stays at 150 while desired stays at 87 — and
     // re-asking for 87 every event would feedback-loop. The request-based
     // dedup pins this at one fire per measurement.
-    if (!overflowing && Math.abs(desired - lastSentHeight) < 1) return
+    if (!overflowing && Math.abs(desired - lastSentHeight) < 1) {
+      cancelHeal() // window already matches its content — stop any heal retries
+      return
+    }
     lastSentHeight = desired
     // Send PHYSICAL pixels computed from the webview's own devicePixelRatio,
     // not a logical height for Rust to scale. Near a mixed-DPI monitor boundary
@@ -137,10 +172,23 @@
     frontendLog('trace', 'auto_resize measure', {
       desired,
       dpr,
-      inner_height: window.innerHeight,
+      inner_height: vh,
       physical: Math.round(desired * dpr),
+      heal: healTries,
     }).catch(() => {})
     applyAutoResize(Math.round(desired * dpr)).catch((err) => console.error('apply_auto_resize failed', err))
+    // A window less than half the height its content needs is the OS swallowing
+    // our resize during a display/DPI transition — not the ~1-frame lag of a
+    // normal grow (which clears the half-height bar and settles on its own).
+    // Keep re-applying past the transition; it self-cancels once the window
+    // catches up. Re-arm if a fresh collapse shows up after the budget is spent.
+    const collapsed = overflowing && vh * 2 < desired
+    if (overflowing && (collapsed || healTries > 0)) {
+      if (collapsed && healTries >= HEAL_DELAYS.length) healTries = 0
+      scheduleHeal()
+    } else if (!overflowing) {
+      cancelHeal()
+    }
   }
 
   // Re-measure on external viewport changes (manual drag, monitor move, DPI
@@ -298,6 +346,7 @@
       unlistenShowSetup?.()
       unlistenSetupState?.()
       if (measureTimer !== null) clearTimeout(measureTimer)
+      if (healTimer !== null) clearTimeout(healTimer)
       contentObserver?.disconnect()
     }
   })
