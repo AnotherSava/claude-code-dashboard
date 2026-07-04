@@ -18,6 +18,19 @@ import os
 import sys
 from collections import defaultdict, deque
 
+# The decision-log `reason` carries arbitrary assistant text — arrows, em
+# dashes, ellipses, emoji — so force UTF-8 output regardless of the console
+# codepage. A Windows console on a non-UTF-8 codepage (e.g. cp1251) otherwise
+# crashes on the first non-encodable glyph, such as the '→' in a rename note.
+# errors="replace" is a last-resort guard so a stray unencodable char degrades
+# to '?' rather than a traceback that hides the answer.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
 # Status -> the chip label the dashboard shows.
 CHIP = {"Working": "WORK", "Waiting": "WAIT", "Blocked": "BLOCK", "Done": "DONE", "Idle": "IDLE", "Error": "ERROR"}
 
