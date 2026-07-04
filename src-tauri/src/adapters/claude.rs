@@ -208,7 +208,10 @@ fn classify_stop(payload: &Value, rules: QuestionRules) -> Classification {
             return Classification::new(
                 Status::Blocked,
                 Some("has a question".into()),
-                format!("turn ended on a question [{rule}]: \"{}\"", evidence_snippet(text)),
+                // Snippet the note-stripped text so the log shows the matched
+                // question, not a trailing housekeeping `Note:` that would read
+                // as if it (not the real hand-back) triggered the block.
+                format!("turn ended on a question [{rule}]: \"{}\"", evidence_snippet(strip_trailing_notes(text, rules))),
             );
         }
     }
@@ -508,7 +511,42 @@ pub(crate) fn is_a_question(text: &str, rules: QuestionRules) -> bool {
 /// text reads as a plain statement). The matched-rule string is recorded in the
 /// decision log so an investigation can see why a turn was judged a question
 /// without re-running the heuristics or reading the transcript.
+///
+/// Trailing `Note:` housekeeping paragraphs are peeled first (see
+/// [`strip_trailing_notes`]) so a caveat appended after the real closing
+/// question doesn't mask it.
 pub(crate) fn question_reason(text: &str, rules: QuestionRules) -> Option<&'static str> {
+    question_reason_core(strip_trailing_notes(text, rules), rules)
+}
+
+/// Drop trailing `Note:` paragraphs before the hand-back checks. Agents often
+/// append a housekeeping caveat *after* the closing question
+/// (`"Shall I proceed?\n\nNote: I also renamed X — flag if you'd rather keep
+/// it."`); the final-message checks would otherwise see only the note and read
+/// the turn as Done. Peels blank-line-separated paragraphs that open with
+/// `Note:`, newest-first, but stops at (keeps) a note that is *itself* a
+/// hand-back — tested with [`question_reason_core`] — so an ask that lives only
+/// inside a note still awaits. Returns a prefix slice of `text`.
+fn strip_trailing_notes<'a>(text: &'a str, rules: QuestionRules) -> &'a str {
+    let mut cut = text.trim_end();
+    while let Some((before, last)) = cut.rsplit_once("\n\n") {
+        let para = last.trim();
+        let is_note = para
+            .trim_start_matches(|c: char| matches!(c, '*' | '_' | '#' | ' '))
+            .to_lowercase()
+            .starts_with("note:");
+        if is_note && question_reason_core(para, rules).is_none() {
+            cut = before.trim_end();
+        } else {
+            break;
+        }
+    }
+    cut
+}
+
+/// The hand-back heuristics proper, run on text that [`question_reason`] has
+/// already stripped of trailing notes.
+fn question_reason_core(text: &str, rules: QuestionRules) -> Option<&'static str> {
     let plain = strip_markdown(text);
     let effective = strip_trailing_options(&plain);
     let is_benign_closer = {
@@ -1208,6 +1246,47 @@ mod tests {
             "Should I delete the backup first? Or are you good?",
             with_closers(&closers)
         ));
+    }
+
+    // ----- trailing `Note:` paragraphs (housekeeping after the hand-back) -----
+
+    #[test]
+    fn trailing_note_paragraph_does_not_mask_the_closing_question() {
+        // The real bug: a commit plan ending in "Shall I proceed?" carried a
+        // trailing "Note:" housekeeping paragraph, so the final-message checks
+        // saw only the note and settled Done. Peeling the note first exposes the
+        // question, so the row awaits.
+        let text = "I plan to create 9 commits.\n\nI plan to create 9 commit(s) with these changes. Shall I proceed?\n\nNote: I also genericized \"X Lab\" to \"Y Co.\" per the confidentiality check while you were away — flag if you'd rather keep the original.";
+        assert!(is_a_question(text, NO_RULES));
+    }
+
+    #[test]
+    fn multiple_trailing_notes_are_all_peeled() {
+        let text = "Ready to go. Should I deploy?\n\nNote: bumped the version.\n\nNote: cleaned up temp files.";
+        assert!(is_a_question(text, NO_RULES));
+    }
+
+    #[test]
+    fn trailing_note_after_a_statement_stays_done() {
+        // No question anywhere — peeling the note must not invent one.
+        let text = "All wrapped up and pushed.\n\nNote: I also tidied the imports.";
+        assert!(!is_a_question(text, NO_RULES));
+    }
+
+    #[test]
+    fn a_note_that_is_itself_a_question_still_awaits() {
+        // The only ask lives inside the note — the guard keeps it (a note that is
+        // itself a hand-back is not peeled), so the row still awaits.
+        let text = "Deployed and green.\n\nNote: should I also tag the release?";
+        assert!(is_a_question(text, NO_RULES));
+    }
+
+    #[test]
+    fn note_only_stripped_when_trailing() {
+        // A note in the *middle* isn't housekeeping-after-the-close; the trailing
+        // paragraph is a plain statement, so nothing is peeled and it reads Done.
+        let text = "Note: this took two passes.\n\nEverything is committed and pushed.";
+        assert!(!is_a_question(text, NO_RULES));
     }
 
     #[test]

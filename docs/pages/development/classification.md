@@ -92,6 +92,8 @@ Other Unicode passes through untouched — accents, emoji, CJK, math symbols. Th
 
 **`is_a_question(text, rules)`** — pure check on a string, four detection paths. The `rules` argument bundles two config-driven lists that always travel together: `benign_closers` (suffix-matched) and `benign_openers` (prefix-matched). Before any path runs, inline Markdown formatting characters (`*`, `_`, `` ` ``, `#`, `~`) are stripped so a final `**Push?**` reduces to `Push?` and is still recognized — only those marker characters are removed; newlines and every other character (crucially the terminal `?`) are preserved.
 
+**Pre-step — peel trailing `Note:` paragraphs:** Before the four paths run, blank-line-separated paragraphs that open with `Note:` are dropped from the end, newest-first. Agents often append a housekeeping caveat *after* the closing question — `"Shall I proceed?\n\nNote: I also renamed X — flag if you'd rather keep it."` — and every path keys off the tail of the text, so the note would otherwise mask the question and settle the turn `done`. A note that is *itself* a hand-back (it registers as a question on its own) is kept, so peeling can only ever turn `done → blocked`, never hide an ask that lives only inside a note. The verdict runs on the peeled text; the decision-log snippet is peeled too, so the log quotes the real question, not the note.
+
 **Path 1 — trailing `?`:**
 
 1. If `text` (after trim) ends with `)`, peel off one trailing `(...)` group **only when** the substring before the matching `(` ends with `?`. This handles option lists like `"Save these? (all / numbers / none)"` → `"Save these?"`. Other trailing parens (e.g. `"Look at this code (foo.py)"`) are left alone — there's no `?` before them, so the text falls through unchanged.
