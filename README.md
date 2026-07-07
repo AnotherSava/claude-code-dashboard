@@ -8,8 +8,8 @@ A desktop app for Windows and macOS — a compact always-on-top widget that list
 
 ## Features
 
-- **Notifications** — Telegram pings you when an agent finishes or is waiting while you're away from your machine — staying quiet when you were there to see it — or when a session's context fills past a threshold.
-- **Color terminal tabs** — each session's status appears as a colored circle in its terminal tab, so you see who needs you even without the widget on screen.
+- **Notifications** — Telegram pings you when an agent finishes or is waiting while you're away from your machine — staying quiet when you were there to see it — when a session's context fills past a threshold, or when a heavily-used usage limit resets.
+- **Color terminal tabs** — each session's status appears as a colored circle in its terminal tab — with its context usage once it climbs high — so you see who needs you even without the widget on screen.
 - **Multi-device sync** — track sessions running on your other devices the same way as local ones.
 - **Focus on the task** — once Claude resumes after a question, the row shows your original request, not the *yes* you typed.
 - **Context usage** — each row shows how full the model's context is, colored green → amber → red as it fills, so you can tell at a glance whether `/compact` is due.

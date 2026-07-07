@@ -69,6 +69,13 @@ pub struct Config {
     /// "<colored circle> <name>" (e.g. "🔵 ai-dashboard"). Read by
     /// `terminal_title::sync`; Windows-only today.
     pub terminal_titles: bool,
+    /// When a session's context usage reaches this percent of its model's
+    /// window, append it to the terminal tab title as " [N%]" (e.g.
+    /// "🔵 printlab [67%]") — a glanceable "this one's filling up" cue right in
+    /// the tab. `null` or `0` disables the suffix (the glyph + name still show).
+    /// Read by `terminal_title::sync`; needs `terminal_titles` on to appear at
+    /// all. Same percentage as the token counter (`notifications::context_percent`).
+    pub terminal_title_context_percent: Option<f32>,
     /// Revert a `Working` row to its pre-prompt status when its turn was
     /// cancelled with Esc — which emits no lifecycle hook. Gated by this flag,
     /// `log_watcher` detects the cancel from the "[Request interrupted by user]"
@@ -234,6 +241,16 @@ pub struct TelegramConfig {
     /// resets the token count), the session vanishes, or the feature is turned
     /// off — and it re-arms after a drop so a later crossing alerts again.
     pub context_alert_percent: Option<f32>,
+    /// Fire a one-shot Telegram message when the 5-hour or 7-day usage window
+    /// resets, if the window that just ended had been used to at least this
+    /// percent. `null` or `0` disables it. A reset is detected from the usage
+    /// poller's `resets_at` jumping forward by ~a window length (never the
+    /// ±1min-jittery value directly), so the post-cap transient that briefly
+    /// zeroes both buckets' percentages doesn't false-fire. Unlike the other
+    /// alerts this is a point event — it's sent once and never auto-deleted.
+    /// Account-wide, so with the dashboard running on several devices each one
+    /// pings independently; set this to `null` on the extras to avoid dupes.
+    pub limit_reset_percent: Option<f32>,
     /// Reading pace, in characters per second, used to defer a notification by
     /// how long the final assistant message takes to read. The reconciler adds
     /// `chars / reading_speed_cps` (capped, see `notifications::READING_CAP_MS`)
@@ -261,6 +278,7 @@ impl Default for TelegramConfig {
             .into_iter()
             .collect(),
             context_alert_percent: Some(80.0),
+            limit_reset_percent: Some(90.0),
             reading_speed_cps: Some(10),
         }
     }
@@ -321,6 +339,7 @@ impl Default for Config {
             start_minimized: false,
             continuation_prompts: ["go", "continue", "proceed", "yes", "y", "yeah", "yep", "yup", "ok", "okay", "sure", "go ahead", "do it"].iter().map(|s| s.to_string()).collect(),
             terminal_titles: true,
+            terminal_title_context_percent: Some(50.0),
             detect_cancelled_turns: true,
             reap_exited_sessions: true,
             sync: SyncConfig::default(),
@@ -437,6 +456,11 @@ mod tests {
             Some(10),
             "default reading_speed_cps survives when caller only supplies creds"
         );
+        assert_eq!(
+            tg.limit_reset_percent,
+            Some(90.0),
+            "default limit_reset_percent survives when caller only supplies creds"
+        );
     }
 
     #[test]
@@ -475,6 +499,27 @@ mod tests {
         .unwrap();
         let tg = off.notifications.unwrap().telegram.unwrap();
         assert_eq!(tg.context_alert_percent, None);
+    }
+
+    #[test]
+    fn limit_reset_percent_defaults_and_can_be_overridden_and_disabled() {
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            cfg.notifications.unwrap().telegram.unwrap().limit_reset_percent,
+            Some(90.0),
+            "default limit_reset_percent survives an empty config"
+        );
+        let set: Config = serde_json::from_str(
+            r#"{ "notifications": { "telegram": { "limit_reset_percent": 75 } } }"#,
+        )
+        .unwrap();
+        assert_eq!(set.notifications.unwrap().telegram.unwrap().limit_reset_percent, Some(75.0));
+        // null disables it.
+        let off: Config = serde_json::from_str(
+            r#"{ "notifications": { "telegram": { "limit_reset_percent": null } } }"#,
+        )
+        .unwrap();
+        assert_eq!(off.notifications.unwrap().telegram.unwrap().limit_reset_percent, None);
     }
 
     #[test]
@@ -538,6 +583,16 @@ mod tests {
         assert!(cfg.terminal_titles);
         let off: Config = serde_json::from_str(r#"{ "terminal_titles": false }"#).unwrap();
         assert!(!off.terminal_titles);
+    }
+
+    #[test]
+    fn terminal_title_context_percent_defaults_and_parses() {
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(cfg.terminal_title_context_percent, Some(50.0), "default survives an empty config");
+        let set: Config = serde_json::from_str(r#"{ "terminal_title_context_percent": 70 }"#).unwrap();
+        assert_eq!(set.terminal_title_context_percent, Some(70.0));
+        let off: Config = serde_json::from_str(r#"{ "terminal_title_context_percent": null }"#).unwrap();
+        assert_eq!(off.terminal_title_context_percent, None);
     }
 
     #[test]

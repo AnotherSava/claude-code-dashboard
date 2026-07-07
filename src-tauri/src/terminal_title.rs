@@ -15,11 +15,13 @@
 //! caller sees.
 
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use std::sync::Mutex;
 
 use tauri::{AppHandle, Manager};
 
 use crate::config::ConfigState;
+use crate::notifications::context_percent;
 use crate::state::{AgentSession, Status};
 
 /// How long a pushed title is trusted to still be on the console. Spawned
@@ -89,6 +91,25 @@ fn status_glyph(status: Status) -> &'static str {
     }
 }
 
+/// The tab title for a session: "<glyph> <name>", with " [N%]" appended when
+/// the session's context usage is at least `context_threshold` percent of its
+/// model's window (the same figure as the token counter). `context_threshold
+/// <= 0` — or an unknown percentage (no tokens / model / window) — omits the
+/// suffix. Pure and testable; the console-write side effects live in
+/// `push_title`.
+fn build_title(session: &AgentSession, context_threshold: f32, window_tokens: &HashMap<String, u64>) -> String {
+    let name = session.display_name.as_deref().unwrap_or(&session.id);
+    let mut title = format!("{} {}", status_glyph(session.status), name);
+    if context_threshold > 0.0 {
+        if let Some(pct) = context_percent(session, window_tokens) {
+            if pct >= context_threshold {
+                let _ = write!(title, " [{}%]", pct.round() as u32);
+            }
+        }
+    }
+    title
+}
+
 /// Reconcile terminal tab titles with the current sessions. Called from
 /// `emit_sessions_updated`, which every state transition already flows
 /// through (hook events, transcript watcher, renames, row removal) — so the
@@ -99,10 +120,8 @@ pub fn sync(app: &AppHandle, sessions: &[AgentSession]) {
     let Some(titles) = app.try_state::<TerminalTitles>() else {
         return;
     };
-    let enabled = app
-        .try_state::<ConfigState>()
-        .map(|s| s.snapshot().terminal_titles)
-        .unwrap_or(true);
+    let cfg = app.try_state::<ConfigState>().map(|s| s.snapshot());
+    let enabled = cfg.as_ref().map(|c| c.terminal_titles).unwrap_or(true);
     let mut pids = titles.pids.lock().unwrap();
     let mut last = titles.last.lock().unwrap();
 
@@ -128,13 +147,16 @@ pub fn sync(app: &AppHandle, sessions: &[AgentSession]) {
         false
     });
 
+    let context_threshold = cfg.as_ref().and_then(|c| c.terminal_title_context_percent).unwrap_or(0.0);
+    let empty_tokens = HashMap::new();
+    let window_tokens = cfg.as_ref().map(|c| &c.context_window_tokens).unwrap_or(&empty_tokens);
+
     let now = crate::commands::now_ms();
     for s in sessions {
         let Some(candidates) = pids.get(&s.id) else {
             continue;
         };
-        let name = s.display_name.as_deref().unwrap_or(&s.id);
-        let title = format!("{} {}", status_glyph(s.status), name);
+        let title = build_title(s, context_threshold, window_tokens);
         if let Some((prev, at)) = last.get(&s.id) {
             if *prev == title && now - at < REASSERT_MS {
                 continue;
@@ -242,6 +264,71 @@ mod tests {
 
     fn candidates(t: &TerminalTitles, id: &str) -> Vec<u32> {
         t.pids.lock().unwrap().get(id).cloned().unwrap_or_default()
+    }
+
+    fn session(id: &str, model: Option<&str>, tokens: Option<u64>) -> AgentSession {
+        AgentSession {
+            id: id.to_string(),
+            status: Status::Working,
+            status_before_working: Status::Idle,
+            label: String::new(),
+            original_prompt: None,
+            task_started_at: 0,
+            dialog: Vec::new(),
+            source: "test".to_string(),
+            model: model.map(String::from),
+            input_tokens: tokens,
+            updated: 0,
+            state_entered_at: 0,
+            working_accumulated_ms: 0,
+            display_name: None,
+            origin: None,
+        }
+    }
+
+    fn tokens_map() -> HashMap<String, u64> {
+        [("m".to_string(), 200_000u64)].into_iter().collect()
+    }
+
+    #[test]
+    fn build_title_appends_context_at_or_above_threshold() {
+        let w = tokens_map();
+        // 100k / 200k = 50%, exactly at the default threshold → suffix appears.
+        assert_eq!(build_title(&session("proj", Some("m"), Some(100_000)), 50.0, &w), "🔵 proj [50%]");
+        // 134k / 200k = 67% → rounded suffix.
+        assert_eq!(build_title(&session("proj", Some("m"), Some(134_000)), 50.0, &w), "🔵 proj [67%]");
+    }
+
+    #[test]
+    fn build_title_omits_context_below_threshold() {
+        let w = tokens_map();
+        // 98k / 200k = 49% → below 50, no suffix.
+        assert_eq!(build_title(&session("proj", Some("m"), Some(98_000)), 50.0, &w), "🔵 proj");
+    }
+
+    #[test]
+    fn build_title_threshold_zero_disables_suffix() {
+        let w = tokens_map();
+        // Even a full window shows no suffix when the feature is off (0/null).
+        assert_eq!(build_title(&session("proj", Some("m"), Some(200_000)), 0.0, &w), "🔵 proj");
+    }
+
+    #[test]
+    fn build_title_omits_context_when_uncomputable() {
+        let w = tokens_map();
+        // No tokens, or a model with no configured window → no percentage known.
+        assert_eq!(build_title(&session("proj", Some("m"), None), 50.0, &w), "🔵 proj");
+        assert_eq!(build_title(&session("proj", Some("other"), Some(180_000)), 50.0, &w), "🔵 proj");
+        assert_eq!(build_title(&session("proj", None, Some(180_000)), 50.0, &w), "🔵 proj");
+    }
+
+    #[test]
+    fn build_title_uses_display_name_and_current_glyph() {
+        let w = tokens_map();
+        let mut s = session("proj", Some("m"), Some(180_000));
+        s.display_name = Some("printlab".into());
+        s.status = Status::Blocked;
+        assert_eq!(build_title(&s, 50.0, &w), "✋ printlab [90%]");
     }
 
     #[test]

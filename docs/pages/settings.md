@@ -43,6 +43,7 @@ Every field is optional — omit one and the built-in default applies. A complet
   "tray_context_alert_enabled": true,
   "tray_context_alert_percent": 80,
   "terminal_titles": true,
+  "terminal_title_context_percent": 50,
   "detect_cancelled_turns": true,
   "reap_exited_sessions": true,
   "save_window_position": true,
@@ -61,6 +62,7 @@ Every field is optional — omit one and the built-in default applies. A complet
         "error":    { "afk_window_ms": 60000, "reaction_window_ms": 60000 }
       },
       "context_alert_percent": 80,
+      "limit_reset_percent": 90,
       "reading_speed_cps": 10
     }
   },
@@ -106,6 +108,7 @@ Whether autostart is enabled isn't a config field — it lives in the OS launch 
 ### Color terminal tabs
 
 - `terminal_titles` — mirror each session's status onto its terminal tab as a colored circle next to the session name (🔵 working, 🟠 waiting, 🟢 done, 🔴 error, ⚪ idle). See [Features → color terminal tabs](features#color-terminal-tabs).
+- `terminal_title_context_percent` — once a session's context usage reaches this percent of its model's window, append it to the terminal tab title as ` [N%]` (e.g. `🔵 printlab [67%]`), so a tab filling toward `/compact` stands out. `null` or `0` turns the number off (the colored circle + name still show); it needs `terminal_titles` on to appear at all.
 
 ### Behavior
 
@@ -123,6 +126,7 @@ The `notifications` block controls alerts when a session needs you. Set it to `n
   - A state with neither window set, or a missing state key, never alerts. By default `done` is away-only (no backstop — a finished task you saw needs no nag), while `blocked` and `error` also carry a reaction backstop.
 - `reading_speed_cps` — your reading pace, in characters per second, used to hold a notification back by however long the agent's last message takes to read, on top of both windows above. A one-line "push?" is unaffected, but a page-full answer buys extra time so you aren't pinged while still reading it — reading a long reply looks the same as being away (neither touches the keyboard), and this tells the two apart. A wall of text is capped at six minutes of extra delay so an alert always arrives eventually. The default `10` (≈100 words/min) is deliberately generous — lower it (e.g. `8`) for even more grace on long replies, raise it (e.g. `20`) for snappier alerts. `null` or `0` turns the scaling off (the windows above apply as-is). `error` is exempt — it reacts to its short failure line, not the surrounding output — so error alerts stay prompt.
 - `context_alert_percent` — send a message when a session's context usage crosses this percent of the active model's window (the same percentage that colors the token counter). It fires once on crossing, and — like the question/state alerts — the message is deleted automatically once usage drops back below (a new task or `/clear`), so the chat only shows context warnings that are still current. It re-arms after a drop, so a later crossing alerts again. `null` or `0` turns it off.
+- `limit_reset_percent` — send a message when your 5-hour or 7-day usage window resets, but only if you'd used it to at least this percent — so you get a "you're clear to resume" ping only when you'd actually hit the ceiling. Defaults to `90`; `null` or `0` turns it off. It's a one-off note (unlike the alerts above it isn't auto-deleted). The reset is read from Anthropic's usage data, so the ping lands within a poll cycle of the actual reset rather than the instant it happens. Your usage is account-wide: if you run the dashboard on more than one machine, each one sends its own ping — set this to `null` on the extras if you'd rather not get duplicates.
 
 ### Token coloring
 

@@ -8,6 +8,7 @@ use crate::config::{ConfigState, StateNotify};
 use crate::custom_names::CustomNamesStore;
 use crate::state::{AgentSession, AppState, DialogRole, Status};
 use crate::telegram::{SyncOutcome, TelegramNotifier};
+use crate::usage_limits::UsageLimitsState;
 
 /// Upper bound on the reading-time delay [`reading_time_ms`] can add to a
 /// notification window, so an enormous message can't defer an actionable ping
@@ -217,6 +218,128 @@ pub async fn dismiss_and_forget<V>(
     }
 }
 
+// ---- usage-limit reset detection --------------------------------------------
+
+/// Which usage window reset. `label` is the terse Telegram wording; `key` is the
+/// greppable `bucket` field in the decision log.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LimitWindow {
+    FiveHour,
+    SevenDay,
+}
+
+impl LimitWindow {
+    fn label(self) -> &'static str {
+        match self {
+            Self::FiveHour => "5h",
+            Self::SevenDay => "7d",
+        }
+    }
+    fn key(self) -> &'static str {
+        match self {
+            Self::FiveHour => "five_hour",
+            Self::SevenDay => "seven_day",
+        }
+    }
+}
+
+/// A detected reset of one usage window, carrying the peak percent the
+/// just-ended window reached (its high-water mark).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LimitReset {
+    pub window: LimitWindow,
+    pub peak_pct: f32,
+}
+
+/// A reset is only registered when `resets_at` jumps forward by more than this.
+/// It sits far above the ±1min jitter the fixed 5h window's `resets_at` shows
+/// between polls (see the `usage_five_hour_resets_at_jitter` memory) and far
+/// below any real reset jump — the smallest is a full window minus how early it
+/// fired, ≥ ~3h for 5h and days for 7d — so it cleanly separates jitter from a
+/// genuine window turnover.
+pub const RESET_JUMP_MARGIN_MS: i64 = 10 * 60 * 1000;
+
+/// Per-window reset tracker. Detecting the reset from the `resets_at` forward
+/// jump — not the percentage dropping — is deliberate: a 5h reset transiently
+/// zeroes *both* buckets' percentages for up to ~40min (observed in real data),
+/// so the 7d percentage can fall from a high value to 0 while its window hasn't
+/// reset at all (its `resets_at` held). Only the `resets_at` jump marks a true
+/// reset; `peak_pct` (a running max) rides out the transient dips so the
+/// pre-reset high-water mark is the value reported.
+#[derive(Default)]
+struct WindowReset {
+    /// Last non-null `resets_at` seen; `None` until the first observation
+    /// (seeded silently, so a fresh tracker never fires on its very first poll).
+    resets_at: Option<i64>,
+    peak_pct: f32,
+}
+
+impl WindowReset {
+    /// Fold one poll's `(percent, resets_at)` for this window into the tracker.
+    /// Returns `Some(peak)` — the just-ended window's high-water mark — exactly
+    /// when a reset is detected, else `None`.
+    fn observe(&mut self, pct: Option<f32>, resets_at: Option<i64>, margin_ms: i64) -> Option<f32> {
+        // Detect a reset *before* folding this poll's percentage into the peak:
+        // the poll that carries the jumped `resets_at` is the new window's first
+        // sample, so its percentage belongs to the new window and must not
+        // inflate the just-ended window's high-water mark. (A coarse poll
+        // interval can skip the transient `resets_at: null` reset poll and land
+        // directly on a jumped `resets_at` whose percentage has already climbed.)
+        if let Some(r) = resets_at {
+            match self.resets_at {
+                Some(prev) if r > prev + margin_ms => {
+                    let peak = self.peak_pct; // the ended window's high-water mark
+                    self.resets_at = Some(r);
+                    self.peak_pct = pct.unwrap_or(0.0); // new window starts here
+                    return Some(peak);
+                }
+                // First observation seeds silently; jitter keeps the same window.
+                _ => self.resets_at = Some(r),
+            }
+        }
+        // No reset (seed / jitter / the null reset poll): fold the percentage in.
+        if let Some(p) = pct {
+            self.peak_pct = self.peak_pct.max(p);
+        }
+        None
+    }
+}
+
+/// Tracks 5h + 7d window resets across polls. Loop-local state in the
+/// notification manager; the detection is pure so it unit-tests without a poll
+/// loop.
+#[derive(Default)]
+pub struct ResetTracker {
+    five_hour: WindowReset,
+    seven_day: WindowReset,
+}
+
+impl ResetTracker {
+    /// Fold one usage poll (each bucket's `(percent, resets_at)`) into the
+    /// tracker, returning any windows that just reset with their peak percent.
+    pub fn observe(
+        &mut self,
+        five_hour: (Option<f32>, Option<i64>),
+        seven_day: (Option<f32>, Option<i64>),
+        margin_ms: i64,
+    ) -> Vec<LimitReset> {
+        let mut out = Vec::new();
+        if let Some(peak) = self.five_hour.observe(five_hour.0, five_hour.1, margin_ms) {
+            out.push(LimitReset { window: LimitWindow::FiveHour, peak_pct: peak });
+        }
+        if let Some(peak) = self.seven_day.observe(seven_day.0, seven_day.1, margin_ms) {
+            out.push(LimitReset { window: LimitWindow::SevenDay, peak_pct: peak });
+        }
+        out
+    }
+}
+
+/// Terse Telegram text for a window reset, e.g. `5h limit reset (was 96%)`.
+/// Account-wide, so unlike the per-session messages it carries no `[name]`.
+pub fn build_limit_reset_message(reset: LimitReset) -> String {
+    format!("{} limit reset (was {}%)", reset.window.label(), reset.peak_pct.round() as i64)
+}
+
 pub async fn reconcile(
     notifier: &dyn Notifier,
     sessions: &[AgentSession],
@@ -285,6 +408,15 @@ impl NotificationManager {
             // Live context-usage alerts: session id -> Telegram message handle,
             // so the message can be deleted once usage drops back below.
             let mut context_outstanding: HashMap<String, String> = HashMap::new();
+            // Usage-limit reset detector + the last usage-poll `updated` we
+            // processed, so each poll is folded in exactly once. `observe` fuses
+            // detection with state advance (the jump can't be re-detected), so a
+            // fired reset that fails to send is buffered here and retried each
+            // tick rather than lost — mirroring how the other reconcilers recover
+            // from a transient send failure (they simply don't record success).
+            let mut reset_tracker = ResetTracker::default();
+            let mut last_usage_updated: i64 = 0;
+            let mut pending_limit_resets: Vec<LimitReset> = Vec::new();
             let mut ticker = tokio::time::interval(Duration::from_secs(1));
             // First tick fires immediately; skip it so startup doesn't see
             // stale state before AppState is populated.
@@ -313,18 +445,28 @@ impl NotificationManager {
                     .and_then(|n| n.telegram.as_ref());
 
                 let outcome = telegram.sync_config(tg_cfg);
-                if matches!(outcome, SyncOutcome::CredsChanged | SyncOutcome::Disabled)
-                    && (!outstanding.is_empty() || !context_outstanding.is_empty())
-                {
-                    tracing::warn!(
-                        channel = "telegram",
-                        reason = ?outcome,
-                        count = outstanding.len(),
-                        context_count = context_outstanding.len(),
-                        "credentials changed or disabled; dropping outstanding maps without deleting"
-                    );
-                    outstanding.clear();
-                    context_outstanding.clear();
+                if matches!(outcome, SyncOutcome::CredsChanged | SyncOutcome::Disabled) {
+                    if !outstanding.is_empty() || !context_outstanding.is_empty() {
+                        tracing::warn!(
+                            channel = "telegram",
+                            reason = ?outcome,
+                            count = outstanding.len(),
+                            context_count = context_outstanding.len(),
+                            "credentials changed or disabled; dropping outstanding maps without deleting"
+                        );
+                        outstanding.clear();
+                        context_outstanding.clear();
+                    }
+                    // Re-seed the reset detector so a window that reset while
+                    // creds were absent doesn't fire a stale / frozen-peak ping
+                    // on re-enable: `observe` is gated on `is_enabled()` below, so
+                    // it can't stay seeded across a creds-cleared gap. A fresh
+                    // tracker seeds the next poll silently (mirrors app restart).
+                    // Drop buffered-but-unsent resets too — they predate the new
+                    // credentials and mustn't be delivered under them.
+                    reset_tracker = ResetTracker::default();
+                    last_usage_updated = 0;
+                    pending_limit_resets.clear();
                 }
 
                 if telegram.is_enabled() {
@@ -380,6 +522,60 @@ impl NotificationManager {
                             Err(e) => tracing::warn!(channel = "telegram", id = %s.id, ?e, "context alert send failed"),
                         }
                     }
+
+                    // Usage-limit reset pings. When the account-wide 5h/7d
+                    // window resets after heavy use, fire a one-shot message —
+                    // detected from the usage snapshot's `resets_at` jumping
+                    // forward (see `ResetTracker`), processed once per poll
+                    // (gated on `updated` advancing). A point event: buffered and
+                    // retried until sent, never tracked for deletion. `observe`
+                    // runs whenever creds are set (even with the feature off) so
+                    // the tracker stays seeded and turning the threshold on
+                    // mid-window can't false-fire on a stale window.
+                    if let Some(usage) = app.try_state::<UsageLimitsState>().map(|s| s.snapshot()) {
+                        if usage.updated != 0 && usage.updated != last_usage_updated {
+                            last_usage_updated = usage.updated;
+                            let five = (
+                                usage.five_hour.as_ref().map(|b| b.utilization * 100.0),
+                                usage.five_hour.as_ref().and_then(|b| b.resets_at),
+                            );
+                            let seven = (
+                                usage.seven_day.as_ref().map(|b| b.utilization * 100.0),
+                                usage.seven_day.as_ref().and_then(|b| b.resets_at),
+                            );
+                            let threshold = tg_cfg.and_then(|c| c.limit_reset_percent).unwrap_or(0.0);
+                            for reset in reset_tracker.observe(five, seven, RESET_JUMP_MARGIN_MS) {
+                                let fired = threshold > 0.0 && reset.peak_pct >= threshold;
+                                tracing::debug!(
+                                    channel = "telegram",
+                                    decision = "limit_reset",
+                                    bucket = reset.window.key(),
+                                    peak_pct = reset.peak_pct,
+                                    threshold,
+                                    fired,
+                                    reason = "usage window reset detected via resets_at jump",
+                                    "limit reset detected"
+                                );
+                                // Buffer rather than send inline: `observe` has
+                                // already consumed the jump, so a failed send
+                                // must be retried below, not dropped.
+                                if fired {
+                                    pending_limit_resets.push(reset);
+                                }
+                            }
+                        }
+                    }
+
+                    // Deliver (and retry) buffered reset pings every tick,
+                    // independent of the poll gate, until Telegram accepts them.
+                    let mut still_pending = Vec::new();
+                    for reset in pending_limit_resets.drain(..) {
+                        if let Err(e) = telegram.send_raw(&build_limit_reset_message(reset)).await {
+                            tracing::warn!(channel = "telegram", bucket = reset.window.key(), ?e, "limit reset send failed; will retry");
+                            still_pending.push(reset);
+                        }
+                    }
+                    pending_limit_resets = still_pending;
                 }
             }
         });
@@ -995,6 +1191,115 @@ mod tests {
         assert_eq!(
             build_context_message(&s, &w).as_deref(),
             Some("[printlab] context 72% (144k/200k)")
+        );
+    }
+
+    // -------- usage-limit reset detection --------
+    // The concrete timestamps/percentages below are lifted from real
+    // usage_history.jsonl reset events, so these double as regression fixtures.
+
+    const MARGIN: i64 = RESET_JUMP_MARGIN_MS;
+
+    #[test]
+    fn window_reset_seeds_silently_then_tracks_peak() {
+        let mut w = WindowReset::default();
+        // First observation only seeds — never fires, even with a huge later jump
+        // being possible; there's no prior window to compare against.
+        assert_eq!(w.observe(Some(40.0), Some(1_000_000), MARGIN), None);
+        // Jitter within the margin keeps the same window; peak tracks the max.
+        assert_eq!(w.observe(Some(55.0), Some(1_000_030), MARGIN), None);
+        assert_eq!(w.observe(Some(48.0), Some(999_980), MARGIN), None);
+        assert_eq!(w.peak_pct, 55.0, "peak is the running max, not the latest");
+    }
+
+    #[test]
+    fn window_reset_fires_on_forward_jump_reporting_peak() {
+        let mut w = WindowReset::default();
+        w.observe(Some(90.0), Some(1_000_000), MARGIN);
+        w.observe(Some(96.0), Some(1_000_050), MARGIN); // peak climbs to 96
+        // resets_at jumps a full 5h forward → reset, peak of the ended window.
+        assert_eq!(w.observe(Some(3.0), Some(1_000_000 + 5 * 3600_000), MARGIN), Some(96.0));
+        // New window's peak starts fresh at the recovery reading, not carrying 96.
+        assert_eq!(w.peak_pct, 3.0);
+    }
+
+    #[test]
+    fn window_reset_survives_the_null_reset_poll() {
+        // Real clean 5h reset after a sustained 100%: the reset poll reports
+        // (0, null), then the next poll carries the jumped resets_at.
+        let mut w = WindowReset::default();
+        assert_eq!(w.observe(Some(100.0), Some(1783158000408), MARGIN), None);
+        assert_eq!(w.observe(Some(0.0), None, MARGIN), None, "null reset poll can't compare");
+        assert_eq!(w.observe(Some(2.0), Some(1783176000210), MARGIN), Some(100.0));
+    }
+
+    #[test]
+    fn window_reset_ignores_collateral_zeroing_when_resets_at_holds() {
+        // Real early-5h-reset fixture (both buckets zeroed for ~40min): the 7d
+        // percentage falls 51 -> 0 while its window has NOT reset — its resets_at
+        // only jitters. Detecting off the percentage drop would false-fire a 7d
+        // reset here; keying off the resets_at jump correctly fires 5h only.
+        let mut t = ResetTracker::default();
+        // poll A: seed both windows.
+        assert!(t.observe((Some(100.0), Some(1782944400185)), (Some(51.0), Some(1783306800185)), MARGIN).is_empty());
+        // poll B: both zeroed, both resets_at null.
+        assert!(t.observe((Some(0.0), None), (Some(0.0), None), MARGIN).is_empty());
+        // poll C: 5h resets_at jumped ~4.5h; 7d resets_at only jittered down a hair.
+        let resets = t.observe((Some(10.0), Some(1782960599140)), (Some(1.0), Some(1783306799140)), MARGIN);
+        assert_eq!(resets, vec![LimitReset { window: LimitWindow::FiveHour, peak_pct: 100.0 }],
+            "only the 5h window reset; the 7d percentage-zeroing is collateral, not a reset");
+    }
+
+    #[test]
+    fn window_reset_peak_excludes_new_window_reading_on_direct_jump() {
+        // A coarse poll interval can skip the transient (0, null) reset poll and
+        // land a poll that carries BOTH the jumped resets_at and an
+        // already-climbed new-window percentage. That percentage belongs to the
+        // new window and must not inflate the just-ended window's peak.
+        let mut w = WindowReset::default();
+        w.observe(Some(30.0), Some(1_000_000), MARGIN);
+        assert_eq!(
+            w.observe(Some(95.0), Some(1_000_000 + 5 * 3600_000), MARGIN),
+            Some(30.0),
+            "reports the ended window's 30% peak, not the new window's 95% reading"
+        );
+        assert_eq!(w.peak_pct, 95.0, "the new window's peak seeds at its first reading");
+    }
+
+    #[test]
+    fn window_reset_fires_on_early_reset() {
+        // Real early reset: 5h rolled over ~90min early; resets_at jumped +3.5h
+        // (a full window minus the early amount), still far above the margin.
+        let mut w = WindowReset::default();
+        w.observe(Some(93.0), Some(1781047200343), MARGIN);
+        w.observe(Some(0.0), None, MARGIN);
+        assert_eq!(w.observe(Some(3.0), Some(1781059800867), MARGIN), Some(93.0));
+    }
+
+    #[test]
+    fn reset_tracker_reports_both_windows_when_both_reset() {
+        let mut t = ResetTracker::default();
+        t.observe((Some(95.0), Some(1_000_000)), (Some(92.0), Some(9_000_000)), MARGIN);
+        let resets = t.observe(
+            (Some(1.0), Some(1_000_000 + 5 * 3600_000)),
+            (Some(2.0), Some(9_000_000 + 7 * 86400_000)),
+            MARGIN,
+        );
+        assert_eq!(resets, vec![
+            LimitReset { window: LimitWindow::FiveHour, peak_pct: 95.0 },
+            LimitReset { window: LimitWindow::SevenDay, peak_pct: 92.0 },
+        ]);
+    }
+
+    #[test]
+    fn limit_reset_message_format() {
+        assert_eq!(
+            build_limit_reset_message(LimitReset { window: LimitWindow::FiveHour, peak_pct: 96.4 }),
+            "5h limit reset (was 96%)"
+        );
+        assert_eq!(
+            build_limit_reset_message(LimitReset { window: LimitWindow::SevenDay, peak_pct: 91.6 }),
+            "7d limit reset (was 92%)"
         );
     }
 }
