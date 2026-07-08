@@ -113,6 +113,15 @@ pub struct Config {
     /// shows when `tray_badge` is `None` (no badge to frame), nor when
     /// `tray_context_alert_enabled` is off. Read by `tray_badge::refresh`.
     pub tray_context_alert_percent: Option<f32>,
+    /// "High alert" mode: deliver every *enabled* per-state notification
+    /// (blocked / done / error) to Telegram the instant the state is entered,
+    /// bypassing both the per-state AFK / reaction windows and the reading-time
+    /// budget. A state disabled by zeroing both its windows stays silent — high
+    /// alert speeds up pings that are already configured, it doesn't resurrect
+    /// disabled ones. Does *not* affect the high-context-usage or usage-limit-
+    /// reset alerts (those keep their own lifecycles). Toggled from the tray's
+    /// "High alert" checkbox; read by `notifications::reconcile`. Off by default.
+    pub high_alert: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -346,6 +355,7 @@ impl Default for Config {
             tray_badge: TrayBadge::None,
             tray_context_alert_enabled: true,
             tray_context_alert_percent: Some(80.0),
+            high_alert: false,
         }
     }
 }
@@ -658,6 +668,14 @@ mod tests {
         assert_eq!(set.tray_context_alert_percent, Some(70.0));
         let off: Config = serde_json::from_str(r#"{ "tray_context_alert_percent": null }"#).unwrap();
         assert_eq!(off.tray_context_alert_percent, None);
+    }
+
+    #[test]
+    fn high_alert_defaults_off_and_parses() {
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert!(!cfg.high_alert, "off by default");
+        let on: Config = serde_json::from_str(r#"{ "high_alert": true }"#).unwrap();
+        assert!(on.high_alert);
     }
 
     #[test]

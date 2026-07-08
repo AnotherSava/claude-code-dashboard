@@ -188,6 +188,14 @@ pub fn reading_time_ms(text: &str, speed_cps: u64, cap_ms: u64) -> u64 {
 /// length-dependent time to consume the content, and they run in sequence. The
 /// `afk > 0` / `r > 0` gates run before the addition, so a disabled window is
 /// never resurrected by a long message.
+/// Whether a state rule is configured to notify at all — at least one of its
+/// two windows is set to a positive duration. A rule with both windows unset or
+/// zeroed never fires (the user's way to silence a state), so high alert honors
+/// it too. Mirrors the `afk > 0` / `r > 0` gates inside [`fire_reason`].
+pub fn rule_notifies(rule: &StateNotify) -> bool {
+    rule.afk_window_ms.unwrap_or(0) > 0 || rule.reaction_window_ms.unwrap_or(0) > 0
+}
+
 pub fn fire_reason(rule: &StateNotify, time_in_state_ms: u64, idle_ms: Option<u64>, reading_ms: u64) -> Option<&'static str> {
     let afk_due = matches!((rule.afk_window_ms, idle_ms), (Some(afk), Some(idle)) if afk > 0 && idle >= afk.saturating_add(reading_ms) && idle >= time_in_state_ms);
     if afk_due {
@@ -347,6 +355,7 @@ pub async fn reconcile(
     now_ms: i64,
     idle_ms: Option<u64>,
     reading_speed_cps: u64,
+    high_alert: bool,
 ) {
     let rules = notifier.state_rules();
 
@@ -369,8 +378,18 @@ pub async fn reconcile(
         let key = status_key(s.status);
         let Some(rule) = rules.get(key) else { continue };
         let time_in_state = (now_ms - s.state_entered_at).max(0) as u64;
-        let reading_ms = reading_time_ms(read_burden_text(s), reading_speed_cps, READING_CAP_MS);
-        let Some(reason) = fire_reason(rule, time_in_state, idle_ms, reading_ms) else { continue };
+        // High alert short-circuits the windows entirely: any state that's
+        // configured to notify at all (at least one positive window) fires the
+        // instant it's entered, with no reading-time budget. A state disabled by
+        // zeroing both windows still stays silent — high alert doesn't resurrect
+        // it. Otherwise fall through to the normal AFK/reaction decision.
+        let (reason, reading_ms) = if high_alert && rule_notifies(rule) {
+            (Some("high_alert"), 0)
+        } else {
+            let reading_ms = reading_time_ms(read_burden_text(s), reading_speed_cps, READING_CAP_MS);
+            (fire_reason(rule, time_in_state, idle_ms, reading_ms), reading_ms)
+        };
+        let Some(reason) = reason else { continue };
         match notifier.send(s).await {
             Ok(handle) => {
                 tracing::debug!(
@@ -477,6 +496,7 @@ impl NotificationManager {
                         now_ms(),
                         crate::idle::idle_ms(),
                         tg_cfg.and_then(|c| c.reading_speed_cps).unwrap_or(0),
+                        cfg.high_alert,
                     )
                     .await;
 
@@ -694,7 +714,7 @@ mod tests {
         let m = Mock::with(&[("blocked", 60_000)]);
         let mut out = HashMap::new();
         let sessions = vec![session("s1", Status::Blocked, 0)];
-        reconcile(m.as_ref(), &sessions, &mut out, 60_000, None, 0).await;
+        reconcile(m.as_ref(), &sessions, &mut out, 60_000, None, 0, false).await;
         assert_eq!(out.len(), 1);
         assert_eq!(out["s1"].for_status, Status::Blocked);
         assert_eq!(out["s1"].handle, "h1");
@@ -706,7 +726,7 @@ mod tests {
         let m = Mock::with(&[("blocked", 60_000)]);
         let mut out = HashMap::new();
         let sessions = vec![session("s1", Status::Blocked, 0)];
-        reconcile(m.as_ref(), &sessions, &mut out, 59_999, None, 0).await;
+        reconcile(m.as_ref(), &sessions, &mut out, 59_999, None, 0, false).await;
         assert!(out.is_empty());
         assert!(m.events().is_empty());
     }
@@ -720,7 +740,7 @@ mod tests {
             Outstanding { handle: "h1".into(), for_status: Status::Blocked, },
         );
         let sessions = vec![session("s1", Status::Blocked, 0)];
-        reconcile(m.as_ref(), &sessions, &mut out, 120_000, None, 0).await;
+        reconcile(m.as_ref(), &sessions, &mut out, 120_000, None, 0, false).await;
         assert_eq!(out.len(), 1);
         assert!(m.events().is_empty(), "no events when nothing changes");
     }
@@ -734,7 +754,7 @@ mod tests {
             Outstanding { handle: "h9".into(), for_status: Status::Blocked, },
         );
         let sessions = vec![session("s1", Status::Working, 100_000)];
-        reconcile(m.as_ref(), &sessions, &mut out, 120_000, None, 0).await;
+        reconcile(m.as_ref(), &sessions, &mut out, 120_000, None, 0, false).await;
         assert!(out.is_empty());
         assert_eq!(m.events(), vec![Event::Dismiss { handle: "h9".into() }]);
     }
@@ -750,7 +770,7 @@ mod tests {
             Outstanding { handle: "h7".into(), for_status: Status::Blocked, },
         );
         let sessions: Vec<AgentSession> = vec![];
-        reconcile(m.as_ref(), &sessions, &mut out, 120_000, None, 0).await;
+        reconcile(m.as_ref(), &sessions, &mut out, 120_000, None, 0, false).await;
         assert!(out.is_empty());
         assert_eq!(m.events(), vec![Event::Dismiss { handle: "h7".into() }]);
     }
@@ -761,7 +781,7 @@ mod tests {
         let m = Mock::with(&[("blocked", 60_000)]);
         let mut out = HashMap::new();
         let sessions: Vec<AgentSession> = vec![];
-        reconcile(m.as_ref(), &sessions, &mut out, 30_000, None, 0).await;
+        reconcile(m.as_ref(), &sessions, &mut out, 30_000, None, 0, false).await;
         assert!(out.is_empty());
         assert!(m.events().is_empty());
     }
@@ -771,7 +791,7 @@ mod tests {
         let m = Mock::with(&[("blocked", 0)]);
         let mut out = HashMap::new();
         let sessions = vec![session("s1", Status::Blocked, 0)];
-        reconcile(m.as_ref(), &sessions, &mut out, 1_000_000, None, 0).await;
+        reconcile(m.as_ref(), &sessions, &mut out, 1_000_000, None, 0, false).await;
         assert!(out.is_empty());
         assert!(m.events().is_empty());
     }
@@ -781,7 +801,7 @@ mod tests {
         let m = Mock::with(&[("error", 60_000)]);
         let mut out = HashMap::new();
         let sessions = vec![session("s1", Status::Blocked, 0)];
-        reconcile(m.as_ref(), &sessions, &mut out, 1_000_000, None, 0).await;
+        reconcile(m.as_ref(), &sessions, &mut out, 1_000_000, None, 0, false).await;
         assert!(out.is_empty());
         assert!(m.events().is_empty());
     }
@@ -792,7 +812,7 @@ mod tests {
         *m.send_err.lock().unwrap() = true;
         let mut out = HashMap::new();
         let sessions = vec![session("s1", Status::Blocked, 0)];
-        reconcile(m.as_ref(), &sessions, &mut out, 60_000, None, 0).await;
+        reconcile(m.as_ref(), &sessions, &mut out, 60_000, None, 0, false).await;
         assert!(out.is_empty(), "failed send must not populate outstanding");
     }
 
@@ -927,10 +947,10 @@ mod tests {
         let sessions = vec![session_with_message("s1", Status::Done, 0, &text)];
         let mut out = HashMap::new();
         // 90s in, idle 90s: today this fires (idle > 60s); now suppressed mid-read.
-        reconcile(m.as_ref(), &sessions, &mut out, 90_000, Some(90_000), 15).await;
+        reconcile(m.as_ref(), &sessions, &mut out, 90_000, Some(90_000), 15, false).await;
         assert!(out.is_empty(), "present reader of a long message isn't pinged mid-read");
         // 170s in, idle 170s: past the 60s + 100s budget → fires.
-        reconcile(m.as_ref(), &sessions, &mut out, 170_000, Some(170_000), 15).await;
+        reconcile(m.as_ref(), &sessions, &mut out, 170_000, Some(170_000), 15, false).await;
         assert_eq!(out.len(), 1, "fires once the reading budget elapses");
     }
 
@@ -944,7 +964,7 @@ mod tests {
         s.label = "api error".into();
         let sessions = vec![s];
         let mut out = HashMap::new();
-        reconcile(m.as_ref(), &sessions, &mut out, 61_000, Some(0), 15).await;
+        reconcile(m.as_ref(), &sessions, &mut out, 61_000, Some(0), 15, false).await;
         assert_eq!(out.len(), 1, "error backstop fires off its short label, not the stale long turn");
     }
 
@@ -954,7 +974,7 @@ mod tests {
         let mut out = HashMap::new();
         // Done for 10s, user idle 70s (away since before it finished).
         let sessions = vec![session("s1", Status::Done, 0)];
-        reconcile(m.as_ref(), &sessions, &mut out, 10_000, Some(70_000), 0).await;
+        reconcile(m.as_ref(), &sessions, &mut out, 10_000, Some(70_000), 0, false).await;
         assert_eq!(out.len(), 1, "AFK path fires done");
         assert_eq!(out["s1"].for_status, Status::Done);
     }
@@ -965,9 +985,42 @@ mod tests {
         let mut out = HashMap::new();
         // Done for 10s but user touched the machine 2s ago → saw it.
         let sessions = vec![session("s1", Status::Done, 0)];
-        reconcile(m.as_ref(), &sessions, &mut out, 10_000, Some(2_000), 0).await;
+        reconcile(m.as_ref(), &sessions, &mut out, 10_000, Some(2_000), 0, false).await;
         assert!(out.is_empty(), "present user => no done ping");
         assert!(m.events().is_empty());
+    }
+
+    #[tokio::test]
+    async fn high_alert_fires_instantly_ignoring_windows_and_reading_budget() {
+        // done is AFK-only 60s; a present user (idle 0) with a long unread
+        // message would never ping normally. High alert fires it the instant the
+        // state is entered, regardless of presence or reading budget.
+        let m = Mock::with_rules(&[("done", AFK_ONLY)]);
+        let mut out = HashMap::new();
+        let sessions = vec![session_with_message("s1", Status::Done, 0, &"x".repeat(5_000))];
+        reconcile(m.as_ref(), &sessions, &mut out, 0, Some(0), 15, true).await;
+        assert_eq!(out.len(), 1, "high alert pings immediately");
+        assert_eq!(out["s1"].for_status, Status::Done);
+    }
+
+    #[tokio::test]
+    async fn high_alert_does_not_resurrect_a_disabled_state() {
+        // A state silenced by zeroing both windows stays silent even under high
+        // alert — high alert only accelerates pings that are already configured.
+        let m = Mock::with_rules(&[("done", StateNotify { afk_window_ms: Some(0), reaction_window_ms: Some(0) })]);
+        let mut out = HashMap::new();
+        let sessions = vec![session("s1", Status::Done, 0)];
+        reconcile(m.as_ref(), &sessions, &mut out, 0, Some(0), 0, true).await;
+        assert!(out.is_empty(), "disabled state stays silent under high alert");
+        assert!(m.events().is_empty());
+    }
+
+    #[test]
+    fn rule_notifies_reflects_any_positive_window() {
+        assert!(rule_notifies(&StateNotify { afk_window_ms: Some(1), reaction_window_ms: None }));
+        assert!(rule_notifies(&StateNotify { afk_window_ms: None, reaction_window_ms: Some(1) }));
+        assert!(!rule_notifies(&StateNotify { afk_window_ms: Some(0), reaction_window_ms: Some(0) }));
+        assert!(!rule_notifies(&StateNotify { afk_window_ms: None, reaction_window_ms: None }));
     }
 
     #[test]

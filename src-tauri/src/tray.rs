@@ -29,6 +29,7 @@ const MENU_TRAY_BADGE_7D_LIGHT: &str = "tray_badge_7d_light";
 const MENU_TRAY_BADGE_5H_NUM: &str = "tray_badge_5h_num";
 const MENU_TRAY_BADGE_7D_NUM: &str = "tray_badge_7d_num";
 const MENU_CONTEXT_ALERT: &str = "context_alert";
+const MENU_HIGH_ALERT: &str = "high_alert";
 const MENU_OPEN_DATA_DIR: &str = "open_data_dir";
 const MENU_OPEN_INTENSITY: &str = "open_intensity";
 const MENU_HELP_ABOUT: &str = "help_about";
@@ -58,6 +59,7 @@ pub struct TrayHandles {
     pub tray_badge_5h_num: CheckMenuItem<Wry>,
     pub tray_badge_7d_num: CheckMenuItem<Wry>,
     pub context_alert: CheckMenuItem<Wry>,
+    pub high_alert: CheckMenuItem<Wry>,
 }
 
 pub fn setup(app: &AppHandle) -> tauri::Result<()> {
@@ -156,6 +158,14 @@ pub fn setup(app: &AppHandle) -> tauri::Result<()> {
         app, MENU_CONTEXT_ALERT, "Show high context usage", true, context_alert_initial, None::<&str>,
     )?;
 
+    let high_alert_initial = app
+        .try_state::<ConfigState>()
+        .map(|s| s.snapshot().high_alert)
+        .unwrap_or(false);
+    let high_alert = CheckMenuItem::with_id(
+        app, MENU_HIGH_ALERT, "High alert", true, high_alert_initial, None::<&str>,
+    )?;
+
     let open_data_dir = MenuItem::with_id(app, MENU_OPEN_DATA_DIR, "Open config/logs location", true, None::<&str>)?;
     let open_intensity = MenuItem::with_id(app, MENU_OPEN_INTENSITY, "Work intensity", true, None::<&str>)?;
     let help_about = MenuItem::with_id(app, MENU_HELP_ABOUT, "About", true, None::<&str>)?;
@@ -178,6 +188,7 @@ pub fn setup(app: &AppHandle) -> tauri::Result<()> {
             &hist_font_submenu,
             &tray_badge_submenu,
             &context_alert,
+            &high_alert,
             &PredefinedMenuItem::separator(app)?,
             &open_intensity,
             &open_data_dir,
@@ -208,6 +219,7 @@ pub fn setup(app: &AppHandle) -> tauri::Result<()> {
         tray_badge_5h_num: tray_badge_5h_num.clone(),
         tray_badge_7d_num: tray_badge_7d_num.clone(),
         context_alert: context_alert.clone(),
+        high_alert: high_alert.clone(),
     });
 
     let icon = app
@@ -261,6 +273,7 @@ fn handle_menu_event(app: &AppHandle, id: &str) {
         MENU_TRAY_BADGE_5H_NUM => select_tray_badge(app, TrayBadge::FiveHourNumber),
         MENU_TRAY_BADGE_7D_NUM => select_tray_badge(app, TrayBadge::SevenDayNumber),
         MENU_CONTEXT_ALERT => toggle_context_alert(app),
+        MENU_HIGH_ALERT => toggle_high_alert(app),
         MENU_OPEN_DATA_DIR => open_data_dir(app),
         MENU_OPEN_INTENSITY => show_intensity(app),
         MENU_HELP_ABOUT => show_about(app),
@@ -422,6 +435,20 @@ fn toggle_context_alert(app: &AppHandle) {
     // Repaint the icon immediately so the alert appears/clears without waiting
     // for the next usage poll or state change.
     crate::tray_badge::refresh(app);
+}
+
+fn toggle_high_alert(app: &AppHandle) {
+    let Some(state) = app.try_state::<ConfigState>() else { return };
+    let new_state = !state.snapshot().high_alert;
+    state.with_mut(|c| c.high_alert = new_state);
+    let _ = state.save_to_disk();
+    if let Some(handles) = app.try_state::<TrayHandles>() {
+        let _ = handles.high_alert.set_checked(new_state);
+    }
+    // The notification reconciler reads `high_alert` from the config snapshot
+    // on its next tick, so persisting is enough — no immediate refresh needed
+    // (unlike the tray badge / context alert, which repaint the icon).
+    emit_config_updated(app);
 }
 
 fn sync_tray_badge_checks(app: &AppHandle, mode: TrayBadge) {
