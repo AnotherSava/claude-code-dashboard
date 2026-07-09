@@ -267,49 +267,117 @@ pub struct LimitReset {
 /// genuine window turnover.
 pub const RESET_JUMP_MARGIN_MS: i64 = 10 * 60 * 1000;
 
-/// Per-window reset tracker. Detecting the reset from the `resets_at` forward
-/// jump — not the percentage dropping — is deliberate: a 5h reset transiently
-/// zeroes *both* buckets' percentages for up to ~40min (observed in real data),
-/// so the 7d percentage can fall from a high value to 0 while its window hasn't
-/// reset at all (its `resets_at` held). Only the `resets_at` jump marks a true
-/// reset; `peak_pct` (a running max) rides out the transient dips so the
-/// pre-reset high-water mark is the value reported.
+/// Slack around a window's scheduled `resets_at` within which the reset counts as
+/// *arrived*. On a genuine reset the reset poll lands right at (or just after) the
+/// scheduled time, while collateral zeroing (the sibling bucket cratering this one
+/// when *it* resets) strikes while this window's `resets_at` is still hours or
+/// days ahead — so a couple of minutes of slack (covering poll cadence + the ±1min
+/// `resets_at` jitter) cleanly separates the two.
+pub const RESET_ARRIVAL_SLACK_MS: i64 = 2 * 60 * 1000;
+
+/// Per-window reset tracker. A reset is credited on the earlier of two signals:
+/// the prompt path — this window's `resets_at` clears to null with its percentage
+/// cleared (0 or null) *and its scheduled reset time has arrived* — and the
+/// fallback path —
+/// `resets_at` jumping forward past the just-ended window (for coarse polls that
+/// skip the null transient, or early rollovers the arrival gate declines). The
+/// arrival gate is what makes the prompt path safe: a 5h reset transiently zeroes
+/// *both* buckets' percentages (and can null *both* `resets_at`s) for up to ~40min
+/// (observed in real data), so a bare null-drop can't tell a real reset from
+/// collateral — but the collateral bucket's own scheduled reset is still far in
+/// the future, so it fails the gate and falls through to the immune forward-jump
+/// path. `peak_pct` (a running max) rides out the transient dips so the pre-reset
+/// high-water mark is the value reported.
 #[derive(Default)]
 struct WindowReset {
-    /// Last non-null `resets_at` seen; `None` until the first observation
-    /// (seeded silently, so a fresh tracker never fires on its very first poll).
+    /// Last non-null `resets_at` seen (this window's scheduled boundary); `None`
+    /// until the first observation (seeded silently, so a fresh tracker never
+    /// fires on its very first poll).
     resets_at: Option<i64>,
     peak_pct: f32,
+    /// Set once we've prompt-fired a reset off the `resets_at`→null transient and
+    /// are waiting for `resets_at` to recover to its new value; the recovery poll
+    /// (a forward jump) is then consumed silently so the reset isn't reported
+    /// twice.
+    awaiting_recovery: bool,
 }
 
 impl WindowReset {
-    /// Fold one poll's `(percent, resets_at)` for this window into the tracker.
-    /// Returns `Some(peak)` — the just-ended window's high-water mark — exactly
-    /// when a reset is detected, else `None`.
-    fn observe(&mut self, pct: Option<f32>, resets_at: Option<i64>, margin_ms: i64) -> Option<f32> {
-        // Detect a reset *before* folding this poll's percentage into the peak:
-        // the poll that carries the jumped `resets_at` is the new window's first
-        // sample, so its percentage belongs to the new window and must not
-        // inflate the just-ended window's high-water mark. (A coarse poll
-        // interval can skip the transient `resets_at: null` reset poll and land
-        // directly on a jumped `resets_at` whose percentage has already climbed.)
-        if let Some(r) = resets_at {
-            match self.resets_at {
-                Some(prev) if r > prev + margin_ms => {
-                    let peak = self.peak_pct; // the ended window's high-water mark
-                    self.resets_at = Some(r);
-                    self.peak_pct = pct.unwrap_or(0.0); // new window starts here
-                    return Some(peak);
-                }
-                // First observation seeds silently; jitter keeps the same window.
-                _ => self.resets_at = Some(r),
-            }
-        }
-        // No reset (seed / jitter / the null reset poll): fold the percentage in.
+    /// Fold a poll's percentage into the running high-water mark.
+    fn track_peak(&mut self, pct: Option<f32>) {
         if let Some(p) = pct {
             self.peak_pct = self.peak_pct.max(p);
         }
-        None
+    }
+
+    /// Fold one poll's `(percent, resets_at)` for this window into the tracker,
+    /// with `now_ms` the poll's wall-clock (the usage snapshot's `updated`).
+    /// Returns `Some(peak)` — the just-ended window's high-water mark — exactly
+    /// when a reset is detected, else `None`.
+    fn observe(
+        &mut self,
+        pct: Option<f32>,
+        resets_at: Option<i64>,
+        now_ms: i64,
+        margin_ms: i64,
+    ) -> Option<f32> {
+        match resets_at {
+            // `resets_at` cleared: this bucket is in a reset transient — either its
+            // own real reset, or collateral zeroing from the sibling window's reset.
+            None => {
+                if self.awaiting_recovery {
+                    // Already reported this reset; keep tracking the new window.
+                    self.track_peak(pct);
+                    return None;
+                }
+                // Prompt path: a cleared `resets_at` at/after this window's *own*
+                // scheduled reset is itself the reset marker — fire whether the
+                // reset poll's percentage came back as 0 or as null (the API returns
+                // "0/null" in the transient). The arrival gate rejects collateral
+                // zeroing (sibling reset; our `resets_at` still far ahead) and early
+                // rollovers (deferred to the forward-jump path). Only a concrete
+                // *positive* percentage contradicts a reset — fall through on that.
+                let arrived = self
+                    .resets_at
+                    .is_some_and(|sched| now_ms + RESET_ARRIVAL_SLACK_MS >= sched);
+                if arrived && pct.map_or(true, |p| p <= 0.0) {
+                    let peak = self.peak_pct; // the ended window's high-water mark
+                    self.awaiting_recovery = true;
+                    self.peak_pct = 0.0; // new window starts here
+                    return Some(peak);
+                }
+                // Collateral / early / pre-seed null: just fold the percentage in.
+                self.track_peak(pct);
+                None
+            }
+            Some(r) => {
+                if self.awaiting_recovery {
+                    // Recovery poll after a prompt-fired reset: adopt the new
+                    // window's scheduled time and consume the jump silently.
+                    self.resets_at = Some(r);
+                    self.awaiting_recovery = false;
+                    self.track_peak(pct);
+                    return None;
+                }
+                // Forward-jump fallback: a coarse poll skipped the `(0, null)`
+                // transient, or an early rollover didn't pass the arrival gate,
+                // landing directly on the jumped `resets_at`. Its percentage
+                // belongs to the new window, so it must not inflate the ended
+                // window's peak.
+                if let Some(prev) = self.resets_at {
+                    if r > prev + margin_ms {
+                        let peak = self.peak_pct;
+                        self.resets_at = Some(r);
+                        self.peak_pct = pct.unwrap_or(0.0); // new window starts here
+                        return Some(peak);
+                    }
+                }
+                // First observation seeds silently; jitter keeps the same window.
+                self.resets_at = Some(r);
+                self.track_peak(pct);
+                None
+            }
+        }
     }
 }
 
@@ -329,13 +397,14 @@ impl ResetTracker {
         &mut self,
         five_hour: (Option<f32>, Option<i64>),
         seven_day: (Option<f32>, Option<i64>),
+        now_ms: i64,
         margin_ms: i64,
     ) -> Vec<LimitReset> {
         let mut out = Vec::new();
-        if let Some(peak) = self.five_hour.observe(five_hour.0, five_hour.1, margin_ms) {
+        if let Some(peak) = self.five_hour.observe(five_hour.0, five_hour.1, now_ms, margin_ms) {
             out.push(LimitReset { window: LimitWindow::FiveHour, peak_pct: peak });
         }
-        if let Some(peak) = self.seven_day.observe(seven_day.0, seven_day.1, margin_ms) {
+        if let Some(peak) = self.seven_day.observe(seven_day.0, seven_day.1, now_ms, margin_ms) {
             out.push(LimitReset { window: LimitWindow::SevenDay, peak_pct: peak });
         }
         out
@@ -545,9 +614,12 @@ impl NotificationManager {
 
                     // Usage-limit reset pings. When the account-wide 5h/7d
                     // window resets after heavy use, fire a one-shot message —
-                    // detected from the usage snapshot's `resets_at` jumping
-                    // forward (see `ResetTracker`), processed once per poll
-                    // (gated on `updated` advancing). A point event: buffered and
+                    // detected the instant the window's percentage drops to zero at
+                    // its scheduled reset time, with a forward-`resets_at`-jump
+                    // fallback for coarse polls / early rollovers (see
+                    // `ResetTracker`). Processed once per poll (gated on `updated`
+                    // advancing), with `updated` doubling as the poll's wall-clock
+                    // for the reset-arrival check. A point event: buffered and
                     // retried until sent, never tracked for deletion. `observe`
                     // runs whenever creds are set (even with the feature off) so
                     // the tracker stays seeded and turning the threshold on
@@ -564,7 +636,7 @@ impl NotificationManager {
                                 usage.seven_day.as_ref().and_then(|b| b.resets_at),
                             );
                             let threshold = tg_cfg.and_then(|c| c.limit_reset_percent).unwrap_or(0.0);
-                            for reset in reset_tracker.observe(five, seven, RESET_JUMP_MARGIN_MS) {
+                            for reset in reset_tracker.observe(five, seven, usage.updated, RESET_JUMP_MARGIN_MS) {
                                 let fired = threshold > 0.0 && reset.peak_pct >= threshold;
                                 tracing::debug!(
                                     channel = "telegram",
@@ -573,11 +645,11 @@ impl NotificationManager {
                                     peak_pct = reset.peak_pct,
                                     threshold,
                                     fired,
-                                    reason = "usage window reset detected via resets_at jump",
+                                    reason = "usage window reset detected",
                                     "limit reset detected"
                                 );
                                 // Buffer rather than send inline: `observe` has
-                                // already consumed the jump, so a failed send
+                                // already consumed the reset, so a failed send
                                 // must be retried below, not dropped.
                                 if fired {
                                     pending_limit_resets.push(reset);
@@ -1258,49 +1330,96 @@ mod tests {
         let mut w = WindowReset::default();
         // First observation only seeds — never fires, even with a huge later jump
         // being possible; there's no prior window to compare against.
-        assert_eq!(w.observe(Some(40.0), Some(1_000_000), MARGIN), None);
+        assert_eq!(w.observe(Some(40.0), Some(1_000_000), 1_000_000, MARGIN), None);
         // Jitter within the margin keeps the same window; peak tracks the max.
-        assert_eq!(w.observe(Some(55.0), Some(1_000_030), MARGIN), None);
-        assert_eq!(w.observe(Some(48.0), Some(999_980), MARGIN), None);
+        assert_eq!(w.observe(Some(55.0), Some(1_000_030), 1_000_030, MARGIN), None);
+        assert_eq!(w.observe(Some(48.0), Some(999_980), 999_980, MARGIN), None);
         assert_eq!(w.peak_pct, 55.0, "peak is the running max, not the latest");
     }
 
     #[test]
     fn window_reset_fires_on_forward_jump_reporting_peak() {
+        // Coarse poll skips the (0, null) transient and lands straight on the
+        // jumped resets_at — the forward-jump fallback fires.
         let mut w = WindowReset::default();
-        w.observe(Some(90.0), Some(1_000_000), MARGIN);
-        w.observe(Some(96.0), Some(1_000_050), MARGIN); // peak climbs to 96
+        w.observe(Some(90.0), Some(1_000_000), 1_000_000, MARGIN);
+        w.observe(Some(96.0), Some(1_000_050), 1_000_050, MARGIN); // peak climbs to 96
         // resets_at jumps a full 5h forward → reset, peak of the ended window.
-        assert_eq!(w.observe(Some(3.0), Some(1_000_000 + 5 * 3600_000), MARGIN), Some(96.0));
+        let jumped = 1_000_000 + 5 * 3600_000;
+        assert_eq!(w.observe(Some(3.0), Some(jumped), jumped, MARGIN), Some(96.0));
         // New window's peak starts fresh at the recovery reading, not carrying 96.
         assert_eq!(w.peak_pct, 3.0);
     }
 
     #[test]
-    fn window_reset_survives_the_null_reset_poll() {
+    fn window_reset_fires_promptly_on_arrived_null_drop() {
         // Real clean 5h reset after a sustained 100%: the reset poll reports
-        // (0, null), then the next poll carries the jumped resets_at.
+        // (0, null) at the scheduled reset time. The prompt path fires right then,
+        // and the later resets_at recovery is consumed silently (no double fire).
+        let sched = 1783158000408;
         let mut w = WindowReset::default();
-        assert_eq!(w.observe(Some(100.0), Some(1783158000408), MARGIN), None);
-        assert_eq!(w.observe(Some(0.0), None, MARGIN), None, "null reset poll can't compare");
-        assert_eq!(w.observe(Some(2.0), Some(1783176000210), MARGIN), Some(100.0));
+        assert_eq!(w.observe(Some(100.0), Some(sched), sched - 600_000, MARGIN), None);
+        assert_eq!(
+            w.observe(Some(0.0), None, sched, MARGIN),
+            Some(100.0),
+            "the scheduled reset has arrived and the percentage is zero → fire now"
+        );
+        assert_eq!(
+            w.observe(Some(2.0), Some(1783176000210), 1783176000210, MARGIN),
+            None,
+            "the recovery poll is consumed silently — the reset was already reported"
+        );
     }
 
     #[test]
-    fn window_reset_ignores_collateral_zeroing_when_resets_at_holds() {
-        // Real early-5h-reset fixture (both buckets zeroed for ~40min): the 7d
-        // percentage falls 51 -> 0 while its window has NOT reset — its resets_at
-        // only jitters. Detecting off the percentage drop would false-fire a 7d
-        // reset here; keying off the resets_at jump correctly fires 5h only.
+    fn window_reset_fires_when_reset_poll_reports_null_pct() {
+        // Some reset polls report (null, null) rather than (0, null). A cleared
+        // resets_at at the arrived scheduled time is the reset marker on its own,
+        // so the prompt path fires without needing a concrete zero percentage.
+        let sched = 1783158000408;
+        let mut w = WindowReset::default();
+        assert_eq!(w.observe(Some(100.0), Some(sched), sched - 600_000, MARGIN), None);
+        assert_eq!(w.observe(None, None, sched, MARGIN), Some(100.0));
+    }
+
+    #[test]
+    fn window_reset_null_resets_at_with_live_pct_does_not_fire() {
+        // Defensive: a cleared resets_at while the percentage is still a live
+        // positive value contradicts a reset (a real reset zeroes the percentage),
+        // so hold fire and let the forward-jump path settle it if it was real.
+        let sched = 1783158000408;
+        let mut w = WindowReset::default();
+        w.observe(Some(80.0), Some(sched), sched - 600_000, MARGIN);
+        assert_eq!(w.observe(Some(80.0), None, sched, MARGIN), None);
+    }
+
+    #[test]
+    fn window_reset_ignores_collateral_zeroing_via_arrival_gate() {
+        // Real early-5h-reset fixture (both buckets zeroed, both resets_at nulled
+        // for ~40min): only the 5h window has actually reached its scheduled reset.
+        // The 7d window's own reset is still ~4 days out, so the arrival gate
+        // rejects its null-drop as collateral and fires 5h only.
+        let five_sched = 1782944400185;
         let mut t = ResetTracker::default();
-        // poll A: seed both windows.
-        assert!(t.observe((Some(100.0), Some(1782944400185)), (Some(51.0), Some(1783306800185)), MARGIN).is_empty());
-        // poll B: both zeroed, both resets_at null.
-        assert!(t.observe((Some(0.0), None), (Some(0.0), None), MARGIN).is_empty());
-        // poll C: 5h resets_at jumped ~4.5h; 7d resets_at only jittered down a hair.
-        let resets = t.observe((Some(10.0), Some(1782960599140)), (Some(1.0), Some(1783306799140)), MARGIN);
+        // poll A: seed both windows, shortly before the 5h reset.
+        assert!(t.observe(
+            (Some(100.0), Some(five_sched)),
+            (Some(51.0), Some(1783306800185)),
+            five_sched - 300_000,
+            MARGIN,
+        ).is_empty());
+        // poll B: both zeroed, both resets_at null, at the 5h scheduled time.
+        let resets = t.observe((Some(0.0), None), (Some(0.0), None), five_sched, MARGIN);
         assert_eq!(resets, vec![LimitReset { window: LimitWindow::FiveHour, peak_pct: 100.0 }],
-            "only the 5h window reset; the 7d percentage-zeroing is collateral, not a reset");
+            "only the 5h window's reset has arrived; the 7d zeroing is collateral");
+        // poll C: 5h resets_at recovers (consumed silently); 7d jitters, no reset.
+        let resets = t.observe(
+            (Some(10.0), Some(1782960599140)),
+            (Some(1.0), Some(1783306799140)),
+            1782960599140,
+            MARGIN,
+        );
+        assert!(resets.is_empty(), "recovery is silent; the 7d window never reset");
     }
 
     #[test]
@@ -1310,9 +1429,10 @@ mod tests {
         // already-climbed new-window percentage. That percentage belongs to the
         // new window and must not inflate the just-ended window's peak.
         let mut w = WindowReset::default();
-        w.observe(Some(30.0), Some(1_000_000), MARGIN);
+        w.observe(Some(30.0), Some(1_000_000), 1_000_000, MARGIN);
+        let jumped = 1_000_000 + 5 * 3600_000;
         assert_eq!(
-            w.observe(Some(95.0), Some(1_000_000 + 5 * 3600_000), MARGIN),
+            w.observe(Some(95.0), Some(jumped), jumped, MARGIN),
             Some(30.0),
             "reports the ended window's 30% peak, not the new window's 95% reading"
         );
@@ -1320,22 +1440,30 @@ mod tests {
     }
 
     #[test]
-    fn window_reset_fires_on_early_reset() {
-        // Real early reset: 5h rolled over ~90min early; resets_at jumped +3.5h
-        // (a full window minus the early amount), still far above the margin.
+    fn window_reset_early_rollover_falls_back_to_forward_jump() {
+        // Real early reset: 5h rolled over ~90min early; at the (0, null) poll the
+        // scheduled time hasn't arrived, so the arrival gate declines the prompt
+        // path and the reset is credited later off the +3.5h resets_at jump.
+        let sched = 1781047200343;
         let mut w = WindowReset::default();
-        w.observe(Some(93.0), Some(1781047200343), MARGIN);
-        w.observe(Some(0.0), None, MARGIN);
-        assert_eq!(w.observe(Some(3.0), Some(1781059800867), MARGIN), Some(93.0));
+        w.observe(Some(93.0), Some(sched), sched - 3600_000, MARGIN);
+        assert_eq!(
+            w.observe(Some(0.0), None, sched - 5_400_000, MARGIN),
+            None,
+            "90min early: the scheduled reset hasn't arrived → no prompt fire"
+        );
+        assert_eq!(w.observe(Some(3.0), Some(1781059800867), 1781059800867, MARGIN), Some(93.0));
     }
 
     #[test]
     fn reset_tracker_reports_both_windows_when_both_reset() {
         let mut t = ResetTracker::default();
-        t.observe((Some(95.0), Some(1_000_000)), (Some(92.0), Some(9_000_000)), MARGIN);
+        t.observe((Some(95.0), Some(1_000_000)), (Some(92.0), Some(9_000_000)), 1_000_000, MARGIN);
+        let five_jump = 1_000_000 + 5 * 3600_000;
         let resets = t.observe(
-            (Some(1.0), Some(1_000_000 + 5 * 3600_000)),
+            (Some(1.0), Some(five_jump)),
             (Some(2.0), Some(9_000_000 + 7 * 86400_000)),
+            9_000_000 + 7 * 86400_000,
             MARGIN,
         );
         assert_eq!(resets, vec![
