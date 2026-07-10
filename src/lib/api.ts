@@ -1,5 +1,6 @@
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
+import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow'
 import type { AgentSession, Config, SetupState, UsageLimits, WeekChart } from './types'
 
 export function getSessions(): Promise<AgentSession[]> {
@@ -66,6 +67,15 @@ export function closeWindow(): Promise<void> {
 
 export function getWindowLabel(): Promise<string> {
   return invoke<string>('get_window_label')
+}
+
+// Synchronous counterpart: the current window's label is injected before the
+// app script runs, so it's readable without an IPC round-trip. Used where a
+// decision must be made on the component's first synchronous pass, before the
+// async `getWindowLabel()` above could resolve (e.g. gating the auto-resize
+// measure subsystem to the main window on its very first reactive run).
+export function getWindowLabelSync(): string {
+  return getCurrentWebviewWindow().label
 }
 
 export function setHistoryFontSize(size: string): Promise<void> {

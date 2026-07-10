@@ -14,6 +14,7 @@
     getSetupState,
     getUsageLimits,
     getWindowLabel,
+    getWindowLabelSync,
     hideWindow,
     onConfigUpdated,
     onSessionsUpdated,
@@ -28,6 +29,12 @@
   let historyMode = $state(false)
   let aboutMode = $state(false)
   let intensityMode = $state(false)
+  // Auto-resize is main-window-only. Resolved synchronously (not via the async
+  // getWindowLabel() in onMount, which lands after the first reactive measure)
+  // so the measure subsystem can exclude the secondary windows — history /
+  // about / intensity render their own root, never `.widget`, so their
+  // widgetEl is permanently absent and would otherwise read as a readiness gap.
+  const isMainWindow = getWindowLabelSync() === 'main'
   let sessions = $state<AgentSession[]>([])
   let config = $state<Config | null>(null)
   let usage = $state<UsageLimits | null>(null)
@@ -98,6 +105,39 @@
     }
   }
 
+  // Bounded retry for a *missed initial measure*, distinct from the collapse
+  // heal above. Every measure trigger (mount, the $effect, the ResizeObserver)
+  // fires exactly once; if the first one lands before the widget subtree is
+  // committed, measureAndSend early-returns and — because nothing guarantees a
+  // later event re-fires it and the collapse heal only rescues too-*short*
+  // windows — the window freezes at its default (tall) height with no recovery
+  // (observed after a deploy relaunch: zero measures, window stuck ~480px).
+  // These retries re-attempt on a short backoff until the first real
+  // measurement lands, then go quiet and hand off to the event-driven path.
+  const READY_RETRY_DELAYS = [50, 150, 300, 600, 1000, 1500]
+  let readyRetryTimer: ReturnType<typeof setTimeout> | null = null
+  let readyRetries = 0
+  let firstMeasureDone = false
+  let warnedNotReady = false
+
+  function scheduleReadyRetry() {
+    if (firstMeasureDone) return
+    if (readyRetries >= READY_RETRY_DELAYS.length) return // budget spent — fall back to event-driven re-measure
+    const delay = READY_RETRY_DELAYS[readyRetries++]
+    if (readyRetryTimer !== null) clearTimeout(readyRetryTimer)
+    readyRetryTimer = setTimeout(() => {
+      readyRetryTimer = null
+      measureAndSend()
+    }, delay)
+  }
+
+  function cancelReadyRetry() {
+    if (readyRetryTimer !== null) {
+      clearTimeout(readyRetryTimer)
+      readyRetryTimer = null
+    }
+  }
+
   // Re-measure whenever the rendered content height changes, even when no
   // Svelte-tracked dep ($effect below) fired — e.g. the layout settling a frame
   // after a session row was added/removed. This is the backstop that keeps the
@@ -116,9 +156,49 @@
 
   function measureAndSend() {
     measureTimer = null
-    if (!widgetEl || !config || config.auto_resize === 'none') return
-    const headerEl = widgetEl.querySelector('header') as HTMLElement | null
-    if (!headerEl) return
+    // Secondary windows never mount the `.widget` tree, so their permanently
+    // absent widgetEl must not be treated as a readiness gap (no log, no
+    // retry). Silent bail — same as auto_resize disabled.
+    if (!isMainWindow) {
+      cancelReadyRetry()
+      return
+    }
+    // A deliberate disable is not a readiness failure — stop any pending retry
+    // and bail. (Guarded on config existing so a null config falls through to
+    // the not-ready path below rather than being read as 'not none'.)
+    if (config && config.auto_resize === 'none') {
+      cancelReadyRetry()
+      return
+    }
+    // Resolve the subtree once: header plus a content element (SessionList's
+    // `.list-inner` or `.empty`, or SetupPanel's `.panel`). SessionList always
+    // renders one of the former when `config` is set, so their absence means
+    // the tree hasn't committed yet — a readiness gap, not an empty widget.
+    const headerEl = widgetEl?.querySelector('header') as HTMLElement | null
+    const content = widgetEl?.querySelector('.list-inner') as HTMLElement | null
+    const panel = widgetEl?.querySelector('.panel') as HTMLElement | null
+    const emptyEl = widgetEl?.querySelector('.empty') as HTMLElement | null
+    const contentEl = content ?? panel ?? emptyEl
+    if (!widgetEl || !config || !headerEl || !contentEl) {
+      // Not ready — retry until the tree commits (see scheduleReadyRetry). Log
+      // the specific missing piece once, so a stuck window is self-explaining
+      // in widget.jsonl rather than a silent early-return.
+      if (!warnedNotReady) {
+        warnedNotReady = true
+        frontendLog('debug', 'auto_resize measure not ready', {
+          has_widget: !!widgetEl,
+          has_config: !!config,
+          has_header: !!headerEl,
+          has_content: !!contentEl,
+        }).catch(() => {})
+      }
+      scheduleReadyRetry()
+      return
+    }
+    // The subtree is committed — the initial-measure race is closed; the
+    // event-driven triggers ($effect, ResizeObserver) carry it from here.
+    firstMeasureDone = true
+    cancelReadyRetry()
     // Measure a single non-stretching content element rather than summing the
     // scroll viewport's children. The list viewport (`.list`) has
     // `flex: 1; min-height: 0`, so its own `scrollHeight` reports the stretched
@@ -129,18 +209,16 @@
     // shrink-wraps the rows, so one `getBoundingClientRect()` read gives the
     // true, internally-consistent content height.
     let listH = 0
-    const content = widgetEl.querySelector('.list-inner') as HTMLElement | null
-    const panel = widgetEl.querySelector('.panel') as HTMLElement | null
     if (content) {
       listH = content.getBoundingClientRect().height
     } else if (panel) {
       // SetupPanel renders one block — measure its intrinsic content height
       // so auto-resize grows to fit the onboarding copy.
       listH = panel.scrollHeight
-    } else if (widgetEl.querySelector('.empty')) {
+    } else if (emptyEl) {
       listH = 36
     }
-    observeContent(content ?? panel ?? widgetEl.querySelector('.empty'))
+    observeContent(contentEl)
     // Subpixel-accurate getBoundingClientRect(), then ceil the total: rounding
     // down would leave us asking for a hair less than the content needs and the
     // OS would resize to exactly that, surfacing a scrollbar.
@@ -347,6 +425,7 @@
       unlistenSetupState?.()
       if (measureTimer !== null) clearTimeout(measureTimer)
       if (healTimer !== null) clearTimeout(healTimer)
+      cancelReadyRetry()
       contentObserver?.disconnect()
     }
   })
