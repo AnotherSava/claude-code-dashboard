@@ -30,6 +30,16 @@
 <style>
   .list {
     overflow-y: auto;
+    /* Never scroll horizontally — rows truncate with an ellipsis and surface
+       full text via the tooltip/history window, so a horizontal scrollbar is
+       never wanted. Leaving overflow-x at its default let a narrow window
+       trigger a self-feeding cascade: at min-content width the vertical
+       scrollbar steals ~15px, the rows overflow sideways → horizontal
+       scrollbar → it steals ~15px of height → the vertical bar re-triggers and
+       locks in. Auto-resize measures .list-inner (which excludes the
+       horizontal scrollbar's height), so the window stays permanently ~15px
+       too short with both bars showing. Clipping the x-axis breaks the loop. */
+    overflow-x: hidden;
     flex: 1;
     min-height: 0;
   }

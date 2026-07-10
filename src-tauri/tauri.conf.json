@@ -16,6 +16,7 @@
         "title": "Claude Code Dashboard",
         "width": 420,
         "height": 320,
+        "minWidth": 300,
         "decorations": false,
         "alwaysOnTop": true,
         "skipTaskbar": true,
