@@ -25,9 +25,6 @@ __pycache__/
 !/docs/plans/completed/
 !/docs/plans/draft/
 
-# Local convenience scripts (not committed)
-scripts/
-
 # Deploy-time config. `local.template.json` is the per-machine, secret-free
 # source (secrets are {{tojson .NAME}} placeholders pulled from Doppler project
 # `claude-code-dashboard`). `scripts/deploy.sh` renders it to `local.json`,
