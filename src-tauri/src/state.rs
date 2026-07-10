@@ -437,7 +437,19 @@ impl AppState {
         let Some(session) = sessions.iter_mut().find(|s| s.id == id) else {
             return false;
         };
-        append_boundary(session, now_ms)
+        // A context compaction shrinks the real context, so clear the stale
+        // pre-compact token count. `input_tokens` is watcher-only and isn't
+        // rewritten until the next turn flushes fresh usage to the transcript —
+        // if the user compacts and walks away, context_percent would otherwise
+        // stay frozen at the old (high) value and the reconciler would fire a
+        // spurious high-context alert. `None` = unknown until the watcher
+        // repopulates it from the first post-compact turn.
+        let tokens_cleared = session.input_tokens.take().is_some();
+        let separator_added = append_boundary(session, now_ms);
+        if tokens_cleared && !separator_added {
+            session.updated = now_ms;
+        }
+        tokens_cleared || separator_added
     }
 
     /// Watcher-driven text capture. Processes transcript text entries in
@@ -1252,6 +1264,34 @@ mod tests {
     fn mark_session_boundary_missing_session_is_noop() {
         let state = AppState::new();
         assert!(!state.mark_session_boundary("nope", 100));
+    }
+
+    #[test]
+    fn mark_session_boundary_clears_stale_input_tokens() {
+        let state = AppState::new();
+        seed(&state, vec![user_entry("u1", 10), assistant_entry("a1", 20)]);
+        state.sessions.lock().unwrap()[0].input_tokens = Some(160_000);
+        let changed = state.mark_session_boundary("a", 100);
+        assert!(changed);
+        // Compaction reduced the real context — the stale count must be dropped
+        // so context_percent doesn't stay frozen at the pre-compact value.
+        assert_eq!(get(&state, "a").input_tokens, None);
+    }
+
+    #[test]
+    fn mark_session_boundary_clears_tokens_even_when_separator_is_noop() {
+        let state = AppState::new();
+        seed(&state, vec![user_entry("u1", 10), separator_entry(20)]);
+        state.sessions.lock().unwrap()[0].input_tokens = Some(160_000);
+        // The dialog already ends in a separator, so no separator is appended,
+        // but the compaction still cleared the context — tokens must reset and
+        // the change must be reported so the reconciler re-evaluates.
+        let changed = state.mark_session_boundary("a", 100);
+        assert!(changed);
+        let s = get(&state, "a");
+        assert_eq!(s.input_tokens, None);
+        assert_eq!(s.updated, 100);
+        assert_eq!(s.dialog.len(), 2);
     }
 
     #[test]
