@@ -406,7 +406,22 @@ impl UsageLimitsPoller {
             tracing::info!("usage limits poller started");
             loop {
                 poll_once(&app, &client).await;
-                let secs = poll_interval_seconds(&app);
+                let configured = poll_interval_seconds(&app);
+                let delay = app
+                    .try_state::<ConfigState>()
+                    .map(|c| c.snapshot().usage_reset_poll_delay_seconds)
+                    .unwrap_or(30);
+                let (five_reset, seven_reset) = app
+                    .try_state::<UsageLimitsState>()
+                    .map(|s| {
+                        let u = s.snapshot();
+                        (
+                            u.five_hour.as_ref().and_then(|b| b.resets_at),
+                            u.seven_day.as_ref().and_then(|b| b.resets_at),
+                        )
+                    })
+                    .unwrap_or((None, None));
+                let secs = next_poll_secs(configured, delay, five_reset, seven_reset, now_ms());
                 let wake = app
                     .try_state::<UsageLimitsState>()
                     .map(|s| s.wake.clone());
@@ -518,6 +533,48 @@ fn poll_interval_seconds(app: &AppHandle) -> u64 {
         .map(|cfg| cfg.snapshot().usage_limits_poll_interval_seconds)
         .unwrap_or(600)
         .max(MIN_POLL_SECS)
+}
+
+/// Seconds to sleep before the next usage poll.
+///
+/// Normally the configured interval — but when a bucket reset (5h or 7d
+/// `resets_at`) falls within one interval ahead (or has just passed), that reset
+/// takes over scheduling: the next poll is aligned to `reset_delay_secs` *after*
+/// the soonest such reset, and the regular poll that would fall before it is
+/// skipped. Two effects:
+/// - The bar refreshes off its stale pre-reset value within `reset_delay` of the
+///   reset instead of up to a full interval later (the reported reset was up to
+///   an interval old otherwise). The delay lands the poll past the ±1min
+///   `resets_at` jitter and server-side propagation, so it reads the fresh
+///   window rather than re-reading the pre-reset value.
+/// - Skipping the pre-reset poll keeps the two polls from firing close together
+///   and tripping the usage endpoint's aggressive 429.
+///
+/// A reset that has already passed by more than `reset_delay` yields a target in
+/// the past, so the floor at [`MIN_POLL_SECS`] re-polls at most once a minute
+/// until the fresh window propagates. All times in ms; result in seconds.
+fn next_poll_secs(
+    configured_secs: u64,
+    reset_delay_secs: u64,
+    five_reset: Option<i64>,
+    seven_reset: Option<i64>,
+    now_ms: i64,
+) -> u64 {
+    let interval_ms = configured_secs as i64 * 1000;
+    let delay_ms = reset_delay_secs as i64 * 1000;
+    // Resets within one interval ahead (or just passed) override the regular
+    // cadence; pick the soonest and aim for `reset_delay` after it.
+    let aligned_target = [five_reset, seven_reset]
+        .into_iter()
+        .flatten()
+        .filter(|r| r - now_ms <= interval_ms)
+        .map(|r| r + delay_ms)
+        .min();
+    let secs = match aligned_target {
+        Some(target) => (target - now_ms).max(0) as u64 / 1000,
+        None => configured_secs,
+    };
+    secs.max(MIN_POLL_SECS)
 }
 
 async fn poll_once(app: &AppHandle, client: &reqwest::Client) {
@@ -636,6 +693,48 @@ mod tests {
     use super::*;
     use std::io::Write;
     use std::sync::{Mutex, OnceLock};
+
+    const NOW: i64 = 1_000_000_000_000;
+    const HOUR: i64 = 3_600_000;
+
+    #[test]
+    fn next_poll_uses_interval_when_no_reset_is_near() {
+        // Both resets are more than one interval away → plain configured cadence.
+        let secs = next_poll_secs(600, 120, Some(NOW + 5 * HOUR), Some(NOW + 7 * 24 * HOUR), NOW);
+        assert_eq!(secs, 600);
+    }
+
+    #[test]
+    fn next_poll_aligns_to_reset_plus_delay_within_interval() {
+        // 5h reset 5 min out (< 10-min interval) → poll 120s after it (300+120),
+        // skipping the regular tick.
+        let secs = next_poll_secs(600, 120, Some(NOW + 300_000), Some(NOW + 7 * 24 * HOUR), NOW);
+        assert_eq!(secs, 420);
+    }
+
+    #[test]
+    fn next_poll_can_exceed_interval_to_skip_the_pre_reset_poll() {
+        // Reset 9 min out (still within the 10-min interval): aiming for reset+2min
+        // = 11 min means one longer sleep that skips the regular 10-min poll, so the
+        // two don't fire close together and trip a 429.
+        let secs = next_poll_secs(600, 120, Some(NOW + 540_000), None, NOW);
+        assert_eq!(secs, 660);
+    }
+
+    #[test]
+    fn next_poll_retries_at_floor_after_a_reset_passed() {
+        // Reset passed by more than the delay (target in the past) → floor to
+        // MIN_POLL_SECS, re-polling once a minute until the fresh window lands.
+        let secs = next_poll_secs(600, 120, Some(NOW - 200_000), None, NOW);
+        assert_eq!(secs, MIN_POLL_SECS);
+    }
+
+    #[test]
+    fn next_poll_picks_the_soonest_near_reset() {
+        // 7d reset also happens to be near; the sooner one (5h) drives the schedule.
+        let secs = next_poll_secs(600, 120, Some(NOW + 480_000), Some(NOW + 120_000), NOW);
+        assert_eq!(secs, 240, "aligns to the sooner 2-min reset (+120s delay)");
+    }
 
     /// Serializes tests that override the per-platform credentials env var
     /// (`USERPROFILE` on Windows, `HOME` elsewhere) — cargo test runs them in
