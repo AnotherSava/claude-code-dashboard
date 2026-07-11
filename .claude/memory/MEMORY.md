@@ -42,3 +42,5 @@
 - [Doppler secret storage](doppler_secret_storage.md) — bot_token/chat_id/sync token live in Doppler project `claude-code-dashboard`/`dev`; deploy renders local.template.json → local.json then wipes it; no plaintext secrets at rest
 - [Usage endpoint zeros both buckets after 5h cap](usage_endpoint_zeros_after_5h_cap.md) — after 5h hits 100%, OAuth usage API transiently returns 0/null for both buckets; empty/IDLE bars then = upstream artifact, self-corrects ≤10min; don't re-investigate
 - [Context-% features need watcher-resolved tokens](context_percent_tokens_watcher_only.md) — input_tokens is watcher-only (None post-restart, can't be faked via hooks); config reload doesn't re-sync terminal titles
+- [Background-task kill is silent](background-task-kill-is-silent.md) — a user-killed bg task (dev server) fires no hook and writes nothing to the transcript; WAIT can't self-clear → waiting_settle backstop
+- [Measure background-task duration](measure-background-task-duration.md) — task-notification ts is flush-time not completion; use the output-file mtime; finite shell tasks + subagents cap ~9 min

@@ -47,6 +47,7 @@ Every field is optional — omit one and the built-in default applies. A complet
   "terminal_title_context_percent": 50,
   "detect_cancelled_turns": true,
   "reap_exited_sessions": true,
+  "waiting_settle_ms": 600000,
   "save_window_position": true,
   "window_position": null,
   "history_window_position": null,
@@ -81,6 +82,7 @@ Every field is optional — omit one and the built-in default applies. A complet
   "continuation_prompts": ["go", "continue", "proceed", "yes", "y", "yeah", "yep", "yup", "ok", "okay", "sure", "go ahead", "do it"],
   "limit_bar_segments": 16,
   "usage_limits_poll_interval_seconds": 600,
+  "usage_reset_poll_delay_seconds": 30,
   "sync": {
     "device_name": "",
     "listen": false,
@@ -115,6 +117,7 @@ Whether autostart is enabled isn't a config field — it lives in the OS launch 
 
 - `detect_cancelled_turns` — settle a working row back out of the working state when its turn was cancelled with Esc, returning it to wherever it was before that turn — a question it was waiting on, otherwise idle — so a cancelled reply doesn't get mistaken for a new task. Cancelling emits no event; the dashboard recognizes it from the conversation transcript, and on Windows also by noticing the terminal returned to its idle prompt (which catches an instant cancel that left nothing in the transcript). On by default. Turn it off to leave a cancelled row showing as working until the next prompt.
 - `reap_exited_sessions` — remove a session's row once you've quit it (typed `exit`, pressed Ctrl-D, or closed the terminal). Quitting that way doesn't reliably tell the dashboard the session ended, so the row would otherwise linger — often stuck showing "working" if you quit mid-turn. The dashboard removes it once it confirms the session's process is gone. On by default. Turn it off to keep rows until you clear them or restart the app.
+- `waiting_settle_ms` — how long a row can sit in WAIT (background work still running) before the dashboard settles it to DONE on its own. WAIT normally clears when the background work finishes, but if you *stop* it yourself — say you kill a background dev server — nothing tells the dashboard, so the row would otherwise stay WAIT until your next prompt. This backstop clears it after the set time (10 minutes by default). `null` or `0` turns it off.
 
 ### Notifications
 
@@ -148,6 +151,7 @@ For the full classification logic see [Classification](development/classificatio
 
 - `limit_bar_segments` — number of segments in the 5-hour / 7-day usage bars; higher is finer-grained.
 - `usage_limits_poll_interval_seconds` — how often to poll Anthropic for usage. Clamped to a 60-second minimum.
+- `usage_reset_poll_delay_seconds` — how many seconds after a usage window resets to re-poll, so the 5-hour / 7-day bars refresh promptly instead of briefly showing the old full bar. 30 by default.
 - `tray_badge` — show a usage limit on the tray icon. Values: `"none"`; `"five_hour_light"` / `"seven_day_light"` (recolor the traffic-light icon by usage); `"five_hour_number"` / `"seven_day_number"` (show the percentage, all-red light at 100%). The hover tooltip always shows both figures. Set it from the tray's **Tray usage badge** submenu.
 - `tray_context_alert_enabled` — whether the tray icon flags high context usage at all (the **Show high context usage** tray checkbox; on by default). Turning it off keeps `tray_context_alert_percent` intact, so re-checking it restores the same threshold.
 - `tray_context_alert_percent` — flag the tray icon when any session's context usage reaches this percent of its model's window — an at-a-glance "an agent is filling its context" warning. The light modes draw a red border around the traffic-light icon; the number modes draw the digits over a red background. `null` or `0` turns it off, and it never shows when `tray_badge` is `"none"` (there's no badge to frame) or when **Show high context usage** is unchecked.

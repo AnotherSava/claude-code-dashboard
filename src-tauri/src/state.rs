@@ -428,6 +428,30 @@ impl AppState {
         Some(s.status)
     }
 
+    /// Settle a stale `Waiting` row to `Done` — the backstop for background work
+    /// that ended without a signal (a user-killed dev server writes nothing to
+    /// the hooks or the transcript, so no `Stop` ever clears the row). Called by
+    /// `waiting_settle` once the row has sat in `Waiting` for the grace window.
+    /// Guarded by `expect_updated`: if any event bumped `updated` since the tick
+    /// observed the row (a follow-up turn, a new prompt), the settle aborts so it
+    /// can't clobber a row that just moved on — closing the settle-vs-event race.
+    /// No-op unless still `Waiting`. `Waiting` isn't `Working`, so there's no
+    /// run-time to bank (mirrors `revert_cancelled_turn`, which does). Returns
+    /// true if it acted.
+    pub fn settle_stale_waiting(&self, id: &str, expect_updated: i64, now_ms: i64) -> bool {
+        let mut sessions = self.sessions.lock().unwrap();
+        let Some(s) = sessions.iter_mut().find(|s| s.id == id) else {
+            return false;
+        };
+        if s.status != Status::Waiting || s.updated != expect_updated {
+            return false;
+        }
+        s.status = Status::Done;
+        s.state_entered_at = now_ms;
+        s.updated = now_ms;
+        true
+    }
+
     /// Mark a session-boundary in the in-memory dialog. Called on the
     /// authoritative boundary signals — `SessionEnd` (before `/clear` removes
     /// the row) and `PreCompact` (context compaction) — to append a history
@@ -621,6 +645,40 @@ mod tests {
         state.apply_set(set("a", Status::Blocked, "run bash?"), 0, NO_CONTINUATIONS, None);
         assert_eq!(state.revert_cancelled_turn("a", 20_000), None);
         assert_eq!(get(&state, "a").status, Status::Blocked);
+    }
+
+    #[test]
+    fn settle_stale_waiting_moves_waiting_to_done() {
+        // A row wedged in Waiting (killed background task, no clearing signal) is
+        // settled to Done, with the label preserved and the timestamps advanced.
+        let state = AppState::new();
+        state.apply_set(set("a", Status::Waiting, "run tests"), 0, NO_CONTINUATIONS, None);
+        assert!(state.settle_stale_waiting("a", 0, 600_000));
+        let s = get(&state, "a");
+        assert_eq!(s.status, Status::Done);
+        assert_eq!(s.label, "run tests", "the task label carries over into Done");
+        assert_eq!(s.state_entered_at, 600_000);
+        assert_eq!(s.updated, 600_000);
+    }
+
+    #[test]
+    fn settle_stale_waiting_is_guarded_by_updated() {
+        // A follow-up turn / new prompt bumped `updated` after the tick's
+        // snapshot — the stale-`updated` guard must abort so a row that just
+        // moved on isn't clobbered back to Done.
+        let state = AppState::new();
+        state.apply_set(set("a", Status::Waiting, "run tests"), 0, NO_CONTINUATIONS, None);
+        assert!(!state.settle_stale_waiting("a", 999, 600_000), "mismatched updated aborts");
+        assert_eq!(get(&state, "a").status, Status::Waiting);
+    }
+
+    #[test]
+    fn settle_stale_waiting_is_noop_when_not_waiting() {
+        // Only Waiting is time-settled; a Done/Working/etc. row is left alone.
+        let state = AppState::new();
+        state.apply_set(set("a", Status::Working, "do a thing"), 0, NO_CONTINUATIONS, None);
+        assert!(!state.settle_stale_waiting("a", 0, 600_000));
+        assert_eq!(get(&state, "a").status, Status::Working);
     }
 
     #[test]

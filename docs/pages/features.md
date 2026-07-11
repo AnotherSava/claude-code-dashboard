@@ -18,7 +18,7 @@ Each Claude Code session becomes one row. The row's `id` is *initially* derived 
 The row's status badge tracks the agent in real time:
 
 - **WORK** — Claude is working on your task. Timer accumulates total time spent working on the same prompt across approval cycles.
-- **WAIT** — the main turn finished but background subagents Claude spawned are still running, so the row stays active (light-blue) rather than dropping to DONE while work continues.
+- **WAIT** — the main turn finished but background work Claude started (a subagent, or a background command like a dev server) is still running, so the row stays active (light-blue) rather than dropping to DONE while work continues. If you stop that work yourself instead of letting it finish, the row settles to DONE on its own after a while rather than staying stuck.
 - **BLOCK** — Claude is blocked on you. The row shows the agent's current question or permission request.
 - **IDLE** — the session is alive but not actively working. A task you cancel with Esc usually settles here too: cancelling sends no event of its own, but the dashboard notices the turn ended and settles the row back on its own — to idle, or back to a question it was waiting on (on by default, see [Settings](settings#behavior)).
 - **DONE** — Claude finished the task and isn't waiting on you. Timer shows time since it finished.

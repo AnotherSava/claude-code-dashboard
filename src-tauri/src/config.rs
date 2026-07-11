@@ -34,6 +34,15 @@ pub struct Config {
     /// rate-limits this endpoint aggressively (see claude-code#31637), so 10
     /// minutes is the conservative default. Clamped to 60s minimum at runtime.
     pub usage_limits_poll_interval_seconds: u64,
+    /// Seconds after a usage window's reset (5h or 7d `resets_at`) to land the
+    /// next poll. When a reset falls within one poll interval, `usage_limits`
+    /// skips its regular poll and instead wakes this many seconds *after* the
+    /// reset — past the ±1min `resets_at` jitter and server propagation — so the
+    /// bar refreshes off its stale pre-reset value promptly (within this delay)
+    /// instead of up to a full interval later. Skipping the pre-reset poll also
+    /// keeps the two polls from firing close together and tripping the endpoint's
+    /// aggressive 429. Clamped to 60s minimum at runtime (with the interval).
+    pub usage_reset_poll_delay_seconds: u64,
     /// Number of segments in the 5h / 7d usage limit bars. Segments scale to
     /// fit the available track width; higher values give finer resolution but
     /// thinner individual segments.
@@ -90,6 +99,18 @@ pub struct Config {
     /// which removes the row only once the owning pid is positively confirmed
     /// gone. Off keeps the stranded row until the next `/clear` or app restart.
     pub reap_exited_sessions: bool,
+    /// Grace window (ms) after which a `Waiting` row that hasn't changed status
+    /// is settled to `Done`. `Waiting` ("looks done but isn't") is entered at
+    /// `Stop` from the hook's `background_tasks` and normally left when the
+    /// background work finishes and the follow-up turn settles the row — but a
+    /// background task the user *kills* (e.g. a dev server via the Claude UI)
+    /// ends silently (no hook, nothing in the transcript), so nothing clears the
+    /// row and it sits in WAIT until the next prompt. Read by `waiting_settle`,
+    /// the backstop that settles it. It's pure time-in-state, so legitimate
+    /// background work — which self-resolves well within the window (finite
+    /// shell tasks and subagents both cap ~9 min in practice) — is never reached;
+    /// only a stuck, killed-task WAIT ages past it. `None`/`0` disables.
+    pub waiting_settle_ms: Option<u64>,
     /// Multi-device session sync (see `sync.rs`). Disabled by default:
     /// `listen=false` and empty `peers` make every sync task a no-op.
     pub sync: SyncConfig,
@@ -340,6 +361,7 @@ impl Default for Config {
             projects_root: None,
             notifications: Some(NotificationsConfig::default()),
             usage_limits_poll_interval_seconds: 600,
+            usage_reset_poll_delay_seconds: 30,
             limit_bar_segments: 16,
             auto_resize: AutoResize::None,
             history_font_size: HistoryFontSize::Regular,
@@ -351,6 +373,7 @@ impl Default for Config {
             terminal_title_context_percent: Some(50.0),
             detect_cancelled_turns: true,
             reap_exited_sessions: true,
+            waiting_settle_ms: Some(600_000),
             sync: SyncConfig::default(),
             tray_badge: TrayBadge::None,
             tray_context_alert_enabled: true,
@@ -603,6 +626,24 @@ mod tests {
         assert_eq!(set.terminal_title_context_percent, Some(70.0));
         let off: Config = serde_json::from_str(r#"{ "terminal_title_context_percent": null }"#).unwrap();
         assert_eq!(off.terminal_title_context_percent, None);
+    }
+
+    #[test]
+    fn waiting_settle_ms_defaults_and_parses() {
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(cfg.waiting_settle_ms, Some(600_000), "default 10-min window survives an empty config");
+        let set: Config = serde_json::from_str(r#"{ "waiting_settle_ms": 900000 }"#).unwrap();
+        assert_eq!(set.waiting_settle_ms, Some(900_000));
+        let off: Config = serde_json::from_str(r#"{ "waiting_settle_ms": null }"#).unwrap();
+        assert_eq!(off.waiting_settle_ms, None);
+    }
+
+    #[test]
+    fn usage_reset_poll_delay_defaults_and_parses() {
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(cfg.usage_reset_poll_delay_seconds, 30, "default 30s post-reset delay survives an empty config");
+        let set: Config = serde_json::from_str(r#"{ "usage_reset_poll_delay_seconds": 90 }"#).unwrap();
+        assert_eq!(set.usage_reset_poll_delay_seconds, 90);
     }
 
     #[test]

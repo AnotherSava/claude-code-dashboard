@@ -25,6 +25,7 @@ mod tray;
 mod tray_badge;
 mod usage_history;
 mod usage_limits;
+mod waiting_settle;
 
 use config::ConfigState;
 use log_watcher::WatcherRegistry;
@@ -311,6 +312,7 @@ pub fn run() {
             notifications::NotificationManager::spawn(app.handle().clone());
             UsageLimitsPoller::spawn(app.handle().clone());
             liveness_reaper::spawn(app.handle().clone());
+            waiting_settle::spawn(app.handle().clone());
 
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
