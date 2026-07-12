@@ -1,12 +1,21 @@
 ---
 name: debug_auto_resize_config_race
-description: "Auto-resize \"too tall\" root cause = get_config mount race making frontend auto_resize='none'; fixed by managing ConfigState first in setup() + one authoritative getConfig() re-read at end of mount. Debug via window rect + widget.jsonl, beware multi-window log interleaving."
+description: "Auto-resize \"too tall\" = webview commands racing state managed in setup(). Two causes: get_config→auto_resize='none' latch, AND (dominant) frontend_log→FrontendLogger-unmanaged dropping early logs + leaving window unmeasured. Definitive fix (2026-07-11): manage ConfigState+FrontendLogger in the PRE-BUILD builder chain (app_data via dirs::data_dir().join(identifier)). 0/105 stuck vs ~24%."
 metadata: 
   node_type: memory
   type: project
 ---
 
-**The "dashboard too tall with auto-resize on" bug (2026-07-01).** The window opens at its launch/saved size and never shrinks to fit the rows. Intermittent (~1/3 of launches).
+**DEFINITIVE FIX (2026-07-11) — supersedes the "manage-first-in-setup + authoritative re-read" fix documented below.** The re-read + `show_window`/timer config re-pushes were all **removed**; they were insufficient backstops, not the cure.
+
+- **Two mount-time races, one root cause:** config-defined webviews invoke commands concurrently with `setup()` (on worker threads), beating any `app.manage(State)` that runs *inside* setup. (1) `get_config` → `Config::default()` (`auto_resize:'none'`) → frontend latches → window frozen tall. (2) **The dominant cause** (~20-40% of launches, and why this was invisible for months): `frontend_log(logger: State<FrontendLogger>)` **errors and drops its work** when `FrontendLogger` isn't managed yet — so every *early* frontend log (mount snapshot, the readiness retries, the measures) was silently lost, AND the main window's `measureAndSend` never completed (no `applyAutoResize`) → stuck tall. Fixing only the config race left **~24%** of relaunches still stuck.
+- **Fix = manage webview-read state in the PRE-BUILD builder chain**, before `.setup()` and before any webview exists (like `AppState` etc. always were). The blocker was that `ConfigState`/`FrontendLogger` need `app_data_dir` (an AppHandle). Broken by resolving it *without* the handle: `let ctx = tauri::generate_context!(); let app_data = dirs::data_dir().map(|d| d.join(&ctx.config().identifier)).unwrap();` — **byte-identical** to Tauri 2.10.3's `app_data_dir()` (literally `dirs::data_dir()?.join(&config().identifier)`, `path/desktop.rs`). Add `dirs = "6"` (matches Tauri's major → reuses the same resolved node). Compute `app_data` once, `move` it into the setup closure (single source of truth); pass the pre-generated `ctx` to `.run(ctx)`. `debug_assert_eq!(app.path().app_data_dir()?, app_data)` at setup start = dev/CI tripwire against a future `dirs`-major skew silently splitting config across two dirs.
+- **Verified 0 stuck / 105 relaunches** (aggressive 1.5s + gentle 4s kill-relaunch cadences) vs ~24% before. Distinguish real-stuck from dropped-log false-positives via **backend** `auto_resize::apply` (tracing, not FrontendLogger) — present ⇒ window resized even if the frontend `auto_resize measure` log was dropped; absent ⇒ genuinely stuck.
+- Managing `FrontendLogger` pre-build has a standalone payoff: early frontend logs (`mount snapshot`, `auto_resize measure not ready`) now actually appear in `widget.jsonl` — this class of bug is no longer invisible.
+
+---
+
+**The "dashboard too tall with auto-resize on" bug (2026-07-01) — original investigation, fix now superseded (see above).** The window opens at its launch/saved size and never shrinks to fit the rows. Intermittent (~1/3 of launches).
 
 **Root cause:** a startup race. The webview's mount-time `getConfig()` can beat `setup()`'s `app.manage(ConfigState)` (lib.rs), so `get_config` returns `Config::default()` with `auto_resize: None`. The frontend then reads `config.auto_resize === 'none'` and `measureAndSend` early-returns on its very first guard — auto-resize is silently disabled for the whole session, so the window is frozen wherever it launched. `show_window` re-emits `config_updated` to fix this, but that event can be missed, AND the **safety-net reveal timer** (lib.rs `spawn`, ~1500ms) revealed the window WITHOUT re-pushing config/setup — the gap.
 

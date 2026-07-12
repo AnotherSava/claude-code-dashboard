@@ -31,3 +31,10 @@ anyhow = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 open = "5"
 fontdue = "0.9"
+# Resolve the app-data dir before the Tauri builder runs (see lib.rs run()), so
+# ConfigState is managed before the webview can call get_config. MUST match
+# Tauri's own `dirs` major (currently 6) — Tauri's app_data_dir() is
+# `dirs::data_dir()/<identifier>`, and we recompute that same path pre-build.
+# Bump in lockstep with a Tauri upgrade that moves `dirs`, or the two paths could
+# diverge onto different config files.
+dirs = "6"

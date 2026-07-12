@@ -34,7 +34,12 @@ pub fn get_sessions(app: AppHandle) -> Vec<AgentSession> {
 
 #[tauri::command]
 pub fn get_config(app: AppHandle) -> Config {
-    app.try_state::<ConfigState>().map(|s| s.snapshot()).unwrap_or_default()
+    // ConfigState is managed in the builder chain before `.setup()` and before
+    // any webview exists (see lib.rs run()), so it is always present by the time
+    // a `get_config` IPC can run. No `unwrap_or_default` fallback — that used to
+    // hand back `Config::default()` (auto_resize None) when the webview beat
+    // setup()'s late `.manage()`, which the frontend latched and stayed stuck on.
+    app.state::<ConfigState>().snapshot()
 }
 
 #[tauri::command]
@@ -172,9 +177,8 @@ pub fn show_window(window: WebviewWindow, app: AppHandle) -> Result<(), String> 
     if let Some(suppress) = app.try_state::<SuppressInitialShow>() {
         if suppress.0.load(std::sync::atomic::Ordering::SeqCst) {
             // Started minimized to tray: swallow the frontend's auto-reveal but
-            // still re-push config (the get_config race fix below applies even
-            // when the window stays hidden — the history window reads it too).
-            emit_config_updated(&app);
+            // still re-push setup_state (its get_setup_state read can race
+            // setup() managing PromptHistoryStore, flashing the onboarding panel).
             emit_setup_state(&app);
             return Ok(());
         }
@@ -182,12 +186,11 @@ pub fn show_window(window: WebviewWindow, app: AppHandle) -> Result<(), String> 
     ensure_window_on_screen(&window);
     window.show().map_err(|e| e.to_string())?;
     window.set_focus().map_err(|e| e.to_string())?;
-    // The webview can invoke get_config before setup() finishes managing
-    // ConfigState, in which case it receives Config::default() (auto_resize
-    // None) and stays stuck there forever. The frontend registers its
-    // config_updated listener before calling show_window, so re-pushing the
-    // now-authoritative config here corrects any value lost to that race.
-    emit_config_updated(window.app_handle());
+    // Re-push setup_state: `get_setup_state` can run before setup() manages
+    // PromptHistoryStore and latch has_history:false. The frontend registers its
+    // setup_state listener before calling show_window, so this corrects it.
+    // Config no longer needs re-pushing — ConfigState is managed before the
+    // webview loads (see lib.rs run()), so `get_config` can't race to `None`.
     emit_setup_state(window.app_handle());
     Ok(())
 }

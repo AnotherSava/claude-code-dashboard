@@ -173,6 +173,12 @@
   let readyRetries = 0
   let firstMeasureDone = false
   let warnedNotReady = false
+  // One-shot: log the first time auto-resize is skipped for auto_resize='none'.
+  // Post-fix the backend can't race this to 'none' (ConfigState is managed before
+  // the webview loads), so for a user who enabled auto-resize this must NEVER
+  // appear — its presence in widget.jsonl is a positive regression signal. For a
+  // user who genuinely left auto-resize off it fires once per session, benign.
+  let loggedAutoResizeDisabled = false
 
   function scheduleReadyRetry() {
     if (firstMeasureDone) return
@@ -211,8 +217,7 @@
   function measureAndSend() {
     measureTimer = null
     // Secondary windows never mount the `.widget` tree, so their permanently
-    // absent widgetEl must not be treated as a readiness gap (no log, no
-    // retry). Silent bail — same as auto_resize disabled.
+    // absent widgetEl must not be treated as a readiness gap (no log, no retry).
     if (!isMainWindow) {
       cancelReadyRetry()
       return
@@ -221,6 +226,10 @@
     // and bail. (Guarded on config existing so a null config falls through to
     // the not-ready path below rather than being read as 'not none'.)
     if (config && config.auto_resize === 'none') {
+      if (!loggedAutoResizeDisabled) {
+        loggedAutoResizeDisabled = true
+        frontendLog('debug', 'auto_resize disabled', { auto_resize: config.auto_resize }).catch(() => {})
+      }
       cancelReadyRetry()
       return
     }
@@ -375,9 +384,9 @@
         // Attach before show_window below: the mount-time getSetupState() can
         // win the race against the backend managing PromptHistoryStore and latch
         // has_history=false (flashing the onboarding panel on a configured
-        // install). show_window re-emits the authoritative setup_state (same fix
-        // as config_updated), and this listener overwrites the stale snapshot —
-        // registered first so it's listening before show_window fires.
+        // install). show_window re-emits the authoritative setup_state, and this
+        // listener overwrites the stale snapshot — registered first so it's
+        // listening before show_window fires.
         unlistenSetupState = await onSetupState((s) => (setup = s))
         config = await getConfig()
         sessions = await getSessions()
@@ -411,16 +420,6 @@
         // cached snapshot may be stale. The 60s floor inside the backend
         // protects Anthropic from thrash on real reloads.
         refreshUsageLimits().catch((err) => console.error('mount refresh failed', err))
-        // Authoritative config re-read to close the get_config mount race: the
-        // getConfig() at the top of mount can beat setup()'s ConfigState
-        // management and return Config::default() (auto_resize 'none'), which
-        // would disable auto-resize for the session. By here the backend has
-        // answered several commands (config / sessions / usage / setup), so it is
-        // up — re-read once to correct any raced value. A single sequenced read,
-        // not a loop; placed before the finally so a stalled pre-show rAF can't
-        // skip it.
-        const authoritativeConfig = await getConfig()
-        if (authoritativeConfig) config = authoritativeConfig
       } catch (err) {
         frontendLog('error', 'init_failed', { error: String(err) }).catch(() => {})
         console.error('failed to initialize', err)
@@ -443,9 +442,9 @@
             // Take one measure now the window is visible and the DOM is committed
             // (tick + two frames above) — the reactive measure can race ahead of
             // the rows laying out, and nothing re-fires it if the list then stays
-            // put. The auto_resize='none' get_config race is closed by the
-            // authoritative re-read above; later session/usage updates refine the
-            // height.
+            // put. The initial getConfig() above is authoritative (the backend
+            // manages ConfigState before the webview loads, so auto_resize can't
+            // race to 'none'); later session/usage updates refine the height.
             scheduleMeasure()
           } catch (err) {
             console.error('failed to reveal window', err)
