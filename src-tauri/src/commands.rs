@@ -176,22 +176,17 @@ pub struct SuppressInitialShow(pub std::sync::atomic::AtomicBool);
 pub fn show_window(window: WebviewWindow, app: AppHandle) -> Result<(), String> {
     if let Some(suppress) = app.try_state::<SuppressInitialShow>() {
         if suppress.0.load(std::sync::atomic::Ordering::SeqCst) {
-            // Started minimized to tray: swallow the frontend's auto-reveal but
-            // still re-push setup_state (its get_setup_state read can race
-            // setup() managing PromptHistoryStore, flashing the onboarding panel).
-            emit_setup_state(&app);
+            // Started minimized to tray: swallow the frontend's auto-reveal.
             return Ok(());
         }
     }
     ensure_window_on_screen(&window);
     window.show().map_err(|e| e.to_string())?;
     window.set_focus().map_err(|e| e.to_string())?;
-    // Re-push setup_state: `get_setup_state` can run before setup() manages
-    // PromptHistoryStore and latch has_history:false. The frontend registers its
-    // setup_state listener before calling show_window, so this corrects it.
-    // Config no longer needs re-pushing — ConfigState is managed before the
-    // webview loads (see lib.rs run()), so `get_config` can't race to `None`.
-    emit_setup_state(window.app_handle());
+    // No state re-push: every store the frontend reads at mount (ConfigState,
+    // PromptHistoryStore, …) is managed before the webview exists (see lib.rs
+    // run()'s build()/run() gap), so get_config / get_setup_state can't race a
+    // default. The former config/setup_state re-emit backstops are gone.
     Ok(())
 }
 
@@ -667,16 +662,6 @@ pub fn emit_config_updated(app: &AppHandle) {
     if let Some(state) = app.try_state::<ConfigState>() {
         let _ = app.emit("config_updated", state.snapshot());
     }
-}
-
-/// Push the authoritative setup state to the frontend. Like `get_config`,
-/// `get_setup_state` can be invoked at mount before `setup()` has managed
-/// `PromptHistoryStore`, returning `has_history: false` and flashing the
-/// onboarding panel on a configured install. The frontend registers its
-/// `setup_state` listener before calling `show_window`, so re-pushing from there
-/// reliably corrects any value lost to that race.
-pub fn emit_setup_state(app: &AppHandle) {
-    let _ = app.emit("setup_state", get_setup_state(app.clone()));
 }
 
 pub fn emit_usage_limits_updated(app: &AppHandle) {

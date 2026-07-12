@@ -147,10 +147,6 @@ export function onShowSetupInstructions(handler: () => void): Promise<UnlistenFn
   return listen('show_setup_instructions', () => handler())
 }
 
-export function onSetupState(handler: (setup: SetupState) => void): Promise<UnlistenFn> {
-  return listen<SetupState>('setup_state', (evt) => handler(evt.payload))
-}
-
 export function onHistoryLoading(
   handler: (payload: { id: string; loading: boolean }) => void,
 ): Promise<UnlistenFn> {

@@ -99,58 +99,22 @@ fn default_device_name() -> String {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // Must run before the Builder creates the config-defined webviews, which
-    // begin loading `index.html` immediately — clearing later (e.g. in setup())
-    // would be too late to affect the initial navigation.
+    use tauri::Manager;
+
+    // Clear the WebView2 cache before any webview is created (they load
+    // `index.html` immediately); clearing later is too late for the initial nav.
     clear_webview_cache();
 
-    // Build ConfigState BEFORE the builder so it can be `.manage()`d in the
-    // pre-build chain (below), before `.setup()` and before any webview exists.
-    // Previously ConfigState was managed deep inside `.setup()`; a webview that
-    // invoked `get_config` first (its 2nd IPC on mount) got `Config::default()`
-    // (auto_resize None), which the frontend latched onto and stayed stuck at —
-    // freezing the window at its launch height on ~20% of launches. Managing it
-    // here removes the unmanaged window entirely: there is no instant at which
-    // the webview exists but ConfigState is absent.
-    let ctx = tauri::generate_context!();
-    // Tauri's `PathResolver::app_data_dir()` is `dirs::data_dir()?/<identifier>`
-    // (tauri 2.10.3 path/desktop.rs). We recompute that exact path with the same
-    // `dirs` crate/version, so it is byte-identical on Windows (%APPDATA%\Roaming)
-    // and macOS (~/Library/Application Support). NB this is data_dir (Roaming),
-    // NOT clear_webview_cache's LOCALAPPDATA.
-    let app_data = dirs::data_dir()
-        .map(|d| d.join(&ctx.config().identifier))
-        .expect("could not resolve platform data dir for app_data");
-    std::fs::create_dir_all(&app_data).ok();
-    let config_path = app_data.join("config.json");
-    // `!exists()` is the authoritative first-run signal; capture it before the
-    // save below creates the file, so the setup() autostart-enable still fires.
-    let is_first_run = !config_path.exists();
-    let config_state = ConfigState::new(config_path.clone());
-    // Finalize the config fully BEFORE managing it, so the webview always reads a
-    // complete value (nothing mutates the managed config after this point — no
-    // stale-field window). First run: persist defaults so external editing works.
-    if is_first_run {
-        let _ = config_state.save_to_disk();
-    }
-    // Resolve an empty sync.device_name once from the hostname so peers have a
-    // stable badge label; written back so the user can see/edit it in config.json.
-    if config_state.snapshot().sync.device_name.is_empty() {
-        config_state.with_mut(|c| c.sync.device_name = default_device_name());
-        let _ = config_state.save_to_disk();
-    }
-
-    // Initialize logging + the FrontendLogger before the builder too, and manage
-    // it in the pre-build chain. `frontend_log` takes `State<FrontendLogger>`,
-    // which ERRORS (and the frontend's fire-and-forget `.catch` swallows it) when
-    // invoked before setup() managed it — so every early frontend log (mount-time
-    // measures, readiness retries) was silently dropped, which is exactly why
-    // auto-resize stalls were historically invisible in widget.jsonl. Managing it
-    // pre-build closes that gap and lets backend tracing fire this early too.
-    let (log_guard, frontend_logger) = logging::init(&app_data);
-    tracing::info!(version = env!("CARGO_PKG_VERSION"), "widget starting");
-
-    tauri::Builder::default()
+    // Two-phase startup: `build()` the app but don't `run()` it yet. Between
+    // `build()` and `run()` the PathResolver is live (`app.path().app_data_dir()`
+    // works) while NO webview exists — config-defined webviews are created only by
+    // the `RunEvent::Ready` that `run()` drives. That gap (below the builder) is
+    // where we manage every store the frontend reads at mount, so no
+    // `get_config` / `frontend_log` / `get_setup_state` can ever race an unmanaged
+    // `State`: the fix is structural. (Managing frontend-read state inside
+    // `.setup()`, which runs AFTER the webviews are created, is exactly the race
+    // this avoids — it once froze auto-resize and dropped early logs.)
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             // Tag the login-launch command so startup can tell an autostart
@@ -159,12 +123,7 @@ pub fn run() {
             Some(vec![AUTOSTART_ARG]),
         ))
         .plugin(tauri_plugin_dialog::init())
-        // Managed before `.setup()` and before any webview exists, so the very
-        // first `get_config` / `frontend_log` the frontend fires always finds
-        // them — no race, no dropped early logs.
-        .manage(config_state)
-        .manage(log_guard)
-        .manage(frontend_logger)
+        // Handle-independent state — constructible up front, on the Builder.
         .manage(AppState::new())
         .manage(WatcherRegistry::new())
         .manage(UsageLimitsState::new())
@@ -201,8 +160,11 @@ pub fn run() {
             commands::open_about,
             commands::set_window_size,
         ])
-        .setup(move |app| {
-            use tauri::Manager;
+        .setup(|app| {
+            // Runs at `RunEvent::Ready`, AFTER the webviews exist — so it does
+            // only window / tray / service wiring and reads config from state
+            // already managed in the build()/run() gap below. It never manages
+            // frontend-read state itself (that would reintroduce the mount race).
 
             // Run as a macOS accessory: no Dock icon, no app menu bar — the
             // tray icon is the only entry point, mirroring Windows where
@@ -210,73 +172,13 @@ pub fn run() {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
-            // `app_data` / `config_path` were computed once before the builder
-            // (single source of truth) and moved into this closure; the dir was
-            // created there and ConfigState is already managed (builder chain).
-            // Assert our pre-build path matches Tauri's own resolver — a cheap
-            // dev/CI tripwire against a future `dirs`-major skew silently
-            // splitting config across two directories (see the Cargo.toml note).
-            debug_assert_eq!(
-                app.path().app_data_dir().ok().as_deref(),
-                Some(app_data.as_path()),
-                "pre-build app_data must match Tauri's app_data_dir()",
-            );
-
-            // Logging + FrontendLogger are initialized and managed before the
-            // builder (see run() above) so early frontend logs aren't dropped.
-
-            // First-run autostart: enable on by default. Gated on the pre-build
-            // `is_first_run` signal (needs the AppHandle, so it can't move
-            // pre-build with the rest of the first-run bootstrap). Users can opt
-            // out via the tray menu, and the choice lives in the OS (registry on
-            // Windows, LaunchAgent on macOS), so re-enabling here would fight the
-            // user on every launch.
-            if is_first_run {
-                use tauri_plugin_autostart::ManagerExt;
-                let _ = app.autolaunch().enable();
-            }
             let current_config = app.state::<ConfigState>().snapshot();
             let server_port = current_config.server_port;
-
-            let history_store =
-                prompt_history::PromptHistoryStore::new(app_data.join("prompt_history.json"));
-            app.manage(history_store);
-
-            app.manage(remote_history::RemoteHistoryStore::new(
-                app_data.join("remote_history"),
-            ));
-
-            // Drop the embedded Python hook next to config.json so users can
-            // paste its path into ~/.claude/settings.json without cloning the
-            // repo. Overwrites on every launch to track app updates.
-            if let Err(e) = setup::write_hook_script(&app_data) {
-                tracing::warn!(?e, "failed to write claude_hook.py to app data dir");
-            }
-
-            app.manage(chat_id_registry::ChatIdRegistry::new(
-                app_data.join("session_chat_ids.json"),
-            ));
-
-            app.manage(custom_names::CustomNamesStore::new(
-                app_data.join("custom_names.json"),
-            ));
-
-            app.manage(usage_history::UsageHistoryStore::new(
-                app_data.join("usage_history.jsonl"),
-            ));
-
-            app.manage(remote_usage::RemoteUsageStore::new(
-                app_data.join("remote_usage"),
-            ));
-
-            // "Open to tray": when the OS launched us at login and the user
-            // picked the minimized mode, keep the main window in the tray by
-            // suppressing both automatic reveal paths (frontend mount-time
-            // `show_window` and the safety-net timer below).
+            // "Open to tray": suppress the two auto-reveal paths (the frontend's
+            // `show_window` and the safety-net timer below) when launched at login
+            // in minimized mode. The `SuppressInitialShow` flag itself is managed
+            // in the build()/run() gap so `show_window` can't race it.
             let start_minimized = current_config.start_minimized && launched_via_autostart();
-            app.manage(commands::SuppressInitialShow(
-                std::sync::atomic::AtomicBool::new(start_minimized),
-            ));
 
             // Apply config to the window
             if let Some(window) = app.get_webview_window("main") {
@@ -316,15 +218,12 @@ pub fn run() {
                     tauri::async_runtime::spawn(async move {
                         tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
                         if matches!(window_for_timeout.is_visible(), Ok(false)) {
+                            // The frontend's own `show_window` didn't run (broken
+                            // or slow JS) — reveal the window anyway. No state
+                            // re-push needed: every frontend-read store is managed
+                            // before the webview exists (see run()), so nothing
+                            // raced a default.
                             let _ = window_for_timeout.show();
-                            // We only get here because the frontend's own
-                            // `show_window` didn't run — mirror its setup_state
-                            // re-push so a raced `get_setup_state` (webview beat
-                            // setup() managing PromptHistoryStore) doesn't leave
-                            // the onboarding panel flashed. Config no longer needs
-                            // re-pushing: ConfigState is managed before the webview
-                            // loads, so `get_config` can't race to `None`.
-                            commands::emit_setup_state(window_for_timeout.app_handle());
                         }
                     });
                 }
@@ -345,6 +244,9 @@ pub fn run() {
             }
 
             tray::setup(app.handle())?;
+            // Re-resolve the config path via Tauri's resolver (the build()/run()
+            // gap owns the canonical one; the watcher just needs a copy).
+            let config_path = app.path().app_data_dir()?.join("config.json");
             config_watcher::spawn(app.handle().clone(), config_path);
             notifications::NotificationManager::spawn(app.handle().clone());
             UsageLimitsPoller::spawn(app.handle().clone());
@@ -407,8 +309,83 @@ pub fn run() {
                 }
             }
         })
-        .run(ctx)
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application");
+
+    // ---- Between build() and run(): PathResolver live, no webview yet. ----
+    // Resolve app_data via Tauri's OWN resolver (no `dirs` dep, no version-skew
+    // possible) and manage every frontend-read / path-derived store here, before
+    // run() creates any webview — so a mount-time command can never race an
+    // unmanaged State.
+    let app_data = app
+        .path()
+        .app_data_dir()
+        .expect("could not resolve app data dir");
+    std::fs::create_dir_all(&app_data).ok();
+
+    let config_path = app_data.join("config.json");
+    // `!exists()` is the first-run signal; capture it before the save creates it.
+    let is_first_run = !config_path.exists();
+    let config_state = ConfigState::new(config_path);
+    if is_first_run {
+        // Persist defaults so external editing works from the first launch.
+        let _ = config_state.save_to_disk();
+    }
+    // Resolve an empty sync.device_name once from the hostname (stable peer badge).
+    if config_state.snapshot().sync.device_name.is_empty() {
+        config_state.with_mut(|c| c.sync.device_name = default_device_name());
+        let _ = config_state.save_to_disk();
+    }
+
+    let (log_guard, frontend_logger) = logging::init(&app_data);
+    tracing::info!(version = env!("CARGO_PKG_VERSION"), "widget starting");
+
+    // First-run: enable autostart by default (opt out via the tray; the choice
+    // lives in the OS registry / LaunchAgent, so re-enabling here would fight it).
+    if is_first_run {
+        use tauri_plugin_autostart::ManagerExt;
+        let _ = app.autolaunch().enable();
+    }
+
+    // Drop the embedded Python hook next to config.json so users can point
+    // ~/.claude/settings.json at it without cloning the repo.
+    if let Err(e) = setup::write_hook_script(&app_data) {
+        tracing::warn!(?e, "failed to write claude_hook.py to app data dir");
+    }
+
+    // "Open to tray" suppression flag — managed before run() so `show_window`
+    // (a mount-time command) can't race it.
+    let start_minimized = config_state.snapshot().start_minimized && launched_via_autostart();
+    app.manage(commands::SuppressInitialShow(
+        std::sync::atomic::AtomicBool::new(start_minimized),
+    ));
+
+    // Every store the frontend reads at mount (get_config, frontend_log,
+    // get_setup_state, get_sessions' name overlay, …) — all managed here, before
+    // any webview exists.
+    app.manage(config_state);
+    app.manage(log_guard);
+    app.manage(frontend_logger);
+    app.manage(prompt_history::PromptHistoryStore::new(
+        app_data.join("prompt_history.json"),
+    ));
+    app.manage(remote_history::RemoteHistoryStore::new(
+        app_data.join("remote_history"),
+    ));
+    app.manage(chat_id_registry::ChatIdRegistry::new(
+        app_data.join("session_chat_ids.json"),
+    ));
+    app.manage(custom_names::CustomNamesStore::new(
+        app_data.join("custom_names.json"),
+    ));
+    app.manage(usage_history::UsageHistoryStore::new(
+        app_data.join("usage_history.jsonl"),
+    ));
+    app.manage(remote_usage::RemoteUsageStore::new(
+        app_data.join("remote_usage"),
+    ));
+
+    app.run(|_app, _event| {});
 }
 
 fn save_history_position_if_enabled(window: &tauri::Window) {
