@@ -44,7 +44,11 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tagName: ${{ github.ref_type == 'tag' && github.ref_name || format('v-{0}', github.sha) }}
-          releaseName: 'Claude Code Dashboard ${{ github.ref_name }}'
+          # Title = just the version tag (e.g. "v1.6.3"). The product name is
+          # redundant on the repo's own releases page and, in the narrow release
+          # sidebar, its prefix truncates off the version — the one distinguishing
+          # part. GitHub defaults an unset name to the tag anyway.
+          releaseName: ${{ github.ref_name }}
           releaseBody: |
             See the [installation guide](https://anothersava.github.io/claude-code-dashboard/pages/install) for downloads, system requirements, and the macOS first-launch workaround.
           releaseDraft: true
