@@ -139,6 +139,7 @@ pub fn run() {
             commands::get_usage_intensity_week,
             commands::get_usage_intensity_weeks,
             commands::apply_auto_resize,
+            commands::get_scale_factor,
             commands::frontend_log,
             commands::hide_window,
             commands::show_window,

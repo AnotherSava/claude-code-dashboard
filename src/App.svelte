@@ -10,6 +10,7 @@
     applyAutoResize,
     frontendLog,
     getConfig,
+    getScaleFactor,
     getSessions,
     getSetupState,
     getUsageLimits,
@@ -69,57 +70,26 @@
   // physical px; see measureAndSend.)
   let suppressResizeUntil = 0
   // window.devicePixelRatio is unreliable on mixed-DPI multi-monitor setups:
-  // WebView2 transiently reports 1.0 on a 150% monitor (then flips back), and
-  // because the window is sized as `desired * dpr`, a low misread lands a
-  // collapsed physical height (seen in widget.jsonl: dpr flapping 1.5↔1.0,
-  // physical=105 shrinking a ~219px window to ~70 logical px — a header sliver).
-  // Keep the last *stable* scale and adopt a changed reading only once it has
-  // persisted for SCALE_ADOPT_MS: a genuine monitor DPI change sticks and gets
-  // adopted, a flicker reverts first and is ignored. (Width is not covered here
-  // — auto-resize preserves it backend-side — so a `minWidth` floor in
+  // WebView2 transiently reports 1.0 on a 150% monitor and holds it for tens of
+  // seconds before flipping back. Because the window is sized as `desired * dpr`,
+  // a low misread lands a collapsed physical height (seen in widget.jsonl: dpr
+  // flapping 1.5↔1.0, physical=105 shrinking a ~219px window to ~70 logical px
+  // — a header sliver), and it did so on ~9% of measures. The OS per-monitor
+  // scale factor read on the Rust side is stable across that flap, so we size
+  // against it instead: `apply_auto_resize` returns it and `get_scale_factor`
+  // seeds it at mount. `backendScale` holds the last value the backend reported;
+  // until it's seeded we fall back to devicePixelRatio (one provisional measure,
+  // immediately corrected by the first backend reply). (Width is not covered
+  // here — auto-resize preserves it backend-side — so a `minWidth` floor in
   // tauri.conf.json guards the width axis against the same DPI events.)
-  const SCALE_ADOPT_MS = 800
-  let stableScale = 0 // 0 = uninitialised (seeded on the first measure)
-  let pendingScale = 0
-  let pendingScaleSince = 0
-  let scaleRecheckTimer: ReturnType<typeof setTimeout> | null = null
-
-  function scheduleScaleRecheck(delay: number) {
-    if (scaleRecheckTimer !== null) return
-    scaleRecheckTimer = setTimeout(() => {
-      scaleRecheckTimer = null
-      measureAndSend()
-    }, Math.max(50, delay))
+  let backendScale = 0 // 0 = not yet reported by the backend
+  function effectiveScale(): number {
+    return backendScale || window.devicePixelRatio
   }
-
-  // Resolve the scale to size with, filtering transient devicePixelRatio
-  // misreads by requiring a changed reading to persist before it's adopted.
-  function resolveScale(): number {
-    const raw = window.devicePixelRatio
-    if (stableScale === 0) {
-      stableScale = raw
-      return raw
-    }
-    if (raw === stableScale) {
-      pendingScale = 0
-      return stableScale
-    }
-    const nowMs = Date.now()
-    if (raw !== pendingScale) {
-      pendingScale = raw
-      pendingScaleSince = nowMs
-    }
-    const elapsed = nowMs - pendingScaleSince
-    if (elapsed >= SCALE_ADOPT_MS) {
-      stableScale = raw
-      pendingScale = 0
-      return stableScale
-    }
-    // Not yet confirmed — keep the stable scale, but schedule a re-check so a
-    // genuine DPI change is still applied even if no content change fires
-    // another measure before the settle window elapses.
-    scheduleScaleRecheck(SCALE_ADOPT_MS - elapsed + 30)
-    return stableScale
+  // Adopt a scale the backend reported (mount seed and every apply reply share
+  // this so the two paths can't drift). Null/0 replies leave the last value.
+  function adoptScale(s: number | null) {
+    if (s) backendScale = s
   }
   // Self-heal for the display-disable collapse: when a monitor holding the
   // widget is disabled, Windows moves/shrinks the window and swallows the
@@ -292,10 +262,10 @@
     // them where a request-based dedup wouldn't.
     const vh = window.innerHeight
     const overflowing = desired > vh + 1
-    // Resolve the scale to size with BEFORE the dedup: a scale adoption changes
-    // the physical height even when `desired` is unchanged, so it has to be part
-    // of the dedup key or a settled DPI change would be silently skipped.
-    const scale = resolveScale()
+    // Resolve the scale to size with BEFORE the dedup: a scale change moves the
+    // physical height even when `desired` is unchanged, so it has to be part of
+    // the dedup key or a settled DPI change would be silently skipped.
+    const scale = effectiveScale()
     // For non-overflow cases, dedup against what we last requested. Crucial
     // for the OS-clamp scenario: if we asked for 87 but Windows enforced a
     // ~150 minimum, viewport stays at 150 while desired stays at 87 — and
@@ -307,13 +277,14 @@
     }
     lastSentHeight = desired
     lastSentScale = scale
-    // Send PHYSICAL pixels computed from `scale` — the webview's devicePixelRatio
-    // filtered for transient misreads (see resolveScale) — not a logical height
-    // for Rust to scale. Near a mixed-DPI boundary Rust's window.scale_factor()
-    // and the webview's dpr disagree, so a logical request lands at the wrong
-    // physical size (false-overflow, scrollbar, drift); but a raw dpr flicker
-    // (1.5→1.0) is just as fatal the other way, collapsing the window to a header
-    // sliver. `scale` is the trustworthy middle — the last dpr that held steady.
+    // Send PHYSICAL pixels computed from `scale` — the OS-authoritative
+    // per-monitor scale the backend reported (see effectiveScale) — not a
+    // logical height for Rust to scale. Near a mixed-DPI boundary Rust's
+    // window.scale_factor() and the webview's dpr disagree, so a logical request
+    // lands at the wrong physical size (false-overflow, scrollbar, drift); but a
+    // webview dpr flicker (1.5→1.0) is just as fatal the other way, collapsing
+    // the window to a header sliver. Sourcing the scale from the OS gives us
+    // both: physical-px sizing without the flaky devicePixelRatio.
     suppressResizeUntil = Date.now() + 150
     frontendLog('trace', 'auto_resize measure', {
       desired,
@@ -323,7 +294,12 @@
       physical: Math.round(desired * scale),
       heal: healTries,
     }).catch(() => {})
-    applyAutoResize(Math.round(desired * scale)).catch((err) => console.error('apply_auto_resize failed', err))
+    applyAutoResize(Math.round(desired * scale))
+      // Adopt the OS scale the backend read after applying, so the next measure
+      // sizes against it. A genuine monitor DPI change lands here within one
+      // measure; a transient webview dpr misread never enters the math at all.
+      .then(adoptScale)
+      .catch((err) => console.error('apply_auto_resize failed', err))
     // A window less than half the height its content needs is the OS swallowing
     // our resize during a display/DPI transition — not the ~1-frame lag of a
     // normal grow (which clears the half-height bar and settles on its own).
@@ -379,6 +355,11 @@
           intensityMode = true
           return
         }
+        // Seed the conversion scale from the OS before the first measure so it
+        // can't size against a WebView2 devicePixelRatio misread (see
+        // effectiveScale). Fire-and-forget — it resolves well within the mount
+        // awaits below, and any later measure adopts the backend's reply anyway.
+        getScaleFactor().then(adoptScale).catch(() => {})
         config = await getConfig()
         sessions = await getSessions()
         usage = await getUsageLimits()
@@ -475,7 +456,6 @@
       unlistenShowSetup?.()
       if (measureTimer !== null) clearTimeout(measureTimer)
       if (healTimer !== null) clearTimeout(healTimer)
-      if (scaleRecheckTimer !== null) clearTimeout(scaleRecheckTimer)
       cancelReadyRetry()
       contentObserver?.disconnect()
     }
