@@ -31,10 +31,28 @@ pub struct TelegramNotifier {
     inner: RwLock<Inner>,
 }
 
+/// Fail fast when Telegram is unreachable: a connect failure is *definitely
+/// not delivered*, so the reconcile loop's retry is duplicate-free. Kept short
+/// so a real outage surfaces as a connect error (safe to retry) rather than
+/// aging into an ambiguous read timeout.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Generous overall budget for a request that *did* reach Telegram. The former
+/// 10s ceiling was the duplicate-notification bug: Telegram delivers the message
+/// but its ACK can take longer than 10s under a network hiccup, so the send read
+/// as failed and the loop resent it — the user got two copies. A bot can't read
+/// its own sent messages, so there's no way to confirm/dedupe a delivered
+/// message; widening the window so a slow-but-successful send acks (instead of
+/// false-timing-out) is what removes the duplicate in practice. A read timeout
+/// past this is genuinely ambiguous and still retried (at-least-once, so an
+/// actual outage never silently drops an actionable ping) — the residual, rare
+/// duplicate case Telegram's API leaves no way to close.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
 impl TelegramNotifier {
     pub fn new() -> Self {
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(10))
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(REQUEST_TIMEOUT)
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
         Self {
@@ -87,7 +105,15 @@ impl TelegramNotifier {
     ) -> Result<serde_json::Value, TelegramCallError> {
         let creds = self.creds().ok_or(TelegramCallError::Disabled)?;
         let url = format!("https://api.telegram.org/bot{}/{}", creds.bot_token, method);
-        let resp = self.client.post(&url).json(&body).send().await?;
+        let resp = self.client.post(&url).json(&body).send().await.inspect_err(|e| {
+            // A connect error means the request never reached Telegram — the
+            // message is *definitely not delivered*, so the caller's retry is
+            // duplicate-free. A read timeout is ambiguous: Telegram may have
+            // delivered it and only the ACK was lost, so the retry can produce a
+            // duplicate the API gives us no way to dedupe (see REQUEST_TIMEOUT).
+            let delivery = if e.is_connect() { "not_delivered" } else if e.is_timeout() { "uncertain" } else { "unknown" };
+            tracing::warn!(channel = "telegram", method, delivery, error = %e, "telegram send transport error");
+        })?;
         let http_status = resp.status();
         let body: serde_json::Value = resp.json().await?;
         let ok = body.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
