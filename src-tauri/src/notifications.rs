@@ -23,12 +23,48 @@ pub struct Outstanding {
     pub for_status: Status,
 }
 
+/// A failed notification send, tagged with whether the message might already
+/// have reached the channel — the signal [`reconcile`]'s retry backoff keys on
+/// to keep a network outage from multiplying duplicate pings.
+#[derive(Debug)]
+pub struct SendError {
+    /// A post-connect read timeout: the channel may have received the message
+    /// and only the ACK was lost, so retrying immediately risks a duplicate the
+    /// channel gives no way to dedupe. `false` for a connect error / API
+    /// rejection / disabled, where the message definitely didn't land and a
+    /// prompt retry is duplicate-free.
+    pub maybe_delivered: bool,
+    pub source: anyhow::Error,
+}
+
+/// After a send that *might* already have been delivered (a read timeout — see
+/// [`SendError::maybe_delivered`]), how long to hold before retrying that
+/// session's ping. Immediately retrying an ambiguous timeout is what turned a
+/// ~4-min Telegram outage into six duplicate pings: each attempt reached
+/// Telegram and delivered, but the lost ACK read as failure and the next tick
+/// resent. Holding collapses a sustained outage to ~1 retry while staying
+/// at-least-once (a genuinely-undelivered ping still lands, just later). The
+/// value is generous because a maybe-delivered ping most likely already
+/// arrived, so waiting costs nothing in the common case — only a true loss
+/// pays it, and even then a `done` ping tolerates the delay.
+const UNCERTAIN_RETRY_BACKOFF_MS: i64 = 5 * 60 * 1000;
+
+/// A per-session retry hold set after a maybe-delivered send failure: don't
+/// retry this session's ping before `until_ms`. `for_status` scopes the hold to
+/// the state that failed, so a *new* actionable state (e.g. Done→Blocked) pings
+/// promptly instead of inheriting the previous state's backoff.
+#[derive(Clone, Debug)]
+pub struct RetryHold {
+    pub until_ms: i64,
+    pub for_status: Status,
+}
+
 #[async_trait]
 pub trait Notifier: Send + Sync {
     fn channel_name(&self) -> &'static str;
     fn is_enabled(&self) -> bool;
     fn state_rules(&self) -> HashMap<String, StateNotify>;
-    async fn send(&self, session: &AgentSession) -> anyhow::Result<String>;
+    async fn send(&self, session: &AgentSession) -> Result<String, SendError>;
     async fn dismiss(&self, handle: &str) -> anyhow::Result<()>;
 }
 
@@ -421,6 +457,7 @@ pub async fn reconcile(
     notifier: &dyn Notifier,
     sessions: &[AgentSession],
     outstanding: &mut HashMap<String, Outstanding>,
+    retry_backoff: &mut HashMap<String, RetryHold>,
     now_ms: i64,
     idle_ms: Option<u64>,
     reading_speed_cps: u64,
@@ -439,6 +476,11 @@ pub async fn reconcile(
         .map(|(k, _)| k.clone())
         .collect();
     dismiss_and_forget(notifier, outstanding, stale, |o| o.handle.as_str()).await;
+
+    // Drop retry holds whose session vanished or changed state: a hold only
+    // scopes the state that failed to send, so a new state (or a resolved one)
+    // must be free to ping without waiting out the old state's backoff.
+    retry_backoff.retain(|id, h| sessions.iter().any(|s| &s.id == id && s.status == h.for_status));
 
     for s in sessions {
         if outstanding.contains_key(&s.id) {
@@ -459,6 +501,12 @@ pub async fn reconcile(
             (fire_reason(rule, time_in_state, idle_ms, reading_ms), reading_ms)
         };
         let Some(reason) = reason else { continue };
+        // Hold off retrying a ping whose prior send may already have landed (a
+        // read timeout). The `retain` above guarantees any surviving hold is for
+        // this same status, so a bare deadline check is enough.
+        if retry_backoff.get(&s.id).is_some_and(|h| now_ms < h.until_ms) {
+            continue;
+        }
         match notifier.send(s).await {
             Ok(handle) => {
                 tracing::debug!(
@@ -473,12 +521,29 @@ pub async fn reconcile(
                     s.id.clone(),
                     Outstanding { handle, for_status: s.status },
                 );
+                retry_backoff.remove(&s.id);
             }
-            Err(e) => {
+            // A maybe-delivered failure (read timeout) backs off before the next
+            // attempt so a sustained outage can't multiply duplicate pings; a
+            // definitely-not-delivered failure (connect error / API rejection)
+            // clears any hold and lets the next tick retry promptly.
+            Err(SendError { maybe_delivered: true, source }) => {
+                retry_backoff.insert(s.id.clone(), RetryHold { until_ms: now_ms + UNCERTAIN_RETRY_BACKOFF_MS, for_status: s.status });
                 tracing::warn!(
                     channel = notifier.channel_name(),
                     id = %s.id,
-                    ?e,
+                    status = key,
+                    backoff_ms = UNCERTAIN_RETRY_BACKOFF_MS,
+                    error = %source,
+                    "send may have been delivered; backing off retry"
+                );
+            }
+            Err(SendError { maybe_delivered: false, source }) => {
+                retry_backoff.remove(&s.id);
+                tracing::warn!(
+                    channel = notifier.channel_name(),
+                    id = %s.id,
+                    error = %source,
                     "send failed"
                 );
             }
@@ -493,6 +558,10 @@ impl NotificationManager {
         tauri::async_runtime::spawn(async move {
             let telegram = Arc::new(TelegramNotifier::new());
             let mut outstanding: HashMap<String, Outstanding> = HashMap::new();
+            // Per-session retry holds after a maybe-delivered send failure, so a
+            // network outage backs off instead of resending the same ping each
+            // tick (see [`RetryHold`] / [`UNCERTAIN_RETRY_BACKOFF_MS`]).
+            let mut retry_backoff: HashMap<String, RetryHold> = HashMap::new();
             // Live context-usage alerts: session id -> Telegram message handle,
             // so the message can be deleted once usage drops back below.
             let mut context_outstanding: HashMap<String, String> = HashMap::new();
@@ -545,6 +614,10 @@ impl NotificationManager {
                         outstanding.clear();
                         context_outstanding.clear();
                     }
+                    // Retry holds are handle-free (nothing to delete), but they
+                    // predate the new credentials, so drop them too — a ping held
+                    // under the old bot must re-evaluate under the new one.
+                    retry_backoff.clear();
                     // Re-seed the reset detector so a window that reset while
                     // creds were absent doesn't fire a stale / frozen-peak ping
                     // on re-enable: `observe` is gated on `is_enabled()` below, so
@@ -562,6 +635,7 @@ impl NotificationManager {
                         telegram.as_ref() as &dyn Notifier,
                         &sessions,
                         &mut outstanding,
+                        &mut retry_backoff,
                         now_ms(),
                         crate::idle::idle_ms(),
                         tg_cfg.and_then(|c| c.reading_speed_cps).unwrap_or(0),
@@ -698,7 +772,9 @@ mod tests {
         rules: HashMap<String, StateNotify>,
         events: Mutex<Vec<Event>>,
         handle_counter: Mutex<u64>,
-        send_err: Mutex<bool>,
+        /// `None` = sends succeed; `Some(maybe_delivered)` = every send fails,
+        /// with that delivery certainty (drives the retry-backoff branch).
+        send_err: Mutex<Option<bool>>,
     }
 
     impl Mock {
@@ -711,7 +787,7 @@ mod tests {
                 rules: rules.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
                 events: Mutex::new(vec![]),
                 handle_counter: Mutex::new(0),
-                send_err: Mutex::new(false),
+                send_err: Mutex::new(None),
             })
         }
         fn events(&self) -> Vec<Event> {
@@ -724,9 +800,9 @@ mod tests {
         fn channel_name(&self) -> &'static str { "mock" }
         fn is_enabled(&self) -> bool { true }
         fn state_rules(&self) -> HashMap<String, StateNotify> { self.rules.clone() }
-        async fn send(&self, session: &AgentSession) -> anyhow::Result<String> {
-            if *self.send_err.lock().unwrap() {
-                return Err(anyhow::anyhow!("boom"));
+        async fn send(&self, session: &AgentSession) -> Result<String, SendError> {
+            if let Some(maybe_delivered) = *self.send_err.lock().unwrap() {
+                return Err(SendError { maybe_delivered, source: anyhow::anyhow!("boom") });
             }
             let mut c = self.handle_counter.lock().unwrap();
             *c += 1;
@@ -786,7 +862,7 @@ mod tests {
         let m = Mock::with(&[("blocked", 60_000)]);
         let mut out = HashMap::new();
         let sessions = vec![session("s1", Status::Blocked, 0)];
-        reconcile(m.as_ref(), &sessions, &mut out, 60_000, None, 0, false).await;
+        reconcile(m.as_ref(), &sessions, &mut out, &mut HashMap::new(), 60_000, None, 0, false).await;
         assert_eq!(out.len(), 1);
         assert_eq!(out["s1"].for_status, Status::Blocked);
         assert_eq!(out["s1"].handle, "h1");
@@ -798,7 +874,7 @@ mod tests {
         let m = Mock::with(&[("blocked", 60_000)]);
         let mut out = HashMap::new();
         let sessions = vec![session("s1", Status::Blocked, 0)];
-        reconcile(m.as_ref(), &sessions, &mut out, 59_999, None, 0, false).await;
+        reconcile(m.as_ref(), &sessions, &mut out, &mut HashMap::new(), 59_999, None, 0, false).await;
         assert!(out.is_empty());
         assert!(m.events().is_empty());
     }
@@ -812,7 +888,7 @@ mod tests {
             Outstanding { handle: "h1".into(), for_status: Status::Blocked, },
         );
         let sessions = vec![session("s1", Status::Blocked, 0)];
-        reconcile(m.as_ref(), &sessions, &mut out, 120_000, None, 0, false).await;
+        reconcile(m.as_ref(), &sessions, &mut out, &mut HashMap::new(), 120_000, None, 0, false).await;
         assert_eq!(out.len(), 1);
         assert!(m.events().is_empty(), "no events when nothing changes");
     }
@@ -826,7 +902,7 @@ mod tests {
             Outstanding { handle: "h9".into(), for_status: Status::Blocked, },
         );
         let sessions = vec![session("s1", Status::Working, 100_000)];
-        reconcile(m.as_ref(), &sessions, &mut out, 120_000, None, 0, false).await;
+        reconcile(m.as_ref(), &sessions, &mut out, &mut HashMap::new(), 120_000, None, 0, false).await;
         assert!(out.is_empty());
         assert_eq!(m.events(), vec![Event::Dismiss { handle: "h9".into() }]);
     }
@@ -842,7 +918,7 @@ mod tests {
             Outstanding { handle: "h7".into(), for_status: Status::Blocked, },
         );
         let sessions: Vec<AgentSession> = vec![];
-        reconcile(m.as_ref(), &sessions, &mut out, 120_000, None, 0, false).await;
+        reconcile(m.as_ref(), &sessions, &mut out, &mut HashMap::new(), 120_000, None, 0, false).await;
         assert!(out.is_empty());
         assert_eq!(m.events(), vec![Event::Dismiss { handle: "h7".into() }]);
     }
@@ -853,7 +929,7 @@ mod tests {
         let m = Mock::with(&[("blocked", 60_000)]);
         let mut out = HashMap::new();
         let sessions: Vec<AgentSession> = vec![];
-        reconcile(m.as_ref(), &sessions, &mut out, 30_000, None, 0, false).await;
+        reconcile(m.as_ref(), &sessions, &mut out, &mut HashMap::new(), 30_000, None, 0, false).await;
         assert!(out.is_empty());
         assert!(m.events().is_empty());
     }
@@ -863,7 +939,7 @@ mod tests {
         let m = Mock::with(&[("blocked", 0)]);
         let mut out = HashMap::new();
         let sessions = vec![session("s1", Status::Blocked, 0)];
-        reconcile(m.as_ref(), &sessions, &mut out, 1_000_000, None, 0, false).await;
+        reconcile(m.as_ref(), &sessions, &mut out, &mut HashMap::new(), 1_000_000, None, 0, false).await;
         assert!(out.is_empty());
         assert!(m.events().is_empty());
     }
@@ -873,19 +949,66 @@ mod tests {
         let m = Mock::with(&[("error", 60_000)]);
         let mut out = HashMap::new();
         let sessions = vec![session("s1", Status::Blocked, 0)];
-        reconcile(m.as_ref(), &sessions, &mut out, 1_000_000, None, 0, false).await;
+        reconcile(m.as_ref(), &sessions, &mut out, &mut HashMap::new(), 1_000_000, None, 0, false).await;
         assert!(out.is_empty());
         assert!(m.events().is_empty());
     }
 
     #[tokio::test]
     async fn send_failure_leaves_no_outstanding_so_next_tick_retries() {
+        // A definitely-not-delivered failure (connect error / API rejection).
         let m = Mock::with(&[("blocked", 60_000)]);
-        *m.send_err.lock().unwrap() = true;
+        *m.send_err.lock().unwrap() = Some(false);
         let mut out = HashMap::new();
+        let mut backoff = HashMap::new();
         let sessions = vec![session("s1", Status::Blocked, 0)];
-        reconcile(m.as_ref(), &sessions, &mut out, 60_000, None, 0, false).await;
+        reconcile(m.as_ref(), &sessions, &mut out, &mut backoff, 60_000, None, 0, false).await;
         assert!(out.is_empty(), "failed send must not populate outstanding");
+        assert!(backoff.is_empty(), "not-delivered failure sets no hold → next tick retries promptly");
+    }
+
+    #[tokio::test]
+    async fn maybe_delivered_failure_backs_off_then_retries_after_window() {
+        // A read timeout: the ping may already have landed, so the next tick must
+        // NOT resend immediately — it holds for the backoff window, then retries.
+        let m = Mock::with(&[("done", 60_000)]);
+        *m.send_err.lock().unwrap() = Some(true);
+        let mut out = HashMap::new();
+        let mut backoff = HashMap::new();
+        let sessions = vec![session("s1", Status::Done, 0)];
+        // Window elapsed → attempt; the send times out (maybe delivered).
+        reconcile(m.as_ref(), &sessions, &mut out, &mut backoff, 60_000, None, 0, false).await;
+        assert!(out.is_empty());
+        assert!(m.events().is_empty(), "a failed send emits no Send event");
+        assert!(matches!(backoff.get("s1"), Some(h) if h.for_status == Status::Done), "maybe-delivered failure sets a retry hold");
+        // Channel recovers, but we're still inside the hold → no retry.
+        *m.send_err.lock().unwrap() = None;
+        reconcile(m.as_ref(), &sessions, &mut out, &mut backoff, 60_000 + 1_000, None, 0, false).await;
+        assert!(m.events().is_empty(), "no retry while the hold is active");
+        assert!(out.is_empty());
+        // Past the hold → retries and succeeds, clearing the hold.
+        reconcile(m.as_ref(), &sessions, &mut out, &mut backoff, 60_000 + UNCERTAIN_RETRY_BACKOFF_MS + 1, None, 0, false).await;
+        assert_eq!(out.len(), 1, "retries once the backoff window elapses");
+        assert!(!backoff.contains_key("s1"), "a successful send clears the hold");
+    }
+
+    #[tokio::test]
+    async fn retry_hold_cleared_when_state_changes_so_new_state_pings_promptly() {
+        // A hold is scoped to the state that failed; a *new* actionable state
+        // must ping at once rather than inheriting the old state's backoff.
+        let m = Mock::with(&[("done", 60_000), ("blocked", 60_000)]);
+        *m.send_err.lock().unwrap() = Some(true);
+        let mut out = HashMap::new();
+        let mut backoff = HashMap::new();
+        let done = vec![session("s1", Status::Done, 0)];
+        reconcile(m.as_ref(), &done, &mut out, &mut backoff, 60_000, None, 0, false).await;
+        assert!(matches!(backoff.get("s1"), Some(h) if h.for_status == Status::Done));
+        // Same session is now Blocked; channel recovered.
+        *m.send_err.lock().unwrap() = None;
+        let blocked = vec![session("s1", Status::Blocked, 0)];
+        reconcile(m.as_ref(), &blocked, &mut out, &mut backoff, 60_000, None, 0, false).await;
+        assert_eq!(out.len(), 1, "the new Blocked state pings promptly");
+        assert_eq!(out["s1"].for_status, Status::Blocked);
     }
 
     // -------- fire_reason (per-state AFK + reaction rule) --------
@@ -1019,10 +1142,10 @@ mod tests {
         let sessions = vec![session_with_message("s1", Status::Done, 0, &text)];
         let mut out = HashMap::new();
         // 90s in, idle 90s: today this fires (idle > 60s); now suppressed mid-read.
-        reconcile(m.as_ref(), &sessions, &mut out, 90_000, Some(90_000), 15, false).await;
+        reconcile(m.as_ref(), &sessions, &mut out, &mut HashMap::new(), 90_000, Some(90_000), 15, false).await;
         assert!(out.is_empty(), "present reader of a long message isn't pinged mid-read");
         // 170s in, idle 170s: past the 60s + 100s budget → fires.
-        reconcile(m.as_ref(), &sessions, &mut out, 170_000, Some(170_000), 15, false).await;
+        reconcile(m.as_ref(), &sessions, &mut out, &mut HashMap::new(), 170_000, Some(170_000), 15, false).await;
         assert_eq!(out.len(), 1, "fires once the reading budget elapses");
     }
 
@@ -1036,7 +1159,7 @@ mod tests {
         s.label = "api error".into();
         let sessions = vec![s];
         let mut out = HashMap::new();
-        reconcile(m.as_ref(), &sessions, &mut out, 61_000, Some(0), 15, false).await;
+        reconcile(m.as_ref(), &sessions, &mut out, &mut HashMap::new(), 61_000, Some(0), 15, false).await;
         assert_eq!(out.len(), 1, "error backstop fires off its short label, not the stale long turn");
     }
 
@@ -1046,7 +1169,7 @@ mod tests {
         let mut out = HashMap::new();
         // Done for 10s, user idle 70s (away since before it finished).
         let sessions = vec![session("s1", Status::Done, 0)];
-        reconcile(m.as_ref(), &sessions, &mut out, 10_000, Some(70_000), 0, false).await;
+        reconcile(m.as_ref(), &sessions, &mut out, &mut HashMap::new(), 10_000, Some(70_000), 0, false).await;
         assert_eq!(out.len(), 1, "AFK path fires done");
         assert_eq!(out["s1"].for_status, Status::Done);
     }
@@ -1057,7 +1180,7 @@ mod tests {
         let mut out = HashMap::new();
         // Done for 10s but user touched the machine 2s ago → saw it.
         let sessions = vec![session("s1", Status::Done, 0)];
-        reconcile(m.as_ref(), &sessions, &mut out, 10_000, Some(2_000), 0, false).await;
+        reconcile(m.as_ref(), &sessions, &mut out, &mut HashMap::new(), 10_000, Some(2_000), 0, false).await;
         assert!(out.is_empty(), "present user => no done ping");
         assert!(m.events().is_empty());
     }
@@ -1070,7 +1193,7 @@ mod tests {
         let m = Mock::with_rules(&[("done", AFK_ONLY)]);
         let mut out = HashMap::new();
         let sessions = vec![session_with_message("s1", Status::Done, 0, &"x".repeat(5_000))];
-        reconcile(m.as_ref(), &sessions, &mut out, 0, Some(0), 15, true).await;
+        reconcile(m.as_ref(), &sessions, &mut out, &mut HashMap::new(), 0, Some(0), 15, true).await;
         assert_eq!(out.len(), 1, "high alert pings immediately");
         assert_eq!(out["s1"].for_status, Status::Done);
     }
@@ -1082,7 +1205,7 @@ mod tests {
         let m = Mock::with_rules(&[("done", StateNotify { afk_window_ms: Some(0), reaction_window_ms: Some(0) })]);
         let mut out = HashMap::new();
         let sessions = vec![session("s1", Status::Done, 0)];
-        reconcile(m.as_ref(), &sessions, &mut out, 0, Some(0), 0, true).await;
+        reconcile(m.as_ref(), &sessions, &mut out, &mut HashMap::new(), 0, Some(0), 0, true).await;
         assert!(out.is_empty(), "disabled state stays silent under high alert");
         assert!(m.events().is_empty());
     }

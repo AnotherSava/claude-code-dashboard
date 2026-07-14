@@ -4,7 +4,7 @@ use std::sync::RwLock;
 use std::time::Duration;
 
 use crate::config::{StateNotify, TelegramConfig};
-use crate::notifications::{build_message_text, Notifier};
+use crate::notifications::{build_message_text, Notifier, SendError};
 use crate::state::AgentSession;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -133,17 +133,26 @@ impl TelegramNotifier {
         }
     }
 
-    /// Send a free-form message — used by the `test_telegram_notification`
-    /// command. Returns the message_id stringified.
-    pub async fn send_raw(&self, text: &str) -> anyhow::Result<String> {
-        let creds = self.creds().ok_or_else(|| anyhow::anyhow!("telegram disabled"))?;
+    /// Send message text, returning the new message_id string or a *typed*
+    /// error whose delivery certainty the retry policy inspects (see
+    /// [`TelegramCallError::maybe_delivered`]). The typed-error boundary is why
+    /// the per-state notification path calls this rather than [`send_raw`].
+    async fn send_text(&self, text: &str) -> Result<String, TelegramCallError> {
+        let creds = self.creds().ok_or(TelegramCallError::Disabled)?;
         let body = serde_json::json!({ "chat_id": creds.chat_id, "text": text });
         let resp = self.call("sendMessage", body).await?;
-        let id = resp
-            .pointer("/result/message_id")
+        resp.pointer("/result/message_id")
             .and_then(|v| v.as_i64())
-            .ok_or_else(|| anyhow::anyhow!("missing result.message_id in sendMessage response"))?;
-        Ok(id.to_string())
+            .map(|id| id.to_string())
+            .ok_or(TelegramCallError::Api { code: 0, description: "missing result.message_id in sendMessage response".to_string() })
+    }
+
+    /// Send a free-form message — used by the `test_telegram_notification`
+    /// command and the context-alert / limit-reset paths. Returns the
+    /// message_id stringified. Erases the delivery certainty into `anyhow`;
+    /// callers that need it (the per-state retry backoff) use the trait `send`.
+    pub async fn send_raw(&self, text: &str) -> anyhow::Result<String> {
+        self.send_text(text).await.map_err(|e| anyhow::anyhow!(e))
     }
 }
 
@@ -152,6 +161,20 @@ enum TelegramCallError {
     Disabled,
     Http(reqwest::Error),
     Api { code: i64, description: String },
+}
+
+impl TelegramCallError {
+    /// Whether the failure might mean the message already reached Telegram — the
+    /// signal the per-state retry backoff keys on. A *post-connect read timeout*
+    /// is ambiguous: Telegram may have delivered the message and only the ACK was
+    /// lost, so an immediate retry can duplicate (a bot can't read its own sends,
+    /// so there's no way to dedupe). Everything else — a connect error (never
+    /// reached Telegram), an API rejection, or disabled — definitely didn't
+    /// deliver, so a prompt retry is duplicate-free. Mirrors the `delivery` tag
+    /// logged in [`call`].
+    fn maybe_delivered(&self) -> bool {
+        matches!(self, Self::Http(e) if e.is_timeout() && !e.is_connect())
+    }
 }
 
 impl std::fmt::Display for TelegramCallError {
@@ -195,9 +218,9 @@ impl Notifier for TelegramNotifier {
         self.inner.read().unwrap().rules.clone()
     }
 
-    async fn send(&self, session: &AgentSession) -> anyhow::Result<String> {
+    async fn send(&self, session: &AgentSession) -> Result<String, SendError> {
         let text = build_message_text(session);
-        self.send_raw(&text).await
+        self.send_text(&text).await.map_err(|e| SendError { maybe_delivered: e.maybe_delivered(), source: anyhow::anyhow!(e) })
     }
 
     async fn dismiss(&self, handle: &str) -> anyhow::Result<()> {
