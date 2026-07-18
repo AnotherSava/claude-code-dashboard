@@ -247,7 +247,11 @@ fn classify_detailed(
     match event {
         "UserPromptSubmit" => {
             let prompt = payload.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
-            if prompt.trim().is_empty() {
+            // A `<task-notification>` (background-task completion) is auto-submitted
+            // as a prompt to wake the agent — it resumes the *existing* task, so
+            // classify it like an empty/continuation prompt (no label → no task
+            // boundary, `original_prompt` preserved) rather than a fresh task.
+            if prompt.trim().is_empty() || is_system_injected(prompt.trim()) {
                 Some(Classification::new(Status::Working, None, "user submitted a prompt (empty/continuation)"))
             } else {
                 Some(Classification::new(Status::Working, Some(clean_prompt(prompt)), "user submitted a prompt"))
@@ -944,6 +948,18 @@ mod tests {
     #[test]
     fn user_prompt_submit_missing_prompt_returns_working_without_label() {
         let p = json!({});
+        let (status, label) = classify("UserPromptSubmit", &p, NO_RULES).unwrap();
+        assert_eq!(status, Status::Working);
+        assert_eq!(label, None);
+    }
+
+    #[test]
+    fn user_prompt_submit_task_notification_returns_working_without_label() {
+        // A background-task completion is auto-submitted as a `<task-notification>`
+        // prompt. It resumes the existing task, so it must classify like an
+        // empty/continuation prompt (no label) — never clobber `original_prompt`
+        // or the row preview with the notification text.
+        let p = json!({"prompt": "<task-notification>\n<status>completed</status>\n</task-notification>"});
         let (status, label) = classify("UserPromptSubmit", &p, NO_RULES).unwrap();
         assert_eq!(status, Status::Working);
         assert_eq!(label, None);
