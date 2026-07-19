@@ -29,17 +29,11 @@ export function getUsageIntensityWeeks(): Promise<WeekChart[]> {
   return invoke<WeekChart[]>('get_usage_intensity_weeks')
 }
 
-// Resolves to the window's OS-authoritative scale factor (null if unavailable)
-// so the caller can size future measures against it instead of the flaky
-// WebView2 devicePixelRatio. See the Rust `apply_auto_resize` for why.
-export function applyAutoResize(physicalHeight: number): Promise<number | null> {
+// Resize the main window to fit `physicalHeight` physical px. Fire-and-forget:
+// the frontend sizes against the webview's own devicePixelRatio (see App.svelte
+// effectiveScale), so nothing needs to round-trip back from Rust.
+export function applyAutoResize(physicalHeight: number): Promise<void> {
   return invoke('apply_auto_resize', { physicalHeight })
-}
-
-// The window's OS scale factor, fetched once at mount to seed the conversion
-// scale before the first auto-resize measure.
-export function getScaleFactor(): Promise<number | null> {
-  return invoke('get_scale_factor')
 }
 
 export function frontendLog(

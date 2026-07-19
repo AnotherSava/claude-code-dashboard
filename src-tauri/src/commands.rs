@@ -127,17 +127,13 @@ pub fn get_usage_intensity_weeks(app: AppHandle) -> Result<Vec<crate::usage_hist
     Ok(weeks)
 }
 
-/// Resize the main window to `physical_height` and return the window's
-/// OS-authoritative per-monitor scale factor. The frontend sizes future
-/// measures against this returned value rather than the WebView2
-/// `devicePixelRatio`: that JS reading misreads (e.g. 1.5→1.0) for tens of
-/// seconds on mixed-DPI setups, and multiplying the content height by a low
-/// misread collapsed the window to a header sliver (~9% of measures). The OS
-/// scale factor read here is stable across that flap, so adopting it kills the
-/// collapse while keeping the physical-px protocol that fixed the DPI drift.
+/// Resize the main window to fit `physical_height` physical px. The frontend
+/// sizes against the webview's own `devicePixelRatio` (the ratio it rasterizes
+/// content at), which — unlike Rust's `window.scale_factor()` — tracks the
+/// window landing on a different-DPI monitor, so nothing round-trips back here.
 #[tauri::command]
-pub fn apply_auto_resize(physical_height: f64, app: AppHandle) -> Option<f64> {
-    let window = app.get_webview_window("main")?;
+pub fn apply_auto_resize(physical_height: f64, app: AppHandle) {
+    let Some(window) = app.get_webview_window("main") else { return };
     let mode = app
         .try_state::<ConfigState>()
         .map(|s| s.snapshot().auto_resize)
@@ -145,16 +141,6 @@ pub fn apply_auto_resize(physical_height: f64, app: AppHandle) -> Option<f64> {
     if let Err(e) = crate::auto_resize::apply(&window, mode, physical_height) {
         tracing::warn!(?e, physical_height, "apply_auto_resize failed");
     }
-    window.scale_factor().ok()
-}
-
-/// The main window's OS-authoritative per-monitor scale factor. Called once at
-/// frontend mount to seed the conversion scale before the first auto-resize
-/// measure, so that first measure can't size against a WebView2
-/// `devicePixelRatio` misread (see `apply_auto_resize`).
-#[tauri::command]
-pub fn get_scale_factor(app: AppHandle) -> Option<f64> {
-    app.get_webview_window("main")?.scale_factor().ok()
 }
 
 /// Diagnostic ping from the frontend — writes a single JSONL line to

@@ -10,7 +10,6 @@
     applyAutoResize,
     frontendLog,
     getConfig,
-    getScaleFactor,
     getSessions,
     getSetupState,
     getUsageLimits,
@@ -69,27 +68,28 @@
   // just caused. (The DPI-mismatch loop itself is prevented by sizing in
   // physical px; see measureAndSend.)
   let suppressResizeUntil = 0
-  // window.devicePixelRatio is unreliable on mixed-DPI multi-monitor setups:
-  // WebView2 transiently reports 1.0 on a 150% monitor and holds it for tens of
-  // seconds before flipping back. Because the window is sized as `desired * dpr`,
-  // a low misread lands a collapsed physical height (seen in widget.jsonl: dpr
-  // flapping 1.5↔1.0, physical=105 shrinking a ~219px window to ~70 logical px
-  // — a header sliver), and it did so on ~9% of measures. The OS per-monitor
-  // scale factor read on the Rust side is stable across that flap, so we size
-  // against it instead: `apply_auto_resize` returns it and `get_scale_factor`
-  // seeds it at mount. `backendScale` holds the last value the backend reported;
-  // until it's seeded we fall back to devicePixelRatio (one provisional measure,
-  // immediately corrected by the first backend reply). (Width is not covered
-  // here — auto-resize preserves it backend-side — so a `minWidth` floor in
-  // tauri.conf.json guards the width axis against the same DPI events.)
-  let backendScale = 0 // 0 = not yet reported by the backend
+  // Size the window against the webview's own devicePixelRatio — the ratio it
+  // actually rasterizes content at, so `cssHeight * devicePixelRatio` is by
+  // construction the physical height that fits the content. We deliberately do
+  // NOT size against Rust's window.scale_factor(): it's read at window creation
+  // and does not track the window later landing on a different-DPI monitor, so
+  // on a mixed-DPI setup it goes stale. Observed in widget.jsonl after a
+  // relaunch onto a 150% monitor: devicePixelRatio correctly settled to 1.5
+  // within ~2s while scale_factor stayed stuck at 1.0 for 35+min, sizing the
+  // window at 1.0 and clipping the 1.5-rendered content to a sliver. (An earlier
+  // fix trusted scale_factor to dodge a devicePixelRatio flap; that traded a
+  // transient failure for this persistent one — see below and the
+  // `auto_resize_dpr_flicker_collapse` memory.)
+  //
+  // devicePixelRatio's only unreliability is a brief mount-time transient — it
+  // can read 1.0 for ~2s before settling — and that self-corrects because
+  // *every* dpr change re-fires a measure: the 'resize' listener plus the
+  // matchMedia('resolution') listener installed in onMount guarantee a settled
+  // dpr always re-sizes the window. That re-measure-on-change is the real cure
+  // for the stuck-sliver symptom in both directions. (Width is preserved
+  // backend-side, so a `minWidth` floor in tauri.conf.json guards that axis.)
   function effectiveScale(): number {
-    return backendScale || window.devicePixelRatio
-  }
-  // Adopt a scale the backend reported (mount seed and every apply reply share
-  // this so the two paths can't drift). Null/0 replies leave the last value.
-  function adoptScale(s: number | null) {
-    if (s) backendScale = s
+    return window.devicePixelRatio || 1
   }
   // Self-heal for the display-disable collapse: when a monitor holding the
   // widget is disabled, Windows moves/shrinks the window and swallows the
@@ -277,14 +277,13 @@
     }
     lastSentHeight = desired
     lastSentScale = scale
-    // Send PHYSICAL pixels computed from `scale` — the OS-authoritative
-    // per-monitor scale the backend reported (see effectiveScale) — not a
-    // logical height for Rust to scale. Near a mixed-DPI boundary Rust's
-    // window.scale_factor() and the webview's dpr disagree, so a logical request
-    // lands at the wrong physical size (false-overflow, scrollbar, drift); but a
-    // webview dpr flicker (1.5→1.0) is just as fatal the other way, collapsing
-    // the window to a header sliver. Sourcing the scale from the OS gives us
-    // both: physical-px sizing without the flaky devicePixelRatio.
+    // Send PHYSICAL pixels — `desired` (CSS px) times the webview's own
+    // devicePixelRatio (see effectiveScale) — not a logical height for Rust to
+    // scale. Near a mixed-DPI boundary Rust's window.scale_factor() and the
+    // webview's dpr disagree, so a logical request would land at the wrong
+    // physical size (false-overflow, scrollbar, drift); sizing in physical px
+    // off the ratio the webview actually rasterizes at avoids both that and the
+    // stale-scale collapse.
     suppressResizeUntil = Date.now() + 150
     frontendLog('trace', 'auto_resize measure', {
       desired,
@@ -295,10 +294,6 @@
       heal: healTries,
     }).catch(() => {})
     applyAutoResize(Math.round(desired * scale))
-      // Adopt the OS scale the backend read after applying, so the next measure
-      // sizes against it. A genuine monitor DPI change lands here within one
-      // measure; a transient webview dpr misread never enters the math at all.
-      .then(adoptScale)
       .catch((err) => console.error('apply_auto_resize failed', err))
     // A window less than half the height its content needs is the OS swallowing
     // our resize during a display/DPI transition — not the ~1-frame lag of a
@@ -355,11 +350,6 @@
           intensityMode = true
           return
         }
-        // Seed the conversion scale from the OS before the first measure so it
-        // can't size against a WebView2 devicePixelRatio misread (see
-        // effectiveScale). Fire-and-forget — it resolves well within the mount
-        // awaits below, and any later measure adopts the backend's reply anyway.
-        getScaleFactor().then(adoptScale).catch(() => {})
         config = await getConfig()
         sessions = await getSessions()
         usage = await getUsageLimits()
@@ -446,10 +436,29 @@
     // the overflow path settles instead of looping.)
     window.addEventListener('resize', onWindowResize)
 
+    // Re-measure whenever the webview's devicePixelRatio changes — the ~2s
+    // mount-time settle, or a monitor move across a DPI boundary. A dpr change
+    // doesn't reliably emit a 'resize' event, so without this a settled dpr
+    // could leave the window sized against the pre-change ratio until an
+    // unrelated trigger (the stuck-sliver symptom). matchMedia fires once per
+    // change and the query string pins the current ratio, so re-arm after each.
+    let dprMedia: MediaQueryList | null = null
+    function armDprListener() {
+      dprMedia?.removeEventListener('change', onDprChange)
+      dprMedia = window.matchMedia(`(resolution: ${window.devicePixelRatio}dppx)`)
+      dprMedia.addEventListener('change', onDprChange)
+    }
+    function onDprChange() {
+      armDprListener()
+      scheduleMeasure()
+    }
+    armDprListener()
+
     return () => {
       clearInterval(tickId)
       document.removeEventListener('visibilitychange', onVisibility)
       window.removeEventListener('resize', onWindowResize)
+      dprMedia?.removeEventListener('change', onDprChange)
       unlistenSessions?.()
       unlistenConfig?.()
       unlistenUsage?.()
