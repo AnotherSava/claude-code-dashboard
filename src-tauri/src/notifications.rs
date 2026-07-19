@@ -838,6 +838,7 @@ mod tests {
             updated: state_entered_at,
             state_entered_at,
             working_accumulated_ms: 0,
+            waiting_backstop_armed: false,
             display_name: None,
             origin: None,
         }

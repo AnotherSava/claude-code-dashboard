@@ -66,7 +66,7 @@ pub fn dispatch(event: &str, payload: &Value, cfg: &Config) -> AdapterOutput {
         return AdapterOutput::Boundary { id: chat_id };
     }
 
-    let Some(Classification { status, label, reason }) = classify_detailed(event, payload, QuestionRules::from_config(cfg)) else {
+    let Some(Classification { status, label, reason, waiting_backstop_armed }) = classify_detailed(event, payload, QuestionRules::from_config(cfg)) else {
         return AdapterOutput::Ignore;
     };
 
@@ -110,6 +110,7 @@ pub fn dispatch(event: &str, payload: &Value, cfg: &Config) -> AdapterOutput {
             model: None,
             input_tokens: None,
             dialog_entry,
+            waiting_backstop_armed,
         },
         transcript_path,
         reason,
@@ -166,11 +167,22 @@ struct Classification {
     status: Status,
     label: Option<String>,
     reason: String,
+    /// Only meaningful when `status == Waiting`: whether the WAIT is held by a
+    /// silently-killable background task (a `shell` command), which the
+    /// `waiting_settle` time-backstop must cover. A subagent-only WAIT sets this
+    /// `false` so the backstop leaves the row to the subagent's completion turn.
+    waiting_backstop_armed: bool,
 }
 
 impl Classification {
     fn new(status: Status, label: Option<String>, reason: impl Into<String>) -> Self {
-        Self { status, label, reason: reason.into() }
+        Self { status, label, reason: reason.into(), waiting_backstop_armed: false }
+    }
+
+    /// A `Waiting` classification carrying whether the time-backstop should arm
+    /// (a `shell` background task is in flight vs. subagents only).
+    fn waiting(backstop_armed: bool, reason: impl Into<String>) -> Self {
+        Self { status: Status::Waiting, label: None, reason: reason.into(), waiting_backstop_armed: backstop_armed }
     }
 }
 
@@ -184,6 +196,13 @@ fn classify(
     rules: QuestionRules,
 ) -> Option<(Status, Option<String>)> {
     classify_detailed(event, payload, rules).map(|c| (c.status, c.label))
+}
+
+/// The `type` discriminator of a `background_tasks` element — `"shell"` for a
+/// background `Bash` command, `"subagent"` for a background Agent (see the Stop
+/// hook schema at code.claude.com/docs/en/hooks.md). `None` when absent/malformed.
+fn task_type(task: &Value) -> Option<&str> {
+    task.get("type").and_then(|v| v.as_str())
 }
 
 /// Classify the `Stop` hook straight from its payload — authoritative, no
@@ -217,19 +236,33 @@ fn classify_stop(payload: &Value, rules: QuestionRules) -> Classification {
     }
 
     // `background_tasks` is present (and non-empty) only while background work is
-    // in flight — the signal for the "main turn settled but subagents are still
-    // running" Waiting state, set here at Stop time instead of scraped from the
-    // transcript's `pendingBackgroundAgentCount`. Label is left unset so the
+    // in flight — the signal for the "main turn settled but background work is
+    // still running" Waiting state, set here at Stop time instead of scraped from
+    // the transcript's `pendingBackgroundAgentCount`. Label is left unset so the
     // working task label is preserved while the row waits.
+    //
+    // The two documented task `type`s have opposite silent-end semantics, so we
+    // arm the `waiting_settle` time-backstop by kind: a background `shell`
+    // command can be killed via the Claude UI, which fires no hook and writes
+    // nothing to the transcript, so a WAIT it holds would sit stuck without the
+    // backstop; a background `subagent` always resolves with a completion turn,
+    // so its WAIT is left to that turn and time-settling it would falsely mark a
+    // live subagent Done. Arm unless *every* in-flight task is a subagent, so an
+    // unknown/future type stays covered by the backstop (safety net over stuck).
     let background_pending = payload
         .get("background_tasks")
         .and_then(|v| v.as_array())
         .filter(|tasks| !tasks.is_empty());
     if let Some(tasks) = background_pending {
-        return Classification::new(
-            Status::Waiting,
-            None,
-            format!("turn ended with {} background task(s) still in flight → waiting", tasks.len()),
+        let shell = tasks.iter().filter(|t| task_type(t) == Some("shell")).count();
+        let subagent = tasks.iter().filter(|t| task_type(t) == Some("subagent")).count();
+        let other = tasks.len() - shell - subagent;
+        let armed = tasks.iter().any(|t| task_type(t) != Some("subagent"));
+        let other_note = if other > 0 { format!(", {other} other") } else { String::new() };
+        let backstop = if armed { "armed" } else { "disarmed (subagent-only self-resolves on its completion turn)" };
+        return Classification::waiting(
+            armed,
+            format!("turn ended with background work still in flight ({shell} shell, {subagent} subagent{other_note}) → waiting; backstop {backstop}"),
         );
     }
 
@@ -1023,6 +1056,58 @@ mod tests {
         let (status, label) = classify("Stop", &p, NO_RULES).unwrap();
         assert_eq!(status, Status::Blocked);
         assert_eq!(label.as_deref(), Some("has a question"));
+    }
+
+    #[test]
+    fn waiting_from_shell_task_arms_the_backstop() {
+        // A background `shell` command can be killed silently (fires no hook),
+        // so the WAIT it holds needs the `waiting_settle` time-backstop.
+        let p = json!({
+            "last_assistant_message": "Kicked off the batch.",
+            "background_tasks": [{"type": "shell", "command": "npm run dev"}]
+        });
+        let c = classify_stop(&p, NO_RULES);
+        assert_eq!(c.status, Status::Waiting);
+        assert!(c.waiting_backstop_armed, "shell task must arm the backstop");
+    }
+
+    #[test]
+    fn waiting_from_subagent_only_disarms_the_backstop() {
+        // A background subagent always resolves with a completion turn, so its
+        // WAIT must NOT be time-settled — time-settling a live subagent would
+        // falsely mark it Done. Leave the backstop disarmed.
+        let p = json!({
+            "last_assistant_message": "Spawned the reviewer.",
+            "background_tasks": [{"type": "subagent", "agent_type": "code-reviewer"}]
+        });
+        let c = classify_stop(&p, NO_RULES);
+        assert_eq!(c.status, Status::Waiting);
+        assert!(!c.waiting_backstop_armed, "subagent-only WAIT must leave the backstop disarmed");
+    }
+
+    #[test]
+    fn waiting_from_mixed_tasks_arms_the_backstop() {
+        // A shell task alongside a subagent still arms the backstop — the shell
+        // is the silently-killable one.
+        let p = json!({
+            "background_tasks": [
+                {"type": "subagent", "agent_type": "explorer"},
+                {"type": "shell", "command": "cargo test"}
+            ]
+        });
+        let c = classify_stop(&p, NO_RULES);
+        assert_eq!(c.status, Status::Waiting);
+        assert!(c.waiting_backstop_armed);
+    }
+
+    #[test]
+    fn waiting_from_unknown_task_type_arms_the_backstop() {
+        // An unknown/future task type stays covered by the backstop (safety net
+        // over a stuck row) — only an all-subagent WAIT disarms it.
+        let p = json!({"background_tasks": [{"type": "future-thing"}]});
+        let c = classify_stop(&p, NO_RULES);
+        assert_eq!(c.status, Status::Waiting);
+        assert!(c.waiting_backstop_armed);
     }
 
     // ----- classify: Notification -----

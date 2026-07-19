@@ -281,6 +281,7 @@ mod tests {
             updated: 0,
             state_entered_at: 0,
             working_accumulated_ms: 0,
+            waiting_backstop_armed: false,
             display_name: None,
             origin: None,
         }

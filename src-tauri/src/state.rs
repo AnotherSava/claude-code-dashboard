@@ -90,6 +90,16 @@ pub struct AgentSession {
     pub updated: i64,
     pub state_entered_at: i64,
     pub working_accumulated_ms: u64,
+    /// Only meaningful while `status == Waiting`: `true` when the WAIT is held
+    /// by at least one silently-killable background task (a `shell` command),
+    /// which the `waiting_settle` time-backstop must cover. A subagent-only WAIT
+    /// leaves this `false` — a background subagent always resolves with a
+    /// completion turn, so time-settling it would falsely mark a live subagent
+    /// Done. Set by `apply_set` from the `Stop` classification. Internal
+    /// bookkeeping, never serialized (a restored row is never in WAIT since
+    /// `status` isn't persisted).
+    #[serde(skip)]
+    pub waiting_backstop_armed: bool,
     /// User-assigned display name, resolved from `CustomNamesStore` at emit
     /// time (keyed by `id`). Always `None` in `AppState`; filled on the way
     /// to the frontend. Not persisted in `prompt_history`.
@@ -122,6 +132,10 @@ pub struct SetInput {
     pub model: Option<String>,
     pub input_tokens: Option<u64>,
     pub dialog_entry: Option<PendingDialogEntry>,
+    /// Set by the `Stop` adapter when it classifies `Waiting`: `true` when a
+    /// silently-killable (`shell`) background task holds the WAIT, arming the
+    /// `waiting_settle` backstop. `false` for every other event/status.
+    pub waiting_backstop_armed: bool,
 }
 
 /// True when `label` (after trim, case-insensitive) matches one of the
@@ -285,6 +299,7 @@ impl AppState {
             }
 
             existing.status = input.status;
+            existing.waiting_backstop_armed = input.waiting_backstop_armed;
             existing.label = new_label;
             existing.original_prompt = new_original_prompt;
             if let Some(src) = input.source {
@@ -372,6 +387,7 @@ impl AppState {
                 updated: now_ms,
                 state_entered_at: now_ms,
                 working_accumulated_ms: 0,
+                waiting_backstop_armed: input.waiting_backstop_armed,
                 display_name: None,
                 origin: None,
             });
@@ -575,6 +591,7 @@ mod tests {
             model: None,
             input_tokens: None,
             dialog_entry: None,
+            waiting_backstop_armed: false,
         }
     }
 
@@ -587,6 +604,7 @@ mod tests {
             model: None,
             input_tokens: None,
             dialog_entry: None,
+            waiting_backstop_armed: false,
         }
     }
 
@@ -862,6 +880,7 @@ mod tests {
                 model: Some("claude-opus-4-7".into()),
                 input_tokens: Some(50_000),
                 dialog_entry: None,
+                waiting_backstop_armed: false,
             },
             1000,
             NO_CONTINUATIONS,
@@ -1037,6 +1056,7 @@ mod tests {
                 role: DialogRole::User,
                 text: label.to_string(),
             }),
+            waiting_backstop_armed: false,
         }
     }
 
@@ -1052,6 +1072,7 @@ mod tests {
                 role: DialogRole::Assistant,
                 text: agent_text.to_string(),
             }),
+            waiting_backstop_armed: false,
         }
     }
 
@@ -1206,6 +1227,7 @@ mod tests {
             updated: 0,
             state_entered_at: 0,
             working_accumulated_ms: 0,
+            waiting_backstop_armed: false,
             display_name: None,
             origin: None,
         });
@@ -1443,6 +1465,7 @@ mod tests {
             updated: 0,
             state_entered_at: 0,
             working_accumulated_ms: 0,
+            waiting_backstop_armed: false,
             display_name: None,
             origin: Some(origin.to_string()),
         }

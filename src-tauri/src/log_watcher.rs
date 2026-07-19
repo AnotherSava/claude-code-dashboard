@@ -211,12 +211,13 @@ pub fn apply_watcher_update(
     now_ms: i64,
 ) -> bool {
     let mut changed = false;
-    // The watcher drives the two transcript-derived *active* states. `Working` is
-    // a pure promote (carry a too-early `Stop` back). `Waiting` is the "main turn
-    // done, background agents still running" state and may move a row off
-    // `Working` — but only when the turn genuinely resolved Done with agents
-    // pending (see `infer_state`), never on a stale read. Done/Idle/Blocked come
-    // from lifecycle hooks, so the watcher leaves them alone.
+    // The watcher is a promote *to* `Working` only: `infer_state` resolves the
+    // transcript to `Working` when the main turn resumed (a tool call or a fresh
+    // user prompt after a too-early `Stop`), and this carries the row back. It
+    // never demotes — `Done`/`Idle`/`Blocked`/`Error` come from lifecycle hooks,
+    // and `Waiting` from the adapter's `Stop`-time `background_tasks`
+    // classification, so the watcher leaves them alone. (The arm still accepts
+    // `Waiting` defensively, but `infer_state` never yields it.)
     match update.state {
         Some(s @ (Status::Working | Status::Waiting)) if session.status != s => {
             session.status = s;
@@ -1008,6 +1009,7 @@ mod tests {
             updated: 0,
             state_entered_at: 0,
             working_accumulated_ms: 0,
+            waiting_backstop_armed: false,
             display_name: None,
             origin: None,
         }
