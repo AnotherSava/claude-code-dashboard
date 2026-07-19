@@ -241,28 +241,34 @@ fn classify_stop(payload: &Value, rules: QuestionRules) -> Classification {
     // the transcript's `pendingBackgroundAgentCount`. Label is left unset so the
     // working task label is preserved while the row waits.
     //
-    // The two documented task `type`s have opposite silent-end semantics, so we
-    // arm the `waiting_settle` time-backstop by kind: a background `shell`
-    // command can be killed via the Claude UI, which fires no hook and writes
-    // nothing to the transcript, so a WAIT it holds would sit stuck without the
-    // backstop; a background `subagent` always resolves with a completion turn,
-    // so its WAIT is left to that turn and time-settling it would falsely mark a
-    // live subagent Done. Arm unless *every* in-flight task is a subagent, so an
-    // unknown/future type stays covered by the backstop (safety net over stuck).
+    // Task `type`s have opposite silent-end semantics, so we arm the
+    // `waiting_settle` time-backstop by kind. Only a background `shell` command
+    // ends silently: the user can kill it via the Claude UI (down-arrow → x),
+    // which fires no hook and writes nothing, so a WAIT it holds would sit stuck
+    // without the backstop. Every Claude-managed kind — `subagent`, `Workflow`,
+    // and any other — instead resolves with a completion `<task-notification>`
+    // that drives a follow-up turn whose `Stop` clears the WAIT, so time-settling
+    // one would falsely mark still-running work Done. Hence: arm *only* when a
+    // `shell` task is in flight. (An earlier "arm unless all-subagent" default
+    // wrongly settled a running Workflow — typed neither shell nor subagent — to
+    // Done after the window; see the printlab regression.)
     let background_pending = payload
         .get("background_tasks")
         .and_then(|v| v.as_array())
         .filter(|tasks| !tasks.is_empty());
     if let Some(tasks) = background_pending {
-        let shell = tasks.iter().filter(|t| task_type(t) == Some("shell")).count();
-        let subagent = tasks.iter().filter(|t| task_type(t) == Some("subagent")).count();
-        let other = tasks.len() - shell - subagent;
-        let armed = tasks.iter().any(|t| task_type(t) != Some("subagent"));
-        let other_note = if other > 0 { format!(", {other} other") } else { String::new() };
-        let backstop = if armed { "armed" } else { "disarmed (subagent-only self-resolves on its completion turn)" };
+        // Tally by `type` so an unknown/new kind is named in the log, not bucketed
+        // into an opaque "other" (which hid the Workflow case).
+        let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+        for t in tasks {
+            *counts.entry(task_type(t).unwrap_or("untyped")).or_default() += 1;
+        }
+        let armed = counts.contains_key("shell");
+        let breakdown = counts.iter().map(|(k, n)| format!("{n} {k}")).collect::<Vec<_>>().join(", ");
+        let backstop = if armed { "armed" } else { "disarmed (no killable shell task; resolves on its completion turn)" };
         return Classification::waiting(
             armed,
-            format!("turn ended with background work still in flight ({shell} shell, {subagent} subagent{other_note}) → waiting; backstop {backstop}"),
+            format!("turn ended with background work still in flight ({breakdown}) → waiting; backstop {backstop}"),
         );
     }
 
@@ -1101,13 +1107,18 @@ mod tests {
     }
 
     #[test]
-    fn waiting_from_unknown_task_type_arms_the_backstop() {
-        // An unknown/future task type stays covered by the backstop (safety net
-        // over a stuck row) — only an all-subagent WAIT disarms it.
-        let p = json!({"background_tasks": [{"type": "future-thing"}]});
-        let c = classify_stop(&p, NO_RULES);
-        assert_eq!(c.status, Status::Waiting);
-        assert!(c.waiting_backstop_armed);
+    fn waiting_from_non_shell_task_disarms_the_backstop() {
+        // The printlab regression: a running Workflow reports a `type` that's
+        // neither "shell" nor "subagent". Like a subagent it resolves with a
+        // completion turn, so it must NOT be time-settled — only a killable shell
+        // arms the backstop. Covers Workflow, an unknown future type, and a
+        // task with no `type` field at all.
+        for t in [json!({"type": "workflow"}), json!({"type": "future-thing"}), json!({})] {
+            let p = json!({"background_tasks": [t]});
+            let c = classify_stop(&p, NO_RULES);
+            assert_eq!(c.status, Status::Waiting);
+            assert!(!c.waiting_backstop_armed, "a non-shell task must leave the backstop disarmed");
+        }
     }
 
     // ----- classify: Notification -----
