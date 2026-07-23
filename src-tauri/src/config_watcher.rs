@@ -74,6 +74,18 @@ pub fn spawn(app: AppHandle, path: PathBuf) {
                 continue; // no effective change (likely our own write)
             }
             state.with_mut(|c| *c = new_cfg.clone());
+            // If the adherence canary was turned off, clear any stranded drift
+            // flags so the row badge + terminal-title ⚠ drop immediately (the
+            // Telegram reconciler already dismisses its pings on the toggle). The
+            // Stop-path drift writer lives behind the feature gate, so nothing else
+            // would ever clear the flag. Idempotent + no-op when nothing is flagged.
+            if !new_cfg.instruction_canary_enabled {
+                if let Some(app_state) = app.try_state::<crate::state::AppState>() {
+                    if app_state.clear_all_drift(crate::commands::now_ms()) {
+                        crate::commands::emit_sessions_updated(&app);
+                    }
+                }
+            }
             apply_config_to_window(&app, &new_cfg, Some(&prior));
             // Re-render the tray badge in case `tray_badge` changed externally.
             crate::tray_badge::refresh(&app);

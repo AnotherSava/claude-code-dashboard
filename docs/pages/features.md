@@ -46,6 +46,10 @@ The dashboard doesn't just relay raw events — it reads the conversation to kee
 
 Several of these rules are tunable — see [Settings](settings) — and the full ruleset is documented under [Classification](development/classification).
 
+## Instruction adherence
+
+Over a long conversation an agent can gradually stop honoring its standing instructions. As an early-warning tripwire, the dashboard can hand each session a private one-time token when it starts and ask the agent to end every reply with it. Each time the agent finishes, the dashboard checks that the token is there — if it's missing, the row is flagged with a ⚠ (on the dashboard, on the terminal tab, and as a Telegram ping), a cue to look closely at that session's output before trusting it, and perhaps to compact or re-anchor the conversation. The flag clears itself as soon as the agent's next reply carries the token again. The agent's name is also tinted by its canary status — green once it's confirmed following, amber while still unconfirmed, red if it's drifted. The token is hidden — it renders invisibly in your terminal — and stripped from the dashboard's own history and notifications, so it never clutters what you read. Off by default; see [Settings](settings#instruction-adherence).
+
 ## Context usage
 
 The row shows the session's live context usage, updated as Claude works. The count is colored green → amber → red as it climbs toward the model's context window, so you can tell at a glance whether `/compact` is due.

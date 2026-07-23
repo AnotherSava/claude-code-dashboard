@@ -96,6 +96,8 @@ mod tests {
             waiting_backstop_armed: false,
             display_name: None,
             origin: None,
+            instruction_drift: false,
+            canary: crate::state::Canary::Off,
         }
     }
 

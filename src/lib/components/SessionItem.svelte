@@ -144,6 +144,11 @@
   )
   const tokColor = $derived(tokenColor(session, config))
   const shouldPulse = $derived(session.status === 'blocked' || session.status === 'error')
+  // Agent-name color by canary status: green (confirmed adhering), amber (set up
+  // but not yet confirmed), red (drifted), default near-white (not set up).
+  const canaryClass = $derived(
+    !session.canary || session.canary === 'off' ? '' : `canary-${session.canary}`,
+  )
 
   function formatClock(ms: number): string {
     if (!ms) return ' --:--'
@@ -253,12 +258,15 @@
           onblur={cancelEdit}
         />
       {:else}
-        <span class="id" title="{displayName} — double-click to rename" ondblclick={startEdit} role="textbox" tabindex="-1">{displayName}</span>
+        <span class="id {canaryClass}" title="{displayName} — double-click to rename" ondblclick={startEdit} role="textbox" tabindex="-1">{displayName}</span>
       {/if}
       {#if session.origin}
         <span class="device" title="Session on {session.origin}">{session.origin}</span>
       {/if}
       <span class="pill state-{session.status}" class:pulse={shouldPulse}>{stateLabel[session.status]}</span>
+      {#if session.instruction_drift}
+        <span class="drift" title="Instruction drift — the last reply dropped its adherence marker; treat its output with caution">⚠</span>
+      {/if}
       <span class="time">{time}</span>
       <span class="tokens" style:color={tokColor}>{#if tokensText}{tokensText}<span class="k">k</span>{/if}</span>
     </div>
@@ -309,6 +317,17 @@
     flex: 1;
     min-width: 0;
   }
+  /* Canary status on the agent name: green = confirmed adhering, amber = set up
+     but not yet confirmed, red = drifted, default (#e8e8ea above) = not set up. */
+  .id.canary-alive {
+    color: #86efac;
+  }
+  .id.canary-pending {
+    color: #d9b44a;
+  }
+  .id.canary-dead {
+    color: #f87171;
+  }
   .id-edit {
     font-size: 13px;
     font-weight: 600;
@@ -335,6 +354,16 @@
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
+  }
+  .drift {
+    font-size: 11px;
+    color: #fca5a5;
+    background: #3a1e1e;
+    padding: 2px 5px;
+    border-radius: 9px;
+    flex-shrink: 0;
+    line-height: 1.3;
+    cursor: default;
   }
   .pill {
     font-size: 9px;

@@ -226,7 +226,7 @@ def main() -> None:
     url = os.environ.get("TAURI_DASHBOARD_URL", DEFAULT_URL).rstrip("/") + "/api/event"
     body = {"client": "claude", "event": event, "payload": payload, "console_pids": console_pids(), "agent_pid": agent_pid()}
     try:
-        urllib.request.urlopen(
+        with urllib.request.urlopen(
             urllib.request.Request(
                 url,
                 data=json.dumps(body).encode(),
@@ -234,7 +234,22 @@ def main() -> None:
                 method="POST",
             ),
             timeout=2,
-        )
+        ) as resp:
+            # SessionStart is the only event whose stdout Claude Code folds back
+            # into the model's context. When the instruction-adherence canary is
+            # on, the widget returns an `additional_context` string (the per-session
+            # marker instruction); echo it as the documented SessionStart
+            # additionalContext so Claude ends each reply with the hidden marker.
+            # Every other event — and a widget build / config with the feature off —
+            # returns nothing here, so the hook stays silent.
+            if event == "SessionStart":
+                try:
+                    data = json.loads(resp.read().decode("utf-8", "replace") or "{}")
+                except Exception:
+                    data = {}
+                ctx = data.get("additional_context") if isinstance(data, dict) else None
+                if ctx:
+                    print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": ctx}}))
     except Exception:
         pass  # widget may not be running — swallow so Claude hooks don't hard-fail
 

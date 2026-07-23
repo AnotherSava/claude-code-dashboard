@@ -48,6 +48,8 @@ Every field is optional — omit one and the built-in default applies. A complet
   "detect_cancelled_turns": true,
   "reap_exited_sessions": true,
   "waiting_settle_ms": 600000,
+  "instruction_canary_enabled": false,
+  "instruction_canary_marker": "<!-- {nonce} -->",
   "save_window_position": true,
   "window_position": null,
   "history_window_position": null,
@@ -118,6 +120,13 @@ Whether autostart is enabled isn't a config field — it lives in the OS launch 
 - `detect_cancelled_turns` — settle a working row back out of the working state when its turn was cancelled with Esc, returning it to wherever it was before that turn — a question it was waiting on, otherwise idle — so a cancelled reply doesn't get mistaken for a new task. Cancelling emits no event; the dashboard recognizes it from the conversation transcript, and on Windows also by noticing the terminal returned to its idle prompt (which catches an instant cancel that left nothing in the transcript). On by default. Turn it off to leave a cancelled row showing as working until the next prompt.
 - `reap_exited_sessions` — remove a session's row once you've quit it (typed `exit`, pressed Ctrl-D, or closed the terminal). Quitting that way doesn't reliably tell the dashboard the session ended, so the row would otherwise linger — often stuck showing "working" if you quit mid-turn. The dashboard removes it once it confirms the session's process is gone. On by default. Turn it off to keep rows until you clear them or restart the app.
 - `waiting_settle_ms` — how long a row can sit in WAIT (background work still running) before the dashboard settles it to DONE on its own. WAIT normally clears when the background work finishes, but if you *stop* it yourself — say you kill a background dev server — nothing tells the dashboard, so the row would otherwise stay WAIT until your next prompt. This backstop clears it after the set time (10 minutes by default). `null` or `0` turns it off.
+
+### Instruction adherence
+
+An opt-in tripwire for an agent that has drifted from its standing instructions over a long conversation. See [Features → instruction adherence](features#instruction-adherence).
+
+- `instruction_canary_enabled` — when on, each session is handed a rotating one-time token at startup and asked to end every reply with it; each time the agent finishes, the dashboard checks the final message for that token. A miss flags the row with a ⚠ badge, adds a ⚠ to its terminal tab title, and sends a Telegram ping (when Telegram is set up) — a cue to stop trusting that session's output and consider compacting or re-anchoring it. The flag clears the moment the agent's next reply carries the token again. Off by default: it injects an instruction into every session and can ping.
+- `instruction_canary_marker` — the template for that token, with `{nonce}` standing in for the per-session value. The default `"<!-- {nonce} -->"` is an HTML comment, which the Claude Code terminal hides, so the token stays invisible in your terminal; the dashboard also strips it from its own history and notifications. Switch it to a visible form like `"⟦{nonce}⟧"` only if a terminal ever shows the raw comment.
 
 ### Notifications
 

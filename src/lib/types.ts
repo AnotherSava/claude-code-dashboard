@@ -32,6 +32,16 @@ export interface AgentSession {
   // Device name of the peer dashboard this session was synced from; null for
   // sessions on this machine. Remote ids are namespaced "{origin}/{raw_id}".
   origin?: string | null
+  // Instruction-adherence canary flag: true when the last final-message-bearing
+  // Stop was missing this session's rotating marker (see the Rust
+  // `Config::instruction_canary_enabled`). Orthogonal to `status` — rendered as a
+  // ⚠ badge alongside the state pill. Absent for rows from older backends.
+  instruction_drift?: boolean
+  // Instruction-adherence canary status, coloring the agent name: 'alive' = set up
+  // and confirmed adhering (green), 'dead' = set up but drifted (red), 'pending' =
+  // set up but not yet confirmed — the marker hasn't been observed, so aliveness is
+  // unknown (amber), 'off' = not set up (default). Absent for rows from older backends.
+  canary?: 'off' | 'pending' | 'alive' | 'dead'
 }
 
 export interface ContextBarThreshold {

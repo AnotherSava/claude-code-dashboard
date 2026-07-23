@@ -517,6 +517,29 @@ fn apply_and_emit(app: &AppHandle, chat_id: &str, update: &InferredState, text_e
         );
     }
     let demoted = reverted_to.is_some();
+    // Strip the adherence-canary marker from captured assistant text before
+    // storing it, so the history window, notification reading-time text, and
+    // synced dialog deltas never show it. Gated on `instruction_canary_enabled`:
+    // when the feature is off (the default) the strip is skipped entirely, so a
+    // user who never enabled the canary never has an incidental hex HTML comment
+    // touched. An assistant block that was nothing but a marker strips to empty
+    // and is dropped.
+    let marker_template = app.try_state::<ConfigState>().and_then(|c| {
+        let cfg = c.config.lock().unwrap();
+        cfg.instruction_canary_enabled.then(|| cfg.instruction_canary_marker.clone())
+    });
+    let text_entries: Vec<(DialogRole, String)> = if let Some(marker_template) = marker_template {
+        text_entries
+            .into_iter()
+            .map(|(role, text)| match role {
+                DialogRole::Assistant => (role, crate::adapters::claude::strip_response_marker(&text, &marker_template)),
+                _ => (role, text),
+            })
+            .filter(|(_, text)| !text.is_empty())
+            .collect()
+    } else {
+        text_entries
+    };
     let dialog_changed = if !text_entries.is_empty() {
         app_state.apply_text_entries(chat_id, &text_entries, now)
     } else {
@@ -1012,6 +1035,8 @@ mod tests {
             waiting_backstop_armed: false,
             display_name: None,
             origin: None,
+            instruction_drift: false,
+            canary: crate::state::Canary::Off,
         }
     }
 

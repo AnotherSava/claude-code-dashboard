@@ -12,6 +12,7 @@ mod liveness;
 mod liveness_reaper;
 mod log_watcher;
 mod logging;
+mod nonce_store;
 mod notifications;
 mod prompt_history;
 mod remote_history;
@@ -130,6 +131,7 @@ pub fn run() {
         .manage(commands::HistoryTarget(std::sync::Mutex::new(None)))
         .manage(terminal_title::TerminalTitles::new())
         .manage(liveness::AgentPids::new())
+        .manage(nonce_store::NonceStore::new())
         .manage(sync::SyncDirty(std::sync::Arc::new(tokio::sync::Notify::new())))
         .invoke_handler(tauri::generate_handler![
             commands::get_sessions,
@@ -522,6 +524,8 @@ fn seed_dev_sessions(app: &tauri::AppHandle) {
                 waiting_backstop_armed: false,
                 display_name: None,
                 origin: Some("macbook".into()),
+                instruction_drift: false,
+                canary: crate::state::Canary::Off,
             }],
             last_seen: now,
             origin_addr: "http://127.0.0.1:9078".into(),

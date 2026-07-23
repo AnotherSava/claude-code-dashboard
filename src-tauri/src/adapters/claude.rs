@@ -27,6 +27,63 @@ pub(crate) fn is_system_injected(prompt: &str) -> bool {
     prompt.starts_with("<task-notification>")
 }
 
+/// Build the concrete adherence-canary marker for a session by substituting its
+/// nonce into the configured template (`Config::instruction_canary_marker`,
+/// holding a `{nonce}` placeholder). E.g. `("<!-- {nonce} -->", "a7f3")` →
+/// `"<!-- a7f3 -->"`. Used by `http_server` for both the SessionStart injection
+/// text and the Stop-time presence check.
+pub(crate) fn marker_for(template: &str, nonce: &str) -> String {
+    template.replace("{nonce}", nonce)
+}
+
+/// Length of a canary nonce in hex digits — must match `nonce_store::mint`'s
+/// `{:04x}` output. `strip_response_marker` only removes a marker whose interior
+/// is *exactly* this many hex digits, so an incidental HTML comment with a
+/// different-length hex interior (a 6-digit color `<!-- ff0088 -->`, a 2-digit
+/// byte `<!-- ab -->`, a 7-digit short SHA) is left intact.
+const MARKER_HEX_LEN: usize = 4;
+
+/// Remove the adherence-canary marker from `text`, nonce-agnostically.
+/// `template` holds a `{nonce}` placeholder; every occurrence of its literal
+/// prefix + exactly [`MARKER_HEX_LEN`] hex digits + suffix is stripped and the
+/// result trimmed. A no-op when the template has no placeholder, has an empty
+/// prefix, or the text carries no marker; it also clears a stale marker a prior
+/// session's (now-rotated) nonce left in restored history. Shared by
+/// `classify_stop` (before question detection) and the transcript watcher (before
+/// storing dialog text) so the two can't diverge. **Callers gate this on
+/// `Config::instruction_canary_enabled`** (passing an empty template / skipping
+/// the call when the feature is off) so a user who never enabled the canary never
+/// has an incidental hex comment touched; when the feature *is* on, a comment that
+/// exactly matches the marker shape is collateral-stripped — the accepted cost of
+/// opting in.
+pub(crate) fn strip_response_marker(text: &str, template: &str) -> String {
+    let Some((prefix, suffix)) = template.split_once("{nonce}") else {
+        return text.trim().to_string();
+    };
+    if prefix.is_empty() {
+        return text.trim().to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(pi) = rest.find(prefix) {
+        let after = &rest[pi + prefix.len()..];
+        // Exactly MARKER_HEX_LEN hex digits — a longer or shorter run is not our
+        // marker (nonces are always 4 hex), so incidental hex comments survive.
+        let hex_len = after.bytes().take_while(u8::is_ascii_hexdigit).count();
+        if hex_len == MARKER_HEX_LEN && after[hex_len..].starts_with(suffix) {
+            out.push_str(&rest[..pi]);
+            rest = &after[hex_len + suffix.len()..];
+        } else {
+            // A `prefix` that isn't a real marker — emit through it, keep scanning.
+            let through = pi + prefix.len();
+            out.push_str(&rest[..through]);
+            rest = &rest[through..];
+        }
+    }
+    out.push_str(rest);
+    out.trim().to_string()
+}
+
 fn blocked_label_for(tool_name: &str) -> &'static str {
     match tool_name {
         "ExitPlanMode" => "plan approval",
@@ -66,7 +123,11 @@ pub fn dispatch(event: &str, payload: &Value, cfg: &Config) -> AdapterOutput {
         return AdapterOutput::Boundary { id: chat_id };
     }
 
-    let Some(Classification { status, label, reason, waiting_backstop_armed }) = classify_detailed(event, payload, QuestionRules::from_config(cfg)) else {
+    // Only strip the marker for question detection when the canary is enabled;
+    // an empty template makes `strip_response_marker` a plain trim, so a user who
+    // never turned the feature on never has an incidental hex comment altered.
+    let marker_template = if cfg.instruction_canary_enabled { cfg.instruction_canary_marker.as_str() } else { "" };
+    let Some(Classification { status, label, reason, waiting_backstop_armed }) = classify_detailed(event, payload, QuestionRules::from_config(cfg), marker_template) else {
         return AdapterOutput::Ignore;
     };
 
@@ -195,7 +256,7 @@ fn classify(
     payload: &Value,
     rules: QuestionRules,
 ) -> Option<(Status, Option<String>)> {
-    classify_detailed(event, payload, rules).map(|c| (c.status, c.label))
+    classify_detailed(event, payload, rules, "<!-- {nonce} -->").map(|c| (c.status, c.label))
 }
 
 /// The `type` discriminator of a `background_tasks` element — `"shell"` for a
@@ -215,14 +276,19 @@ fn task_type(task: &Value) -> Option<&str> {
 /// `Done`. This replaces the old transcript-scan path and the after-the-fact
 /// `Stop`-was-stale corrections, which existed only because the hook used to
 /// fire before the final turn flushed to JSONL.
-fn classify_stop(payload: &Value, rules: QuestionRules) -> Classification {
-    let final_text = payload
+fn classify_stop(payload: &Value, rules: QuestionRules, marker_template: &str) -> Classification {
+    // Strip the adherence-canary marker (nonce-agnostic) before any question
+    // heuristic runs: the marker is appended to the END of the reply, and a
+    // trailing `<!-- .. -->` would otherwise defeat the `ends_with('?')` check
+    // and pollute the decision-log snippet. The drift verdict itself is decided
+    // in `http_server` (it needs the stored nonce); here we only clean the text.
+    let final_text: Option<String> = payload
         .get("last_assistant_message")
         .and_then(|v| v.as_str())
-        .map(str::trim)
+        .map(|t| strip_response_marker(t, marker_template))
         .filter(|s| !s.is_empty());
 
-    if let Some(text) = final_text {
+    if let Some(text) = final_text.as_deref() {
         if let Some(rule) = question_reason(text, rules) {
             return Classification::new(
                 Status::Blocked,
@@ -272,7 +338,7 @@ fn classify_stop(payload: &Value, rules: QuestionRules) -> Classification {
         );
     }
 
-    match final_text {
+    match final_text.as_deref() {
         Some(text) => Classification::new(Status::Done, None, format!("turn ended; final message is not a question: \"{}\"", evidence_snippet(text))),
         None => Classification::new(Status::Done, None, "turn ended; no final assistant message in payload"),
     }
@@ -282,6 +348,7 @@ fn classify_detailed(
     event: &str,
     payload: &Value,
     rules: QuestionRules,
+    marker_template: &str,
 ) -> Option<Classification> {
     match event {
         "UserPromptSubmit" => {
@@ -315,7 +382,7 @@ fn classify_detailed(
                 Some(Classification::new(Status::Working, Some(clean_prompt(prompt)), "slash command invoked (early Working signal)"))
             }
         }
-        "Stop" => Some(classify_stop(payload, rules)),
+        "Stop" => Some(classify_stop(payload, rules, marker_template)),
         "PreToolUse" => {
             let tool_name = payload.get("tool_name").and_then(|v| v.as_str()).unwrap_or("");
             if !USER_GATING_TOOLS.contains(&tool_name) {
@@ -1031,6 +1098,57 @@ mod tests {
         assert_eq!(label, None);
     }
 
+    // ----- adherence-canary marker helpers -----
+
+    #[test]
+    fn marker_for_substitutes_the_nonce() {
+        assert_eq!(marker_for("<!-- {nonce} -->", "a7f3"), "<!-- a7f3 -->");
+        assert_eq!(marker_for("⟦{nonce}⟧", "beef"), "⟦beef⟧");
+    }
+
+    #[test]
+    fn strip_response_marker_removes_only_the_exact_marker_shape() {
+        let t = "<!-- {nonce} -->";
+        // Trailing (the canary's placement) and leading both go.
+        assert_eq!(strip_response_marker("All done. <!-- a7f3 -->", t), "All done.");
+        assert_eq!(strip_response_marker("Should I proceed? <!-- a7f3 -->", t), "Should I proceed?");
+        assert_eq!(strip_response_marker("<!-- a7f3 -->\n\nAll done.", t), "All done.");
+        // Multiple 4-hex markers (e.g. a stale one from a prior rotation) all go.
+        assert_eq!(strip_response_marker("<!-- 0011 --> foo <!-- 0022 -->", t), "foo");
+        // No marker → unchanged (trimmed).
+        assert_eq!(strip_response_marker("plain text", t), "plain text");
+        // A non-hex HTML comment is left intact.
+        assert_eq!(strip_response_marker("keep <!-- TODO --> me", t), "keep <!-- TODO --> me");
+        // A hex interior of the WRONG length is NOT our marker — incidental hex
+        // comments (a 2-digit byte, a 6-digit color, a 7-digit short SHA) survive.
+        assert_eq!(strip_response_marker("byte <!-- ab -->", t), "byte <!-- ab -->");
+        assert_eq!(strip_response_marker("color <!-- ff0088 -->", t), "color <!-- ff0088 -->");
+        assert_eq!(strip_response_marker("sha <!-- a1b2c3d -->", t), "sha <!-- a1b2c3d -->");
+        // A custom (visible) template works the same way.
+        assert_eq!(strip_response_marker("hi ⟦a7f3⟧", "⟦{nonce}⟧"), "hi");
+    }
+
+    #[test]
+    fn strip_response_marker_is_noop_for_malformed_templates() {
+        // No `{nonce}` placeholder — nothing to locate.
+        assert_eq!(strip_response_marker("text <!-- ab -->", "no-placeholder"), "text <!-- ab -->");
+        // An empty literal prefix can't be located unambiguously → trimmed input.
+        assert_eq!(strip_response_marker("  x  ", "{nonce}-->"), "x");
+    }
+
+    #[test]
+    fn classify_stop_strips_trailing_marker_before_question_detection() {
+        // A trailing marker must not defeat the `ends_with('?')` question check…
+        let q = json!({"last_assistant_message": "Should I proceed? <!-- a7f3 -->"});
+        assert_eq!(classify_stop(&q, NO_RULES, "<!-- {nonce} -->").status, Status::Blocked);
+        // …nor turn a plain statement into anything but Done.
+        let d = json!({"last_assistant_message": "All tests pass. <!-- a7f3 -->"});
+        assert_eq!(classify_stop(&d, NO_RULES, "<!-- {nonce} -->").status, Status::Done);
+        // A marker-only final message reads as empty → Done, not a question.
+        let m = json!({"last_assistant_message": "<!-- a7f3 -->"});
+        assert_eq!(classify_stop(&m, NO_RULES, "<!-- {nonce} -->").status, Status::Done);
+    }
+
     #[test]
     fn stop_with_in_flight_background_tasks_is_waiting() {
         // Background work still running when the main turn settles → Waiting,
@@ -1072,7 +1190,7 @@ mod tests {
             "last_assistant_message": "Kicked off the batch.",
             "background_tasks": [{"type": "shell", "command": "npm run dev"}]
         });
-        let c = classify_stop(&p, NO_RULES);
+        let c = classify_stop(&p, NO_RULES, "<!-- {nonce} -->");
         assert_eq!(c.status, Status::Waiting);
         assert!(c.waiting_backstop_armed, "shell task must arm the backstop");
     }
@@ -1086,7 +1204,7 @@ mod tests {
             "last_assistant_message": "Spawned the reviewer.",
             "background_tasks": [{"type": "subagent", "agent_type": "code-reviewer"}]
         });
-        let c = classify_stop(&p, NO_RULES);
+        let c = classify_stop(&p, NO_RULES, "<!-- {nonce} -->");
         assert_eq!(c.status, Status::Waiting);
         assert!(!c.waiting_backstop_armed, "subagent-only WAIT must leave the backstop disarmed");
     }
@@ -1101,7 +1219,7 @@ mod tests {
                 {"type": "shell", "command": "cargo test"}
             ]
         });
-        let c = classify_stop(&p, NO_RULES);
+        let c = classify_stop(&p, NO_RULES, "<!-- {nonce} -->");
         assert_eq!(c.status, Status::Waiting);
         assert!(c.waiting_backstop_armed);
     }
@@ -1115,7 +1233,7 @@ mod tests {
         // task with no `type` field at all.
         for t in [json!({"type": "workflow"}), json!({"type": "future-thing"}), json!({})] {
             let p = json!({"background_tasks": [t]});
-            let c = classify_stop(&p, NO_RULES);
+            let c = classify_stop(&p, NO_RULES, "<!-- {nonce} -->");
             assert_eq!(c.status, Status::Waiting);
             assert!(!c.waiting_backstop_armed, "a non-shell task must leave the backstop disarmed");
         }

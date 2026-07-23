@@ -4,7 +4,7 @@ use axum::{
     routing::post,
     Json, Router,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use tauri::{AppHandle, Manager};
 
@@ -60,27 +60,38 @@ struct EventRequest {
     agent_pid: Option<u32>,
 }
 
+/// Response body for `/api/event`. Empty for most events; on `SessionStart` with
+/// the instruction-adherence canary enabled it carries `additional_context` — the
+/// text the hook injects as `hookSpecificOutput.additionalContext` so Claude ends
+/// every reply with this session's hidden marker.
+#[derive(Serialize, Default, Debug)]
+struct EventResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    additional_context: Option<String>,
+}
+
 async fn post_event(
     State(app): State<AppHandle>,
     headers: HeaderMap,
     Json(req): Json<EventRequest>,
-) -> StatusCode {
+) -> (StatusCode, Json<EventResponse>) {
     // CSRF guard: block browser-originated requests. urllib / curl don't send
     // Origin; browser XHRs do. "null" is allowed (file:// / data:).
     if let Some(origin) = headers.get("origin") {
         match origin.to_str() {
             Ok("null") => {}
-            _ => return StatusCode::FORBIDDEN,
+            _ => return (StatusCode::FORBIDDEN, Json(EventResponse::default())),
         }
     }
 
     let Some(state) = app.try_state::<AppState>() else {
-        return StatusCode::INTERNAL_SERVER_ERROR;
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(EventResponse::default()));
     };
     let Some(cfg_state) = app.try_state::<ConfigState>() else {
-        return StatusCode::INTERNAL_SERVER_ERROR;
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(EventResponse::default()));
     };
     let cfg = cfg_state.snapshot();
+    let mut resp = EventResponse::default();
 
     let mut output = adapters::dispatch(&req.client, &req.event, &req.payload, &cfg);
 
@@ -155,6 +166,51 @@ async fn post_event(
                     h.save_to_disk();
                 }
             }
+            // --- Instruction-adherence canary (see Config::instruction_canary_enabled) ---
+            // On SessionStart, mint the session's rotating nonce and hand the hook
+            // the instruction to inject; on Stop, a dropped marker on the settled
+            // turn's final message flags orthogonal drift (status is untouched).
+            if cfg.instruction_canary_enabled {
+                if req.event == "SessionStart" {
+                    if let Some(ns) = app.try_state::<crate::nonce_store::NonceStore>() {
+                        let nonce = ns.mint(&chat_id, now);
+                        let marker = crate::adapters::claude::marker_for(&cfg.instruction_canary_marker, &nonce);
+                        resp.additional_context = Some(format!(
+                            "Adherence check for this session: end every response you write with the exact text {marker} \
+                             — a hidden marker, so do not mention, explain, or alter it."
+                        ));
+                    }
+                } else if req.event == "Stop" {
+                    // Judged only when this session has a nonce and produced a final
+                    // message; a tool-only / empty-final turn is exempt (left as-is).
+                    let final_msg = req.payload.get("last_assistant_message").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty());
+                    if let (Some(final_msg), Some(ns)) = (final_msg, app.try_state::<crate::nonce_store::NonceStore>()) {
+                        if let Some((nonce, seen)) = ns.get(&chat_id) {
+                            let marker = crate::adapters::claude::marker_for(&cfg.instruction_canary_marker, &nonce);
+                            let present = final_msg.contains(&marker);
+                            if present {
+                                ns.mark_seen(&chat_id);
+                            }
+                            // "starts to skip": flag drift only once the session has
+                            // PROVEN it can emit the marker (`seen`). An unconfirmed
+                            // session — e.g. one whose SessionStart response was lost, so
+                            // the marker instruction never reached the model — is held
+                            // unflagged, so a delivery miss can't manufacture a permanent
+                            // false drift; only a drop *after* prior adherence flags.
+                            let drifted = !present && seen;
+                            let reason = if present {
+                                "adherence marker present"
+                            } else if seen {
+                                "final message dropped the marker after prior adherence"
+                            } else {
+                                "marker absent but never confirmed (instruction may be undelivered); holding"
+                            };
+                            let changed = state.set_drift(&chat_id, drifted, now);
+                            tracing::debug!(chat_id = %chat_id, decision = "drift_check", drifted, seen, changed, marker = %marker, reason, "canary drift check");
+                        }
+                    }
+                }
+            }
             if let Some(tp) = transcript_path {
                 if let Some(reg) = watcher {
                     reg.start(app.clone(), chat_id, tp);
@@ -180,6 +236,11 @@ async fn post_event(
             // boundary. `None` = remove unconditionally (this is the
             // authoritative end signal, not a speculative reap).
             crate::commands::remove_session(&app, &id, None, now_ms());
+            // Drop the session's canary nonce so a `/clear`-recreated row (same
+            // cwd-derived chat_id) mints a fresh one on its next SessionStart.
+            if let Some(ns) = app.try_state::<crate::nonce_store::NonceStore>() {
+                ns.forget(&id);
+            }
         }
         AdapterOutput::Boundary { id } => {
             tracing::debug!(
@@ -214,5 +275,5 @@ async fn post_event(
             );
         }
     }
-    StatusCode::NO_CONTENT
+    (StatusCode::OK, Json(resp))
 }

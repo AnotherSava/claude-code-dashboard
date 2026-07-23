@@ -93,10 +93,12 @@ fn status_glyph(status: Status) -> &'static str {
 
 /// The tab title for a session: "<glyph> <name>", with " [N%]" appended when
 /// the session's context usage is at least `context_threshold` percent of its
-/// model's window (the same figure as the token counter). `context_threshold
+/// model's window (the same figure as the token counter), and a trailing " ⚠"
+/// when the instruction-adherence canary has flagged the row. `context_threshold
 /// <= 0` — or an unknown percentage (no tokens / model / window) — omits the
-/// suffix. Pure and testable; the console-write side effects live in
-/// `push_title`.
+/// percent suffix. The drift warning is orthogonal to status, so it rides
+/// alongside whatever glyph the state resolves to. Pure and testable; the
+/// console-write side effects live in `push_title`.
 fn build_title(session: &AgentSession, context_threshold: f32, window_tokens: &HashMap<String, u64>) -> String {
     let name = session.display_name.as_deref().unwrap_or(&session.id);
     let mut title = format!("{} {}", status_glyph(session.status), name);
@@ -106,6 +108,9 @@ fn build_title(session: &AgentSession, context_threshold: f32, window_tokens: &H
                 let _ = write!(title, " [{}%]", pct.round() as u32);
             }
         }
+    }
+    if session.instruction_drift {
+        let _ = write!(title, " ⚠");
     }
     title
 }
@@ -284,6 +289,8 @@ mod tests {
             waiting_backstop_armed: false,
             display_name: None,
             origin: None,
+            instruction_drift: false,
+            canary: crate::state::Canary::Off,
         }
     }
 
@@ -321,6 +328,19 @@ mod tests {
         assert_eq!(build_title(&session("proj", Some("m"), None), 50.0, &w), "🔵 proj");
         assert_eq!(build_title(&session("proj", Some("other"), Some(180_000)), 50.0, &w), "🔵 proj");
         assert_eq!(build_title(&session("proj", None, Some(180_000)), 50.0, &w), "🔵 proj");
+    }
+
+    #[test]
+    fn build_title_appends_drift_warning_alongside_status_and_context() {
+        let w = tokens_map();
+        let mut s = session("proj", Some("m"), Some(100_000));
+        s.instruction_drift = true;
+        // The ⚠ rides after the context suffix, and the status glyph is untouched.
+        assert_eq!(build_title(&s, 50.0, &w), "🔵 proj [50%] ⚠");
+        // …and shows with no context suffix too.
+        assert_eq!(build_title(&session("proj", Some("m"), Some(100_000)), 50.0, &w), "🔵 proj [50%]");
+        s.input_tokens = None;
+        assert_eq!(build_title(&s, 50.0, &w), "🔵 proj ⚠");
     }
 
     #[test]

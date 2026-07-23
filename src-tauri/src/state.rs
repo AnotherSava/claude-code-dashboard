@@ -21,6 +21,30 @@ pub enum Status {
     Error,
 }
 
+/// Instruction-adherence canary status for a session — colors the agent name in
+/// the dashboard (stamped for local rows by `commands::resolved_snapshot`; read by
+/// `SessionItem.svelte`). Ordered by certainty: `Alive` is only claimed once the
+/// marker has actually been observed, so a set-up-but-unconfirmed session reads
+/// `Pending` rather than falsely vouching green.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Canary {
+    /// Not set up: the feature is off, or no nonce exists (session predates the
+    /// feature, or an app restart lost the in-memory nonce).
+    #[default]
+    Off,
+    /// Set up but not yet confirmed — the marker has not been observed on any turn
+    /// yet, so we can't vouch it's working (the instruction may never have reached
+    /// the model). Deliberately distinct from `Alive`: no false certainty before
+    /// the agent has echoed the marker at least once.
+    Pending,
+    /// Set up and confirmed adhering — the marker has been observed and the latest
+    /// checkable turn still carried it.
+    Alive,
+    /// Set up but drifted — the agent dropped its marker after prior adherence.
+    Dead,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DialogRole {
@@ -111,6 +135,25 @@ pub struct AgentSession {
     /// device badge from it. Always `None` in `AppState.sessions`.
     #[serde(default)]
     pub origin: Option<String>,
+    /// Instruction-adherence canary flag (see `Config::instruction_canary_enabled`).
+    /// `true` when the most recent final-message-bearing `Stop` was missing this
+    /// session's rotating marker — an orthogonal "the agent stopped honoring its
+    /// standing instructions" warning that rides *alongside* `status` (Done /
+    /// Blocked / Waiting are untouched), rendered as a row badge, a `⚠` in the
+    /// terminal tab title, and a Telegram ping. Set / cleared by
+    /// [`AppState::set_drift`] from the `http_server` Stop check. Serialized to the
+    /// frontend (unlike the `#[serde(skip)]` internals above) so the row can render
+    /// it; a synced remote row carries it for its badge, while notifications /
+    /// titles stay local-only by construction.
+    #[serde(default)]
+    pub instruction_drift: bool,
+    /// Instruction-adherence canary status ([`Canary`]) — colors the agent name in
+    /// the dashboard. Stamped at emit time by `commands::resolved_snapshot` for
+    /// local rows from the live nonce store (`Off` in `AppState`, like
+    /// `display_name`); remote rows stay `Off` — this device isn't running the
+    /// canary for them.
+    #[serde(default)]
+    pub canary: Canary,
 }
 
 impl AgentSession {
@@ -390,6 +433,8 @@ impl AppState {
                 waiting_backstop_armed: input.waiting_backstop_armed,
                 display_name: None,
                 origin: None,
+                instruction_drift: false,
+                canary: Canary::Off,
             });
             has_new_entry || dialog_restored
         }
@@ -466,6 +511,45 @@ impl AppState {
         s.state_entered_at = now_ms;
         s.updated = now_ms;
         true
+    }
+
+    /// Set (or clear) a session's instruction-drift flag — the canary overlay,
+    /// stamped from the `http_server` Stop check when the final assistant message
+    /// is (or is no longer) missing this session's adherence marker. Orthogonal to
+    /// `status`: it never changes the state, only this flag, so a drifting turn
+    /// still reads Done / Blocked / Waiting. Bumps `updated` (so the following
+    /// `emit_sessions_updated` fans the change out to every surface) and returns
+    /// whether the value actually changed. No-op when the row is gone or already at
+    /// `drift`.
+    pub fn set_drift(&self, id: &str, drift: bool, now_ms: i64) -> bool {
+        let mut sessions = self.sessions.lock().unwrap();
+        let Some(s) = sessions.iter_mut().find(|s| s.id == id) else {
+            return false;
+        };
+        if s.instruction_drift == drift {
+            return false;
+        }
+        s.instruction_drift = drift;
+        s.updated = now_ms;
+        true
+    }
+
+    /// Clear the instruction-drift flag on every local session — called when the
+    /// adherence canary is turned off, so the row badge and terminal-title `⚠`
+    /// drop immediately, matching the Telegram reconciler (which dismisses its
+    /// pings on the same toggle). Without this, the only writer of the flag lives
+    /// behind the feature gate, so a stranded warning would otherwise persist for
+    /// the row's life. Bumps `updated` on each changed row and returns whether any
+    /// changed (the caller emits only then).
+    pub fn clear_all_drift(&self, now_ms: i64) -> bool {
+        let mut sessions = self.sessions.lock().unwrap();
+        let mut changed = false;
+        for s in sessions.iter_mut().filter(|s| s.instruction_drift) {
+            s.instruction_drift = false;
+            s.updated = now_ms;
+            changed = true;
+        }
+        changed
     }
 
     /// Mark a session-boundary in the in-memory dialog. Called on the
@@ -697,6 +781,42 @@ mod tests {
         state.apply_set(set("a", Status::Working, "do a thing"), 0, NO_CONTINUATIONS, None);
         assert!(!state.settle_stale_waiting("a", 0, 600_000));
         assert_eq!(get(&state, "a").status, Status::Working);
+    }
+
+    #[test]
+    fn set_drift_flags_and_clears_orthogonally_to_status() {
+        let state = AppState::new();
+        state.apply_set(set("a", Status::Done, "done"), 0, NO_CONTINUATIONS, None);
+        // Flag it — changed, `updated` bumped, status untouched.
+        assert!(state.set_drift("a", true, 1_000));
+        let s = get(&state, "a");
+        assert!(s.instruction_drift);
+        assert_eq!(s.status, Status::Done, "drift rides alongside status, never changes it");
+        assert_eq!(s.updated, 1_000);
+        // Same value again is a no-op (and doesn't bump `updated`).
+        assert!(!state.set_drift("a", true, 2_000));
+        assert_eq!(get(&state, "a").updated, 1_000);
+        // Clearing flips it back.
+        assert!(state.set_drift("a", false, 3_000));
+        assert!(!get(&state, "a").instruction_drift);
+        // Unknown row is a no-op.
+        assert!(!state.set_drift("nope", true, 4_000));
+    }
+
+    #[test]
+    fn clear_all_drift_clears_every_flagged_row_and_is_idempotent() {
+        let state = AppState::new();
+        state.apply_set(set("a", Status::Done, "x"), 0, NO_CONTINUATIONS, None);
+        state.apply_set(set("b", Status::Working, "y"), 0, NO_CONTINUATIONS, None);
+        state.set_drift("a", true, 100);
+        // Only "a" is flagged → clearing changes it; status preserved, "b" untouched.
+        assert!(state.clear_all_drift(200));
+        assert!(!get(&state, "a").instruction_drift);
+        assert_eq!(get(&state, "a").status, Status::Done, "clearing drift never changes status");
+        assert_eq!(get(&state, "a").updated, 200);
+        // Nothing flagged now → no-op, `updated` untouched.
+        assert!(!state.clear_all_drift(300));
+        assert_eq!(get(&state, "a").updated, 200);
     }
 
     #[test]
@@ -1230,6 +1350,8 @@ mod tests {
             waiting_backstop_armed: false,
             display_name: None,
             origin: None,
+            instruction_drift: false,
+            canary: Canary::Off,
         });
     }
 
@@ -1468,6 +1590,8 @@ mod tests {
             waiting_backstop_armed: false,
             display_name: None,
             origin: Some(origin.to_string()),
+            instruction_drift: false,
+            canary: Canary::Off,
         }
     }
 

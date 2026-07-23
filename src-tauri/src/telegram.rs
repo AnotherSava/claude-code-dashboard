@@ -148,11 +148,21 @@ impl TelegramNotifier {
     }
 
     /// Send a free-form message — used by the `test_telegram_notification`
-    /// command and the context-alert / limit-reset paths. Returns the
-    /// message_id stringified. Erases the delivery certainty into `anyhow`;
-    /// callers that need it (the per-state retry backoff) use the trait `send`.
+    /// command. Returns the message_id stringified. Erases the delivery certainty
+    /// into `anyhow`; callers that need it (the context / drift / limit-reset
+    /// reconcilers and the per-state path) use [`send_raw_tracked`] / the trait
+    /// `send` instead.
     pub async fn send_raw(&self, text: &str) -> anyhow::Result<String> {
         self.send_text(text).await.map_err(|e| anyhow::anyhow!(e))
+    }
+
+    /// Like [`send_raw`] but preserves delivery certainty
+    /// (`SendError::maybe_delivered`), so the context-usage / instruction-drift /
+    /// limit-reset reconcilers can back off a maybe-delivered read timeout instead
+    /// of re-sending every tick — the protection the per-state trait `send`
+    /// already has. Same error mapping as `send`.
+    pub async fn send_raw_tracked(&self, text: &str) -> Result<String, SendError> {
+        self.send_text(text).await.map_err(|e| SendError { maybe_delivered: e.maybe_delivered(), source: anyhow::anyhow!(e) })
     }
 }
 
@@ -220,7 +230,7 @@ impl Notifier for TelegramNotifier {
 
     async fn send(&self, session: &AgentSession) -> Result<String, SendError> {
         let text = build_message_text(session);
-        self.send_text(&text).await.map_err(|e| SendError { maybe_delivered: e.maybe_delivered(), source: anyhow::anyhow!(e) })
+        self.send_raw_tracked(&text).await
     }
 
     async fn dismiss(&self, handle: &str) -> anyhow::Result<()> {

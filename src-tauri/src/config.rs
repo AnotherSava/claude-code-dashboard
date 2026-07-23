@@ -143,6 +143,27 @@ pub struct Config {
     /// reset alerts (those keep their own lifecycles). Toggled from the tray's
     /// "High alert" checkbox; read by `notifications::reconcile`. Off by default.
     pub high_alert: bool,
+    /// Instruction-adherence canary. When on, each session is issued a rotating
+    /// nonce at `SessionStart` (returned to the hook, which injects an
+    /// instruction to end every reply with the marker below), and every `Stop`
+    /// checks the final assistant message for that exact marker. A miss flags the
+    /// row with an orthogonal "instruction drift" warning — a dashboard badge, a
+    /// `⚠` in the terminal tab title, and a Telegram ping — without touching the
+    /// real status. A dropped marker means the agent has stopped honoring its
+    /// standing instructions: a cue to stop trusting the output and compact /
+    /// re-anchor. Off by default (it injects an instruction into every session and
+    /// can ping). Read by `http_server` (mint + check), `notifications` (ping),
+    /// and `terminal_title` + the row (render).
+    pub instruction_canary_enabled: bool,
+    /// Template for the hidden marker the canary asks the agent to end each reply
+    /// with; `{nonce}` is replaced with the per-session token. Defaults to an HTML
+    /// comment, which the Claude Code terminal renderer hides — swap it for a
+    /// visible form (e.g. `⟦{nonce}⟧`) if a future renderer shows it. The literal
+    /// prefix/suffix around `{nonce}` are stripped nonce-agnostically from every
+    /// displayed / classified assistant message (see
+    /// `adapters::claude::strip_response_marker`), so a rotated marker left in
+    /// restored history is cleaned too.
+    pub instruction_canary_marker: String,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -379,6 +400,8 @@ impl Default for Config {
             tray_context_alert_enabled: true,
             tray_context_alert_percent: Some(80.0),
             high_alert: false,
+            instruction_canary_enabled: false,
+            instruction_canary_marker: "<!-- {nonce} -->".to_string(),
         }
     }
 }
@@ -717,6 +740,19 @@ mod tests {
         assert!(!cfg.high_alert, "off by default");
         let on: Config = serde_json::from_str(r#"{ "high_alert": true }"#).unwrap();
         assert!(on.high_alert);
+    }
+
+    #[test]
+    fn instruction_canary_defaults_off_with_html_comment_marker() {
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert!(!cfg.instruction_canary_enabled, "off by default");
+        assert_eq!(cfg.instruction_canary_marker, "<!-- {nonce} -->");
+        let on: Config = serde_json::from_str(
+            r#"{ "instruction_canary_enabled": true, "instruction_canary_marker": "⟦{nonce}⟧" }"#,
+        )
+        .unwrap();
+        assert!(on.instruction_canary_enabled);
+        assert_eq!(on.instruction_canary_marker, "⟦{nonce}⟧");
     }
 
     #[test]

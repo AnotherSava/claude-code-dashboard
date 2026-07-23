@@ -141,6 +141,15 @@ pub fn build_context_message(session: &AgentSession, window_tokens: &HashMap<Str
     Some(format!("[{}] context {}% ({}/{})", session.display_label(), pct.round() as u32, tokens_k(tokens), tokens_k(max)))
 }
 
+/// Telegram text for an instruction-drift alert, e.g.
+/// `⚠ [proj] instruction drift — the last reply dropped its adherence marker; treat its output with caution.`
+pub fn build_drift_message(session: &AgentSession) -> String {
+    format!(
+        "⚠ [{}] instruction drift — the last reply dropped its adherence marker; treat its output with caution.",
+        session.display_label()
+    )
+}
+
 /// Reconcile context-usage alerts against the currently-over set, mirroring the
 /// per-state notification lifecycle: an alert is *sent* when a session first
 /// crosses `threshold_percent` of its context window, and *dismissed* (the
@@ -161,6 +170,24 @@ pub fn context_reconcile<'a>(
     let over_ids: HashSet<&str> = sessions.iter().filter(|s| is_over(s)).map(|s| s.id.as_str()).collect();
     let to_dismiss: Vec<String> = outstanding.keys().filter(|id| !over_ids.contains(id.as_str())).cloned().collect();
     let to_send: Vec<&AgentSession> = sessions.iter().filter(|s| is_over(s) && !outstanding.contains_key(&s.id)).collect();
+    (to_dismiss, to_send)
+}
+
+/// Reconcile instruction-drift alerts, mirroring [`context_reconcile`]: an alert
+/// is *sent* when a session's `instruction_drift` flag is first set, and
+/// *dismissed* (the Telegram message deleted) once the flag clears — the agent
+/// resumed emitting its marker, the session vanished, or the feature was turned
+/// off (`enabled == false` dismisses everything outstanding). `outstanding` maps a
+/// session id to its live alert's handle. Returns `(to_dismiss, to_send)`.
+pub fn drift_reconcile<'a>(
+    enabled: bool,
+    sessions: &'a [AgentSession],
+    outstanding: &HashMap<String, String>,
+) -> (Vec<String>, Vec<&'a AgentSession>) {
+    let is_flagged = |s: &AgentSession| enabled && s.instruction_drift;
+    let flagged_ids: HashSet<&str> = sessions.iter().filter(|s| is_flagged(s)).map(|s| s.id.as_str()).collect();
+    let to_dismiss: Vec<String> = outstanding.keys().filter(|id| !flagged_ids.contains(id.as_str())).cloned().collect();
+    let to_send: Vec<&AgentSession> = sessions.iter().filter(|s| is_flagged(s) && !outstanding.contains_key(&s.id)).collect();
     (to_dismiss, to_send)
 }
 
@@ -266,7 +293,7 @@ pub async fn dismiss_and_forget<V>(
 
 /// Which usage window reset. `label` is the terse Telegram wording; `key` is the
 /// greppable `bucket` field in the decision log.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum LimitWindow {
     FiveHour,
     SevenDay,
@@ -565,6 +592,19 @@ impl NotificationManager {
             // Live context-usage alerts: session id -> Telegram message handle,
             // so the message can be deleted once usage drops back below.
             let mut context_outstanding: HashMap<String, String> = HashMap::new();
+            // Live instruction-drift alerts: session id -> Telegram message handle,
+            // deleted once the agent resumes emitting its adherence marker.
+            let mut drift_outstanding: HashMap<String, String> = HashMap::new();
+            // Maybe-delivered (read-timeout) backoff for the raw-send alerts, so a
+            // sustained outage can't re-send a possibly-delivered alert every tick
+            // (mirrors `retry_backoff` for the per-state pings). Per-session for the
+            // context / drift reconcilers (id -> until_ms, pruned once expired);
+            // account-wide for the point-event limit-reset ping.
+            let mut context_backoff: HashMap<String, i64> = HashMap::new();
+            let mut drift_backoff: HashMap<String, i64> = HashMap::new();
+            // Per-window (not account-wide) so a maybe-delivered hold on one bucket
+            // isn't clobbered by the other bucket's send when both drain together.
+            let mut reset_backoff: HashMap<LimitWindow, i64> = HashMap::new();
             // Usage-limit reset detector + the last usage-poll `updated` we
             // processed, so each poll is folded in exactly once. `observe` fuses
             // detection with state advance (the jump can't be re-detected), so a
@@ -603,21 +643,26 @@ impl NotificationManager {
 
                 let outcome = telegram.sync_config(tg_cfg);
                 if matches!(outcome, SyncOutcome::CredsChanged | SyncOutcome::Disabled) {
-                    if !outstanding.is_empty() || !context_outstanding.is_empty() {
+                    if !outstanding.is_empty() || !context_outstanding.is_empty() || !drift_outstanding.is_empty() {
                         tracing::warn!(
                             channel = "telegram",
                             reason = ?outcome,
                             count = outstanding.len(),
                             context_count = context_outstanding.len(),
+                            drift_count = drift_outstanding.len(),
                             "credentials changed or disabled; dropping outstanding maps without deleting"
                         );
                         outstanding.clear();
                         context_outstanding.clear();
+                        drift_outstanding.clear();
                     }
                     // Retry holds are handle-free (nothing to delete), but they
                     // predate the new credentials, so drop them too — a ping held
                     // under the old bot must re-evaluate under the new one.
                     retry_backoff.clear();
+                    context_backoff.clear();
+                    drift_backoff.clear();
+                    reset_backoff.clear();
                     // Re-seed the reset detector so a window that reset while
                     // creds were absent doesn't fire a stale / frozen-peak ping
                     // on re-enable: `observe` is gated on `is_enabled()` below, so
@@ -643,7 +688,16 @@ impl NotificationManager {
                     )
                     .await;
 
+                    // One tick clock for the raw-send backoffs. Prune holds that have
+                    // expired OR whose alert condition no longer holds, so a
+                    // genuinely-new alert after the condition clears and re-arms isn't
+                    // suppressed by a stale hold (mirrors the per-state retry_backoff's
+                    // `for_status` scoping).
+                    let now = now_ms();
                     let threshold = tg_cfg.and_then(|c| c.context_alert_percent).unwrap_or(0.0);
+                    context_backoff.retain(|id, until| now < *until && sessions.iter().any(|s| &s.id == id && threshold > 0.0 && context_percent(s, &cfg.context_window_tokens).is_some_and(|p| p >= threshold)));
+                    drift_backoff.retain(|id, until| now < *until && cfg.instruction_canary_enabled && sessions.iter().any(|s| &s.id == id && s.instruction_drift));
+                    reset_backoff.retain(|_, until| now < *until);
                     let (to_dismiss, to_send) = context_reconcile(threshold, &sessions, &cfg.context_window_tokens, &context_outstanding);
                     // Delete alerts whose session dropped back below the threshold
                     // (or vanished) — same revoke path as per-state notifications.
@@ -667,7 +721,12 @@ impl NotificationManager {
                     dismiss_and_forget(telegram.as_ref() as &dyn Notifier, &mut context_outstanding, to_dismiss, |h| h.as_str()).await;
                     for s in to_send {
                         let Some(text) = build_context_message(s, &cfg.context_window_tokens) else { continue };
-                        match telegram.send_raw(&text).await {
+                        // Skip while a maybe-delivered hold is active (don't re-send a
+                        // possibly-delivered alert every tick).
+                        if context_backoff.get(&s.id).is_some_and(|until| now < *until) {
+                            continue;
+                        }
+                        match telegram.send_raw_tracked(&text).await {
                             // Track the handle so we can delete it when usage drops.
                             Ok(handle) => {
                                 tracing::debug!(
@@ -680,9 +739,67 @@ impl NotificationManager {
                                     "context alert sent"
                                 );
                                 context_outstanding.insert(s.id.clone(), handle);
+                                context_backoff.remove(&s.id);
                             }
-                            // Not tracked → the next tick retries this session.
-                            Err(e) => tracing::warn!(channel = "telegram", id = %s.id, ?e, "context alert send failed"),
+                            // A maybe-delivered read timeout backs off; a definite
+                            // failure clears the hold and retries on the next tick.
+                            Err(SendError { maybe_delivered: true, source }) => {
+                                context_backoff.insert(s.id.clone(), now + UNCERTAIN_RETRY_BACKOFF_MS);
+                                tracing::warn!(channel = "telegram", id = %s.id, decision = "context_alert", backoff_ms = UNCERTAIN_RETRY_BACKOFF_MS, error = %source, "context alert may have been delivered; backing off retry");
+                            }
+                            Err(SendError { maybe_delivered: false, source }) => {
+                                context_backoff.remove(&s.id);
+                                tracing::warn!(channel = "telegram", id = %s.id, error = %source, "context alert send failed");
+                            }
+                        }
+                    }
+
+                    // Instruction-drift alerts (the adherence canary) — same
+                    // send / track / dismiss lifecycle as the context-usage alert,
+                    // driven by the orthogonal `instruction_drift` flag instead of a
+                    // token threshold. Gated on the feature toggle, so disabling it
+                    // dismisses everything outstanding.
+                    let (drift_dismiss, drift_send) = drift_reconcile(cfg.instruction_canary_enabled, &sessions, &drift_outstanding);
+                    for id in &drift_dismiss {
+                        tracing::debug!(
+                            channel = "telegram",
+                            id = %id,
+                            decision = "drift_dismiss",
+                            reason = if sessions.iter().any(|s| &s.id == id) {
+                                "agent resumed emitting the adherence marker (or feature disabled)"
+                            } else {
+                                "session cleared or ended"
+                            },
+                            "instruction-drift alert dismissed"
+                        );
+                    }
+                    dismiss_and_forget(telegram.as_ref() as &dyn Notifier, &mut drift_outstanding, drift_dismiss, |h| h.as_str()).await;
+                    for s in drift_send {
+                        // Skip while a maybe-delivered hold is active (don't re-send a
+                        // possibly-delivered alert every tick).
+                        if drift_backoff.get(&s.id).is_some_and(|until| now < *until) {
+                            continue;
+                        }
+                        match telegram.send_raw_tracked(&build_drift_message(s)).await {
+                            Ok(handle) => {
+                                tracing::debug!(
+                                    channel = "telegram",
+                                    id = %s.id,
+                                    decision = "drift_alert",
+                                    reason = "final message dropped the session adherence marker",
+                                    "instruction-drift alert sent"
+                                );
+                                drift_outstanding.insert(s.id.clone(), handle);
+                                drift_backoff.remove(&s.id);
+                            }
+                            Err(SendError { maybe_delivered: true, source }) => {
+                                drift_backoff.insert(s.id.clone(), now + UNCERTAIN_RETRY_BACKOFF_MS);
+                                tracing::warn!(channel = "telegram", id = %s.id, decision = "drift_alert", backoff_ms = UNCERTAIN_RETRY_BACKOFF_MS, error = %source, "instruction-drift alert may have been delivered; backing off retry");
+                            }
+                            Err(SendError { maybe_delivered: false, source }) => {
+                                drift_backoff.remove(&s.id);
+                                tracing::warn!(channel = "telegram", id = %s.id, error = %source, "instruction-drift alert send failed");
+                            }
                         }
                     }
 
@@ -733,12 +850,29 @@ impl NotificationManager {
                     }
 
                     // Deliver (and retry) buffered reset pings every tick,
-                    // independent of the poll gate, until Telegram accepts them.
+                    // independent of the poll gate, until Telegram accepts them — but
+                    // a maybe-delivered read timeout backs off (account-wide, since
+                    // this is a point event) so a sustained outage can't re-send a
+                    // possibly-delivered reset every tick.
                     let mut still_pending = Vec::new();
                     for reset in pending_limit_resets.drain(..) {
-                        if let Err(e) = telegram.send_raw(&build_limit_reset_message(reset)).await {
-                            tracing::warn!(channel = "telegram", bucket = reset.window.key(), ?e, "limit reset send failed; will retry");
+                        // Per-window hold: a maybe-delivered read timeout on one bucket
+                        // must neither release nor be released by the other's send.
+                        if reset_backoff.get(&reset.window).is_some_and(|until| now < *until) {
                             still_pending.push(reset);
+                            continue;
+                        }
+                        match telegram.send_raw_tracked(&build_limit_reset_message(reset)).await {
+                            Ok(_) => { reset_backoff.remove(&reset.window); }
+                            Err(SendError { maybe_delivered, source }) => {
+                                tracing::warn!(channel = "telegram", bucket = reset.window.key(), maybe_delivered, error = %source, "limit reset send failed; will retry");
+                                if maybe_delivered {
+                                    reset_backoff.insert(reset.window, now + UNCERTAIN_RETRY_BACKOFF_MS);
+                                } else {
+                                    reset_backoff.remove(&reset.window);
+                                }
+                                still_pending.push(reset);
+                            }
                         }
                     }
                     pending_limit_resets = still_pending;
@@ -841,6 +975,8 @@ mod tests {
             waiting_backstop_armed: false,
             display_name: None,
             origin: None,
+            instruction_drift: false,
+            canary: crate::state::Canary::Off,
         }
     }
 
@@ -1420,6 +1556,47 @@ mod tests {
         let s = vec![session("s", Status::Working, 0)];
         let (dismiss, send) = context_reconcile(80.0, &s, &w, &out);
         assert!(send.is_empty() && dismiss.is_empty());
+    }
+
+    #[test]
+    fn drift_alert_fires_once_then_dismisses_when_cleared() {
+        let mut out = HashMap::new();
+        let mut s = session("s", Status::Done, 0);
+        s.instruction_drift = true;
+        let flagged = vec![s];
+        // Flagged + enabled → sends once.
+        let (dismiss, send) = drift_reconcile(true, &flagged, &out);
+        assert_eq!(sent_ids(&send), vec!["s".to_string()]);
+        assert!(dismiss.is_empty());
+        apply(&mut out, dismiss, send);
+        // Still flagged next tick → no re-send.
+        let (dismiss, send) = drift_reconcile(true, &flagged, &out);
+        assert!(send.is_empty() && dismiss.is_empty());
+        // Marker returns (flag cleared) → the live alert is dismissed, re-arming.
+        let cleared = vec![session("s", Status::Done, 0)];
+        let (dismiss, send) = drift_reconcile(true, &cleared, &out);
+        assert_eq!(dismiss, vec!["s".to_string()]);
+        assert!(send.is_empty());
+    }
+
+    #[test]
+    fn drift_alert_disabled_sends_nothing_and_dismisses_outstanding() {
+        let out: HashMap<String, String> = [("s".to_string(), "h-s".to_string())].into_iter().collect();
+        let mut s = session("s", Status::Done, 0);
+        s.instruction_drift = true;
+        let flagged = vec![s];
+        // Feature off: nothing sent, and any outstanding alert is dismissed.
+        let (dismiss, send) = drift_reconcile(false, &flagged, &out);
+        assert_eq!(dismiss, vec!["s".to_string()]);
+        assert!(send.is_empty());
+    }
+
+    #[test]
+    fn drift_message_format() {
+        assert_eq!(
+            build_drift_message(&session("proj", Status::Done, 0)),
+            "⚠ [proj] instruction drift — the last reply dropped its adherence marker; treat its output with caution."
+        );
     }
 
     #[test]
