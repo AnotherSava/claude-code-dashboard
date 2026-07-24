@@ -368,7 +368,7 @@ impl Default for Config {
                 Threshold { percent: 60.0, color: "#c6a03c".into() },
                 Threshold { percent: 85.0, color: "#c64a4a".into() },
             ],
-            benign_closers: vec!["What's next?".into(), "or are you good?".into(), "or leave it?".into(), "or leave it parked?".into(), "or leave that to you?".into(), "or are you set to check it yourself?".into()],
+            benign_closers: vec!["What's next?".into(), "or are you good?".into(), "or leave it?".into(), "or leave it parked?".into(), "or leave that to you?".into(), "or are you set to check it yourself?".into(), "what would you like to work on?".into(), "what would you like to work on next?".into()],
             benign_openers: vec!["anything".into()],
             projects_root: None,
             notifications: Some(NotificationsConfig::default()),

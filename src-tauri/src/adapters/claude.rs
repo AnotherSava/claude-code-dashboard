@@ -1550,6 +1550,25 @@ mod tests {
     }
 
     #[test]
+    fn work_on_closer_default_config() {
+        // A "what would you like to work on?" sign-off is a "what next" offer
+        // (the task is done, awaiting the next one), not a mid-task hand-back, so
+        // the shipped default closer list settles it Done. Both real corpus forms
+        // end with the phrase, so the suffix closer catches them.
+        let cfg = Config::default();
+        for text in [
+            "Ready when you are — what would you like to work on?",
+            "I'm ready to help. What would you like to work on?",
+            "All committed and pushed. What would you like to work on next?",
+        ] {
+            assert!(!is_a_question(text, QuestionRules::from_config(&cfg)), "text: {}", text);
+        }
+        // Guard: a genuine mid-task decision still awaits — it does not end with
+        // the benign "work on?" phrase.
+        assert!(is_a_question("How would you like to proceed?", QuestionRules::from_config(&cfg)));
+    }
+
+    #[test]
     fn leave_it_parked_closer_default_config() {
         // "…, or leave it parked?" is the same offer-to-do-next sign-off as
         // "or leave it?" but with a trailing word, so it needs its own closer —

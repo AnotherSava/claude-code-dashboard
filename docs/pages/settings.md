@@ -78,7 +78,7 @@ Every field is optional — omit one and the built-in default applies. A complet
     "claude-opus": 1000000,
     "claude": 200000
   },
-  "benign_closers": ["What's next?", "or are you good?", "or leave it?", "or leave it parked?", "or leave that to you?", "or are you set to check it yourself?"],
+  "benign_closers": ["What's next?", "or are you good?", "or leave it?", "or leave it parked?", "or leave that to you?", "or are you set to check it yourself?", "what would you like to work on?", "what would you like to work on next?"],
   "benign_openers": ["anything"],
   "continuation_prompts": ["go", "continue", "proceed", "yes", "y", "yeah", "yep", "yup", "ok", "okay", "sure", "go ahead", "do it"],
   "limit_bar_segments": 16,
@@ -148,7 +148,7 @@ The `notifications` block controls alerts when a session needs you. Set it to `n
 
 ### Prompt classification
 
-- `benign_closers` — polite trailing questions that end in `?` but shouldn't flip a finished row to WAIT. Matched case-insensitively as a suffix; a hit excuses the whole closing sentence, so an optional sign-off like "Want me to run the lint pass, or are you good?" stays DONE even though it opens with an offer. A genuine ask in an earlier sentence still waits. Defaults: `["What's next?", "or are you good?", "or leave it?", "or leave it parked?", "or leave that to you?", "or are you set to check it yourself?"]`.
+- `benign_closers` — polite trailing questions that end in `?` but shouldn't flip a finished row to WAIT. Matched case-insensitively as a suffix; a hit excuses the whole closing sentence, so an optional sign-off like "Want me to run the lint pass, or are you good?" stays DONE even though it opens with an offer. A genuine ask in an earlier sentence still waits. Defaults: `["What's next?", "or are you good?", "or leave it?", "or leave it parked?", "or leave that to you?", "or are you set to check it yourself?", "what would you like to work on?", "what would you like to work on next?"]`.
 - `benign_openers` — words that, when they open the final question, mark it an optional offer rather than a hand-back, so a sign-off like "Anything you'd like to look at?" stays DONE. Matched case-insensitively as a prefix of the last sentence. An embedded real ask still flips to WAIT, so "Anything else, or shall I commit?" still waits. Default: `["anything"]`.
 - `continuation_prompts` — short replies that mean *keep going* or *yes, go ahead* rather than a new task (the defaults cover `go` / `continue` / `proceed` plus approvals like `yes` / `y` / `ok` / `sure`), so the original prompt and work timer carry over instead of resetting. Matched exactly, case-insensitively, after trimming.
 
