@@ -124,7 +124,7 @@ Whether autostart is enabled isn't a config field — it lives in the OS launch 
 
 An opt-in tripwire for an agent that has drifted from its standing instructions over a long conversation. See [Features → instruction adherence](features#instruction-adherence).
 
-- `instruction_canary_enabled` — when on, each session is handed a rotating one-time token at startup and asked to end every reply with it (a small `·…·` tag at the end of each reply — it shows in the agent's terminal, but the dashboard strips it from its own history and notifications); each time the agent finishes, the dashboard checks the final message for that token. A miss flags the row with a ⚠ badge, adds a ⚠ to its terminal tab title, and sends a Telegram ping (when Telegram is set up) — a cue to stop trusting that session's output and consider compacting or re-anchoring it. The flag clears the moment the agent's next reply carries the token again. Off by default: it injects an instruction into every session and can ping.
+- `instruction_canary_enabled` — when on, each session is handed a rotating one-time token at startup and asked to end every reply with it (a small `·…·` tag at the end of each reply — it shows in the agent's terminal, but the dashboard strips it from its own history and notifications); each time the agent finishes, the dashboard checks the final message for that token. A sustained miss flags the row with a ⚠ badge, adds a ⚠ to its terminal tab title, and sends a Telegram ping (when Telegram is set up) — a cue to stop trusting that session's output and consider compacting or re-anchoring it. The flag clears the moment the agent's next reply carries the token again. Off by default: it injects an instruction into every session and can ping.
 
 ### Notifications
 

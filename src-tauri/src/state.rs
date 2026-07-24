@@ -534,6 +534,22 @@ impl AppState {
         true
     }
 
+    /// Current confirmed instruction-drift flag for a row (false when the row is
+    /// gone). Read by the `http_server` Stop check to report the resulting state
+    /// after a `Hold` (deferred) decision leaves the flag untouched.
+    pub fn drift_confirmed(&self, id: &str) -> bool {
+        let sessions = self.sessions.lock().unwrap();
+        sessions.iter().find(|s| s.id == id).is_some_and(|s| s.instruction_drift)
+    }
+
+    /// A row's current status (None when the row is gone). Used by the canary check
+    /// to tell a settled *completion* turn from a `Blocked` *handback* turn, which
+    /// defers a dropped-marker verdict rather than confirming drift.
+    pub fn status_of(&self, id: &str) -> Option<Status> {
+        let sessions = self.sessions.lock().unwrap();
+        sessions.iter().find(|s| s.id == id).map(|s| s.status)
+    }
+
     /// Clear the instruction-drift flag on every local session — called when the
     /// adherence canary is turned off, so the row badge and terminal-title `⚠`
     /// drop immediately, matching the Telegram reconciler (which dismisses its
@@ -801,6 +817,19 @@ mod tests {
         assert!(!get(&state, "a").instruction_drift);
         // Unknown row is a no-op.
         assert!(!state.set_drift("nope", true, 4_000));
+    }
+
+    #[test]
+    fn status_of_and_drift_confirmed_read_the_row_or_none() {
+        let state = AppState::new();
+        state.apply_set(set("a", Status::Blocked, "q"), 0, NO_CONTINUATIONS, None);
+        assert_eq!(state.status_of("a"), Some(Status::Blocked));
+        assert!(!state.drift_confirmed("a"));
+        state.set_drift("a", true, 1_000);
+        assert!(state.drift_confirmed("a"));
+        // Missing row reads as absent / not-drifted.
+        assert_eq!(state.status_of("nope"), None);
+        assert!(!state.drift_confirmed("nope"));
     }
 
     #[test]

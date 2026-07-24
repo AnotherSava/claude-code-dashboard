@@ -91,6 +91,38 @@ fn session_start_nonce(ns: &NonceStore, chat_id: &str, source: &str, now_ms: i64
     }
 }
 
+/// What the per-`Stop` canary check should do to the surfaced `instruction_drift`
+/// flag. `Clear`/`Confirm` write it; `Hold` leaves it exactly as-is.
+#[derive(Debug, PartialEq, Eq)]
+enum DriftAction {
+    /// Marker present — the agent is adhering; clear any prior drift.
+    Clear,
+    /// Marker dropped on a *completion* turn after prior adherence — surface drift.
+    Confirm,
+    /// Don't touch the flag: either an unconfirmed session (`!seen`, instruction may
+    /// be undelivered), or a dropped marker on a *handback* turn we defer to the
+    /// next completion turn so a mid-workflow skill turn can't false-alarm.
+    Hold,
+}
+
+/// Decide the canary action from the settled turn's shape. A dropped marker only
+/// *confirms* drift on a completion turn; on a `Blocked` handback (`is_handback`)
+/// the drop is deferred (`Hold`) and re-judged next turn — the model mid-workflow
+/// (e.g. a `/commit` reflection ending on a question) legitimately drops the hidden
+/// marker and picks it back up once the workflow ends, so confirming there would be
+/// a false alarm. `seen` gates everything: an unconfirmed session is always held.
+fn drift_action(present: bool, seen: bool, is_handback: bool) -> (DriftAction, &'static str) {
+    if present {
+        (DriftAction::Clear, "adherence marker present")
+    } else if !seen {
+        (DriftAction::Hold, "marker absent but never confirmed (instruction may be undelivered); holding")
+    } else if is_handback {
+        (DriftAction::Hold, "handback turn dropped the marker; deferring to the next completion turn")
+    } else {
+        (DriftAction::Confirm, "completion turn dropped the marker after prior adherence")
+    }
+}
+
 async fn post_event(
     State(app): State<AppHandle>,
     headers: HeaderMap,
@@ -226,16 +258,20 @@ async fn post_event(
                             // the marker instruction never reached the model — is held
                             // unflagged, so a delivery miss can't manufacture a permanent
                             // false drift; only a drop *after* prior adherence flags.
-                            let drifted = !present && seen;
-                            let reason = if present {
-                                "adherence marker present"
-                            } else if seen {
-                                "final message dropped the marker after prior adherence"
-                            } else {
-                                "marker absent but never confirmed (instruction may be undelivered); holding"
+                            // Two-tier: a drop on a `Blocked` handback (the model mid-
+                            // workflow — e.g. a `/commit` reflection ending on a question)
+                            // is deferred, not confirmed, and re-judged next turn (see
+                            // `drift_action`), so a self-correcting skill turn never pings.
+                            let is_handback = state.status_of(&chat_id) == Some(crate::state::Status::Blocked);
+                            let (action, reason) = drift_action(present, seen, is_handback);
+                            let changed = match action {
+                                DriftAction::Clear => state.set_drift(&chat_id, false, now),
+                                DriftAction::Confirm => state.set_drift(&chat_id, true, now),
+                                DriftAction::Hold => false,
                             };
-                            let changed = state.set_drift(&chat_id, drifted, now);
-                            tracing::debug!(chat_id = %chat_id, decision = "drift_check", drifted, seen, changed, marker = %marker, reason, "canary drift check");
+                            let drifted = state.drift_confirmed(&chat_id);
+                            let deferred = matches!(action, DriftAction::Hold) && seen && !present;
+                            tracing::debug!(chat_id = %chat_id, decision = "drift_check", drifted, deferred, seen, changed, marker = %marker, reason, "canary drift check");
                         }
                     }
                 }
@@ -317,6 +353,35 @@ async fn post_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn drift_present_clears_regardless_of_turn_shape() {
+        // Adherence on any turn (completion or handback) clears drift.
+        assert_eq!(drift_action(true, true, false).0, DriftAction::Clear);
+        assert_eq!(drift_action(true, true, true).0, DriftAction::Clear);
+    }
+
+    #[test]
+    fn drift_unconfirmed_absence_is_held_never_flagged() {
+        // `!seen`: the instruction may never have reached the model — hold, don't flag.
+        assert_eq!(drift_action(false, false, false).0, DriftAction::Hold);
+        assert_eq!(drift_action(false, false, true).0, DriftAction::Hold);
+    }
+
+    #[test]
+    fn drift_completion_turn_drop_confirms() {
+        // The only path that surfaces drift: a settled completion turn dropped the
+        // marker after prior adherence.
+        assert_eq!(drift_action(false, true, false).0, DriftAction::Confirm);
+    }
+
+    #[test]
+    fn drift_handback_turn_drop_is_deferred_not_confirmed() {
+        // The regression this guards: a `/commit` reflection ending on a question is a
+        // `Blocked` handback; the model legitimately drops the hidden marker there and
+        // resumes on the next completion turn, so a drop here must NOT ping.
+        assert_eq!(drift_action(false, true, true).0, DriftAction::Hold);
+    }
 
     #[test]
     fn startup_mints_and_stores_a_fresh_unseen_nonce() {
