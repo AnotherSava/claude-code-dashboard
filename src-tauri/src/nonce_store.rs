@@ -5,7 +5,10 @@
 //! one — a stale marker echoed by rote is then a miss. Not persisted: an app
 //! restart simply pauses drift-checking for in-flight sessions until their next
 //! `SessionStart` (the same accepted trade-off the in-memory `context_outstanding`
-//! alert tracking makes). Cleared on `SessionEnd`.
+//! alert tracking makes). Cleared only on a `/clear` SessionEnd (which wipes the
+//! model's context, and with it the marker instruction); a plain exit/logout keeps
+//! the nonce so a later `resume` — whose context, and original marker, survive —
+//! reuses it rather than rotating to a marker the model isn't emitting.
 //!
 //! Each entry also tracks a `seen` bit — whether the session's marker has been
 //! observed at least once. The Stop drift-check flags drift only after `seen` is
@@ -74,8 +77,9 @@ impl NonceStore {
         }
     }
 
-    /// Drop a session's nonce on `SessionEnd` so a `/clear`-recreated row starts
-    /// clean (its next `SessionStart` mints anew).
+    /// Drop a session's nonce on a `/clear` SessionEnd so the `/clear`-recreated
+    /// row starts clean (its next `SessionStart:clear` mints anew). Not called for
+    /// a plain exit/logout, whose session may resume with its marker intact.
     pub fn forget(&self, chat_id: &str) {
         self.entries.lock().unwrap().remove(chat_id);
     }

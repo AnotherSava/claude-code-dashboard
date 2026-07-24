@@ -13,6 +13,7 @@ use crate::chat_id_registry::ChatIdRegistry;
 use crate::commands::{emit_sessions_updated, now_ms};
 use crate::config::ConfigState;
 use crate::log_watcher::WatcherRegistry;
+use crate::nonce_store::NonceStore;
 use crate::prompt_history::PromptHistoryStore;
 use crate::state::AppState;
 
@@ -68,6 +69,26 @@ struct EventRequest {
 struct EventResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     additional_context: Option<String>,
+}
+
+/// Decide the canary nonce to inject on a `SessionStart` of the given `source`,
+/// or `None` to leave the session untracked (skip injection).
+///
+/// `startup` (brand-new session) and `clear` (`/clear` wiped the context) leave
+/// the model with no prior marker instruction, so mint a fresh nonce. `resume`
+/// and `compact` keep the model's prior context — its ORIGINAL marker
+/// instruction is still live — so reuse the session's existing nonce; minting
+/// there would inject a second, conflicting marker the model won't adopt,
+/// permanently mismatching the expected nonce (the "stuck Pending on resume"
+/// bug). If a resume has no retained nonce (the app restarted mid-session), the
+/// marker the model is already emitting is unknowable, so return `None` rather
+/// than mint a conflict — the row reads `Off` until its next fresh start.
+fn session_start_nonce(ns: &NonceStore, chat_id: &str, source: &str, now_ms: i64) -> Option<String> {
+    if matches!(source, "resume" | "compact") {
+        ns.get(chat_id).map(|(nonce, _seen)| nonce)
+    } else {
+        Some(ns.mint(chat_id, now_ms))
+    }
 }
 
 async fn post_event(
@@ -167,18 +188,26 @@ async fn post_event(
                 }
             }
             // --- Instruction-adherence canary (see Config::instruction_canary_enabled) ---
-            // On SessionStart, mint the session's rotating nonce and hand the hook
-            // the instruction to inject; on Stop, a dropped marker on the settled
-            // turn's final message flags orthogonal drift (status is untouched).
+            // On SessionStart, mint (startup/clear) or reuse (resume/compact) the
+            // session's nonce and hand the hook the instruction to inject; on Stop,
+            // a dropped marker on the settled turn's final message flags orthogonal
+            // drift (status is untouched).
             if cfg.instruction_canary_enabled {
                 if req.event == "SessionStart" {
                     if let Some(ns) = app.try_state::<crate::nonce_store::NonceStore>() {
-                        let nonce = ns.mint(&chat_id, now);
-                        let marker = crate::adapters::claude::marker_for(&cfg.instruction_canary_marker, &nonce);
-                        resp.additional_context = Some(format!(
-                            "Adherence check for this session: end every response you write with the exact text {marker} \
-                             — a hidden marker, so do not mention, explain, or alter it."
-                        ));
+                        // A `resume`/`compact` keeps the model's prior context (and
+                        // its original marker), so reuse the existing nonce rather
+                        // than mint a second, conflicting one; only `startup`/`clear`
+                        // (no prior marker in context) rotate. See `session_start_nonce`.
+                        let source = req.payload.get("source").and_then(|v| v.as_str()).unwrap_or("");
+                        if let Some(nonce) = session_start_nonce(&ns, &chat_id, source, now) {
+                            let marker = crate::adapters::claude::marker_for(crate::adapters::claude::CANARY_MARKER, &nonce);
+                            resp.additional_context = Some(format!(
+                                "Adherence check for this session: end every response you write with the exact text {marker}, \
+                                 placed inline on the same line right after your final character (a single space before it, \
+                                 no blank line) — a hidden marker, so do not mention, explain, or alter it."
+                            ));
+                        }
                     }
                 } else if req.event == "Stop" {
                     // Judged only when this session has a nonce and produced a final
@@ -186,7 +215,7 @@ async fn post_event(
                     let final_msg = req.payload.get("last_assistant_message").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty());
                     if let (Some(final_msg), Some(ns)) = (final_msg, app.try_state::<crate::nonce_store::NonceStore>()) {
                         if let Some((nonce, seen)) = ns.get(&chat_id) {
-                            let marker = crate::adapters::claude::marker_for(&cfg.instruction_canary_marker, &nonce);
+                            let marker = crate::adapters::claude::marker_for(crate::adapters::claude::CANARY_MARKER, &nonce);
                             let present = final_msg.contains(&marker);
                             if present {
                                 ns.mark_seen(&chat_id);
@@ -236,10 +265,17 @@ async fn post_event(
             // boundary. `None` = remove unconditionally (this is the
             // authoritative end signal, not a speculative reap).
             crate::commands::remove_session(&app, &id, None, now_ms());
-            // Drop the session's canary nonce so a `/clear`-recreated row (same
-            // cwd-derived chat_id) mints a fresh one on its next SessionStart.
-            if let Some(ns) = app.try_state::<crate::nonce_store::NonceStore>() {
-                ns.forget(&id);
+            // Drop the session's canary nonce only on a `/clear`, which wipes the
+            // model's context (and its marker instruction); the next
+            // SessionStart:clear then mints a fresh one. A plain exit/logout keeps
+            // the nonce: the session may be resumed with its context (and original
+            // marker) intact, and `session_start_nonce` reuses it so a resumed
+            // session stays confirmed instead of falsely rotating to a marker the
+            // model isn't emitting.
+            if req.payload.get("reason").and_then(|v| v.as_str()) == Some("clear") {
+                if let Some(ns) = app.try_state::<crate::nonce_store::NonceStore>() {
+                    ns.forget(&id);
+                }
             }
         }
         AdapterOutput::Boundary { id } => {
@@ -276,4 +312,67 @@ async fn post_event(
         }
     }
     (StatusCode::OK, Json(resp))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn startup_mints_and_stores_a_fresh_unseen_nonce() {
+        let ns = NonceStore::new();
+        let n = session_start_nonce(&ns, "proj", "startup", 1000).expect("startup mints");
+        assert_eq!(ns.get("proj"), Some((n, false)), "the minted nonce is stored, unseen");
+    }
+
+    #[test]
+    fn clear_rotates_even_when_a_nonce_exists() {
+        // `/clear` wipes the model's context, so the marker instruction is gone —
+        // rotating to a fresh nonce is correct (restored-history stale markers are
+        // scrubbed by `strip_response_marker`).
+        let ns = NonceStore::new();
+        let first = session_start_nonce(&ns, "proj", "startup", 1000).unwrap();
+        let after_clear = session_start_nonce(&ns, "proj", "clear", 2000).unwrap();
+        assert_ne!(first, after_clear, "clear must rotate the nonce");
+        assert_eq!(ns.get("proj").map(|(n, _)| n), Some(after_clear));
+    }
+
+    #[test]
+    fn resume_reuses_the_existing_nonce_and_preserves_seen() {
+        // The regression this guards: a `resume` re-fires SessionStart, but the
+        // model keeps its prior context (and original marker), so the nonce must
+        // NOT rotate — else the backend expects a marker the model never emits and
+        // the row is stuck Pending forever.
+        let ns = NonceStore::new();
+        let first = session_start_nonce(&ns, "proj", "startup", 1000).unwrap();
+        ns.mark_seen("proj"); // confirmed adherent (green)
+        let resumed = session_start_nonce(&ns, "proj", "resume", 2000);
+        assert_eq!(resumed.as_ref(), Some(&first), "resume keeps context → same marker");
+        assert_eq!(ns.get("proj"), Some((first, true)), "reuse keeps the session green");
+    }
+
+    #[test]
+    fn compact_reuses_like_resume() {
+        let ns = NonceStore::new();
+        let first = session_start_nonce(&ns, "proj", "startup", 1000).unwrap();
+        assert_eq!(session_start_nonce(&ns, "proj", "compact", 2000), Some(first));
+    }
+
+    #[test]
+    fn resume_with_no_retained_nonce_is_untracked_not_minted() {
+        // App restarted mid-session: nothing to reuse. Returning None skips the
+        // injection rather than minting a nonce the model isn't emitting (which
+        // would recreate the conflict).
+        let ns = NonceStore::new();
+        assert_eq!(session_start_nonce(&ns, "proj", "resume", 1000), None);
+        assert_eq!(ns.get("proj"), None, "a resume miss must not mint");
+    }
+
+    #[test]
+    fn unknown_source_mints_like_a_fresh_start() {
+        // A missing/unknown `source` is treated as a fresh start — mint — never a
+        // silent reuse.
+        let ns = NonceStore::new();
+        assert!(session_start_nonce(&ns, "proj", "", 1000).is_some());
+    }
 }

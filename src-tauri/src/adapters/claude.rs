@@ -27,11 +27,19 @@ pub(crate) fn is_system_injected(prompt: &str) -> bool {
     prompt.starts_with("<task-notification>")
 }
 
+/// The adherence-canary marker template — the literal text the agent is asked to
+/// end each reply with, `{nonce}` substituted per session (see [`marker_for`]).
+/// A compact middot-delimited tag: every marker form is visible in the agent's
+/// terminal (no renderer hides HTML or markdown comments — verified), so this
+/// trades the bulk of an HTML comment for discretion, while the distinctive
+/// `·…·` prefix/suffix keep [`strip_response_marker`] off incidental 4-hex runs.
+/// Not a user knob — the feature's only setting is `Config::instruction_canary_enabled`.
+pub(crate) const CANARY_MARKER: &str = "·{nonce}·";
+
 /// Build the concrete adherence-canary marker for a session by substituting its
-/// nonce into the configured template (`Config::instruction_canary_marker`,
-/// holding a `{nonce}` placeholder). E.g. `("<!-- {nonce} -->", "a7f3")` →
-/// `"<!-- a7f3 -->"`. Used by `http_server` for both the SessionStart injection
-/// text and the Stop-time presence check.
+/// nonce into a `{nonce}`-holding template (production passes [`CANARY_MARKER`]).
+/// E.g. `("·{nonce}·", "a7f3")` → `"·a7f3·"`. Used by `http_server` for both the
+/// SessionStart injection text and the Stop-time presence check.
 pub(crate) fn marker_for(template: &str, nonce: &str) -> String {
     template.replace("{nonce}", nonce)
 }
@@ -126,7 +134,7 @@ pub fn dispatch(event: &str, payload: &Value, cfg: &Config) -> AdapterOutput {
     // Only strip the marker for question detection when the canary is enabled;
     // an empty template makes `strip_response_marker` a plain trim, so a user who
     // never turned the feature on never has an incidental hex comment altered.
-    let marker_template = if cfg.instruction_canary_enabled { cfg.instruction_canary_marker.as_str() } else { "" };
+    let marker_template = if cfg.instruction_canary_enabled { CANARY_MARKER } else { "" };
     let Some(Classification { status, label, reason, waiting_backstop_armed }) = classify_detailed(event, payload, QuestionRules::from_config(cfg), marker_template) else {
         return AdapterOutput::Ignore;
     };
@@ -1124,8 +1132,12 @@ mod tests {
         assert_eq!(strip_response_marker("byte <!-- ab -->", t), "byte <!-- ab -->");
         assert_eq!(strip_response_marker("color <!-- ff0088 -->", t), "color <!-- ff0088 -->");
         assert_eq!(strip_response_marker("sha <!-- a1b2c3d -->", t), "sha <!-- a1b2c3d -->");
-        // A custom (visible) template works the same way.
+        // A custom (visible) template works the same way — math brackets, and the
+        // compact middot wrapper the dashboard config uses (`·{nonce}·`).
         assert_eq!(strip_response_marker("hi ⟦a7f3⟧", "⟦{nonce}⟧"), "hi");
+        assert_eq!(strip_response_marker("All done. ·a7f3·", "·{nonce}·"), "All done.");
+        // A middot-delimited hex run of the wrong length still survives.
+        assert_eq!(strip_response_marker("mid ·ab· dot", "·{nonce}·"), "mid ·ab· dot");
     }
 
     #[test]

@@ -526,7 +526,7 @@ fn apply_and_emit(app: &AppHandle, chat_id: &str, update: &InferredState, text_e
     // and is dropped.
     let marker_template = app.try_state::<ConfigState>().and_then(|c| {
         let cfg = c.config.lock().unwrap();
-        cfg.instruction_canary_enabled.then(|| cfg.instruction_canary_marker.clone())
+        cfg.instruction_canary_enabled.then(|| crate::adapters::claude::CANARY_MARKER.to_string())
     });
     let text_entries: Vec<(DialogRole, String)> = if let Some(marker_template) = marker_template {
         text_entries

@@ -49,7 +49,6 @@ Every field is optional — omit one and the built-in default applies. A complet
   "reap_exited_sessions": true,
   "waiting_settle_ms": 600000,
   "instruction_canary_enabled": false,
-  "instruction_canary_marker": "<!-- {nonce} -->",
   "save_window_position": true,
   "window_position": null,
   "history_window_position": null,
@@ -125,8 +124,7 @@ Whether autostart is enabled isn't a config field — it lives in the OS launch 
 
 An opt-in tripwire for an agent that has drifted from its standing instructions over a long conversation. See [Features → instruction adherence](features#instruction-adherence).
 
-- `instruction_canary_enabled` — when on, each session is handed a rotating one-time token at startup and asked to end every reply with it; each time the agent finishes, the dashboard checks the final message for that token. A miss flags the row with a ⚠ badge, adds a ⚠ to its terminal tab title, and sends a Telegram ping (when Telegram is set up) — a cue to stop trusting that session's output and consider compacting or re-anchoring it. The flag clears the moment the agent's next reply carries the token again. Off by default: it injects an instruction into every session and can ping.
-- `instruction_canary_marker` — the template for that token, with `{nonce}` standing in for the per-session value. The default `"<!-- {nonce} -->"` is an HTML comment, which the Claude Code terminal hides, so the token stays invisible in your terminal; the dashboard also strips it from its own history and notifications. Switch it to a visible form like `"⟦{nonce}⟧"` only if a terminal ever shows the raw comment.
+- `instruction_canary_enabled` — when on, each session is handed a rotating one-time token at startup and asked to end every reply with it (a small `·…·` tag at the end of each reply — it shows in the agent's terminal, but the dashboard strips it from its own history and notifications); each time the agent finishes, the dashboard checks the final message for that token. A miss flags the row with a ⚠ badge, adds a ⚠ to its terminal tab title, and sends a Telegram ping (when Telegram is set up) — a cue to stop trusting that session's output and consider compacting or re-anchoring it. The flag clears the moment the agent's next reply carries the token again. Off by default: it injects an instruction into every session and can ping.
 
 ### Notifications
 
