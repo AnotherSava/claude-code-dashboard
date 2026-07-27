@@ -62,6 +62,9 @@
   let widgetEl: HTMLDivElement | undefined = $state()
   let lastSentHeight = -1
   let lastSentScale = 0
+  // Instrumentation (temporary): throttles the deduped-measure trace to one line
+  // per distinct (desired, viewport, scale) signature — see measureAndSend.
+  let lastDedupSig = ''
   let measureTimer: ReturnType<typeof setTimeout> | null = null
   // Timestamp until which `window` 'resize' events are treated as the echo of
   // our own applyAutoResize and ignored — so we don't re-measure on a resize we
@@ -273,6 +276,23 @@
     // dedup pins this at one fire per measurement.
     if (!overflowing && Math.abs(desired - lastSentHeight) < 1 && scale === lastSentScale) {
       cancelHeal() // window already matches its content — stop any heal retries
+      // Instrumentation (temporary — remove once the DPI-transient repro is
+      // captured): a deduped pass means we believe the window already fits. Log
+      // it whenever the (desired, viewport, scale) signature changes, so a
+      // stale-metric desync — desired ≈ inner_height here while the window is
+      // physically a row short — surfaces in the trace without flooding on the
+      // per-second dedup churn. Pairs with the requested-vs-actual client height
+      // now logged Rust-side in auto_resize::apply.
+      const sig = `${desired}:${Math.round(vh)}:${scale}`
+      if (sig !== lastDedupSig) {
+        lastDedupSig = sig
+        frontendLog('trace', 'auto_resize dedup', {
+          desired,
+          inner_height: vh,
+          dpr: scale,
+          raw_dpr: window.devicePixelRatio,
+        }).catch(() => {})
+      }
       return
     }
     lastSentHeight = desired

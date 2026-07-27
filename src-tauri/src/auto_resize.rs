@@ -72,11 +72,21 @@ pub fn apply(
     // with the webview's devicePixelRatio across a DPI boundary, so capturing
     // both sides confirms the mismatch from the trace.
     let scale = window.scale_factor().unwrap_or(0.0);
+    // Ground-truth geometry for the mixed-DPI drift class: `os_dpi` is the fresh
+    // per-monitor DPI (GetDpiForWindow), which — unlike `scale` (Tao's cached
+    // scale_factor) — cannot go stale, and `actual_client_h` is the real client
+    // height read back *after* set_size. `actual_client_h != new_height_phys`
+    // means the OS swallowed or rescaled the resize; `os_dpi/96 != scale` means
+    // Tao's scale went stale. Both are the signatures the auto-resize DPI notes
+    // chase, now answerable straight from the trace.
+    let (actual_client_h, os_dpi) = geom::actual_client_and_dpi(window).unwrap_or((-1, 0));
     tracing::debug!(
         ?mode,
         desired_height_phys,
         new_height_phys,
         scale,
+        os_dpi,
+        actual_client_h,
         new_x,
         new_y,
         "auto_resize::apply"
@@ -382,6 +392,52 @@ mod win_chrome {
         // that to DeleteObject is unsafe. The one-time leak is acceptable.
         unsafe { SetClassLongPtrW(hwnd_raw, GCLP_HBRBACKGROUND, brush) };
         tracing::debug!("class background brush set to dark theme");
+    }
+}
+
+/// Reads the window's TRUE client-area height and per-monitor DPI straight from
+/// Win32, so `auto_resize::apply` can log requested-vs-actual height and
+/// OS-DPI-vs-Tao-scale — the mixed-DPI drift diagnostics.
+#[cfg(windows)]
+mod geom {
+    use tauri::WebviewWindow;
+
+    // left/right are written by GetClientRect but we only read the height —
+    // allow the never-read fields since the layout must match RECT exactly.
+    #[repr(C)]
+    #[allow(dead_code)]
+    struct Rect {
+        left: i32,
+        top: i32,
+        right: i32,
+        bottom: i32,
+    }
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn GetClientRect(hwnd: isize, rect: *mut Rect) -> i32;
+        fn GetDpiForWindow(hwnd: isize) -> u32;
+    }
+
+    /// `(client_height_phys, dpi)` read from Win32; `None` if the hwnd is
+    /// unavailable or GetClientRect fails. The app process is per-monitor-DPI
+    /// aware, so these are true physical pixels (no DPI virtualization).
+    pub fn actual_client_and_dpi(window: &WebviewWindow) -> Option<(i32, u32)> {
+        let hwnd = window.hwnd().ok()?.0 as isize;
+        let mut r = Rect { left: 0, top: 0, right: 0, bottom: 0 };
+        if unsafe { GetClientRect(hwnd, &mut r) } == 0 {
+            return None;
+        }
+        Some((r.bottom - r.top, unsafe { GetDpiForWindow(hwnd) }))
+    }
+}
+
+#[cfg(not(windows))]
+mod geom {
+    use tauri::WebviewWindow;
+
+    pub fn actual_client_and_dpi(_window: &WebviewWindow) -> Option<(i32, u32)> {
+        None
     }
 }
 
