@@ -27,6 +27,12 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
+      # aws-lc-sys (via reqwest's rustls/aws-lc-rs backend) needs NASM to
+      # assemble its crypto on the Windows MSVC target; no-op on macOS.
+      - name: Install NASM (Windows, for aws-lc-sys)
+        if: runner.os == 'Windows'
+        uses: ilammy/setup-nasm@v1
+
       - name: Cache Cargo registry and target
         uses: Swatinem/rust-cache@v2
         with:
