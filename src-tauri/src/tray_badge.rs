@@ -449,7 +449,11 @@ fn badge_text(pct: u32) -> String {
 /// Whole-percent value (0..=100) for the bucket the badge tracks, or `None`
 /// when the badge is off or there's no fresh, usable reading.
 fn badge_percent(badge: TrayBadge, usage: &UsageLimits) -> Option<u32> {
-    if usage.status != UsageStatus::Ok {
+    // On a transient network failure the poller keeps the last-known buckets
+    // visible (see `usage_limits::poll_once`'s `keep_prev`); mirror that here so
+    // the badge holds its last value instead of blanking on every blip. Auth /
+    // creds failures null the buckets, so the `?` below blanks those anyway.
+    if !matches!(usage.status, UsageStatus::Ok | UsageStatus::NetworkError) {
         return None;
     }
     let bucket = match badge {
@@ -464,7 +468,11 @@ fn badge_percent(badge: TrayBadge, usage: &UsageLimits) -> Option<u32> {
 /// bare app name when usage is unknown.
 fn tooltip(usage: &UsageLimits) -> String {
     let base = "Claude Code Dashboard";
-    if usage.status != UsageStatus::Ok {
+    // Keep the last-known buckets in the tooltip through a transient network
+    // failure (matching `badge_percent`), tagged "(stale)" so the staleness is
+    // legible — the poller's `keep_prev` relies on the tooltip carrying that
+    // signal. Auth / creds failures null the buckets → falls back to the name.
+    if !matches!(usage.status, UsageStatus::Ok | UsageStatus::NetworkError) {
         return base.to_string();
     }
     let mut parts = Vec::new();
@@ -477,7 +485,8 @@ fn tooltip(usage: &UsageLimits) -> String {
     if parts.is_empty() {
         base.to_string()
     } else {
-        format!("{base} — {}", parts.join(" · "))
+        let suffix = if usage.status == UsageStatus::NetworkError { " (stale)" } else { "" };
+        format!("{base} — {}{suffix}", parts.join(" · "))
     }
 }
 
@@ -552,11 +561,22 @@ mod tests {
     }
 
     #[test]
-    fn badge_percent_none_when_not_ok_or_missing() {
-        let mut u = usage_ok(Some(0.5), None);
-        u.status = UsageStatus::NetworkError;
-        assert_eq!(badge_percent(TrayBadge::FiveHourNumber, &u), None);
+    fn badge_percent_holds_last_value_through_network_error() {
+        // A transient network failure keeps the last-known bucket (the poller
+        // retains it), so the badge holds its value rather than blanking.
+        let mut netdown = usage_ok(Some(0.5), None);
+        netdown.status = UsageStatus::NetworkError;
+        assert_eq!(badge_percent(TrayBadge::FiveHourNumber, &netdown), Some(50));
+    }
 
+    #[test]
+    fn badge_percent_none_when_auth_expired_or_missing() {
+        // Auth expiry blanks the badge — the poller nulls the buckets there.
+        let mut expired = usage_ok(Some(0.5), None);
+        expired.status = UsageStatus::AuthExpired;
+        assert_eq!(badge_percent(TrayBadge::FiveHourNumber, &expired), None);
+
+        // A missing bucket blanks even when the status is Ok.
         let ok_missing = usage_ok(None, Some(0.3));
         assert_eq!(badge_percent(TrayBadge::FiveHourNumber, &ok_missing), None);
     }
@@ -575,6 +595,13 @@ mod tests {
     fn tooltip_lists_available_buckets() {
         assert_eq!(tooltip(&usage_ok(Some(0.42), Some(0.18))), "Claude Code Dashboard — 5h 42% · 7d 18%");
         assert_eq!(tooltip(&usage_ok(Some(0.42), None)), "Claude Code Dashboard — 5h 42%");
+
+        // A network blip keeps the stale buckets, tagged so.
+        let mut netdown = usage_ok(Some(0.42), Some(0.18));
+        netdown.status = UsageStatus::NetworkError;
+        assert_eq!(tooltip(&netdown), "Claude Code Dashboard — 5h 42% · 7d 18% (stale)");
+
+        // Auth expiry falls back to the bare name.
         let mut down = usage_ok(Some(0.42), Some(0.18));
         down.status = UsageStatus::AuthExpired;
         assert_eq!(tooltip(&down), "Claude Code Dashboard");
