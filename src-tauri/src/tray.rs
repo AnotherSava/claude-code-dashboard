@@ -242,6 +242,18 @@ pub fn setup(app: &AppHandle) -> tauri::Result<()> {
                     ..
                 }
             ) {
+                // A Control+click reads as a plain left click here (see
+                // `control_key_held`); honor the macOS secondary-click
+                // convention by opening the tray's *native* menu — the same
+                // one right-click and two-finger click show (status-item
+                // highlight, anchored under the icon) — instead of toggling.
+                // `show_menu` (tray-icon 0.22+) drives the identical
+                // `performClick` path, so both gestures render the same menu.
+                #[cfg(target_os = "macos")]
+                if control_key_held() {
+                    let _ = tray.with_inner_tray_icon(|inner| inner.show_menu());
+                    return;
+                }
                 toggle_window(tray.app_handle());
             }
         })
@@ -309,6 +321,25 @@ fn toggle_window(app: &AppHandle) {
         let _ = window.show();
         let _ = window.set_focus();
     }
+}
+
+/// Whether the Control key is currently held. On macOS, Control+click is the
+/// system-wide "secondary click" that should open the tray menu like a
+/// right-click / two-finger click — but the status item reports it as a plain
+/// left click and drops the modifier (`tray-icon` exposes none), so we recover
+/// the live modifier state ourselves. Queries CoreGraphics rather than pulling
+/// in an Objective-C runtime, matching `idle.rs`'s FFI style; the bit is
+/// `kCGEventFlagMaskControl` (== `NSEventModifierFlagControl`, both `1 << 18`).
+#[cfg(target_os = "macos")]
+fn control_key_held() -> bool {
+    // CGEventSourceStateID::kCGEventSourceStateCombinedSessionState = 0.
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        fn CGEventSourceFlagsState(state_id: i32) -> u64;
+    }
+    const CONTROL_MASK: u64 = 1 << 18;
+    let flags = unsafe { CGEventSourceFlagsState(0) };
+    flags & CONTROL_MASK != 0
 }
 
 fn toggle_always_on_top(app: &AppHandle) {
