@@ -658,6 +658,11 @@ pub fn emit_sessions_updated(app: &AppHandle) {
     // pid bookkeeping.
     let local: Vec<AgentSession> = sessions.iter().filter(|s| s.origin.is_none()).cloned().collect();
     crate::terminal_title::sync(app, &local);
+    // Same chokepoint drives the lid-closed sleep veto: it must be armed while
+    // an agent is busy *before* the lid shuts, since a lid close sleeps the Mac
+    // instantly and leaves no window to react in. Local rows only — a remote
+    // row's work is another machine's problem, and its device holds its own veto.
+    crate::lid_awake::sync(app, &local);
     // Per-session context usage feeds the tray's context-alert border, so this
     // emit chokepoint also keeps the tray icon in step as token counts change.
     crate::tray_badge::refresh(app);

@@ -26,6 +26,7 @@ Right-click the tray icon for the controls you reach for most:
 - **Auto-resize** — fit the window height to its content, growing upward or downward.
 - **History font size** — pick one of five sizes for the history window.
 - **Tray usage badge** — show the 5-hour or 7-day usage on the tray icon, as the recolored traffic light or a number (or none).
+- **Keep awake with lid closed** (macOS) — stop the Mac sleeping when you shut the lid while an agent is still working: off, only on battery, or always, plus a **Start now** button that holds once regardless. The title shows how long a hold lasts, and the first time you use it you're asked for your password. See [Features](features#keeping-the-mac-awake-with-the-lid-closed).
 - **Show high context usage** — flag a session that's filling its context window on the tray icon (on by default). Has no visible effect unless a tray usage badge is on.
 - **High alert** — send every configured state notification (blocked, done, error) to Telegram the instant it happens, skipping the usual delays (off by default). Doesn't affect the context-usage or usage-limit alerts.
 - **Open config/logs location** — open the app data folder.
@@ -162,6 +163,30 @@ For the full classification logic see [Classification](development/classificatio
 - `tray_badge` — show a usage limit on the tray icon. Values: `"none"`; `"five_hour_light"` / `"seven_day_light"` (recolor the traffic-light icon by usage); `"five_hour_number"` / `"seven_day_number"` (show the percentage, all-red light at 100%). The hover tooltip always shows both figures. Set it from the tray's **Tray usage badge** submenu.
 - `tray_context_alert_enabled` — whether the tray icon flags high context usage at all (the **Show high context usage** tray checkbox; on by default). Turning it off keeps `tray_context_alert_percent` intact, so re-checking it restores the same threshold.
 - `tray_context_alert_percent` — flag the tray icon when any session's context usage reaches this percent of its model's window — an at-a-glance "an agent is filling its context" warning. The light modes draw a red border around the traffic-light icon; the number modes draw the digits over a red background. `null` or `0` turns it off, and it never shows when `tray_badge` is `"none"` (there's no badge to frame) or when **Show high context usage** is unchecked.
+
+### Keeping the Mac awake with the lid closed
+
+macOS only. See [Features](features#keeping-the-mac-awake-with-the-lid-closed) for what this does and the one-time password prompt behind it.
+
+- `lid_awake_mode` — when a hold starts *on its own*. `"off"` (default); `"on_battery"` (whenever an agent is working and you're unplugged); `"always"` (whenever an agent is working, on any power source). The tray's **Start now** begins a hold regardless of this, `"off"` included. The setting never changes how long a hold lasts — that's `lid_awake_minutes`, and it's the same either way.
+- `lid_awake_minutes` — how long the lid may stay shut before the Mac is allowed to sleep again, counted from the moment you close it. Reopening the lid resets it, so each leg of a journey gets a full window. Applies to every mode, and the tray submenu title shows the current value. 15 by default; `0` turns the feature off.
+- `lid_awake_release_grace_ms` — how long to keep holding after the last agent stops working, so the pause between turns doesn't put the Mac to sleep mid-errand. 60000 (one minute) by default.
+- `lid_awake_battery_floor_pct` — never hold below this charge, and let go if the battery drops past it while holding. Holding off sleep also disables the low-battery safety sleep, so this stops a closed laptop running itself flat. 20 by default; `0` removes the floor.
+
+#### Undoing the one-time setup
+
+The first hold asks for your password once and installs two files: a rule in `/etc/sudoers.d/` letting the widget flip the sleep setting without asking again, and a job in `/Library/LaunchDaemons/` that clears that setting at every boot (it survives restarts on its own, so this is what guarantees a clean start).
+
+Setting the mode to **Off** stops the feature and leaves both in place, so turning it back on costs no password. To remove them altogether:
+
+```bash
+sudo launchctl bootout system /Library/LaunchDaemons/com.anothersava.claude-code-dashboard.sleepreset.plist
+sudo rm /Library/LaunchDaemons/com.anothersava.claude-code-dashboard.sleepreset.plist
+sudo rm /etc/sudoers.d/claude-code-dashboard-lidawake
+sudo pmset -a disablesleep 0
+```
+
+Using the feature again afterwards reinstalls them, with one more password prompt.
 
 ### Multi-device sync
 

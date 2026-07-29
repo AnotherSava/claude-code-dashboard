@@ -86,6 +86,16 @@ pub fn spawn(app: AppHandle, path: PathBuf) {
                     }
                 }
             }
+            // Turning the lid-closed veto off must drop a live hold at once —
+            // it's a system-wide sleep kill switch, so leaving it set until the
+            // next agent goes idle would keep thermal and low-battery sleep
+            // suppressed after the user asked for it to stop.
+            if new_cfg.lid_awake_mode == crate::config::LidAwakeMode::Off && prior.lid_awake_mode != crate::config::LidAwakeMode::Off {
+                crate::lid_awake::release_now(&app, "mode turned off in config.json");
+            }
+            if new_cfg.lid_awake_minutes != prior.lid_awake_minutes {
+                crate::tray::sync_lid_awake_title(&app, new_cfg.lid_awake_minutes);
+            }
             apply_config_to_window(&app, &new_cfg, Some(&prior));
             // Re-render the tray badge in case `tray_badge` changed externally.
             crate::tray_badge::refresh(&app);

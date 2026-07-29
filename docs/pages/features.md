@@ -66,6 +66,16 @@ Get pinged when a session needs you — for example, when it finishes or sits wa
 
 When you want nothing held back — you're watching for anything at all — the tray's **High alert** toggle sends every notification the moment it happens, skipping the away-detection and reading delays entirely. It applies to the session states (finished, blocked, error) and leaves the context-usage and usage-limit pings on their own schedule.
 
+## Keeping the Mac awake with the lid closed
+
+macOS only. Shut the lid on a working agent and the Mac sleeps, taking the agent's task with it — which is exactly what happens when you pick the laptop up and walk somewhere. The tray's **Keep awake with lid closed** submenu holds sleep off while an agent is still working, so a closed laptop keeps going on the way between desks.
+
+Because it's a big lever — a Mac that can't sleep also can't fall asleep to cool down or to save a dying battery — every hold is bounded. The clock starts when you close the lid, not when the work started, so shutting the lid always buys you a full window, and opening it again resets the clock for the next leg. When the window runs out, or the agent finishes, or the battery falls too low, the Mac goes back to sleeping normally on its own.
+
+**Start now** begins a hold immediately whatever else is set — the one to reach for when you're about to pick the laptop up and off is otherwise fine. While it runs it shows the time remaining, and the tick sits on it rather than on the setting underneath, so the menu always tells you whether the Mac is actually being held. Below it, three settings decide how eager it is on its own: **off**; **on battery only**, which skips it while you're plugged in at a desk; and **always**, whenever an agent is working. Picking one of those ends a hold you started by hand. The window is the same either way — the submenu title shows how long it is — and the setting decides *when* a hold starts, never how long it lasts. The window length and the battery cut-off are yours to set — see [Settings](settings#keeping-the-mac-awake-with-the-lid-closed).
+
+macOS has no ordinary way to do this — the setting it needs is one only an administrator can change — so the first hold asks for your password once, and then never again. Turning the feature off doesn't require your password, and the widget puts the setting back the moment it stops needing it, including if it's force-quit or the Mac restarts. If you'd rather not leave that permission in place at all, [Settings](settings#undoing-the-one-time-setup) shows how to take it back out.
+
 ## Usage limits
 
 The header shows two bars tracking your Anthropic usage against the rolling 5-hour and 7-day rate limits, so you can see how much headroom is left before you hit a cap.

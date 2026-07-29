@@ -6,7 +6,7 @@ use tauri::{
 use tauri_plugin_autostart::ManagerExt;
 
 use crate::commands::emit_config_updated;
-use crate::config::{AutoResize, ConfigState, HistoryFontSize, TrayBadge};
+use crate::config::{AutoResize, ConfigState, HistoryFontSize, LidAwakeMode, TrayBadge};
 
 const MENU_SHOW_HIDE: &str = "show_hide";
 const MENU_ALWAYS_ON_TOP: &str = "always_on_top";
@@ -28,6 +28,10 @@ const MENU_TRAY_BADGE_5H_LIGHT: &str = "tray_badge_5h_light";
 const MENU_TRAY_BADGE_7D_LIGHT: &str = "tray_badge_7d_light";
 const MENU_TRAY_BADGE_5H_NUM: &str = "tray_badge_5h_num";
 const MENU_TRAY_BADGE_7D_NUM: &str = "tray_badge_7d_num";
+const MENU_LID_AWAKE_OFF: &str = "lid_awake_off";
+const MENU_LID_AWAKE_START_NOW: &str = "lid_awake_start_now";
+const MENU_LID_AWAKE_ON_BATTERY: &str = "lid_awake_on_battery";
+const MENU_LID_AWAKE_ALWAYS: &str = "lid_awake_always";
 const MENU_CONTEXT_ALERT: &str = "context_alert";
 const MENU_HIGH_ALERT: &str = "high_alert";
 const MENU_OPEN_DATA_DIR: &str = "open_data_dir";
@@ -35,6 +39,22 @@ const MENU_OPEN_INTENSITY: &str = "open_intensity";
 const MENU_HELP_ABOUT: &str = "help_about";
 const MENU_HELP_INSTRUCTIONS: &str = "help_instructions";
 const MENU_QUIT: &str = "quit";
+
+/// Submenu title for the lid-closed veto. The hold window governs every mode
+/// equally, so it lives here rather than on one item — carried by a single item
+/// it read as if only that one were time-limited.
+fn lid_awake_title(minutes: u64) -> String {
+    format!("Keep awake with lid closed ({minutes} min)")
+}
+
+/// Refresh that title after a config reload — `lid_awake_minutes` is only
+/// editable in `config.json`, so without this the menu would keep advertising
+/// the window length the app started with.
+pub fn sync_lid_awake_title(app: &AppHandle, minutes: u64) {
+    if let Some(handles) = app.try_state::<TrayHandles>() {
+        let _ = handles.lid_awake_submenu.set_text(lid_awake_title(minutes));
+    }
+}
 
 /// Tray menu item handles kept in managed state so menu handlers can update
 /// check-marks after toggling the underlying setting.
@@ -60,6 +80,14 @@ pub struct TrayHandles {
     pub tray_badge_7d_num: CheckMenuItem<Wry>,
     pub context_alert: CheckMenuItem<Wry>,
     pub high_alert: CheckMenuItem<Wry>,
+    pub lid_awake_off: CheckMenuItem<Wry>,
+    pub lid_awake_on_battery: CheckMenuItem<Wry>,
+    pub lid_awake_always: CheckMenuItem<Wry>,
+    pub lid_awake_start_now: CheckMenuItem<Wry>,
+    /// Last text pushed to `lid_awake_start_now`, so the 5s countdown refresh
+    /// only touches the menu when the displayed value actually changes.
+    pub lid_awake_label: std::sync::Mutex<String>,
+    pub lid_awake_submenu: tauri::menu::Submenu<Wry>,
 }
 
 pub fn setup(app: &AppHandle) -> tauri::Result<()> {
@@ -150,6 +178,40 @@ pub fn setup(app: &AppHandle) -> tauri::Result<()> {
         .items(&[&tray_badge_none, &tray_badge_5h_light, &tray_badge_7d_light, &tray_badge_5h_num, &tray_badge_7d_num])
         .build()?;
 
+    // The lid-closed veto is macOS-only (it drives `pmset disablesleep`), so the
+    // items exist everywhere but the submenu is only hung in the menu on macOS —
+    // a dead entry on Windows would just be a puzzle.
+    let (lid_awake_mode_initial, lid_awake_minutes) = app
+        .try_state::<ConfigState>()
+        .map(|s| {
+            let c = s.snapshot();
+            (c.lid_awake_mode, c.lid_awake_minutes)
+        })
+        .unwrap_or((LidAwakeMode::Off, 15));
+    let lid_awake_off = CheckMenuItem::with_id(app, MENU_LID_AWAKE_OFF, "Off", true, lid_awake_mode_initial == LidAwakeMode::Off, None::<&str>)?;
+    // Checkable, and grouped with Off: while a hold is running the tick sits
+    // here and the label counts down, so the menu always shows whether the Mac
+    // is actually being held awake. When the window lapses the tick returns to
+    // the standing policy on its own — the check can't outlive the hold.
+    let lid_awake_start_now = CheckMenuItem::with_id(app, MENU_LID_AWAKE_START_NOW, "Start now", true, false, None::<&str>)?;
+    let lid_awake_on_battery = CheckMenuItem::with_id(
+        app, MENU_LID_AWAKE_ON_BATTERY, "On battery only", true, lid_awake_mode_initial == LidAwakeMode::OnBattery, None::<&str>,
+    )?;
+    let lid_awake_always = CheckMenuItem::with_id(
+        app, MENU_LID_AWAKE_ALWAYS, "Always", true, lid_awake_mode_initial == LidAwakeMode::Always, None::<&str>,
+    )?;
+    // The window is a property of the feature, not of one mode — every mode
+    // holds for the same span once the lid shuts — so it belongs in the submenu
+    // title rather than on a single item, where it read as Manual-only.
+    // Two groups: what's happening right now (nothing, or a hold you started),
+    // then the standing policy that arms on its own. All four are one radio set
+    // — the tick marks whichever is actually in effect.
+    let lid_awake_submenu = SubmenuBuilder::new(app, lid_awake_title(lid_awake_minutes))
+        .items(&[&lid_awake_off, &lid_awake_start_now])
+        .separator()
+        .items(&[&lid_awake_on_battery, &lid_awake_always])
+        .build()?;
+
     let context_alert_initial = app
         .try_state::<ConfigState>()
         .map(|s| s.snapshot().tray_context_alert_enabled)
@@ -175,28 +237,34 @@ pub fn setup(app: &AppHandle) -> tauri::Result<()> {
         .build()?;
     let quit = MenuItem::with_id(app, MENU_QUIT, "Quit", true, None::<&str>)?;
 
-    let menu = Menu::with_items(
-        app,
-        &[
-            &show_hide,
-            &PredefinedMenuItem::separator(app)?,
-            &always_on_top,
-            &save_position,
-            &terminal_titles,
-            &autostart_submenu,
-            &auto_resize_submenu,
-            &hist_font_submenu,
-            &tray_badge_submenu,
-            &context_alert,
-            &high_alert,
-            &PredefinedMenuItem::separator(app)?,
-            &open_intensity,
-            &open_data_dir,
-            &PredefinedMenuItem::separator(app)?,
-            &help_submenu,
-            &quit,
-        ],
-    )?;
+    let sep_top = PredefinedMenuItem::separator(app)?;
+    let sep_tools = PredefinedMenuItem::separator(app)?;
+    let sep_help = PredefinedMenuItem::separator(app)?;
+    let mut items: Vec<&dyn tauri::menu::IsMenuItem<Wry>> = vec![
+        &show_hide,
+        &sep_top,
+        &always_on_top,
+        &save_position,
+        &terminal_titles,
+        &autostart_submenu,
+        &auto_resize_submenu,
+        &hist_font_submenu,
+        &tray_badge_submenu,
+    ];
+    if cfg!(target_os = "macos") {
+        items.push(&lid_awake_submenu);
+    }
+    items.extend([
+        &context_alert as &dyn tauri::menu::IsMenuItem<Wry>,
+        &high_alert,
+        &sep_tools,
+        &open_intensity,
+        &open_data_dir,
+        &sep_help,
+        &help_submenu,
+        &quit,
+    ]);
+    let menu = Menu::with_items(app, &items)?;
 
     app.manage(TrayHandles {
         always_on_top: always_on_top.clone(),
@@ -220,6 +288,12 @@ pub fn setup(app: &AppHandle) -> tauri::Result<()> {
         tray_badge_7d_num: tray_badge_7d_num.clone(),
         context_alert: context_alert.clone(),
         high_alert: high_alert.clone(),
+        lid_awake_off: lid_awake_off.clone(),
+        lid_awake_on_battery: lid_awake_on_battery.clone(),
+        lid_awake_always: lid_awake_always.clone(),
+        lid_awake_start_now: lid_awake_start_now.clone(),
+        lid_awake_label: std::sync::Mutex::new("Start now".to_string()),
+        lid_awake_submenu: lid_awake_submenu.clone(),
     });
 
     let icon = app
@@ -284,6 +358,10 @@ fn handle_menu_event(app: &AppHandle, id: &str) {
         MENU_TRAY_BADGE_7D_LIGHT => select_tray_badge(app, TrayBadge::SevenDayLight),
         MENU_TRAY_BADGE_5H_NUM => select_tray_badge(app, TrayBadge::FiveHourNumber),
         MENU_TRAY_BADGE_7D_NUM => select_tray_badge(app, TrayBadge::SevenDayNumber),
+        MENU_LID_AWAKE_OFF => select_lid_awake_mode(app, LidAwakeMode::Off),
+        MENU_LID_AWAKE_START_NOW => start_lid_awake_now(app),
+        MENU_LID_AWAKE_ON_BATTERY => select_lid_awake_mode(app, LidAwakeMode::OnBattery),
+        MENU_LID_AWAKE_ALWAYS => select_lid_awake_mode(app, LidAwakeMode::Always),
         MENU_CONTEXT_ALERT => toggle_context_alert(app),
         MENU_HIGH_ALERT => toggle_high_alert(app),
         MENU_OPEN_DATA_DIR => open_data_dir(app),
@@ -454,6 +532,118 @@ fn select_tray_badge(app: &AppHandle, mode: TrayBadge) {
     crate::tray_badge::refresh(app);
 }
 
+/// Pick the standing lid-closed policy.
+///
+/// Any policy other than `Off` needs the one-time privileged setup (a pinned
+/// sudoers grant plus the boot-reset daemon), so the first selection runs the
+/// installer behind a single administrator prompt. If the user cancels that, the
+/// policy reverts to `Off` rather than sitting enabled-but-inert.
+///
+/// Picking any policy also cancels an outstanding "Start now": the four items
+/// are one radio set, so the tick has to follow the selection rather than stay
+/// on a hold the user has just overridden. `Off` additionally drops a live veto
+/// immediately — it suppresses thermal and low-battery sleep, so it can't wait
+/// for the next idle.
+fn select_lid_awake_mode(app: &AppHandle, mode: LidAwakeMode) {
+    crate::lid_awake::cancel_manual(app);
+    sync_lid_awake_state(app, mode, None);
+
+    let handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        // Revert rather than sit enabled-but-inert: without the grant every arm
+        // would fail, so a checked policy would promise a hold it can't deliver.
+        if mode != LidAwakeMode::Off && !ensure_lid_awake_installed().await {
+            apply_lid_awake_mode(&handle, LidAwakeMode::Off);
+            sync_lid_awake_state(&handle, LidAwakeMode::Off, None);
+            return;
+        }
+        apply_lid_awake_mode(&handle, mode);
+        if mode == LidAwakeMode::Off {
+            crate::lid_awake::release_now(&handle, "turned off from the tray");
+        }
+    });
+}
+
+/// Run the one-time privileged setup if it hasn't been done yet, reporting
+/// whether the grant ended up in place. Shared by both entry points — picking a
+/// policy and "Start now" — which differ only in how they recover from a
+/// decline, not in how they install.
+async fn ensure_lid_awake_installed() -> bool {
+    if crate::lid_awake::installed() {
+        return true;
+    }
+    match crate::lid_awake::install().await {
+        Ok(()) => {
+            tracing::info!("lid-awake privileged setup installed");
+            true
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "lid-awake setup did not complete");
+            false
+        }
+    }
+}
+
+/// Start one hold right now, whatever the standing policy is — the "about to
+/// pick the laptop up" button. Runs the one-time setup first if it hasn't been
+/// done, since this may well be the user's first contact with the feature.
+fn start_lid_awake_now(app: &AppHandle) {
+    let handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        // Nothing to revert here — the standing policy is untouched, so a
+        // declined setup just means no hold starts.
+        if !ensure_lid_awake_installed().await {
+            return;
+        }
+        crate::lid_awake::arm_manual(&handle);
+    });
+}
+
+fn apply_lid_awake_mode(app: &AppHandle, mode: LidAwakeMode) {
+    let Some(state) = app.try_state::<ConfigState>() else { return };
+    if state.snapshot().lid_awake_mode != mode {
+        state.with_mut(|c| c.lid_awake_mode = mode);
+        let _ = state.save_to_disk();
+        emit_config_updated(app);
+    }
+}
+
+/// Label for the "Start now" item: the countdown while a hold is running, the
+/// invitation otherwise. Rounds up, so a hold never reads "0 min left" while
+/// it's still holding.
+fn lid_awake_start_now_label(remaining_ms: Option<i64>) -> String {
+    match remaining_ms {
+        Some(ms) if ms >= 60_000 => format!("{} min left", ms / 60_000),
+        Some(_) => "<1 min left".to_string(),
+        None => "Start now".to_string(),
+    }
+}
+
+/// Push the live state into the menu: the tick marks whatever is actually in
+/// effect — a running manual hold, else the standing policy — and the "Start
+/// now" label carries the countdown.
+///
+/// No-op updates are dropped: this runs on every 5s tick, and rewriting an
+/// unchanged `NSMenuItem` title would churn the menu for nothing.
+pub fn sync_lid_awake_state(app: &AppHandle, mode: LidAwakeMode, manual_remaining_ms: Option<i64>) {
+    let Some(handles) = app.try_state::<TrayHandles>() else { return };
+    let holding = manual_remaining_ms.is_some();
+    let label = lid_awake_start_now_label(manual_remaining_ms);
+
+    let mut last = handles.lid_awake_label.lock().unwrap();
+    if *last != label {
+        let _ = handles.lid_awake_start_now.set_text(&label);
+        *last = label;
+    }
+
+    let _ = handles.lid_awake_start_now.set_checked(holding);
+    // While a hold runs the tick belongs to it, not to the policy underneath —
+    // otherwise two items would read as active at once.
+    let _ = handles.lid_awake_off.set_checked(!holding && mode == LidAwakeMode::Off);
+    let _ = handles.lid_awake_on_battery.set_checked(!holding && mode == LidAwakeMode::OnBattery);
+    let _ = handles.lid_awake_always.set_checked(!holding && mode == LidAwakeMode::Always);
+}
+
 fn toggle_context_alert(app: &AppHandle) {
     let Some(state) = app.try_state::<ConfigState>() else { return };
     let new_state = !state.snapshot().tray_context_alert_enabled;
@@ -568,5 +758,29 @@ fn show_intensity(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("intensity") {
         let _ = window.show();
         let _ = window.set_focus();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn start_now_label_counts_down_and_never_reads_zero() {
+        assert_eq!(lid_awake_start_now_label(None), "Start now");
+        assert_eq!(lid_awake_start_now_label(Some(15 * 60_000)), "15 min left");
+        assert_eq!(lid_awake_start_now_label(Some(60_000)), "1 min left");
+        // A hold that is still running must never advertise "0 min left" — the
+        // Mac is genuinely still being held awake at that point.
+        assert_eq!(lid_awake_start_now_label(Some(59_999)), "<1 min left");
+        assert_eq!(lid_awake_start_now_label(Some(1)), "<1 min left");
+    }
+
+    #[test]
+    fn submenu_title_carries_the_window_length() {
+        // The window governs every mode, so it belongs in the title rather than
+        // on one item, where it read as applying to that item alone.
+        assert_eq!(lid_awake_title(15), "Keep awake with lid closed (15 min)");
+        assert_eq!(lid_awake_title(30), "Keep awake with lid closed (30 min)");
     }
 }

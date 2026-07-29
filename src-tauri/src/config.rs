@@ -155,6 +155,58 @@ pub struct Config {
     /// can ping). Read by `http_server` (mint + check), `notifications` (ping),
     /// and `terminal_title` + the row (render).
     pub instruction_canary_enabled: bool,
+    /// Keep macOS awake with the lid closed while a local agent is working — the
+    /// "carry the laptop between locations mid-task" case. macOS offers no API
+    /// for this: every IOKit assertion carrying `AppliesOnLidClose` is refused
+    /// (`kIOReturnNotPrivileged`) without an Apple-private entitlement, so the
+    /// only lever is the root-only, system-wide `pmset -a disablesleep` kill
+    /// switch, reached through a one-time scoped sudoers grant (see
+    /// `lid_awake::install`). Because that switch disables *every* sleep —
+    /// including thermal-emergency and low-battery sleep — the hold is always
+    /// bounded by `lid_awake_minutes` and floored by
+    /// `lid_awake_battery_floor_pct`. macOS-only; a no-op elsewhere.
+    /// Read by `lid_awake::sync`; the tray's "Keep awake with lid closed"
+    /// submenu writes it.
+    pub lid_awake_mode: LidAwakeMode,
+    /// How long the lid may stay closed before the veto is released and the Mac
+    /// is allowed to sleep. The countdown is anchored to the *lid close*, not to
+    /// the start of the work — closing the lid always buys a full window, and
+    /// reopening resets it. This is the cap on how long thermal and low-battery
+    /// safety sleep stay disabled, so it is deliberately short. `0` disables the
+    /// feature outright (same as `LidAwakeMode::Off`).
+    pub lid_awake_minutes: u64,
+    /// Grace period after the last busy session before the veto is released.
+    /// Agents flap Working → Done → Working between turns, and releasing on the
+    /// first `Done` would sleep the Mac out from under a session that was about
+    /// to continue. Read by `lid_awake::should_release`.
+    pub lid_awake_release_grace_ms: u64,
+    /// Battery floor: never arm the veto below this percentage, and release it
+    /// if the battery falls below while armed. `disablesleep` suppresses the
+    /// low-battery emergency sleep, so without this floor a closed laptop could
+    /// run itself flat instead of sleeping. `0` disables the floor.
+    pub lid_awake_battery_floor_pct: u8,
+}
+
+/// The standing policy for when the lid-closed sleep veto arms by itself. See
+/// `Config::lid_awake_mode`.
+///
+/// This covers *automatic* arming only. The tray's "Start now" is a one-shot
+/// action that overrides whatever policy is set — `Off` included — so there is
+/// deliberately no `Manual` variant: a mode whose only behavior is "don't arm
+/// automatically" would be indistinguishable from `Off`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LidAwakeMode {
+    /// Never arm on its own. "Start now" still works.
+    #[default]
+    Off,
+    /// Arm while a local agent is busy *and* the Mac is running on battery. The
+    /// narrow policy: a docked machine on AC isn't about to be carried
+    /// anywhere, so this keeps the veto — and its suppressed thermal safety
+    /// sleep — off during desk work.
+    OnBattery,
+    /// Arm whenever a local agent is busy, on any power source.
+    Always,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -392,6 +444,10 @@ impl Default for Config {
             tray_context_alert_percent: Some(80.0),
             high_alert: false,
             instruction_canary_enabled: false,
+            lid_awake_mode: LidAwakeMode::Off,
+            lid_awake_minutes: 15,
+            lid_awake_release_grace_ms: 60_000,
+            lid_awake_battery_floor_pct: 20,
         }
     }
 }
@@ -746,6 +802,25 @@ mod tests {
         assert!(cfg.tray_context_alert_enabled, "checked by default");
         let off: Config = serde_json::from_str(r#"{ "tray_context_alert_enabled": false }"#).unwrap();
         assert!(!off.tray_context_alert_enabled);
+    }
+
+    #[test]
+    fn lid_awake_defaults_off_with_a_bounded_window() {
+        let cfg = Config::default();
+        assert_eq!(cfg.lid_awake_mode, LidAwakeMode::Off, "privileged feature stays opt-in");
+        assert_eq!(cfg.lid_awake_minutes, 15);
+        assert_eq!(cfg.lid_awake_release_grace_ms, 60_000);
+        assert_eq!(cfg.lid_awake_battery_floor_pct, 20);
+    }
+
+    #[test]
+    fn lid_awake_mode_parses_and_classifies() {
+        let on_batt: Config = serde_json::from_str(r#"{ "lid_awake_mode": "on_battery" }"#).unwrap();
+        assert_eq!(on_batt.lid_awake_mode, LidAwakeMode::OnBattery);
+        assert_eq!(serde_json::to_string(&LidAwakeMode::Always).unwrap(), r#""always""#);
+        // An unknown value (e.g. the retired "manual") must not wedge the whole
+        // config — `load_or_default` falls back rather than losing every setting.
+        assert!(serde_json::from_str::<Config>(r#"{ "lid_awake_mode": "manual" }"#).is_err());
     }
 
     #[test]

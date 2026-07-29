@@ -8,6 +8,7 @@ mod custom_names;
 mod http_server;
 mod idle;
 mod label_policy;
+mod lid_awake;
 mod liveness;
 mod liveness_reaper;
 mod log_watcher;
@@ -132,6 +133,7 @@ pub fn run() {
         .manage(terminal_title::TerminalTitles::new())
         .manage(liveness::AgentPids::new())
         .manage(nonce_store::NonceStore::new())
+        .manage(lid_awake::LidAwakeState::default())
         .manage(sync::SyncDirty(std::sync::Arc::new(tokio::sync::Notify::new())))
         .invoke_handler(tauri::generate_handler![
             commands::get_sessions,
@@ -254,6 +256,11 @@ pub fn run() {
             UsageLimitsPoller::spawn(app.handle().clone());
             liveness_reaper::spawn(app.handle().clone());
             waiting_settle::spawn(app.handle().clone());
+            // Clear any `disablesleep` left set by a crash the deadman missed,
+            // before the watcher can arm on top of it. `disablesleep` survives
+            // reboot, so a stranded flag would otherwise persist indefinitely.
+            lid_awake::clear_on_start();
+            lid_awake::spawn(app.handle().clone());
 
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
