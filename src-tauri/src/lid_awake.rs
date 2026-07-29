@@ -824,7 +824,7 @@ mod platform {
     pub(super) fn lid_closed() -> Option<bool> {
         None
     }
-    pub(super) fn clamshell_causes_sleep() -> Option<bool> {
+    pub(super) fn sleep_disabled() -> Option<bool> {
         None
     }
     pub(super) fn power() -> (bool, Option<u8>) {
