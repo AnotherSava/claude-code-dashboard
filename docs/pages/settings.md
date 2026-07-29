@@ -23,7 +23,7 @@ Right-click the tray icon for the controls you reach for most:
 - **Save position on exit** — reopen where you left it, at the same size.
 - **Color terminal tabs** — show each session's status as a colored circle in its terminal tab title.
 - **On system start** — launch at login: off, open the window, or start hidden in the tray.
-- **Auto-resize** — fit the window height to its content, growing upward or downward.
+- **Auto-resize** — fit the window height to its content, growing upward or downward. The widget owns its height while this is on, so dragging its top or bottom edge does nothing; the sides still resize the width.
 - **History font size** — pick one of five sizes for the history window.
 - **Tray usage badge** — show the 5-hour or 7-day usage on the tray icon, as the recolored traffic light or a number (or none).
 - **Keep awake with lid closed** (macOS) — stop the Mac sleeping when you shut the lid while an agent is still working: off, only on battery, or always, plus a **Start now** button that holds once regardless. The title shows how long a hold lasts, and the first time you use it you're asked for your password. See [Features](features#keeping-the-mac-awake-with-the-lid-closed).
@@ -102,7 +102,7 @@ Whether autostart is enabled isn't a config field — it lives in the OS launch 
 
 - `always_on_top` — keep the widget above other windows.
 - `history_font_size` — history-window text size, one of `"smallest"`, `"small"`, `"regular"`, `"large"`, `"largest"`.
-- `auto_resize` — fit the window height to its content: `"up"` grows from a fixed bottom edge, `"down"` from a fixed top edge, `"none"` leaves the window manually sized.
+- `auto_resize` — fit the window height to its content: `"up"` grows from a fixed bottom edge, `"down"` from a fixed top edge, `"none"` leaves the window manually sized. Under `"up"` and `"down"` the height stops being draggable; the width doesn't.
 - `save_window_position` — remember each window's position and size on close. The saved geometry lives in `window_position`, `history_window_position`, and `history_window_maximized`, which the widget manages for you — no need to edit them by hand. If the monitor a window was saved on is later disconnected or rearranged, the widget pulls it back onto a visible screen so it can't get stranded off-screen.
 - `start_minimized` — when launched at login, stay hidden in the tray. Set it through the tray's **On system start → Open to tray**; it's ignored on a manual launch.
 

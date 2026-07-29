@@ -10,15 +10,15 @@ use crate::config::AutoResize;
 /// scale_factor and the webview's devicePixelRatio disagree, and applying a
 /// logical height under Rust's scale lands the viewport at the wrong size —
 /// permanent false-overflow, a content scrollbar, and a re-triggering measure
-/// loop that drifts the window across monitors. Vertical drag is prevented by
-/// the WM_NCHITTEST subclass installed at startup (Windows-only).
+/// loop that drifts the window across monitors. Manual vertical drag is
+/// prevented for the height we apply here by [`resize_lock`].
 pub fn apply(
     window: &WebviewWindow,
     mode: AutoResize,
     desired_height_phys: f64,
 ) -> tauri::Result<()> {
     if matches!(mode, AutoResize::None) {
-        nchittest::set_active(false);
+        resize_lock::release(window);
         return Ok(());
     }
 
@@ -27,7 +27,9 @@ pub fn apply(
     // outer would give an inflated value on frameless Windows windows
     // because of the invisible resize border.
     let size = window.inner_size()?;
-    let new_height_phys = desired_height_phys.round() as i32;
+    // Clamp to a positive height up front so the anchor math, the resize and
+    // the lock's height pin all agree on one value.
+    let new_height_phys = (desired_height_phys.round() as i32).max(1);
     let current_height_phys = size.height as i32;
 
     let raw_y = match mode {
@@ -56,7 +58,13 @@ pub fn apply(
     let bounds = clamp_bounds(window, pos.x, raw_y, width_phys, new_height_phys);
     let (new_x, new_y) = bounds.clamp(pos.x, raw_y, width_phys, new_height_phys);
 
-    window.set_size(PhysicalSize::new(size.width, new_height_phys.max(1) as u32))?;
+    // Re-arm the lock *before* the resize, not after. On macOS the lock is a
+    // min/max content-height pin, so a pin left over from the previous apply()
+    // would clamp this `set_size` back to the old height. Engaging first is
+    // also the only ordering that stays correct whichever way the platform
+    // applies the resize (macOS defers it to the main queue, Windows doesn't).
+    resize_lock::engage(window, new_height_phys);
+    window.set_size(PhysicalSize::new(size.width, new_height_phys as u32))?;
     // Only reposition when the target actually differs from where the window
     // already sits. `set_size` keeps the top-left fixed, so an in-bounds
     // Down-mode resize (and any resize the clamp doesn't touch) needs no move.
@@ -67,7 +75,6 @@ pub fn apply(
     if new_x != pos.x || new_y != pos.y {
         window.set_position(PhysicalPosition::new(new_x, new_y))?;
     }
-    nchittest::set_active(true);
     // `scale` is logged, not used for sizing — it's the value that disagrees
     // with the webview's devicePixelRatio across a DPI boundary, so capturing
     // both sides confirms the mismatch from the trace.
@@ -198,20 +205,12 @@ impl WorkAreaBounds {
     }
 }
 
-/// Install the WM_NCHITTEST subclass on the main window. Called once at
-/// startup; the lock starts inactive and is toggled by `apply()` based on
-/// the configured `AutoResize` mode.
-#[cfg(windows)]
+/// One-time startup wiring for the vertical resize lock (see [`resize_lock`]).
+/// The lock starts released and is engaged by `apply()` once a fit mode is in
+/// effect, so this is inert until the user picks Up or Down.
 pub fn install_resize_lock(window: &WebviewWindow) {
-    let Ok(hwnd) = window.hwnd() else {
-        tracing::warn!("install_resize_lock: hwnd unavailable");
-        return;
-    };
-    nchittest::install(hwnd.0 as isize);
+    resize_lock::install(window);
 }
-
-#[cfg(not(windows))]
-pub fn install_resize_lock(_window: &WebviewWindow) {}
 
 /// Replace the window class's background brush with our dark theme color so
 /// the OS-managed paint during a horizontal resize uses `#1c1c1e` instead
@@ -242,9 +241,67 @@ pub fn set_dark_window_background(window: &WebviewWindow) {
 #[cfg(not(any(windows, target_os = "macos")))]
 pub fn set_dark_window_background(_window: &WebviewWindow) {}
 
+/// Keep a manual drag from fighting auto-resize: while a fit mode owns the
+/// height, an edge drag that changed it would be undone by the next measure
+/// anyway. Only the *vertical* axis is locked — width stays the user's on both
+/// platforms.
+///
+/// The two platforms need different mechanisms. Windows neutralizes the
+/// top/bottom/corner hit-tests so the OS never enters a vertical resize loop.
+/// macOS pins the window's min *and* max content height to the height `apply`
+/// is about to set; AppKit enforces those bounds for the whole live-resize
+/// path, so the edge simply doesn't move. An undecorated NSWindow still
+/// carries `NSWindowStyleMask::Resizable` and is edge-resizable like any
+/// other, which is why the Windows-only hit-test subclass left macOS with a
+/// draggable height that auto-resize then snapped back.
+///
+/// `engage` is called before each resize and `release` when the mode goes back
+/// to `None`; both are idempotent.
+///
+/// The macOS pin binds *programmatic* resizes too, so a `commands::set_window_size`
+/// on the main window — `SetupPanel` widening the widget to fit the onboarding
+/// copy — has its height clamped to the pin while a fit mode is on. That is
+/// harmless rather than something to coordinate around: mounting the panel
+/// flips `showSetup`, whose `$effect` in `App.svelte` schedules a measure, and
+/// the panel's height can neither dedup (it's far from the last request) nor
+/// read as non-overflowing, so auto-resize re-applies and re-pins at the
+/// panel's own height a frame later — uncapped, where `SetupPanel` would have
+/// capped itself at 2/3 of the screen. The width, which is the part only
+/// `set_window_size` can do, is never clamped.
 #[cfg(windows)]
-mod nchittest {
+mod resize_lock {
     use std::sync::atomic::{AtomicBool, Ordering};
+    use tauri::WebviewWindow;
+
+    /// Install the WM_NCHITTEST + WM_NCLBUTTONDOWN subclass on the window.
+    pub fn install(window: &WebviewWindow) {
+        let Ok(hwnd) = window.hwnd() else {
+            tracing::warn!("resize lock: hwnd unavailable");
+            return;
+        };
+        if INSTALLED.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let ok = unsafe {
+            SetWindowSubclass(hwnd.0 as Hwnd, Some(subclass_proc), SUBCLASS_ID, 0)
+        };
+        if ok == 0 {
+            INSTALLED.store(false, Ordering::SeqCst);
+            tracing::warn!("SetWindowSubclass failed for resize lock");
+        } else {
+            tracing::debug!("resize-lock subclass installed");
+        }
+    }
+
+    /// The height is irrelevant here — the subclass blocks the drag outright
+    /// rather than bounding it.
+    pub fn engage(_window: &WebviewWindow, _height_phys: i32) {
+        LOCK_ACTIVE.store(true, Ordering::Relaxed);
+    }
+
+    pub fn release(_window: &WebviewWindow) {
+        LOCK_ACTIVE.store(false, Ordering::Relaxed);
+    }
 
     // Minimal Win32 surface needed for WM_NCHITTEST subclassing. Declared
     // by hand to avoid a `windows`/`windows-sys` dep — these signatures are
@@ -293,25 +350,6 @@ mod nchittest {
     static LOCK_ACTIVE: AtomicBool = AtomicBool::new(false);
     static INSTALLED: AtomicBool = AtomicBool::new(false);
 
-    pub fn set_active(active: bool) {
-        LOCK_ACTIVE.store(active, Ordering::Relaxed);
-    }
-
-    pub fn install(hwnd_raw: isize) {
-        if INSTALLED.swap(true, Ordering::SeqCst) {
-            return;
-        }
-        let ok = unsafe {
-            SetWindowSubclass(hwnd_raw, Some(subclass_proc), SUBCLASS_ID, 0)
-        };
-        if ok == 0 {
-            INSTALLED.store(false, Ordering::SeqCst);
-            tracing::warn!("SetWindowSubclass failed for resize lock");
-        } else {
-            tracing::debug!("resize-lock subclass installed");
-        }
-    }
-
     unsafe extern "system" fn subclass_proc(
         hwnd: Hwnd,
         msg: u32,
@@ -354,9 +392,169 @@ mod nchittest {
     }
 }
 
-#[cfg(not(windows))]
-mod nchittest {
-    pub fn set_active(_active: bool) {}
+#[cfg(target_os = "macos")]
+mod resize_lock {
+    use tauri::utils::config::WindowConfig;
+    use tauri::{LogicalUnit, Manager, PhysicalUnit, PixelUnit, WebviewWindow, WindowSizeConstraints};
+
+    /// Nothing to install — the pin is applied per resize by `engage`.
+    pub fn install(_window: &WebviewWindow) {}
+
+    pub fn engage(window: &WebviewWindow, height_phys: i32) {
+        set_constraints(window, Some(height_phys));
+    }
+
+    pub fn release(window: &WebviewWindow) {
+        set_constraints(window, None);
+    }
+
+    fn set_constraints(window: &WebviewWindow, pinned_height_phys: Option<i32>) {
+        let app = window.app_handle();
+        let declared = app.config().app.windows.iter().find(|w| w.label == window.label());
+        let constraints = constraints_with_pin(declared, pinned_height_phys);
+        if let Err(e) = window.set_size_constraints(constraints) {
+            tracing::warn!(?e, ?pinned_height_phys, "resize lock: set_size_constraints failed");
+        }
+    }
+
+    /// The window's `tauri.conf.json` bounds with the height axis pinned to
+    /// `pinned_height_phys`, or left as declared when there's nothing to pin.
+    ///
+    /// Rebuilt from the declared config rather than from a remembered copy of
+    /// what we last set, because the underlying call writes all four bounds at
+    /// once: reconstructing them keeps `tauri.conf.json` (today `minWidth`) the
+    /// single source of truth instead of a second copy here that would silently
+    /// drop a bound added there later.
+    ///
+    /// The pin is expressed in physical pixels — the unit the height is
+    /// measured and applied in — so it can't disagree with the resize by a
+    /// scale-conversion rounding step and leave AppKit nudging the window by a
+    /// pixel to satisfy its own constraint.
+    ///
+    /// Every field is filled in: a `None` there is not "leave this axis alone"
+    /// but a sentinel tao expands to `f64::MIN` / `f64::MAX`, and those reach
+    /// `NSWindow.setMinSize:` / `setMaxSize:` verbatim — a negative minimum
+    /// size, and a maximum that overflows the frame arithmetic AppKit runs it
+    /// through. `UNBOUNDED_MAX` is tao's own no-maximum value, so a released
+    /// lock leaves the window in exactly the state tao would have.
+    fn constraints_with_pin(
+        declared: Option<&WindowConfig>,
+        pinned_height_phys: Option<i32>,
+    ) -> WindowSizeConstraints {
+        let logical = |v: f64| PixelUnit::Logical(LogicalUnit::new(v));
+        let pin = || pinned_height_phys.map(|h| PixelUnit::Physical(PhysicalUnit::new(h)));
+        let declared_or = |declared: Option<f64>, fallback: f64| {
+            Some(logical(declared.unwrap_or(fallback)))
+        };
+        WindowSizeConstraints {
+            min_width: declared_or(declared.and_then(|d| d.min_width), 0.0),
+            min_height: pin()
+                .or_else(|| declared_or(declared.and_then(|d| d.min_height), 0.0)),
+            max_width: declared_or(declared.and_then(|d| d.max_width), UNBOUNDED_MAX),
+            max_height: pin()
+                .or_else(|| declared_or(declared.and_then(|d| d.max_height), UNBOUNDED_MAX)),
+        }
+    }
+
+    /// Logical size tao itself passes to `NSWindow.setMaxSize:` for "no
+    /// maximum" — large enough to never bind, small enough to stay well inside
+    /// what AppKit's frame math handles.
+    const UNBOUNDED_MAX: f64 = f32::MAX as f64;
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn declared() -> WindowConfig {
+            // Mirrors the main window's tauri.conf.json entry: a min width, no
+            // height bounds of its own.
+            WindowConfig { min_width: Some(300.0), ..Default::default() }
+        }
+
+        fn logical(v: f64) -> Option<PixelUnit> {
+            Some(PixelUnit::Logical(LogicalUnit::new(v)))
+        }
+
+        fn pinned(v: i32) -> Option<PixelUnit> {
+            Some(PixelUnit::Physical(PhysicalUnit::new(v)))
+        }
+
+        #[test]
+        fn engaging_pins_both_height_bounds_to_the_applied_height() {
+            let c = constraints_with_pin(Some(&declared()), Some(341));
+            assert_eq!(c.min_height, pinned(341), "min height pinned");
+            assert_eq!(c.max_height, pinned(341), "max height pinned — min == max is the lock");
+        }
+
+        #[test]
+        fn pinning_the_height_keeps_the_declared_width_bounds() {
+            // The whole point of rebuilding from the config: writing all four
+            // bounds must not quietly drop the configured minimum width, which
+            // would let the user squash the widget to nothing horizontally.
+            let c = constraints_with_pin(Some(&declared()), Some(341));
+            assert_eq!(c.min_width, logical(300.0));
+            assert_eq!(c.max_width, logical(UNBOUNDED_MAX), "no max width declared, none imposed");
+        }
+
+        #[test]
+        fn releasing_frees_the_height_and_keeps_the_declared_width_bounds() {
+            let c = constraints_with_pin(Some(&declared()), None);
+            assert_eq!(c.min_height, logical(0.0), "height free again");
+            assert_eq!(c.max_height, logical(UNBOUNDED_MAX), "height free again");
+            assert_eq!(c.min_width, logical(300.0));
+        }
+
+        #[test]
+        fn every_bound_is_spelled_out_rather_than_left_unset() {
+            // A None field is not "leave it alone" — tao expands it to
+            // f64::MIN/f64::MAX and hands that straight to NSWindow.
+            let c = constraints_with_pin(None, None);
+            assert!(
+                [c.min_width, c.min_height, c.max_width, c.max_height]
+                    .iter()
+                    .all(Option::is_some),
+                "no bound may be left for tao's MIN/MAX sentinels to fill in"
+            );
+        }
+
+        #[test]
+        fn released_height_falls_back_to_declared_height_bounds() {
+            // A minHeight/maxHeight added to tauri.conf.json later must survive
+            // a release rather than being cleared by it.
+            let declared =
+                WindowConfig { min_height: Some(120.0), max_height: Some(900.0), ..declared() };
+            let c = constraints_with_pin(Some(&declared), None);
+            assert_eq!(c.min_height, logical(120.0));
+            assert_eq!(c.max_height, logical(900.0));
+        }
+
+        #[test]
+        fn pin_wins_over_declared_height_bounds() {
+            let declared =
+                WindowConfig { min_height: Some(120.0), max_height: Some(900.0), ..declared() };
+            let c = constraints_with_pin(Some(&declared), Some(341));
+            assert_eq!(c.min_height, pinned(341), "the applied height overrides the declared floor");
+            assert_eq!(c.max_height, pinned(341), "…and the declared ceiling");
+        }
+
+        #[test]
+        fn undeclared_window_still_gets_the_pin() {
+            // A window missing from the config (renamed label) must still lock,
+            // just without any width bounds to preserve.
+            let c = constraints_with_pin(None, Some(341));
+            assert_eq!(c.min_height, pinned(341));
+            assert_eq!(c.min_width, logical(0.0));
+        }
+    }
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+mod resize_lock {
+    use tauri::WebviewWindow;
+
+    pub fn install(_window: &WebviewWindow) {}
+    pub fn engage(_window: &WebviewWindow, _height_phys: i32) {}
+    pub fn release(_window: &WebviewWindow) {}
 }
 
 #[cfg(windows)]

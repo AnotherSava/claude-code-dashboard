@@ -39,6 +39,7 @@
 - [Tray badge deferred work](tray_badge_deferred.md) — macOS contrast on number modes + live DPI re-render not done; config.tray_badge set in config/local.json
 - [Startup session restore infeasible](startup_session_restore_infeasible.md) — can't tell closed from idle-open sessions; Claude doesn't hold transcript open; don't re-attempt
 - [Preview tray rendering via PNG test](debug_preview_tray_rendering.md) — throwaway #[ignore] test + png dev-dep renders tray_badge fns to scratchpad PNGs; view, then remove
+- [Verify macOS window geometry via AX](verify_macos_window_geometry_via_ax.md) — System Events AXSize A/B proves resize locks; a sleeping display fakes a "vanished window" (black screencapture), screen-edge clamp fakes a blocked resize
 - [5h resets_at jitters ±1min](usage_five_hour_resets_at_jitter.md) — never use five_hour_resets_at as a reset signal; detect reset by pct drop, intensity = max(0, Δpct)
 - [Context-alert tracking not persisted](context_alert_outstanding_not_persisted.md) — context_outstanding is in-memory; app restart orphans Telegram alerts (known, deliberately unfixed); grep decision=context_alert/context_dismiss
 - [Telegram has no send confirmation](telegram_no_send_confirmation.md) — bots can't read own sent messages; no idempotency; duplicate-on-timeout only mitigable, not eliminable; mitigations = timeout split + 5min RetryHold backoff on maybe-delivered (read-timeout) sends; don't re-propose getUpdates dedup

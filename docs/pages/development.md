@@ -88,7 +88,7 @@ Under the repo root `claude-code-dashboard/`:
     - `chat_id_registry.rs` — persisted `session_id → chat_id` lock in `session_chat_ids.json`
     - `custom_names.rs` — user-assigned display names persisted to `custom_names.json`
     - `terminal_title.rs` — mirrors session status onto terminal tab titles
-    - `auto_resize.rs` — Up/Down content-fit window + Win32 resize lock + dark class brush
+    - `auto_resize.rs` — Up/Down content-fit window + vertical resize lock (Win32 hit-test subclass / macOS height pin) + dark class brush
     - `label_policy.rs` — shared (label, original_prompt) decision used by adapters
     - `adapters.rs` — adapter dispatch for /api/event payloads
     - `adapters/claude.rs` — Claude Code lifecycle classifier + chat-id derivation
