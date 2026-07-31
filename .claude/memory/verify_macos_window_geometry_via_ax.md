@@ -24,6 +24,13 @@ Two traps that cost real time:
   `constrainFrameRect:toScreen:` truncates the request at the work-area edge, so
   a "blocked" result can just be the window hitting the screen. Move the window
   somewhere with room first, or the A/B proves nothing.
+- **A successful click can leave state behind.** `click menu item …` returns an
+  object reference on success, which reads like noise — easy to misjudge as a
+  failure, especially when a sleeping-display AX error lands in the same breath.
+  Tray → Help → Connect instructions sets a `setupOverride` that resets only when
+  the app **relaunches**, so one exploratory click left the onboarding panel
+  covering the dashboard (and the window widened to 783 px) for a full day. Undo
+  any UI state a test sets, and confirm the undo.
 
 `auto_resize` is `"none"` in the deployed config, so the resize lock is inert
 until you flip it — write `auto_resize` in the app-data `config.json` and the
