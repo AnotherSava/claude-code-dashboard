@@ -622,13 +622,13 @@ impl AppState {
 /// the sync receive path can apply overlapping deltas idempotently (a failed
 /// push leaves the sender's watermark in place, so the next push re-sends
 /// the same entries):
-/// - User: append, unless the last user entry has the same text (watcher
-///   dedup of re-read transcripts) or an identical entry — same timestamp
-///   and text — already exists (replayed delta).
+/// - User: append, unless the dialog still *ends* with a user entry of the
+///   same text (watcher dedup of a re-read transcript) or an identical entry
+///   — same timestamp and text — already exists (replayed delta).
 /// - Assistant: replace the tail assistant of the current turn in place
 ///   (same-turn streaming update — also how a replayed newer version of the
 ///   same turn lands), skip when its text already matches, append when a
-///   user entry intervened.
+///   user entry or a separator intervened.
 /// - Separator: append, unless the dialog already ends with one (mirrors the
 ///   mark_session_boundary guard) or the same separator (by timestamp) was
 ///   already merged.
@@ -638,8 +638,15 @@ pub fn merge_dialog_entries(dialog: &mut Vec<DialogEntry>, incoming: &[DialogEnt
     for entry in incoming {
         match entry.role {
             DialogRole::User => {
-                let last_user = dialog.iter().rev().find(|e| e.role == DialogRole::User);
-                if last_user.is_some_and(|e| e.text == entry.text) {
+                // Scoped to the *tail*: only an unanswered prompt still sitting
+                // at the end is a re-read. Comparing against the last user entry
+                // anywhere in the dialog dropped genuine repeats — an approval
+                // loop ("y", "retry", "all") re-sends the same text one turn
+                // later — and, with that turn boundary now missing, the reply
+                // that followed overwrote the *previous* turn's reply in the
+                // Assistant arm below, silently losing two entries strictly
+                // below the newest one.
+                if dialog.last().is_some_and(|e| e.role == DialogRole::User && e.text == entry.text) {
                     continue;
                 }
                 if dialog.iter().any(|e| e.role == DialogRole::User && e.timestamp == entry.timestamp && e.text == entry.text) {
@@ -649,8 +656,19 @@ pub fn merge_dialog_entries(dialog: &mut Vec<DialogEntry>, incoming: &[DialogEnt
                 changed = true;
             }
             DialogRole::Assistant => {
+                // Replayed delta carrying the identical entry — skip regardless
+                // of turn structure. Mirrors the User arm, and is what keeps a
+                // re-send idempotent once the turn sits behind a separator,
+                // where the tail scan below deliberately stops.
+                if dialog.iter().any(|e| e.role == DialogRole::Assistant && e.timestamp == entry.timestamp && e.text == entry.text) {
+                    continue;
+                }
+                // A separator ends a turn exactly as a user entry does, so the
+                // scan stops at both — otherwise a reply arriving first after a
+                // `/clear` or compact boundary would reach back across it and
+                // overwrite the pre-boundary reply.
                 let tail_idx = dialog.iter().enumerate().rev()
-                    .take_while(|(_, e)| e.role != DialogRole::User)
+                    .take_while(|(_, e)| e.role != DialogRole::User && e.role != DialogRole::Separator)
                     .find(|(_, e)| e.role == DialogRole::Assistant)
                     .map(|(i, _)| i);
                 if let Some(i) = tail_idx {
@@ -1581,12 +1599,37 @@ mod tests {
     }
 
     #[test]
-    fn merge_user_dedups_against_last_user() {
-        let mut dialog = vec![user_entry("fix bug", 10), assistant_entry("done", 20)];
-        // Same prompt re-read with a different timestamp (transcript re-read
-        // on the origin) — text dedup against the last user entry catches it.
+    fn merge_user_dedups_unanswered_reread() {
+        let mut dialog = vec![user_entry("fix bug", 10)];
+        // Same prompt re-read with a different timestamp while it is still the
+        // unanswered tail (transcript re-read on the origin) — text dedup
+        // against the tail catches it.
         assert!(!merge_dialog_entries(&mut dialog, &[user_entry("fix bug", 30)]));
-        assert_eq!(dialog.len(), 2);
+        assert_eq!(dialog.len(), 1);
+    }
+
+    #[test]
+    fn merge_keeps_prompt_repeated_after_a_reply() {
+        // The approval loop — "y" / "retry" / "all" one turn later is a genuine
+        // new turn, not a re-read. Dropping it also cost the reply *before* it:
+        // with the turn boundary gone, the next assistant overwrote that reply
+        // in place, so two entries vanished below the newest one.
+        let mut dialog = vec![user_entry("y", 10), assistant_entry("first reply", 20)];
+        let delta = vec![user_entry("y", 30), assistant_entry("second reply", 40)];
+        assert!(merge_dialog_entries(&mut dialog, &delta));
+        let texts: Vec<&str> = dialog.iter().map(|e| e.text.as_str()).collect();
+        assert_eq!(texts, ["y", "first reply", "y", "second reply"], "both turns survive intact");
+    }
+
+    #[test]
+    fn merge_assistant_stops_at_a_separator() {
+        // A reply arriving first after a /clear or compact boundary must append,
+        // not reach back across the separator and overwrite the previous one.
+        let mut dialog = vec![user_entry("u1", 10), assistant_entry("before", 20), separator_entry(30)];
+        assert!(merge_dialog_entries(&mut dialog, &[assistant_entry("after", 40)]));
+        assert_eq!(dialog.len(), 4);
+        assert_eq!(dialog[1].text, "before", "pre-boundary reply untouched");
+        assert_eq!(dialog[3].text, "after");
     }
 
     #[test]
