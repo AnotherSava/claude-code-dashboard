@@ -4,12 +4,30 @@
 //! frontend payload by `commands::resolved_snapshot`).
 //!
 //! Single-writer model: each device is authoritative for its own sessions.
-//! A push carries a full snapshot of the sender's session metadata (receiver
-//! wholesale-replaces it per device; removal = absence) plus per-session
-//! dialog *deltas* — entries changed since the peer's watermark — which the
-//! receiver accumulates via `state::merge_dialog_entries`. Dialogs run to
-//! hundreds of KB, so resending them on every push would be wasteful, while
-//! metadata-only pushes would leave an open history window stale.
+//!
+//! **Push notifies, pull moves content.** A push carries a full snapshot of the
+//! sender's session metadata (receiver wholesale-replaces it per device;
+//! removal = absence) and, per session, nothing but a `dialog_tip` — the newest
+//! dialog timestamp the sender holds. The receiver compares each tip against
+//! what it actually holds and fetches the difference itself over
+//! `GET /api/sync/{dialog,usage}`. Usage samples work the same way via
+//! `usage_tip`.
+//!
+//! The split is deliberate. Change events originate at the sender — only it
+//! knows *when* a session moved — so notification must be pushed or peers would
+//! have to poll several times a second to keep a live widget fresh. But dialogs
+//! run to hundreds of KB, so they can't ride every push, and the moment content
+//! is sent incrementally the sender needs to know how far the receiver got.
+//! That is a guess about someone else's contents, and it went stale silently:
+//! a delta the receiver discarded still counted as delivered, and the session
+//! stayed stranded for the rest of the sender's run. Only the receiver knows
+//! what it holds, so only the receiver decides what to ask for. The sender is
+//! stateless — the same snapshot goes to every peer every cycle, a failed push
+//! costs a retry and nothing else, and there is no watermark to persist,
+//! reconcile, or leak.
+//!
+//! Everything the receiver stores is therefore derived from data it can see:
+//! its own newest held timestamp, never a number tracked alongside it.
 //!
 //! The listener binds all interfaces (only the tailnet routes here in
 //! practice) and every route requires the shared bearer token; with no token
@@ -42,12 +60,6 @@ const DEBOUNCE_MS: u64 = 300;
 const HEARTBEAT_SECS: u64 = 30;
 /// Drop a remote device after this long without a push (3 missed heartbeats).
 const REMOTE_TTL_MS: i64 = 90_000;
-/// Watermark overlap: a peer's watermark advances to the push capture time
-/// minus this margin, so entries stamped in the same instant a push was being
-/// built can't fall between two pushes. Re-sent entries are deduplicated by
-/// `merge_dialog_entries`, so the overlap only costs a few bytes.
-const WATERMARK_MARGIN_MS: i64 = 2_000;
-
 /// Poked by `commands::emit_sessions_updated` on every state transition; the
 /// pusher debounces and ships local sessions to all peers.
 pub struct SyncDirty(pub Arc<Notify>);
@@ -57,37 +69,43 @@ pub struct SyncDirty(pub Arc<Notify>);
 pub struct SyncPush {
     pub device_name: String,
     /// The sender's own sync listener port; combined with the socket peer IP
-    /// it gives the receiver the origin address for catch-up dialog fetches.
+    /// it gives the receiver the address to pull dialog and usage ranges from.
     pub listen_port: u16,
-    /// The watermark the dialog deltas were selected against (entries with
-    /// `timestamp > delta_from` made it in). `0` means the deltas are each
-    /// session's complete dialog — a freshly started pusher. Lets the
-    /// receiver verify contiguity with what it holds and discard floating
-    /// fragments instead of storing dialogs with an invisible gap; `0` is
-    /// also the serde default, so a legacy sender without the field keeps
-    /// its pushes accepted (the pre-guard behavior).
-    #[serde(default)]
-    pub delta_from: i64,
     pub sessions: Vec<SessionSync>,
-    /// Usage-limit samples newer than the peer's usage watermark. A global
-    /// (non-session) timeline of Anthropic 5h/7d polls; the receiver stores
-    /// them per-device (`RemoteUsageStore`) and unions them into the
-    /// Work-intensity chart to fill the windows its own app wasn't running.
-    /// `serde(default)` keeps heartbeat/legacy pushes (no usage) valid, and is
-    /// carried on the first drain chunk only — never on the dialog-backlog
-    /// follow-ups.
+    /// Newest local usage-sample timestamp, or `0` when there are none. Same
+    /// role as `SessionSync::dialog_tip`: the receiver pulls the records above
+    /// whatever it already holds for this device.
     #[serde(default)]
-    pub usage_delta: Vec<UsageHistoryRecord>,
+    pub usage_tip: i64,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct SessionSync {
-    /// Full metadata snapshot with `dialog` stripped (it travels as a delta),
-    /// raw local id, `origin`/`display_name` unset — the receiver namespaces
-    /// and stamps.
+    /// Full metadata snapshot with `dialog` stripped to the tip below, raw
+    /// local id, `origin`/`display_name` unset — the receiver namespaces and
+    /// stamps.
     pub session: AgentSession,
-    /// Dialog entries changed since this peer's watermark.
-    pub dialog_delta: Vec<DialogEntry>,
+    /// Newest dialog timestamp the origin holds for this session, or `0` for an
+    /// empty dialog. The receiver compares it against its own newest held entry
+    /// and pulls the difference itself — no dialog content rides the push.
+    ///
+    /// This is the whole reason the sender is stateless. A push carrying deltas
+    /// had to remember, per peer and per session, how far it believed that peer
+    /// had got; being a guess about *someone else's* contents it went stale
+    /// silently (a discarded delta still acknowledged, a merge dropping an
+    /// entry) and stranded the session for the rest of the run. A tip is a fact
+    /// about the sender's own data, and the party that acts on it is the only
+    /// one that can check it.
+    #[serde(default)]
+    pub dialog_tip: i64,
+}
+
+/// One dialog range the receiver decided it is missing: `since` is its newest
+/// held timestamp, so the origin returns strictly newer entries.
+#[derive(Debug, PartialEq)]
+struct DialogPull {
+    raw_id: String,
+    since: i64,
 }
 
 /// True when the request carries `Authorization: Bearer <token>` matching the
@@ -104,49 +122,49 @@ fn bearer_ok(headers: &HeaderMap, token: Option<&str>) -> bool {
 }
 
 /// Build the receiver-side state for one device from an incoming push:
-/// namespace ids to "{device}/{raw_id}", stamp `origin`, carry over the
-/// dialog accumulated from earlier pushes (sessions absent from the snapshot
-/// drop out by not being carried), and merge each delta. Sessions without an
-/// in-memory predecessor seed their dialog from `persisted` — the on-disk
-/// copy a dashboard restart would otherwise have discarded.
+/// namespace ids to "{device}/{raw_id}", stamp `origin`, and carry over the
+/// dialog accumulated so far (sessions absent from the snapshot drop out by not
+/// being carried). Sessions without an in-memory predecessor seed their dialog
+/// from `persisted` — the on-disk copy a dashboard restart would otherwise have
+/// discarded.
 ///
-/// Contiguity guard: a delta is merged only when `delta_from == 0` (the
-/// delta is the complete dialog) or `delta_from <=` the newest held entry
-/// (it overlaps what we hold). Anything else is a floating fragment — newer
-/// entries with a hole below them, e.g. a fresh install receiving deltas
-/// from a long-running origin — and is discarded: held dialogs stay gap-free
-/// by construction, and the history window's full-dialog catch-up fills in
-/// the rest at the only moment remote dialog is actually read.
+/// No dialog content arrives here. Instead each session whose advertised
+/// `dialog_tip` is newer than our own newest held entry yields a [`DialogPull`]
+/// for the caller to fetch. Because the range is derived from what we hold at
+/// the moment we ask, a failed or dropped fetch is self-correcting: nothing
+/// recorded that we had it, the next push re-advertises the same tip, and we
+/// ask again.
 fn ingest(
     device: &str,
     sessions: Vec<SessionSync>,
     prev: Option<&RemoteDevice>,
     persisted: &HashMap<String, Vec<DialogEntry>>,
-    delta_from: i64,
     now: i64,
     origin_addr: String,
-) -> RemoteDevice {
+) -> (RemoteDevice, Vec<DialogPull>) {
     let mut out = Vec::with_capacity(sessions.len());
+    let mut pulls = Vec::new();
     for item in sessions {
         let mut s = item.session;
-        s.id = format!("{device}/{}", s.id);
+        let raw_id = s.id.clone();
+        s.id = format!("{device}/{raw_id}");
         s.origin = Some(device.to_string());
         s.display_name = None; // receiver's custom names win at emit time
-        let mut dialog = prev
+        // Carry the dialog we already hold across the metadata replace: in
+        // memory first, else the on-disk copy a restart would otherwise drop.
+        let dialog = prev
             .and_then(|p| p.sessions.iter().find(|ps| ps.id == s.id))
             .map(|ps| ps.dialog.clone())
             .or_else(|| persisted.get(&s.id).cloned())
             .unwrap_or_default();
-        let held_max = dialog.iter().map(|e| e.timestamp).max();
-        if delta_from == 0 || held_max.is_some_and(|m| delta_from <= m) {
-            merge_dialog_entries(&mut dialog, &item.dialog_delta);
-        } else if !item.dialog_delta.is_empty() {
-            tracing::debug!(session = %s.id, delta_from, held_max, "non-contiguous dialog delta discarded");
+        let held = dialog.iter().map(|e| e.timestamp).max().unwrap_or(0);
+        if item.dialog_tip > held {
+            pulls.push(DialogPull { raw_id, since: held });
         }
         s.dialog = dialog;
         out.push(s);
     }
-    RemoteDevice { sessions: out, last_seen: now, origin_addr }
+    (RemoteDevice { sessions: out, last_seen: now, origin_addr }, pulls)
 }
 
 async fn post_sync(
@@ -154,59 +172,54 @@ async fn post_sync(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(push): Json<SyncPush>,
-) -> StatusCode {
+) -> Result<StatusCode, StatusCode> {
     let Some(cfg_state) = app.try_state::<ConfigState>() else {
-        return StatusCode::INTERNAL_SERVER_ERROR;
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
     };
     let cfg = cfg_state.snapshot();
     if !bearer_ok(&headers, cfg.sync.token.as_deref()) {
-        return StatusCode::UNAUTHORIZED;
+        return Err(StatusCode::UNAUTHORIZED);
     }
     let Some(state) = app.try_state::<AppState>() else {
-        return StatusCode::INTERNAL_SERVER_ERROR;
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
     };
     if push.device_name.is_empty() || push.device_name == cfg.sync.device_name {
         tracing::warn!(device = %push.device_name, "sync push rejected: empty or same device_name as ours");
-        return StatusCode::BAD_REQUEST;
+        return Err(StatusCode::BAD_REQUEST);
     }
-    let delta_entries = push.sessions.iter().map(|s| s.dialog_delta.len()).sum::<usize>();
     tracing::debug!(
         device = %push.device_name,
         sessions = push.sessions.len(),
-        delta_entries,
         "sync push received"
     );
     let origin_addr = format!("http://{}:{}", addr.ip(), push.listen_port);
     let now = now_ms();
     let store = app.try_state::<RemoteHistoryStore>();
     let persisted = store.as_ref().map(|s| s.device_dialogs(&push.device_name)).unwrap_or_default();
-    let sessions = {
+    let usage_tip = push.usage_tip;
+    let device_name = push.device_name.clone();
+    let pulls = {
         let mut remote = state.remote.lock().unwrap();
         let prev = remote.get(&push.device_name);
-        let device = ingest(&push.device_name, push.sessions, prev, &persisted, push.delta_from, now, origin_addr);
-        let sessions = device.sessions.clone();
+        let (device, pulls) = ingest(&push.device_name, push.sessions, prev, &persisted, now, origin_addr.clone());
         remote.insert(push.device_name.clone(), device);
-        sessions
+        pulls
     };
-    // Deltas are the only new content — a delta-free push (heartbeat, or one
-    // that merely restored dialogs *from* the store) changes nothing on disk.
-    if delta_entries > 0 {
-        if let Some(store) = store {
-            store.save_device(&push.device_name, &sessions);
-        }
-    }
-    // Usage samples are a global timeline (not per-session): merge them into
-    // this device's per-peer remote-usage store. Sits after the same-/empty-
-    // device-name guard above, so a device never stores its own records.
-    if !push.usage_delta.is_empty() {
-        if let Some(usage_store) = app.try_state::<RemoteUsageStore>() {
-            usage_store.merge_device(&push.device_name, &push.usage_delta);
-            // Nudge an open Work-intensity window to re-fetch the merged chart.
-            emit_usage_limits_updated(&app);
-        }
-    }
     emit_sessions_updated_remote(&app);
-    StatusCode::NO_CONTENT
+    // Content is fetched, not received: we know exactly what we hold, so we ask
+    // for the remainder ourselves rather than have the sender guess. Spawned
+    // after the lock is released; each merge re-emits when it lands.
+    for pull in pulls {
+        fetch_dialog_range(app.clone(), device_name.clone(), origin_addr.clone(), pull);
+    }
+    let usage_held = app
+        .try_state::<RemoteUsageStore>()
+        .map(|s| s.newest_ts(&device_name))
+        .unwrap_or(0);
+    if usage_tip > usage_held {
+        fetch_usage_range(app.clone(), device_name, origin_addr, usage_held);
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(Deserialize)]
@@ -239,6 +252,31 @@ async fn get_dialog(
     Ok(Json(s.dialog.iter().filter(|e| e.timestamp > q.since).cloned().collect()))
 }
 
+#[derive(Deserialize)]
+struct UsageQuery {
+    #[serde(default)]
+    since: i64,
+}
+
+/// The usage counterpart of [`get_dialog`]: our *local* usage samples newer
+/// than `since`. Gives `remote_usage/` the repair path dialog always had — a
+/// peer that lost its copy asks again and refills it, instead of waiting for
+/// this device to restart and re-advertise from scratch.
+async fn get_usage(
+    State(app): State<AppHandle>,
+    headers: HeaderMap,
+    Query(q): Query<UsageQuery>,
+) -> Result<Json<Vec<UsageHistoryRecord>>, StatusCode> {
+    let Some(cfg_state) = app.try_state::<ConfigState>() else {
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    };
+    if !bearer_ok(&headers, cfg_state.snapshot().sync.token.as_deref()) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let records = app.try_state::<UsageHistoryStore>().map(|s| s.read_all()).unwrap_or_default();
+    Ok(Json(usage_since(&records, q.since)))
+}
+
 /// Sync listener on all interfaces — see module docs for why that's safe.
 pub async fn run_listener(app: AppHandle, port: u16) {
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
@@ -254,6 +292,7 @@ pub async fn run_listener(app: AppHandle, port: u16) {
     let router = Router::new()
         .route("/api/sync", post(post_sync))
         .route("/api/sync/dialog", get(get_dialog))
+        .route("/api/sync/usage", get(get_usage))
         .with_state(app);
 
     if let Err(e) = axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>()).await {
@@ -261,77 +300,39 @@ pub async fn run_listener(app: AppHandle, port: u16) {
     }
 }
 
-/// Per-push dialog-delta budget, in summed entry-text bytes. Bounds every
-/// POST: a peer that's far behind gets its backlog drained in successive
-/// bounded chunks within one cycle, and a *down* peer costs each failed
-/// cycle one bounded build + connect attempt instead of an ever-growing
-/// serialization of everything since its frozen watermark.
-const DELTA_BUDGET_BYTES: usize = 256 * 1024;
-
-/// One bounded chunk of a peer push.
-struct PushChunk {
-    push: SyncPush,
-    /// Watermark to adopt once this chunk is acknowledged: the last included
-    /// timestamp, or `capture - WATERMARK_MARGIN_MS` when drained.
-    ack_watermark: i64,
-    /// False when the budget cut the backlog — more chunks remain.
-    drained: bool,
+/// Local usage samples newer than `since`, ascending (the store already
+/// returns them sorted). Pure, so the range selection is unit-testable.
+fn usage_since(records: &[UsageHistoryRecord], since: i64) -> Vec<UsageHistoryRecord> {
+    records.iter().filter(|r| r.ts > since).cloned().collect()
 }
 
-/// Build one push chunk: full metadata for every local session, plus the
-/// *oldest* `budget` bytes of dialog backlog above `watermark` (timestamp
-/// order across sessions). Oldest-first because the receiver only merges
-/// deltas contiguous with what it holds, so backfill must grow upward from
-/// the watermark — a newest-first fragment would be discarded. Entries
-/// sharing the cut timestamp are never split across chunks (selection is
-/// strictly `> watermark`, so a split twin would be skipped forever), and
-/// the first entry always fits regardless of size, guaranteeing progress.
-fn build_push_chunk(device_name: &str, listen_port: u16, sessions: &[AgentSession], watermark: i64, capture: i64, budget: usize) -> PushChunk {
-    let mut pending: Vec<(i64, usize)> = sessions
-        .iter()
-        .flat_map(|s| s.dialog.iter().filter(|e| e.timestamp > watermark))
-        .map(|e| (e.timestamp, e.text.len()))
-        .collect();
-    pending.sort_unstable_by_key(|&(ts, _)| ts);
-    let mut used = 0usize;
-    let mut last_included = watermark;
-    let mut drained = true;
-    for &(ts, len) in &pending {
-        if used > 0 && ts > last_included && used + len > budget {
-            drained = false;
-            break;
-        }
-        used += len;
-        last_included = ts;
-    }
-    let cutoff = if drained { i64::MAX } else { last_included };
-    let push = SyncPush {
+/// Build the one push a cycle sends a peer: a full metadata snapshot of every
+/// local session with its dialog stripped down to a `dialog_tip`, plus the
+/// newest local usage timestamp.
+///
+/// Stateless by construction — nothing here depends on which peer it is going
+/// to or on anything that peer was sent before, so there is no per-peer
+/// bookkeeping to go stale, no backlog to chunk, and a failed push costs
+/// nothing but a retry. Content moves on the pull side, where the party that
+/// knows what it is missing does the asking.
+fn build_push(device_name: &str, listen_port: u16, sessions: &[AgentSession], usage_tip: i64) -> SyncPush {
+    SyncPush {
         device_name: device_name.to_string(),
         listen_port,
-        delta_from: watermark,
         sessions: sessions
             .iter()
             .map(|s| {
+                let dialog_tip = s.dialog.iter().map(|e| e.timestamp).max().unwrap_or(0);
                 let mut meta = s.clone();
-                let dialog_delta = meta.dialog.iter().filter(|e| e.timestamp > watermark && e.timestamp <= cutoff).cloned().collect();
                 meta.dialog = Vec::new();
-                SessionSync { session: meta, dialog_delta }
+                SessionSync { session: meta, dialog_tip }
             })
             .collect(),
-        // Usage records ride on the first chunk only; push_all sets them.
-        usage_delta: Vec::new(),
-    };
-    PushChunk { push, ack_watermark: if drained { capture - WATERMARK_MARGIN_MS } else { last_included }, drained }
+        usage_tip,
+    }
 }
 
-/// Local usage samples newer than `watermark`, in ascending `ts` order (the
-/// store already returns them sorted). Pure so the watermark selection is
-/// unit-testable without an `AppHandle`.
-fn usage_delta_since(records: &[UsageHistoryRecord], watermark: i64) -> Vec<UsageHistoryRecord> {
-    records.iter().filter(|r| r.ts > watermark).cloned().collect()
-}
-
-async fn push_all(app: &AppHandle, client: &reqwest::Client, watermarks: &mut HashMap<String, i64>, usage_watermarks: &mut HashMap<String, i64>) {
+async fn push_all(app: &AppHandle, client: &reqwest::Client) {
     let Some(cfg_state) = app.try_state::<ConfigState>() else {
         return;
     };
@@ -345,62 +346,26 @@ async fn push_all(app: &AppHandle, client: &reqwest::Client, watermarks: &mut Ha
     let Some(state) = app.try_state::<AppState>() else {
         return;
     };
-    // Capture time *before* the snapshot: any entry stamped later either made
-    // it into this snapshot (then the merge dedups the re-send) or pokes the
-    // dirty signal for the next push. Local sessions only — received remote
-    // sessions are never re-broadcast.
-    let capture = now_ms();
+    // Local sessions only — received remote sessions are never re-broadcast.
     let sessions = state.snapshot();
-    // Local usage samples to share; peers union them into their intensity
-    // chart to fill the windows their own app wasn't running. Read once per
-    // cycle, filtered per peer against that peer's usage watermark.
-    let usage = app.try_state::<UsageHistoryStore>().map(|s| s.read_all()).unwrap_or_default();
+    let usage_tip = app
+        .try_state::<UsageHistoryStore>()
+        .and_then(|s| s.read_all().last().map(|r| r.ts))
+        .unwrap_or(0);
+    let push = build_push(&cfg.sync.device_name, cfg.sync.listen_port, &sessions, usage_tip);
     // Cycle breadcrumb: push cadence should never silently stop while peers
     // are configured — if the failure logs go quiet, this shows whether the
     // pusher loop itself is still alive.
     tracing::trace!(peers = cfg.sync.peers.len(), sessions = sessions.len(), "sync push cycle");
     for peer in &cfg.sync.peers {
         let url = format!("{}/api/sync", peer.trim_end_matches('/'));
-        let usage_delta = usage_delta_since(&usage, usage_watermarks.get(peer).copied().unwrap_or(0));
-        let usage_max = usage_delta.last().map(|r| r.ts);
-        // Usage rides the first chunk only — the dialog-backlog follow-ups
-        // carry an empty usage_delta so it isn't resent within one cycle.
-        let mut usage_sent = false;
-        // Drain loop: each acknowledged chunk advances the watermark and the
-        // next chunk follows immediately, so a peer that was offline catches
-        // up within one cycle — but the full backlog is only ever built and
-        // sent once the peer has proven reachable, one bounded POST at a time.
-        loop {
-            let watermark = watermarks.get(peer).copied().unwrap_or(0);
-            let mut chunk = build_push_chunk(&cfg.sync.device_name, cfg.sync.listen_port, &sessions, watermark, capture, DELTA_BUDGET_BYTES);
-            if !usage_sent {
-                chunk.push.usage_delta = usage_delta.clone();
-            }
-            match client.post(&url).bearer_auth(&token).json(&chunk.push).send().await {
-                Ok(resp) if resp.status().is_success() => {
-                    watermarks.insert(peer.clone(), chunk.ack_watermark);
-                    if !usage_sent {
-                        if let Some(max) = usage_max {
-                            usage_watermarks.insert(peer.clone(), max);
-                        }
-                        usage_sent = true;
-                    }
-                    if chunk.drained {
-                        break;
-                    }
-                }
-                // Failures leave the watermark in place, so the next successful
-                // push carries everything the peer missed. Offline peers are
-                // routine — log at debug, not warn.
-                Ok(resp) => {
-                    tracing::debug!(peer = %peer, status = %resp.status(), "sync push rejected");
-                    break;
-                }
-                Err(e) => {
-                    tracing::debug!(peer = %peer, error = %e, "sync push failed");
-                    break;
-                }
-            }
+        match client.post(&url).bearer_auth(&token).json(&push).send().await {
+            Ok(resp) if resp.status().is_success() => {}
+            // Offline peers are routine — log at debug, not warn. Nothing to
+            // roll back: the next push carries the same snapshot and the
+            // receiver re-derives what it needs from the tips.
+            Ok(resp) => tracing::debug!(peer = %peer, status = %resp.status(), "sync push rejected"),
+            Err(e) => tracing::debug!(peer = %peer, error = %e, "sync push failed"),
         }
     }
 }
@@ -414,8 +379,6 @@ pub fn spawn_pusher(app: AppHandle, dirty: Arc<Notify>) {
             .timeout(Duration::from_secs(10))
             .build()
             .expect("reqwest client");
-        let mut watermarks: HashMap<String, i64> = HashMap::new();
-        let mut usage_watermarks: HashMap<String, i64> = HashMap::new();
         loop {
             tokio::select! {
                 _ = dirty.notified() => {
@@ -423,7 +386,7 @@ pub fn spawn_pusher(app: AppHandle, dirty: Arc<Notify>) {
                 }
                 _ = tokio::time::sleep(Duration::from_secs(HEARTBEAT_SECS)) => {}
             }
-            push_all(&app, &client, &mut watermarks, &mut usage_watermarks).await;
+            push_all(&app, &client).await;
         }
     });
 }
@@ -471,36 +434,111 @@ fn emit_history_loading(app: &AppHandle, id: &str, loading: bool) {
 /// GET the origin's full dialog for one raw session id. `None` on any
 /// failure (origin offline, auth mismatch, parse error) — all logged at
 /// debug, since offline peers are routine.
-async fn fetch_full_dialog(origin_addr: &str, raw_id: &str, token: &str) -> Option<Vec<DialogEntry>> {
+/// Fetch one session's missing dialog range and merge it. Spawned from
+/// `post_sync` whenever the origin's advertised tip is newer than what we hold.
+///
+/// Fire-and-forget: on failure nothing is lost, because we never recorded that
+/// we had the range — the next push re-advertises the same tip and we ask
+/// again. That is the property the push-delta model could not have, where a
+/// range the receiver dropped was gone for the rest of the sender's run.
+fn fetch_dialog_range(app: AppHandle, device: String, origin_addr: String, pull: DialogPull) {
+    tauri::async_runtime::spawn(async move {
+        let Some(token) = app.try_state::<ConfigState>().and_then(|c| c.snapshot().sync.token) else {
+            return;
+        };
+        let url = format!("{origin_addr}/api/sync/dialog");
+        let query = [("id", pull.raw_id.clone()), ("since", pull.since.to_string())];
+        let Some(entries): Option<Vec<DialogEntry>> = get_json(&url, &query, &token, "dialog pull").await else {
+            return;
+        };
+        if entries.is_empty() {
+            return;
+        }
+        let Some(state) = app.try_state::<AppState>() else {
+            return;
+        };
+        let id = format!("{device}/{}", pull.raw_id);
+        let merged = {
+            let mut remote = state.remote.lock().unwrap();
+            remote.get_mut(&device).and_then(|dev| dev.sessions.iter_mut().find(|s| s.id == id)).map(|s| {
+                merge_dialog_entries(&mut s.dialog, &entries);
+                s.clone()
+            })
+        };
+        let Some(s) = merged else { return };
+        tracing::debug!(session = %id, entries = entries.len(), since = pull.since, "dialog range pulled");
+        if let Some(store) = app.try_state::<RemoteHistoryStore>() {
+            store.save_device(&device, std::slice::from_ref(&s));
+        }
+        emit_sessions_updated_remote(&app);
+    });
+}
+
+/// Usage counterpart of [`fetch_dialog_range`].
+fn fetch_usage_range(app: AppHandle, device: String, origin_addr: String, since: i64) {
+    tauri::async_runtime::spawn(async move {
+        let Some(token) = app.try_state::<ConfigState>().and_then(|c| c.snapshot().sync.token) else {
+            return;
+        };
+        let url = format!("{origin_addr}/api/sync/usage");
+        let query = [("since", since.to_string())];
+        let Some(records): Option<Vec<UsageHistoryRecord>> = get_json(&url, &query, &token, "usage pull").await else {
+            return;
+        };
+        if records.is_empty() {
+            return;
+        }
+        if let Some(store) = app.try_state::<RemoteUsageStore>() {
+            store.merge_device(&device, &records);
+            tracing::debug!(device = %device, records = records.len(), since, "usage range pulled");
+            // Nudge an open Work-intensity window to re-fetch the merged chart.
+            emit_usage_limits_updated(&app);
+        }
+    });
+}
+
+/// GET a bearer-authed JSON body from a peer; `None` on any failure — offline
+/// origin, bad auth, malformed body. Every caller treats a miss the same way:
+/// nothing is recorded as received, so the next push re-advertises the tip and
+/// the range is simply asked for again. `what` names the operation for the log.
+async fn get_json<T: serde::de::DeserializeOwned>(url: &str, query: &[(&str, String)], token: &str, what: &str) -> Option<T> {
     let client = reqwest::Client::builder().timeout(Duration::from_secs(10)).build().expect("reqwest client");
-    let url = format!("{origin_addr}/api/sync/dialog");
-    match client.get(&url).query(&[("id", raw_id)]).bearer_auth(token).send().await {
+    match client.get(url).query(query).bearer_auth(token).send().await {
         Ok(r) if r.status().is_success() => match r.json().await {
-            Ok(entries) => Some(entries),
+            Ok(v) => Some(v),
             Err(e) => {
-                tracing::debug!(url = %url, error = %e, "dialog catch-up parse failed");
+                tracing::debug!(url = %url, what, error = %e, "peer fetch parse failed");
                 None
             }
         },
         Ok(r) => {
-            tracing::debug!(url = %url, status = %r.status(), "dialog catch-up rejected");
+            tracing::debug!(url = %url, what, status = %r.status(), "peer fetch rejected");
             None
         }
         Err(e) => {
-            tracing::debug!(url = %url, error = %e, "dialog catch-up failed");
+            tracing::debug!(url = %url, what, error = %e, "peer fetch failed");
             None
         }
     }
 }
 
+
 /// Catch-up fetch for one remote session's dialog, triggered when the history
-/// window targets it. Always fetches the origin's full dialog: what we hold
-/// may have a gap *below* its newest entry (a dashboard restart discards the
-/// accumulated copy, and fresh push deltas arrive within seconds), so no
-/// held timestamp can serve as a "since" watermark — the turn-aware merge
-/// dedups the overlap instead. Brackets the fetch in `history_loading`
-/// events so the window can show a hint. Fire-and-forget: on failure (origin
-/// offline) the window simply shows whatever is held.
+/// window targets it. Always fetches the origin's full dialog, and the merge
+/// dedups the overlap.
+///
+/// It deliberately asks for everything rather than for the range above our
+/// newest held entry, which is what the routine [`fetch_dialog_range`] pull
+/// does. The two differ in exactly one case: `merge_dialog_entries` can drop an
+/// entry it cannot distinguish from a transcript re-read (a prompt repeated
+/// with no reply between it and its twin), leaving our newest timestamp above
+/// something we never stored — the one shape a `since` cannot express. Asking
+/// whole is cheap at the single moment the dialog is actually read, so this
+/// stays the belt-and-braces path behind the incremental one.
+///
+/// Brackets the fetch in `history_loading` events so the window can show a
+/// hint. Fire-and-forget: on failure (origin offline) the window simply shows
+/// whatever is held.
 pub fn fetch_remote_dialog(app: AppHandle, session_id: String) {
     tauri::async_runtime::spawn(async move {
         let Some(state) = app.try_state::<AppState>() else {
@@ -516,7 +554,10 @@ pub fn fetch_remote_dialog(app: AppHandle, session_id: String) {
             return;
         };
         emit_history_loading(&app, &session_id, true);
-        if let Some(entries) = fetch_full_dialog(&origin_addr, &raw_id, &token).await.filter(|e| !e.is_empty()) {
+        let url = format!("{origin_addr}/api/sync/dialog");
+        let query = [("id", raw_id.clone()), ("since", "0".to_string())];
+        let full: Option<Vec<DialogEntry>> = get_json(&url, &query, &token, "dialog catch-up").await;
+        if let Some(entries) = full.filter(|e| !e.is_empty()) {
             tracing::debug!(session = %session_id, entries = entries.len(), "dialog catch-up merged");
             let merged = {
                 let mut remote = state.remote.lock().unwrap();
@@ -567,9 +608,8 @@ mod tests {
     fn entry(role: DialogRole, text: &str, ts: i64) -> DialogEntry {
         DialogEntry { role, text: text.into(), timestamp: ts, status: Status::Working, task_start: false }
     }
-
-    fn push_item(id: &str, delta: Vec<DialogEntry>) -> SessionSync {
-        SessionSync { session: session(id, Vec::new()), dialog_delta: delta }
+    fn push_item(id: &str, dialog_tip: i64) -> SessionSync {
+        SessionSync { session: session(id, Vec::new()), dialog_tip }
     }
 
     // -------- ingest --------
@@ -581,7 +621,7 @@ mod tests {
 
     #[test]
     fn ingest_namespaces_and_stamps_origin() {
-        let dev = ingest("laptop", vec![push_item("proj", Vec::new())], None, &no_persisted(), 0, 100, "http://1.2.3.4:9078".into());
+        let (dev, _) = ingest("laptop", vec![push_item("proj", 0)], None, &no_persisted(), 100, "http://1.2.3.4:9078".into());
         assert_eq!(dev.sessions.len(), 1);
         assert_eq!(dev.sessions[0].id, "laptop/proj");
         assert_eq!(dev.sessions[0].origin.as_deref(), Some("laptop"));
@@ -590,201 +630,123 @@ mod tests {
     }
 
     #[test]
-    fn ingest_accumulates_dialog_across_pushes() {
-        let first = ingest("laptop", vec![push_item("proj", vec![entry(DialogRole::User, "u1", 10)])], None, &no_persisted(), 0, 100, String::new());
-        let second = ingest(
-            "laptop",
-            vec![push_item("proj", vec![entry(DialogRole::Assistant, "a1", 20)])],
-            Some(&first),
-            &no_persisted(),
-            10,
-            200,
-            String::new(),
-        );
-        let dialog = &second.sessions[0].dialog;
-        assert_eq!(dialog.len(), 2, "earlier entries survive a delta-only push");
-        assert_eq!(dialog[0].text, "u1");
-        assert_eq!(dialog[1].text, "a1");
+    fn ingest_requests_the_range_above_what_is_held() {
+        let mut persisted = HashMap::new();
+        persisted.insert("laptop/proj".to_string(), vec![entry(DialogRole::User, "held", 10)]);
+        let (_dev, pulls) = ingest("laptop", vec![push_item("proj", 70)], None, &persisted, 100, String::new());
+        assert_eq!(pulls, vec![DialogPull { raw_id: "proj".into(), since: 10 }]);
     }
 
     #[test]
-    fn ingest_drops_sessions_absent_from_snapshot() {
-        let first = ingest(
-            "laptop",
-            vec![push_item("alive", Vec::new()), push_item("gone", Vec::new())],
-            None,
-            &no_persisted(),
-            0,
-            100,
-            String::new(),
-        );
-        let second = ingest("laptop", vec![push_item("alive", Vec::new())], Some(&first), &no_persisted(), 0, 200, String::new());
-        assert_eq!(second.sessions.len(), 1);
-        assert_eq!(second.sessions[0].id, "laptop/alive");
+    fn ingest_requests_everything_when_nothing_is_held() {
+        let (_dev, pulls) = ingest("laptop", vec![push_item("proj", 70)], None, &no_persisted(), 100, String::new());
+        assert_eq!(pulls, vec![DialogPull { raw_id: "proj".into(), since: 0 }], "since 0 is the complete dialog");
     }
 
     #[test]
-    fn ingest_replayed_delta_does_not_duplicate() {
-        let delta = vec![entry(DialogRole::User, "u1", 10), entry(DialogRole::Assistant, "a1", 20)];
-        let first = ingest("laptop", vec![push_item("proj", delta.clone())], None, &no_persisted(), 0, 100, String::new());
-        let second = ingest("laptop", vec![push_item("proj", delta)], Some(&first), &no_persisted(), 10, 200, String::new());
-        assert_eq!(second.sessions[0].dialog.len(), 2);
+    fn ingest_requests_nothing_when_caught_up() {
+        let mut persisted = HashMap::new();
+        persisted.insert("laptop/proj".to_string(), vec![entry(DialogRole::Assistant, "a", 70)]);
+        let (_dev, pulls) = ingest("laptop", vec![push_item("proj", 70)], None, &persisted, 100, String::new());
+        assert!(pulls.is_empty(), "tip equal to held needs no fetch — this is the steady state");
+    }
+
+    #[test]
+    fn ingest_carries_held_dialog_across_the_metadata_replace() {
+        let (first, _) = ingest("laptop", vec![push_item("proj", 0)], None, &no_persisted(), 100, String::new());
+        let mut seeded = first;
+        seeded.sessions[0].dialog = vec![entry(DialogRole::User, "u1", 10)];
+        // A later metadata-only push must not wipe the dialog we accumulated.
+        let (second, pulls) = ingest("laptop", vec![push_item("proj", 10)], Some(&seeded), &no_persisted(), 200, String::new());
+        assert_eq!(second.sessions[0].dialog.len(), 1);
+        assert_eq!(second.sessions[0].dialog[0].text, "u1");
+        assert!(pulls.is_empty());
     }
 
     #[test]
     fn ingest_seeds_dialog_from_persisted_when_no_prev() {
         let mut persisted = HashMap::new();
         persisted.insert("laptop/proj".to_string(), vec![entry(DialogRole::User, "old", 10)]);
-        let dev = ingest("laptop", vec![push_item("proj", vec![entry(DialogRole::Assistant, "new", 20)])], None, &persisted, 10, 100, String::new());
-        let dialog = &dev.sessions[0].dialog;
-        assert_eq!(dialog.len(), 2, "disk dialog restored under the delta");
-        assert_eq!(dialog[0].text, "old");
-        assert_eq!(dialog[1].text, "new");
+        let (dev, _) = ingest("laptop", vec![push_item("proj", 10)], None, &persisted, 100, String::new());
+        assert_eq!(dev.sessions[0].dialog.len(), 1, "disk dialog restored after a restart");
+        assert_eq!(dev.sessions[0].dialog[0].text, "old");
     }
 
     #[test]
     fn ingest_prefers_in_memory_dialog_over_persisted() {
         let mut persisted = HashMap::new();
         persisted.insert("laptop/proj".to_string(), vec![entry(DialogRole::User, "stale-disk", 10)]);
-        let first = ingest("laptop", vec![push_item("proj", vec![entry(DialogRole::User, "live", 30)])], None, &no_persisted(), 0, 100, String::new());
-        let second = ingest("laptop", vec![push_item("proj", Vec::new())], Some(&first), &persisted, 30, 200, String::new());
-        let dialog = &second.sessions[0].dialog;
-        assert_eq!(dialog.len(), 1, "accumulated in-memory dialog wins");
-        assert_eq!(dialog[0].text, "live");
+        let (first, _) = ingest("laptop", vec![push_item("proj", 0)], None, &no_persisted(), 100, String::new());
+        let mut seeded = first;
+        seeded.sessions[0].dialog = vec![entry(DialogRole::User, "live", 30)];
+        let (second, _) = ingest("laptop", vec![push_item("proj", 30)], Some(&seeded), &persisted, 200, String::new());
+        assert_eq!(second.sessions[0].dialog.len(), 1, "accumulated in-memory dialog wins");
+        assert_eq!(second.sessions[0].dialog[0].text, "live");
     }
 
     #[test]
-    fn ingest_discards_fragment_delta_into_empty_dialog() {
-        // A fresh install receiving deltas from a long-running origin: nothing
-        // held, delta selected against a non-zero watermark — a fragment with
-        // the entire history missing below it.
-        let dev = ingest("laptop", vec![push_item("proj", vec![entry(DialogRole::Assistant, "floating", 70)])], None, &no_persisted(), 50, 100, String::new());
-        assert!(dev.sessions[0].dialog.is_empty(), "fragment discarded; catch-up fills on history open");
-    }
-
-    #[test]
-    fn ingest_discards_non_contiguous_delta_above_held() {
-        let mut persisted = HashMap::new();
-        persisted.insert("laptop/proj".to_string(), vec![entry(DialogRole::User, "u1", 10)]);
-        // Held reaches 10, delta covers (50, now] — entries in (10, 50] would
-        // be silently missing if this merged.
-        let dev = ingest("laptop", vec![push_item("proj", vec![entry(DialogRole::Assistant, "gapped", 70)])], None, &persisted, 50, 100, String::new());
-        let dialog = &dev.sessions[0].dialog;
-        assert_eq!(dialog.len(), 1, "held prefix kept, gapped delta discarded");
-        assert_eq!(dialog[0].text, "u1");
-    }
-
-    #[test]
-    fn ingest_accepts_full_dialog_into_empty() {
-        // delta_from == 0: the delta is the complete dialog (fresh origin
-        // pusher), accepted even with nothing held.
-        let dev = ingest("laptop", vec![push_item("proj", vec![entry(DialogRole::User, "u1", 10)])], None, &no_persisted(), 0, 100, String::new());
-        assert_eq!(dev.sessions[0].dialog.len(), 1);
+    fn ingest_drops_sessions_absent_from_snapshot() {
+        let (first, _) = ingest("laptop", vec![push_item("alive", 0), push_item("gone", 0)], None, &no_persisted(), 100, String::new());
+        let (second, _) = ingest("laptop", vec![push_item("alive", 0)], Some(&first), &no_persisted(), 200, String::new());
+        assert_eq!(second.sessions.len(), 1);
+        assert_eq!(second.sessions[0].id, "laptop/alive");
     }
 
     #[test]
     fn ingest_clears_display_name_from_sender() {
-        let mut item = push_item("proj", Vec::new());
+        let mut item = push_item("proj", 0);
         item.session.display_name = Some("sender name".into());
-        let dev = ingest("laptop", vec![item], None, &no_persisted(), 0, 100, String::new());
+        let (dev, _) = ingest("laptop", vec![item], None, &no_persisted(), 100, String::new());
         assert_eq!(dev.sessions[0].display_name, None, "receiver's custom names win");
     }
 
-    // -------- build_push_chunk --------
+    // -------- build_push --------
 
     #[test]
-    fn build_push_chunk_strips_dialog_and_selects_delta_by_watermark() {
+    fn build_push_strips_dialog_to_a_tip() {
         let sessions = vec![session(
             "proj",
             vec![entry(DialogRole::User, "old", 10), entry(DialogRole::User, "new", 100)],
         )];
-        let chunk = build_push_chunk("desktop", 9078, &sessions, 50, 1000, usize::MAX);
-        assert_eq!(chunk.push.device_name, "desktop");
-        assert_eq!(chunk.push.listen_port, 9078);
-        assert_eq!(chunk.push.delta_from, 50, "chunk declares the watermark it was built against");
-        assert!(chunk.push.sessions[0].session.dialog.is_empty(), "dialog travels as delta only");
-        assert_eq!(chunk.push.sessions[0].dialog_delta.len(), 1);
-        assert_eq!(chunk.push.sessions[0].dialog_delta[0].text, "new");
-        assert!(chunk.drained);
-        assert_eq!(chunk.ack_watermark, 1000 - WATERMARK_MARGIN_MS, "drained chunk acks to capture minus margin");
+        let push = build_push("desktop", 9078, &sessions, 4242);
+        assert_eq!(push.device_name, "desktop");
+        assert_eq!(push.listen_port, 9078);
+        assert!(push.sessions[0].session.dialog.is_empty(), "no dialog content on the wire");
+        assert_eq!(push.sessions[0].dialog_tip, 100, "tip is our newest entry");
+        assert_eq!(push.usage_tip, 4242);
     }
 
     #[test]
-    fn build_push_chunk_zero_watermark_sends_full_dialog() {
+    fn build_push_empty_dialog_tips_zero() {
+        let sessions = vec![session("proj", Vec::new())];
+        assert_eq!(build_push("desktop", 9078, &sessions, 0).sessions[0].dialog_tip, 0);
+    }
+
+    #[test]
+    fn build_push_is_identical_for_every_peer_and_cycle() {
+        // The point of going stateless: the push depends only on local data, so
+        // there is no per-peer bookkeeping that can go stale, and re-sending is
+        // free. A peer that missed ten cycles is caught up by the next one.
         let sessions = vec![session("proj", vec![entry(DialogRole::User, "u", 10)])];
-        let chunk = build_push_chunk("desktop", 9078, &sessions, 0, 1000, usize::MAX);
-        assert_eq!(chunk.push.sessions[0].dialog_delta.len(), 1, "first push after start is a full sync");
-        assert_eq!(chunk.push.delta_from, 0);
+        let a = build_push("desktop", 9078, &sessions, 7);
+        let b = build_push("desktop", 9078, &sessions, 7);
+        assert_eq!(serde_json::to_string(&a).unwrap(), serde_json::to_string(&b).unwrap());
+    }
+
+    // -------- usage_since --------
+
+    fn rec(ts: i64) -> UsageHistoryRecord {
+        UsageHistoryRecord { ts, five_hour_pct: Some(1.0), seven_day_pct: None, five_hour_resets_at: None, seven_day_resets_at: None }
     }
 
     #[test]
-    fn build_push_chunk_budget_cuts_oldest_first_and_next_chunk_continues() {
-        // Three entries of 4 text bytes each; budget 8 fits exactly two.
-        let sessions = vec![session(
-            "proj",
-            vec![entry(DialogRole::User, "aaaa", 10), entry(DialogRole::User, "bbbb", 20), entry(DialogRole::User, "cccc", 30)],
-        )];
-        let first = build_push_chunk("desktop", 9078, &sessions, 0, 1000, 8);
-        assert!(!first.drained);
-        let texts: Vec<&str> = first.push.sessions[0].dialog_delta.iter().map(|e| e.text.as_str()).collect();
-        assert_eq!(texts, vec!["aaaa", "bbbb"], "oldest entries first — backfill grows upward from the watermark");
-        assert_eq!(first.ack_watermark, 20, "partial chunk acks its last included timestamp");
-
-        let second = build_push_chunk("desktop", 9078, &sessions, first.ack_watermark, 1000, 8);
-        assert!(second.drained);
-        assert_eq!(second.push.delta_from, 20, "next chunk is contiguous with the previous ack");
-        assert_eq!(second.push.sessions[0].dialog_delta.len(), 1);
-        assert_eq!(second.push.sessions[0].dialog_delta[0].text, "cccc");
-    }
-
-    #[test]
-    fn build_push_chunk_never_splits_equal_timestamps() {
-        // Two sessions with entries at the same timestamp: the budget cut
-        // would land between them, but a `> watermark` selection would then
-        // skip the twin forever — both must ride in the same chunk.
-        let sessions = vec![
-            session("a", vec![entry(DialogRole::User, "aaaa", 10)]),
-            session("b", vec![entry(DialogRole::User, "bbbb", 10), entry(DialogRole::User, "cccc", 20)]),
-        ];
-        let chunk = build_push_chunk("desktop", 9078, &sessions, 0, 1000, 4);
-        assert!(!chunk.drained);
-        assert_eq!(chunk.ack_watermark, 10);
-        let total: usize = chunk.push.sessions.iter().map(|s| s.dialog_delta.len()).sum();
-        assert_eq!(total, 2, "both ts=10 twins included despite the budget");
-    }
-
-    #[test]
-    fn build_push_chunk_oversized_first_entry_still_progresses() {
-        let sessions = vec![session("proj", vec![entry(DialogRole::User, "this text exceeds the tiny budget", 10)])];
-        let chunk = build_push_chunk("desktop", 9078, &sessions, 0, 1000, 4);
-        assert!(chunk.drained, "single entry over budget is sent anyway");
-        assert_eq!(chunk.push.sessions[0].dialog_delta.len(), 1);
-    }
-
-    #[test]
-    fn build_push_chunk_empty_backlog_is_drained_heartbeat() {
-        let sessions = vec![session("proj", vec![entry(DialogRole::User, "u", 10)])];
-        let chunk = build_push_chunk("desktop", 9078, &sessions, 50, 1000, 8);
-        assert!(chunk.drained);
-        assert!(chunk.push.sessions[0].dialog_delta.is_empty(), "metadata-only heartbeat");
-    }
-
-    // -------- usage_delta_since --------
-
-    fn usage(ts: i64) -> UsageHistoryRecord {
-        UsageHistoryRecord { ts, five_hour_pct: Some(1.0), five_hour_resets_at: None, seven_day_pct: None, seven_day_resets_at: None }
-    }
-
-    #[test]
-    fn usage_delta_since_selects_strictly_newer() {
-        let records = [usage(10), usage(20), usage(30)];
-        let delta = usage_delta_since(&records, 20);
-        assert_eq!(delta.iter().map(|r| r.ts).collect::<Vec<_>>(), vec![30], "watermark is exclusive");
-
-        let all = usage_delta_since(&records, 0);
-        assert_eq!(all.len(), 3, "zero watermark sends everything");
-
-        assert!(usage_delta_since(&records, 30).is_empty(), "nothing past the newest");
+    fn usage_since_selects_strictly_newer() {
+        let records = vec![rec(10), rec(20), rec(30)];
+        let delta = usage_since(&records, 20);
+        assert_eq!(delta.len(), 1);
+        assert_eq!(delta[0].ts, 30);
+        assert_eq!(usage_since(&records, 0).len(), 3, "since 0 is the whole timeline");
+        assert!(usage_since(&records, 30).is_empty(), "nothing past the newest");
     }
 
     // -------- resolve_fetch_target --------

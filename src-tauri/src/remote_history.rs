@@ -1,16 +1,15 @@
 //! Disk persistence for remote-device dialogs — the peer-session counterpart
 //! of `prompt_history.rs`, one file per device under `remote_history/` in the
-//! app data dir. Only dialogs are stored: metadata arrives complete with
-//! every push, and the receiver's accumulated dialog is otherwise lost on
-//! restart (push deltas only carry what's newer than the origin's watermark).
-//! Restoration happens at ingest time — the first push from a device after a
-//! dashboard restart seeds each session's dialog from disk before the push's
-//! deltas merge on top. Entries for sessions absent from later pushes are
-//! kept (mirroring `prompt_history`'s keep-forever), so a chat that reopens
-//! on the origin restores its prior dialog here too. The history-window
-//! catch-up fetch remains the completeness guarantee for gaps disk can't
-//! cover (e.g. a fresh install while the origin's watermark is already
-//! advanced).
+//! app data dir. Only dialogs are stored: metadata arrives complete with every
+//! push, while dialog is fetched incrementally, so the accumulated copy would
+//! otherwise be lost on restart and re-pulled in full. Restoration happens at
+//! ingest time — the first push from a device after a dashboard restart seeds
+//! each session's dialog from disk, and what we hold then decides the `since`
+//! of the next pull, so a restored copy costs nothing to catch up. Entries for
+//! sessions absent from later pushes are kept (mirroring `prompt_history`'s
+//! keep-forever), so a chat that reopens on the origin restores its prior
+//! dialog here too. The history-window catch-up fetch remains the completeness
+//! guarantee for what disk can't cover.
 
 use std::collections::HashMap;
 use std::path::PathBuf;

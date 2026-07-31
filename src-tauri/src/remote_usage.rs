@@ -1,8 +1,9 @@
 //! Disk persistence for remote-device usage-limit samples — the peer-side
 //! counterpart of `usage_history.rs`, one file per device under `remote_usage/`
-//! in the app data dir. Each device pushes its `usage_history` records (the
-//! Anthropic 5h/7d polls) to its peers; a receiver stores them here, keyed by
-//! the sender's device name, kept separate from its own local history.
+//! in the app data dir. Each device advertises the newest of its `usage_history`
+//! records (the Anthropic 5h/7d polls) on every push; a peer pulls whatever is
+//! newer than it holds and stores it here, keyed by the sender's device name,
+//! kept separate from its own local history.
 //!
 //! Why keep them at all: the 5h/7d usage counter is account-wide, so a peer's
 //! polls during the windows *this* device's app was closed describe the same
@@ -65,8 +66,9 @@ impl RemoteUsageStore {
 
     /// Append the incoming records newer than what we already hold for `device`,
     /// keep the list sorted ascending, and persist. The `ts > held_max` filter
-    /// is a cheap dedup against replays (a restarted sender re-sends from a zero
-    /// watermark); since the counter is append-only this never drops real data.
+    /// makes the merge idempotent, so two pulls racing over an overlapping range
+    /// can't duplicate; since the counter is append-only this never drops real
+    /// data.
     pub fn merge_device(&self, device: &str, incoming: &[UsageHistoryRecord]) {
         if incoming.is_empty() {
             return;
@@ -106,6 +108,18 @@ impl RemoteUsageStore {
     /// `commands::merged_usage_records`. Caller re-sorts the combined set.
     pub fn all_records(&self) -> Vec<UsageHistoryRecord> {
         self.data.lock().unwrap().values().flat_map(|du| du.records.iter().cloned()).collect()
+    }
+
+    /// Newest record timestamp held for `device`, or `0` when none. The `since`
+    /// the sync receiver pulls from — derived from the stored records rather
+    /// than tracked separately, so it cannot drift from what is actually held.
+    pub fn newest_ts(&self, device: &str) -> i64 {
+        self.data
+            .lock()
+            .unwrap()
+            .get(device)
+            .and_then(|du| du.records.last().map(|r| r.ts))
+            .unwrap_or(0)
     }
 }
 

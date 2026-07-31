@@ -49,23 +49,28 @@ When `sync.listen` is on (and `sync.token` set), a second listener binds **all i
 
 ### `POST /api/sync`
 
-A peer pushes its local sessions. The body is a full snapshot of the sender's session *metadata* (a session absent from the snapshot is removed on the receiver) plus per-session `dialog_delta` — only the dialog entries changed since that peer's last acknowledged push, since full dialogs run to hundreds of KB — plus a top-level `usage_delta` of usage-limit samples (the account-wide 5h/7d poll timeline) the receiver stores per-device and unions into its Work-intensity chart:
+A peer pushes its local sessions. The body is a full snapshot of the sender's session *metadata* (a session absent from the snapshot is removed on the receiver), with each session's dialog reduced to a `dialog_tip` and the account-wide 5h/7d usage timeline to a `usage_tip`. Content is fetched by the receiver afterwards, so a push stays small no matter how far behind a peer is:
 
 ```json
 {
   "device_name": "my-laptop",
   "listen_port": 9078,
-  "delta_from": 1780789975389,
   "sessions": [
-    { "session": { ...AgentSession, "dialog": [] }, "dialog_delta": [ ...DialogEntry ] }
+    { "session": { ...AgentSession, "dialog": [] }, "dialog_tip": 1780789975389 }
   ],
-  "usage_delta": [ ...UsageHistoryRecord ]
+  "usage_tip": 1780789975389
 }
 ```
 
-The `delta_from` field carries the watermark the deltas were selected against (`0` = the deltas start from the beginning of each dialog; also the default when absent). A push may carry only the oldest bounded chunk of a large backlog — the sender drains the rest in immediately following pushes, each contiguous with the last acknowledged one. Returns `204` on ingest, `400` when `device_name` is empty or equals the receiver's own. The receiver namespaces ids to `{device_name}/{id}`, stamps `origin`, and accumulates deltas — but only contiguous ones: a delta whose `delta_from` lies above everything the receiver holds for that session would leave an invisible gap below it, so it's discarded and the held dialog stays gap-free by construction (the history-window catch-up fetches the full dialog at the only moment it's read). `listen_port` plus the connection's source IP becomes the address for catch-up fetches. A device unheard from for 90 s is dropped.
+The push carries **no dialog or usage content** — only a full metadata snapshot plus, per session, the `dialog_tip` (the sender's newest dialog timestamp) and a device-wide `usage_tip`. The receiver compares each tip against what it already holds and fetches the difference itself from the `GET` endpoints below. This keeps the sender stateless: the same body goes to every peer on every cycle, so nothing has to be remembered about a peer's progress and a failed push costs only a retry.
+
+Returns `204` on ingest, `400` when `device_name` is empty or equals the receiver's own, `401` without a valid bearer token. The receiver namespaces ids to `{device_name}/{id}`, stamps `origin`, and carries over the dialog it has already accumulated (persisted per device, re-seeded after a restart). `listen_port` plus the connection's source IP becomes the address it pulls from. A device unheard from for 90 s is dropped.
 
 ### `GET /api/sync/dialog?id=<raw_id>&since=<epoch_ms>`
 
-Catch-up: returns the *local* session's dialog entries with `timestamp > since` (the full dialog when `since` is omitted or `0`). A peer calls this when its history window opens a remote session, always for the full dialog — what it holds accumulates from push deltas (persisted per device, re-seeded after a restart) and can still have a gap *below* its newest entry, e.g. on a fresh install; the dedup merge absorbs the overlap. `404` for unknown ids.
+Returns the *local* session's dialog entries with `timestamp > since` (the full dialog when `since` is omitted or `0`). This is the routine content path: on every push a peer asks for the range above its own newest held entry. The history window additionally asks for the *full* dialog when it opens a remote session — the dedup merge absorbs the overlap, and it covers the one case a `since` cannot express (an entry the merge dropped as an apparent re-read sits below the newest held timestamp). `404` for unknown ids.
+
+### `GET /api/sync/usage?since=<epoch_ms>`
+
+Returns the *local* usage-limit samples with `ts > since` (all of them when `since` is omitted or `0`). The usage counterpart of the dialog pull, requested when a push advertises a `usage_tip` newer than what the receiver holds for that device. Gives `remote_usage/` a repair path of its own: a peer that lost its copy asks again, rather than waiting for the origin to restart.
 
