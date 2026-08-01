@@ -1464,6 +1464,23 @@ mod tests {
         assert_eq!(window_for("claude-opus-4-8", &z), Some(200_000));
     }
 
+    #[test]
+    fn default_window_map_reflects_1m_default_on_the_claude_5_family_only() {
+        // Regression: claude-sonnet-5's 1M window is the default (not a beta
+        // opt-in like 4.x), so a real session's tokens/window ratio was
+        // landing over 200% before "claude-sonnet-5"/"claude-fable" were added.
+        let w = crate::config::Config::default().context_window_tokens;
+        assert_eq!(window_for("claude-opus-5", &w), Some(1_000_000));
+        assert_eq!(window_for("claude-sonnet-5", &w), Some(1_000_000));
+        assert_eq!(window_for("claude-sonnet-5-20260630", &w), Some(1_000_000));
+        assert_eq!(window_for("claude-fable-5", &w), Some(1_000_000));
+        // 4.x sonnet's 1M window is a beta opt-in over its 200k default —
+        // the dashboard has no signal the beta header was used, so it must
+        // keep assuming the smaller default rather than over-crediting it.
+        assert_eq!(window_for("claude-sonnet-4-5-20250929", &w), Some(200_000));
+        assert_eq!(window_for("claude-haiku-4-5", &w), Some(200_000));
+    }
+
     /// Apply a reconcile result to the outstanding map the way the manager loop
     /// does: drop dismissed ids, register a fake handle for each sent session.
     fn apply(outstanding: &mut HashMap<String, String>, to_dismiss: Vec<String>, to_send: Vec<&AgentSession>) {

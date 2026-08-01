@@ -407,10 +407,16 @@ impl Default for Config {
             save_window_position: true,
             window_position: None,
             // Keys are matched by longest prefix (see notifications::window_for),
-            // so two family-level entries cover every model without per-release
+            // so family-level entries cover every model without per-release
             // updates; exact model ids can still be added to override a family.
+            // The Claude 5 generation (opus/sonnet/fable) ships a 1M window as
+            // the default, not a beta opt-in like the 4.x generation's 1M —
+            // "claude-sonnet"/"claude-fable" alone would wrongly also catch
+            // 4.x sonnet models, which stay on the 200k default window.
             context_window_tokens: [
                 ("claude-opus".to_string(), 1_000_000),
+                ("claude-sonnet-5".to_string(), 1_000_000),
+                ("claude-fable".to_string(), 1_000_000),
                 ("claude".to_string(), 200_000),
             ]
             .into_iter()

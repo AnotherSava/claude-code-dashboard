@@ -77,6 +77,8 @@ Every field is optional — omit one and the built-in default applies. A complet
   ],
   "context_window_tokens": {
     "claude-opus": 1000000,
+    "claude-sonnet-5": 1000000,
+    "claude-fable": 1000000,
     "claude": 200000
   },
   "benign_closers": ["What's next?", "or are you good?", "or leave it?", "or leave it parked?", "or leave that to you?", "or are you set to check it yourself?", "what would you like to work on?", "what would you like to work on next?"],
@@ -145,7 +147,7 @@ The `notifications` block controls alerts when a session needs you. Set it to `n
 ### Token coloring
 
 - `context_bar_thresholds` — color stops for the token counter, each a `percent` and a hex `color`. The widget interpolates the color from the live count as a percentage of the active model's window — so it ramps green → amber → red as context fills.
-- `context_window_tokens` — context-window size per model, used as the denominator for that percentage. Keys match by longest prefix, so the two defaults above cover every Claude model — add an exact model id (e.g. `"claude-sonnet-4-6": 1000000`) to override its family.
+- `context_window_tokens` — context-window size per model, used as the denominator for that percentage. Keys match by longest prefix, so the defaults above cover every Claude model — add an exact model id (e.g. `"claude-sonnet-4-6": 1000000`) to override its family.
 
 ### Prompt classification
 
