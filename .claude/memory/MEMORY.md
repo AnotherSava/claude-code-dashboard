@@ -51,3 +51,4 @@
 - [Background-task kill is silent](background-task-kill-is-silent.md) — a user-killed bg task (dev server) fires no hook and writes nothing to the transcript; WAIT can't self-clear → waiting_settle backstop
 - [Measure background-task duration](measure-background-task-duration.md) — task-notification ts is flush-time not completion; use the output-file mtime; finite shell tasks + subagents cap ~9 min
 - [Indicators must not over-claim certainty](feedback_indicator_certainty.md) — green/"healthy" needs confirmed evidence (canary `seen` bit); unconfirmed → distinct pending color, never green (false +) nor off (false −)
+- [Context-window map needs generation updates](context_window_map_needs_generation_updates.md) — Claude 5 gen (opus/sonnet/fable) defaults to 1M, not a beta opt-in like 4.x; add specific keys, don't broaden prefixes
