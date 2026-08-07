@@ -1,14 +1,14 @@
 ---
 name: debug-console-titles-tool-consoles
-description: When verifying terminal-title behavior, the Bash tool runs in its own hidden conPTY console while the PowerShell tool shares the user's real terminal console
-metadata:
+description: Log-based way to confirm a terminal-title write landed without inspecting the screen; general Bash-vs-PowerShell console-isolation trap moved to global learnings
+metadata: 
+  node_type: memory
   type: project
+  modified: 2026-08-07T07:41:15.723Z
 ---
 
-Claude Code's Bash tool spawns each command into a **separate hidden conPTY console** — `GetConsoleProcessList` there returns only the transient bash/python pids, never claude.exe. The PowerShell tool's persistent pwsh host is attached to the **user's real terminal console** (its process list includes claude.exe, the launching cmd wrapper, and the user's shell).
+The general "Bash tool has its own hidden console/tty; verify console-level behavior (titles, `GetConsoleProcessList`, tty resolution) via PowerShell on Windows or via ancestor pids on macOS" trap is not specific to this project — it's now documented in the global `windows-terminal-title.md` and `windows-console-screen-read.md` learnings (moved there 2026-08-07; this file previously duplicated it).
 
-**Why:** Title writes verified by reading `GetConsoleTitleW` from a Bash-tool python looked like failures when they had actually landed on the user's tab (and vice versa — early "successful" tests had set the hidden Bash console's title). This burned an hour of false debugging during the terminal-tab-titles feature (2026-06-04).
+What's specific to this app:
 
-**How to apply:** Any console-level verification (titles, `GetConsoleProcessList`, `AttachConsole` targets) must run via the PowerShell tool, not the Bash tool. Hook-spawn simulation (`CREATE_NO_WINDOW`) behaves the same from either. See [[debug-history-rendering-via-prompt-history]] for the analogous data-vs-render split.
-
-**macOS variant (2026-06-04):** the Bash tool's shell has **no controlling tty** (`ps -o tty= -p $$` → `??`) — the same isolation in tty form. Resolve the real tab's tty from ancestor pids (the session's `claude` process, 1–2 levels up the chain), never from the tool/hook process itself.
+**Log-based cross-check, no screen needed (2026-08-04):** `terminal_title.rs`'s `push_title` only logs `"terminal title written"` (DEBUG, `target: claude_code_dashboard_lib::terminal_title`) *after* the OSC write's `.is_ok()` succeeds — so grepping `widget.jsonl` for that line at the timestamp in question confirms the backend-side write landed, independent of whatever the screen shows. Use this instead of `osascript`/`screencapture` when the physical display can't be inspected (locked or asleep — see [[verify_macos_window_geometry_via_ax]] and the global `macos-ax-window-testing` learning for the black-screencapture false-vanish and the `CGSSessionScreenIsLocked` check). A confirmed-successful write with a visually wrong result points at the terminal/shell side (see [[terminal-title-followups]]), not the backend.

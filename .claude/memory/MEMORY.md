@@ -18,7 +18,7 @@
 - [Doc features in both pages](feedback_doc_both_features_and_settings.md) — a config-driven feature needs a features.md mention, not just a settings.md entry
 - [History window: no blank lines](feedback_history_compact_blank_lines.md) — blank lines inside messages are dropped entirely; user rejected even reduced-height gaps
 - [Debug history rendering via prompt_history.json](debug_history_rendering_via_prompt_history.md) — dump raw stored dialog lines/char codes to split data bugs from render-path bugs
-- [Console-title checks: Bash tool has its own hidden console](debug_console_titles_tool_consoles.md) — verify titles via the PowerShell tool, which shares the real terminal console
+- [Console-title checks: no-screen verification](debug_console_titles_tool_consoles.md) — confirm a write via the widget.jsonl "terminal title written" log line; general Bash-vs-PowerShell trap is now a global learning
 - [Terminal title follow-ups](terminal_title_followups.md) — deferred: yes-button via WriteConsoleInputW, Claude OSC title clobbering options
 - [Synthetic hook events for e2e tests](debug_synthetic_hook_events.md) — pipe fake-cwd payloads through claude_hook.py; SessionEnd cleans up; check widget.jsonl
 - [Sync e2e via fake peer](debug_sync_fake_peer.md) — don't run two app instances (shared %APPDATA%); Python peer on :9080 + temp sync block in config/local.json; PrintWindow flag 3 for occluded-widget screenshots
@@ -39,13 +39,13 @@
 - [Tray badge deferred work](tray_badge_deferred.md) — macOS contrast on number modes + live DPI re-render not done; config.tray_badge set in config/local.json
 - [Startup session restore infeasible](startup_session_restore_infeasible.md) — can't tell closed from idle-open sessions; Claude doesn't hold transcript open; don't re-attempt
 - [Preview tray rendering via PNG test](debug_preview_tray_rendering.md) — throwaway #[ignore] test + png dev-dep renders tray_badge fns to scratchpad PNGs; view, then remove
-- [Verify macOS window geometry via AX](verify_macos_window_geometry_via_ax.md) — System Events AXSize A/B proves resize locks; a sleeping display fakes a "vanished window" (black screencapture), screen-edge clamp fakes a blocked resize
+- [Verify macOS window geometry via AX](verify_macos_window_geometry_via_ax.md) — project-specific gotchas only now (setupOverride, auto_resize default); general AX-testing technique moved to the global macos-ax-window-testing learning
 - [Verify cfg-gated platform branches](verify_cfg_gated_platform_branches.md) — macOS cargo test skips the #[cfg(not(macos))] stub; can't cross-compile (aws-lc-sys needs windows.h) — invert gates in a scratch module copy
 - [5h resets_at jitters ±1min](usage_five_hour_resets_at_jitter.md) — never use five_hour_resets_at as a reset signal; detect reset by pct drop, intensity = max(0, Δpct)
 - [Context-alert tracking not persisted](context_alert_outstanding_not_persisted.md) — context_outstanding is in-memory; app restart orphans Telegram alerts (known, deliberately unfixed); grep decision=context_alert/context_dismiss
 - [Telegram has no send confirmation](telegram_no_send_confirmation.md) — bots can't read own sent messages; no idempotency; duplicate-on-timeout only mitigable, not eliminable; mitigations = timeout split + 5min RetryHold backoff on maybe-delivered (read-timeout) sends; don't re-propose getUpdates dedup
 - [Hook research findings](hooks_research_findings.md) — adopted Stop.last_assistant_message + background_tasks; rejected idle_prompt/PostToolUse/MessageDisplay; no token data in hooks; SessionEnd unreliable on exit → liveness reaper; SessionStart additionalContext injects context (canary); latest-version-only
-- [Doppler secret storage](doppler_secret_storage.md) — bot_token/chat_id/sync token live in Doppler project `claude-code-dashboard`/`dev`; deploy renders local.template.json → local.json then wipes it; no plaintext secrets at rest
+- [Doppler secret storage](doppler_secret_storage.md) — DRIFTED (verified 2026-08-07): documented render-then-wipe flow no longer exists; sync token sits in plaintext config/local.json now
 - [Usage endpoint zeros both buckets after 5h cap](usage_endpoint_zeros_after_5h_cap.md) — after 5h hits 100%, OAuth usage API transiently returns 0/null for both buckets; empty/IDLE bars then = upstream artifact, self-corrects ≤10min; don't re-investigate
 - [Context-% features need watcher-resolved tokens](context_percent_tokens_watcher_only.md) — input_tokens is watcher-only (None post-restart, can't be faked via hooks); config reload doesn't re-sync terminal titles
 - [Background-task kill is silent](background-task-kill-is-silent.md) — a user-killed bg task (dev server) fires no hook and writes nothing to the transcript; WAIT can't self-clear → waiting_settle backstop
