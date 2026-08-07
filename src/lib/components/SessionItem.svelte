@@ -267,10 +267,12 @@
       {#if session.instruction_drift}
         <span class="drift" title="Instruction drift — the last reply dropped its adherence marker; treat its output with caution">⚠</span>
       {/if}
-      <span class="time">{time}</span>
+      {#if !config.compact_mode}
+        <span class="time">{time}</span>
+      {/if}
       <span class="tokens" style:color={tokColor}>{#if tokensText}{tokensText}<span class="k">k</span>{/if}</span>
     </div>
-    {#if labelText}
+    {#if labelText && !config.compact_mode}
       <div class="label" class:past={isPastTask} title={effectiveTitle} onclick={onLabelClick} onkeydown={(e) => { if (e.key === 'Enter') onLabelClick() }} role="button" tabindex="-1">{labelText}</div>
     {/if}
   </div>

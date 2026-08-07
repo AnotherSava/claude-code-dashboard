@@ -138,4 +138,5 @@ export const mockConfig: Config = {
   limit_bar_segments: 16,
   auto_resize: 'none',
   history_font_size: 'regular',
+  compact_mode: false,
 }

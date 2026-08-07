@@ -155,6 +155,12 @@ pub struct Config {
     /// can ping). Read by `http_server` (mint + check), `notifications` (ping),
     /// and `terminal_title` + the row (render).
     pub instruction_canary_enabled: bool,
+    /// Compact view: hide each row's current prompt and time-in-state, and
+    /// collapse the 5h/7d usage bars down to their bare percentage — the
+    /// "just the numbers" density mode. Read by the frontend (`SessionItem`,
+    /// `LimitBar`); toggled from the tray's **Compact view** checkbox. Off by
+    /// default.
+    pub compact_mode: bool,
     /// Keep macOS awake with the lid closed while a local agent is working — the
     /// "carry the laptop between locations mid-task" case. macOS offers no API
     /// for this: every IOKit assertion carrying `AppliesOnLidClose` is refused
@@ -450,6 +456,7 @@ impl Default for Config {
             tray_context_alert_percent: Some(80.0),
             high_alert: false,
             instruction_canary_enabled: false,
+            compact_mode: false,
             lid_awake_mode: LidAwakeMode::Off,
             lid_awake_minutes: 15,
             lid_awake_release_grace_ms: 60_000,
@@ -792,6 +799,14 @@ mod tests {
         assert!(!cfg.high_alert, "off by default");
         let on: Config = serde_json::from_str(r#"{ "high_alert": true }"#).unwrap();
         assert!(on.high_alert);
+    }
+
+    #[test]
+    fn compact_mode_defaults_off_and_parses() {
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert!(!cfg.compact_mode, "off by default");
+        let on: Config = serde_json::from_str(r#"{ "compact_mode": true }"#).unwrap();
+        assert!(on.compact_mode);
     }
 
     #[test]

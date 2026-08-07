@@ -345,6 +345,7 @@
     sessions
     usage
     config?.auto_resize
+    config?.compact_mode
     showSetup
     scheduleMeasure()
   })
@@ -505,7 +506,7 @@
 <div class="widget" bind:this={widgetEl}>
   <header data-tauri-drag-region>
     <span class="title" data-tauri-drag-region>AI AGENTS</span>
-    <div class="limits" data-tauri-drag-region>
+    <div class="limits" class:compact={config?.compact_mode} data-tauri-drag-region>
       <LimitBar
         bucket={usage?.five_hour ?? null}
         status={usage?.status ?? 'unavailable'}
@@ -513,6 +514,7 @@
         {now}
         segments={config?.limit_bar_segments ?? 16}
         format="hm"
+        compact={config?.compact_mode ?? false}
       />
       <LimitBar
         bucket={usage?.seven_day ?? null}
@@ -521,6 +523,7 @@
         {now}
         segments={config?.limit_bar_segments ?? 16}
         format="dhm"
+        compact={config?.compact_mode ?? false}
       />
     </div>
     <button class="hide-btn" onclick={onHide} aria-label="Hide to tray" title="Hide to tray">×</button>
@@ -595,6 +598,11 @@
   .limits > :global(*) {
     flex: 1 1 0;
     min-width: 0;
+  }
+  /* Compact bars shrink-wrap their two numbers instead of stretching to fill
+     the header — without the segmented track there's nothing to fill. */
+  .limits.compact > :global(*) {
+    flex: 0 0 auto;
   }
   .hide-btn {
     background: transparent;

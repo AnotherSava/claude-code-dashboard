@@ -28,6 +28,10 @@ Each badge is color-coded, and BLOCK and ERROR pulse to draw your eye when a ses
 
 **Rows clear when a session ends.** Clearing a session (`/clear`) or quitting it — typing `exit`, pressing Ctrl-D, or closing the terminal — removes its row, so the dashboard only shows sessions that are still around. Quitting doesn't always announce itself, so such a row could otherwise linger (often stuck on WORK if you quit mid-turn); the dashboard drops it once it confirms the session is gone. Reopen the same project and the row returns with its history. On by default — see [Settings](settings#behavior).
 
+## Compact view
+
+Turn on the tray's **Compact view** toggle for a denser widget: each row drops its current prompt and time-in-state, and the 5-hour / 7-day usage bars collapse to their bare percentage, dropping the segmented track. What's left is the state badge, token count, and usage numbers — nothing that needs reading, just glanceable figures. Off by default.
+
 ## Color terminal tabs
 
 Each session's status is mirrored onto the terminal tab it runs in, as a colored circle next to the session name — 🔵 working (also background-agent WAIT), 🟠 blocked on you, 🟢 done, 🔴 error. A glance at your terminal tabs shows which session needs attention, even without the widget on screen. The title updates the moment the status changes and clears when the session ends. On by default; the tray's **Color terminal tabs** toggle turns it off.

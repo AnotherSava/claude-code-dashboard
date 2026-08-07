@@ -66,6 +66,10 @@ export interface Config {
   limit_bar_segments: number
   auto_resize: AutoResize
   history_font_size: HistoryFontSize
+  // Compact view: hide each row's current prompt and time-in-state, and
+  // collapse the usage bars down to their bare percentage. Toggled from the
+  // tray's "Compact view" checkbox.
+  compact_mode: boolean
 }
 
 export type UsageStatus = 'ok' | 'unavailable' | 'auth_expired' | 'network_error'

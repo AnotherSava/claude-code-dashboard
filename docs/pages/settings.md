@@ -22,6 +22,7 @@ Right-click the tray icon for the controls you reach for most:
 - **Always on top** — keep the widget above your other windows.
 - **Save position on exit** — reopen where you left it, at the same size.
 - **Color terminal tabs** — show each session's status as a colored circle in its terminal tab title.
+- **Compact view** — hide each row's current prompt and time-in-state, and collapse the usage bars down to their bare percentage.
 - **On system start** — launch at login: off, open the window, or start hidden in the tray.
 - **Auto-resize** — fit the window height to its content, growing upward or downward. The widget owns its height while this is on, so dragging its top or bottom edge does nothing; the sides still resize the width.
 - **History font size** — pick one of five sizes for the history window.
@@ -41,6 +42,7 @@ Every field is optional — omit one and the built-in default applies. A complet
   "always_on_top": true,
   "history_font_size": "regular",
   "auto_resize": "none",
+  "compact_mode": false,
   "tray_badge": "none",
   "tray_context_alert_enabled": true,
   "tray_context_alert_percent": 80,
@@ -111,6 +113,10 @@ Whether autostart is enabled isn't a config field — it lives in the OS launch 
 ### Session identity
 
 - `projects_root` — the folder your projects live under. Sessions beneath it get short, folder-relative names instead of bare folder basenames. See [Features → session identity](features#session-identity).
+
+### Compact view
+
+- `compact_mode` — hide each row's current prompt and time-in-state, and collapse the 5h/7d usage bars down to their bare percentage. Toggled from the tray's **Compact view** checkbox. Off by default. See [Features](features#compact-view).
 
 ### Color terminal tabs
 

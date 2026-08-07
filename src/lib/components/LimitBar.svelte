@@ -10,9 +10,10 @@
     now: number
     format: 'hm' | 'dhm'
     segments: number
+    compact?: boolean
   }
 
-  let { bucket, status, updated, now, format, segments }: Props = $props()
+  let { bucket, status, updated, now, format, segments, compact = false }: Props = $props()
 
   // When the window's resets_at has passed but we still hold the old snapshot
   // (the poller fires once per 10 min by default), the displayed remaining
@@ -41,7 +42,9 @@
       ? '--%'
       : status === 'ok'
         ? `${Math.round(bucket.utilization * 100)}%`
-        : 'NO DATA',
+        : compact
+          ? '??'
+          : 'NO DATA',
   )
   const timeText = $derived(
     !hasData || !bucket
@@ -99,22 +102,24 @@
   }
 </script>
 
-<div class="bar" title={tooltip} data-tauri-drag-region>
+<div class="bar" class:compact title={tooltip} data-tauri-drag-region>
   <span class="cap cap-left" data-tauri-drag-region>{percentText}</span>
-  <div
-    class="segments"
-    style:--n={segmentCount}
-    style:--fill-color={fillColor}
-    data-tauri-drag-region
-  >
-    {#if filledSegments > 0}
-      <div
-        class="fill"
-        style:--filled={filledSegments}
-        data-tauri-drag-region
-      ></div>
-    {/if}
-  </div>
+  {#if !compact}
+    <div
+      class="segments"
+      style:--n={segmentCount}
+      style:--fill-color={fillColor}
+      data-tauri-drag-region
+    >
+      {#if filledSegments > 0}
+        <div
+          class="fill"
+          style:--filled={filledSegments}
+          data-tauri-drag-region
+        ></div>
+      {/if}
+    </div>
+  {/if}
   <span class="cap cap-right" data-tauri-drag-region>{timeText}</span>
 </div>
 
@@ -179,6 +184,11 @@
   .cap-left {
     border-right: 1px solid rgba(255, 255, 255, 0.12);
     min-width: calc(4ch + 10px);
+  }
+  /* No segmented track to separate from — drop the doubled border where the
+     two number caps now sit flush against each other. */
+  .bar.compact .cap-left {
+    border-right: none;
   }
   .cap-right {
     border-left: 1px solid rgba(255, 255, 255, 0.12);
