@@ -11,7 +11,14 @@ pub struct Config {
     pub save_window_position: bool,
     pub window_position: Option<WindowPosition>,
     pub context_window_tokens: HashMap<String, u64>,
-    pub context_bar_thresholds: Vec<Threshold>,
+    /// Green/amber/red palette for the usage numbers — the limit bars (fill +
+    /// percentage) and the per-session token counter. Frontend-only: the tray
+    /// icon keeps its own brighter, icon-tuned shades.
+    pub usage_colors: UsageColors,
+    /// When true, the token counter interpolates between `usage_colors` as a
+    /// smooth gradient (green@0 → amber@50 → red@85) instead of the 3-color step
+    /// the limit bars use. The limit bars are always a step.
+    pub token_gradient: bool,
     /// Read by `adapters::claude`: conversational closers that end with '?'
     /// but shouldn't register as blocked (e.g. "What's next?"). Matched
     /// case-insensitively as a *suffix* of the final question.
@@ -399,10 +406,27 @@ pub struct WindowPosition {
     pub height: Option<u32>,
 }
 
+/// The three usage-severity colors, shared by every usage number in the
+/// widget. Per-field `#[serde(default)]` so a partial `{"green": "..."}`
+/// override keeps the other two at their defaults.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Threshold {
-    pub percent: f32,
-    pub color: String,
+#[serde(default)]
+pub struct UsageColors {
+    pub green: String,
+    pub amber: String,
+    pub red: String,
+}
+
+impl Default for UsageColors {
+    fn default() -> Self {
+        // The tray icon's palette — bright enough to read as a ~16px digit and
+        // shared with the in-app bars/tokens so everything agrees.
+        Self {
+            green: "#5ad278".into(),
+            amber: "#f0c846".into(),
+            red: "#ff5a5a".into(),
+        }
+    }
 }
 
 impl Default for Config {
@@ -427,11 +451,8 @@ impl Default for Config {
             ]
             .into_iter()
             .collect(),
-            context_bar_thresholds: vec![
-                Threshold { percent: 0.0, color: "#3a7c4a".into() },
-                Threshold { percent: 60.0, color: "#c6a03c".into() },
-                Threshold { percent: 85.0, color: "#c64a4a".into() },
-            ],
+            usage_colors: UsageColors::default(),
+            token_gradient: false,
             benign_closers: vec!["What's next?".into(), "or are you good?".into(), "or leave it?".into(), "or leave it parked?".into(), "or leave that to you?".into(), "or are you set to check it yourself?".into(), "what would you like to work on?".into(), "what would you like to work on next?".into()],
             benign_openers: vec!["anything".into()],
             projects_root: None,

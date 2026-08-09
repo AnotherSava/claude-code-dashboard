@@ -163,6 +163,7 @@ pub fn run() {
             commands::get_about_info,
             commands::open_about,
             commands::set_window_size,
+            commands::set_compact_width,
         ])
         .setup(|app| {
             // Runs at `RunEvent::Ready`, AFTER the webviews exist — so it does
@@ -393,6 +394,10 @@ pub fn run() {
     app.manage(remote_usage::RemoteUsageStore::new(
         app_data.join("remote_usage"),
     ));
+    // Compact-view width memory (runtime-only). Managed before the webview so
+    // the mount-time compact-width command and the close-time save can't race a
+    // missing state.
+    app.manage(commands::CompactWidth::default());
 
     app.run(|_app, _event| {});
 }
@@ -434,13 +439,33 @@ fn save_window_position_if_enabled(window: &tauri::Window) {
     let Ok(pos) = window.outer_position() else {
         return;
     };
-    let size = window.outer_size().ok();
+    let Ok(size) = window.outer_size() else {
+        return;
+    };
+    let (live_w, live_h) = (size.width as i32, size.height as i32);
+    // If the widget is currently shrunk to compact width, persist the
+    // *non-compact* width instead — reconstructed right-anchored from the width
+    // captured on entering compact — so the transient compact width is never
+    // saved and a reopen restores the user's real width. Only width and x are
+    // reconstructed: compact never touches height, so the live height already is
+    // the non-compact height (and this matches the toggle-out restore path).
+    let (save_x, save_w) = match window.try_state::<commands::CompactWidth>() {
+        Some(cw) => match {
+            let g = cw.0.lock().unwrap();
+            (g.shrunk, g.non_compact_width)
+        } {
+            (true, Some(ncw)) => (pos.x + live_w - ncw, ncw),
+            _ => (pos.x, live_w),
+        },
+        None => (pos.x, live_w),
+    };
+    let save_h = live_h;
     state.with_mut(|c| {
         c.window_position = Some(config::WindowPosition {
-            x: pos.x,
+            x: save_x,
             y: pos.y,
-            width: size.map(|s| s.width),
-            height: size.map(|s| s.height),
+            width: Some(save_w as u32),
+            height: Some(save_h as u32),
         });
     });
     let _ = state.save_to_disk();

@@ -1,6 +1,6 @@
 <script lang="ts">
-  import type { LimitBucket, UsageStatus } from '../types'
-  import { formatCompactRemaining } from '../types'
+  import type { LimitBucket, UsageColors, UsageStatus } from '../types'
+  import { formatCompactRemaining, usageColor } from '../types'
   import { refreshUsageLimits } from '../api'
 
   interface Props {
@@ -10,10 +10,11 @@
     now: number
     format: 'hm' | 'dhm'
     segments: number
+    colors: UsageColors
     compact?: boolean
   }
 
-  let { bucket, status, updated, now, format, segments, compact = false }: Props = $props()
+  let { bucket, status, updated, now, format, segments, colors, compact = false }: Props = $props()
 
   // When the window's resets_at has passed but we still hold the old snapshot
   // (the poller fires once per 10 min by default), the displayed remaining
@@ -55,9 +56,12 @@
           : formatCompactRemaining(null, format)
         : formatCompactRemaining(bucket.resets_at - now, format),
   )
-  const fillColor = $derived(
-    utilization >= 0.85 ? '#b91c1c' : utilization >= 0.5 ? '#b45309' : '#047857',
-  )
+  const fillColor = $derived(usageColor(utilization * 100, colors))
+  // Usage level (0–100) — the fill point for the compact progress border: the
+  // box outline is severity-colored from the left up to this percent and gray
+  // beyond, so the number stays neutral. The compact analog of the full-view
+  // horizontal bar.
+  const levelPct = $derived(Math.min(100, Math.max(0, Math.round(utilization * 100))))
   const longLabel = $derived(format === 'hm' ? '5h limit' : '7d limit')
   const tooltip = $derived(buildTooltip(status, bucket, updated, now, longLabel))
 
@@ -102,7 +106,7 @@
   }
 </script>
 
-<div class="bar" class:compact title={tooltip} data-tauri-drag-region>
+<div class="bar" class:compact style:--sev={fillColor} style:--lvl={levelPct + '%'} title={tooltip} data-tauri-drag-region>
   <span class="cap cap-left" data-tauri-drag-region>{percentText}</span>
   {#if !compact}
     <div
@@ -136,6 +140,23 @@
     border: 1px solid rgba(255, 255, 255, 0.18);
     border-radius: 3px;
     overflow: hidden;
+    /* Horizontal padding inside each number cap; the caps' min-widths derive
+       from it, so tightening it in compact reclaims width for larger text. */
+    --cap-pad: 5px;
+  }
+  /* Compact view swaps the segmented track for a progress border: the box
+     outline fills from the left in the severity color up to the usage level, the
+     rest in the track gray — a horizontal gauge on the frame that keeps the
+     number neutral. Two background layers (fill on padding-box, gradient on
+     border-box) so the rounded corners survive, which border-image would square
+     off. */
+  .bar.compact {
+    --track: rgba(255, 255, 255, 0.18);
+    border-color: transparent;
+    border-width: 2px;
+    background:
+      linear-gradient(#2a2a2d, #2a2a2d) padding-box,
+      linear-gradient(90deg, var(--sev) var(--lvl), var(--track) var(--lvl)) border-box;
   }
   .segments {
     position: relative;
@@ -174,7 +195,7 @@
     align-items: center;
     justify-content: center;
     height: 16px;
-    padding: 0 5px;
+    padding: 0 var(--cap-pad);
     background: #2a2a2d;
     color: #b9b9bc;
     font-weight: 600;
@@ -183,15 +204,20 @@
   }
   .cap-left {
     border-right: 1px solid rgba(255, 255, 255, 0.12);
-    min-width: calc(4ch + 10px);
+    min-width: calc(4ch + var(--cap-pad) * 2);
   }
-  /* No segmented track to separate from — drop the doubled border where the
-     two number caps now sit flush against each other. */
+  /* Drop cap-left's right border so it doesn't double up with cap-right's left
+     border — the single divider between the two values. */
   .bar.compact .cap-left {
     border-right: none;
   }
   .cap-right {
     border-left: 1px solid rgba(255, 255, 255, 0.12);
-    min-width: calc(7ch + 10px);
+    min-width: calc(7ch + var(--cap-pad) * 2);
+  }
+  /* Thicken that divider to 2px to match the progress border, in the same track
+     gray so the frame reads as one system. */
+  .bar.compact .cap-right {
+    border-left: 2px solid var(--track);
   }
 </style>

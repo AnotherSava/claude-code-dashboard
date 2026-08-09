@@ -488,6 +488,119 @@ pub fn set_window_size(
     Ok(())
 }
 
+/// Runtime-only state for compact-view width. The widget's width in compact
+/// view is a transient display width; the user's real (non-compact) width is
+/// remembered here so leaving compact restores it and so the save-on-close path
+/// never persists the compact width. Not persisted — captured on the first
+/// shrink and cleared on restore, so it only ever holds a value while shrunk.
+#[derive(Default)]
+pub struct CompactWidth(pub std::sync::Mutex<CompactWidthState>);
+
+#[derive(Default, Clone, Copy)]
+pub struct CompactWidthState {
+    /// The window is currently shrunk to compact width.
+    pub shrunk: bool,
+    /// Outer width in physical px captured the moment compact was entered — the
+    /// width to restore on exit and to persist (right-anchored) on close. Only
+    /// the width is remembered: the compact transform touches width and x only;
+    /// height is a separate auto-managed axis, so the save keeps the live height.
+    pub non_compact_width: Option<i32>,
+}
+
+/// Fit the main window's width to compact view, or restore the remembered
+/// non-compact width. Driven by the frontend when `compact_mode` changes, and
+/// re-fired while compact whenever the header content (e.g. the usage numbers)
+/// changes so the fit stays tight.
+///
+/// `header_inner_width_phys` is the header's natural content width in physical
+/// px, measured in the DOM; `None` on the restore path.
+///
+/// Width is anchored to the window's right edge — the widget shrinks from the
+/// left and keeps its corner. The compact width is never saved: it's a
+/// transient transform over the non-compact geometry captured on entry, which
+/// the close-time save reconstructs (see `save_window_position_if_enabled`).
+#[tauri::command]
+pub fn set_compact_width(
+    compact: bool,
+    header_inner_width_phys: Option<f64>,
+    app: AppHandle,
+) -> Result<(), String> {
+    let Some(window) = app.get_webview_window("main") else {
+        return Ok(());
+    };
+    let state = app.state::<CompactWidth>();
+    let (Ok(pos), Ok(outer), Ok(inner)) =
+        (window.outer_position(), window.outer_size(), window.inner_size())
+    else {
+        return Ok(());
+    };
+    // The invisible resize border on frameless Windows makes outer > inner; keep
+    // width math in outer space for the right-edge anchor, but set the inner
+    // (client) size — the unit `set_size` writes and the frontend measured.
+    let frame_w = outer.width as i32 - inner.width as i32;
+    let cur_outer_w = outer.width as i32;
+    let cur_inner_w = inner.width as i32;
+    let cur_inner_h = inner.height;
+    let outer_h = outer.height as i32;
+    let right_edge = pos.x + cur_outer_w;
+
+    let mut guard = state.0.lock().unwrap();
+
+    if compact {
+        let Some(hdr) = header_inner_width_phys else {
+            return Ok(());
+        };
+        // Relax the min-width floor first so the narrow set_size isn't clamped
+        // back up. Idempotent — safe to re-assert on every re-measure.
+        crate::auto_resize::set_compact_min_width(&window, true);
+        // Capture the non-compact width once, on the transition into compact.
+        if !guard.shrunk {
+            guard.non_compact_width = Some(cur_outer_w);
+            guard.shrunk = true;
+        }
+        let target_inner = (hdr.round() as i32).max(1);
+        // Already fitted (a re-measure with unchanged header) — nothing to do.
+        if (target_inner - cur_inner_w).abs() <= 1 {
+            return Ok(());
+        }
+        let target_outer = target_inner + frame_w;
+        let raw_x = right_edge - target_outer;
+        let (new_x, new_y) =
+            crate::auto_resize::clamp_to_work_area(&window, raw_x, pos.y, target_outer, outer_h);
+        window
+            .set_position(tauri::PhysicalPosition::new(new_x, new_y))
+            .map_err(|e| e.to_string())?;
+        window
+            .set_size(tauri::PhysicalSize::new(target_inner as u32, cur_inner_h))
+            .map_err(|e| e.to_string())?;
+        tracing::debug!(target_inner, cur_inner_w, new_x, decision = "compact_width", "shrunk to header width");
+    } else {
+        // Restore path: no-op unless we actually shrank.
+        if !guard.shrunk {
+            return Ok(());
+        }
+        let ncw = guard.non_compact_width.unwrap_or(cur_outer_w);
+        let target_outer = ncw;
+        let target_inner = (ncw - frame_w).max(1);
+        let raw_x = right_edge - target_outer;
+        let (new_x, new_y) =
+            crate::auto_resize::clamp_to_work_area(&window, raw_x, pos.y, target_outer, outer_h);
+        window
+            .set_position(tauri::PhysicalPosition::new(new_x, new_y))
+            .map_err(|e| e.to_string())?;
+        window
+            .set_size(tauri::PhysicalSize::new(target_inner as u32, cur_inner_h))
+            .map_err(|e| e.to_string())?;
+        guard.shrunk = false;
+        guard.non_compact_width = None;
+        // Restore the floor after widening (a 300 floor under an already-wider
+        // window can't clamp it).
+        crate::auto_resize::set_compact_min_width(&window, false);
+        tracing::debug!(restored_outer = ncw, new_x, decision = "compact_width", "restored non-compact width");
+    }
+    Ok(())
+}
+
 /// The history window's OS title bar: the user's custom name for the chat, or
 /// the chat_id when unnamed.
 fn history_title(app: &AppHandle, chat_id: &str) -> String {

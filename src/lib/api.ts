@@ -36,6 +36,18 @@ export function applyAutoResize(physicalHeight: number): Promise<void> {
   return invoke('apply_auto_resize', { physicalHeight })
 }
 
+// Fit the main window's width to compact view (`compact=true`, passing the
+// header's natural content width in physical px), or restore the remembered
+// non-compact width (`compact=false`, `headerInnerWidthPhys=null`). The compact
+// width is never persisted — the backend reconstructs the non-compact geometry
+// on close. Fire-and-forget, like applyAutoResize.
+export function setCompactWidth(
+  compact: boolean,
+  headerInnerWidthPhys: number | null,
+): Promise<void> {
+  return invoke('set_compact_width', { compact, headerInnerWidthPhys })
+}
+
 export function frontendLog(
   level: 'trace' | 'debug' | 'info' | 'warn' | 'error',
   message: string,

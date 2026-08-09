@@ -127,11 +127,8 @@ export const mockConfig: Config = {
     'claude-opus': 200_000,
     claude: 200_000,
   },
-  context_bar_thresholds: [
-    { percent: 0, color: '#3a7c4a' },
-    { percent: 60, color: '#c6a03c' },
-    { percent: 85, color: '#c64a4a' },
-  ],
+  usage_colors: { green: '#5ad278', amber: '#f0c846', red: '#ff5a5a' },
+  token_gradient: false,
   benign_closers: ["What's next?"],
   benign_openers: ['anything'],
   usage_limits_poll_interval_seconds: 600,

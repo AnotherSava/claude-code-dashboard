@@ -21,6 +21,7 @@
     onShowSetupInstructions,
     onUsageLimitsUpdated,
     refreshUsageLimits,
+    setCompactWidth,
     showWindow,
   } from './lib/api'
   import type { AgentSession, Config, SetupState, UsageLimits } from './lib/types'
@@ -350,6 +351,74 @@
     scheduleMeasure()
   })
 
+  // --- Compact-view width fit -------------------------------------------------
+  // In compact view the window width is fitted to the header's natural content
+  // width (backend anchors it to the right edge). The compact width is never
+  // persisted; leaving compact restores the non-compact width the backend
+  // captured on entry. `prevCompact` gates the one-shot restore so we don't
+  // re-send it on every unrelated re-render while non-compact.
+  let prevCompact: boolean | undefined = undefined
+  let widthTimer: ReturnType<typeof setTimeout> | null = null
+
+  // The header's natural (min-content) width in CSS px, or null if the header
+  // subtree isn't laid out yet. Everything up to the last limit bar is
+  // left-packed, so that bar's right edge is its true position; the hover-× is
+  // pushed to the far right by `margin-left: auto` today, so we place it just
+  // after the bars (one header gap) rather than trusting its stretched
+  // position. Spacing is read from computed styles so this survives CSS tweaks.
+  function measureHeaderWidth(): number | null {
+    const header = widgetEl?.querySelector('header') as HTMLElement | null
+    const limits = header?.querySelector('.limits') as HTMLElement | null
+    const lastBar = limits?.lastElementChild as HTMLElement | null
+    const hide = header?.querySelector('.hide-btn') as HTMLElement | null
+    if (!header || !limits || !lastBar || !hide) return null
+    const cs = getComputedStyle(header)
+    const headerGap = parseFloat(cs.columnGap || cs.gap || '0') || 0
+    const padRight = parseFloat(cs.paddingRight || '0') || 0
+    const left = header.getBoundingClientRect().left
+    const barsRight = lastBar.getBoundingClientRect().right
+    const hideW = hide.getBoundingClientRect().width
+    return Math.ceil(barsRight - left + headerGap + hideW + padRight)
+  }
+
+  function scheduleWidthAdjust() {
+    if (widthTimer !== null) clearTimeout(widthTimer)
+    // Slightly longer than the height debounce so the compact layout (bars
+    // re-rendering to their number-only form) has committed before we measure.
+    widthTimer = setTimeout(widthAdjust, 60)
+  }
+
+  function widthAdjust() {
+    widthTimer = null
+    if (!isMainWindow || !config) return
+    const compact = !!config.compact_mode
+    if (compact) {
+      const cssW = measureHeaderWidth()
+      if (cssW == null) return // header not laid out yet; a later trigger re-fires
+      prevCompact = true
+      setCompactWidth(true, cssW * effectiveScale()).catch((err) =>
+        console.error('set_compact_width failed', err),
+      )
+    } else {
+      // Only send the restore once, on the compact → non-compact transition.
+      if (prevCompact) {
+        setCompactWidth(false, null).catch((err) =>
+          console.error('set_compact_width failed', err),
+        )
+      }
+      prevCompact = false
+    }
+  }
+
+  // Re-fit compact width when the mode flips or the header content changes
+  // (usage numbers alter the compacted bar width). The backend dedups a
+  // re-measure that matches the current width, so this can't feed back a loop.
+  $effect(() => {
+    config?.compact_mode
+    usage
+    scheduleWidthAdjust()
+  })
+
   onMount(() => {
     let unlistenSessions: (() => void) | undefined
     let unlistenConfig: (() => void) | undefined
@@ -429,6 +498,10 @@
             // manages ConfigState before the webview loads, so auto_resize can't
             // race to 'none'); later session/usage updates refine the height.
             scheduleMeasure()
+            // Same for the compact width fit — close the initial-measure gap so a
+            // launch-into-compact shrinks to the header without waiting for a
+            // later usage/config trigger.
+            scheduleWidthAdjust()
           } catch (err) {
             console.error('failed to reveal window', err)
           }
@@ -472,6 +545,10 @@
     function onDprChange() {
       armDprListener()
       scheduleMeasure()
+      // Re-fit compact width at the new scale too: the width sent to the backend
+      // is physical (cssWidth × dpr), so a dpr transient at mount or a DPI-boundary
+      // move would otherwise leave the compact window fitted at the stale scale.
+      scheduleWidthAdjust()
     }
     armDprListener()
 
@@ -486,10 +563,17 @@
       unlistenShowSetup?.()
       if (measureTimer !== null) clearTimeout(measureTimer)
       if (healTimer !== null) clearTimeout(healTimer)
+      if (widthTimer !== null) clearTimeout(widthTimer)
       cancelReadyRetry()
       contentObserver?.disconnect()
     }
   })
+
+  // Usage palette for the limit bars, with a pre-config-load fallback to the
+  // built-in defaults (mirrors config.rs UsageColors::default()).
+  const usageColors = $derived(
+    config?.usage_colors ?? { green: '#5ad278', amber: '#f0c846', red: '#ff5a5a' },
+  )
 
   function onHide() {
     hideWindow().catch((err) => console.error('hide failed', err))
@@ -514,6 +598,7 @@
         {now}
         segments={config?.limit_bar_segments ?? 16}
         format="hm"
+        colors={usageColors}
         compact={config?.compact_mode ?? false}
       />
       <LimitBar
@@ -523,6 +608,7 @@
         {now}
         segments={config?.limit_bar_segments ?? 16}
         format="dhm"
+        colors={usageColors}
         compact={config?.compact_mode ?? false}
       />
     </div>

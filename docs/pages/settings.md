@@ -72,17 +72,14 @@ Every field is optional — omit one and the built-in default applies. A complet
       "reading_speed_cps": 10
     }
   },
-  "context_bar_thresholds": [
-    { "percent": 0,  "color": "#3a7c4a" },
-    { "percent": 60, "color": "#c6a03c" },
-    { "percent": 85, "color": "#c64a4a" }
-  ],
   "context_window_tokens": {
     "claude-opus": 1000000,
     "claude-sonnet-5": 1000000,
     "claude-fable": 1000000,
     "claude": 200000
   },
+  "usage_colors": { "green": "#5ad278", "amber": "#f0c846", "red": "#ff5a5a" },
+  "token_gradient": false,
   "benign_closers": ["What's next?", "or are you good?", "or leave it?", "or leave it parked?", "or leave that to you?", "or are you set to check it yourself?", "what would you like to work on?", "what would you like to work on next?"],
   "benign_openers": ["anything"],
   "continuation_prompts": ["go", "continue", "proceed", "yes", "y", "yeah", "yep", "yup", "ok", "okay", "sure", "go ahead", "do it"],
@@ -150,10 +147,11 @@ The `notifications` block controls alerts when a session needs you. Set it to `n
 
 `high_alert` is a top-level field (a sibling of `notifications`, not inside it), toggled from the tray's **High alert** checkbox. When on, every *configured* state notification — `blocked`, `done`, `error` — is sent the instant the state is entered, skipping both windows above and the reading-time delay. It only accelerates states that already alert: a state you've silenced by zeroing both its windows stays silent. It doesn't touch the `context_alert_percent` or `limit_reset_percent` alerts, which keep their own timing. Off by default.
 
-### Token coloring
+### Usage colors
 
-- `context_bar_thresholds` — color stops for the token counter, each a `percent` and a hex `color`. The widget interpolates the color from the live count as a percentage of the active model's window — so it ramps green → amber → red as context fills.
-- `context_window_tokens` — context-window size per model, used as the denominator for that percentage. Keys match by longest prefix, so the defaults above cover every Claude model — add an exact model id (e.g. `"claude-sonnet-4-6": 1000000`) to override its family.
+- `usage_colors` — the green/amber/red palette shared by every usage number: the limit bars (fill + percentage), the per-session token counter, **and the tray icon number** read green below 50%, amber 50–84%, and red at 85%+. Override any of the three (a partial `{ "amber": "#…" }` keeps the other two). The defaults are tuned bright enough to read as a ~16px tray digit — pick your own with that in mind if you change them.
+- `token_gradient` — when `true`, the token counter interpolates smoothly between `usage_colors` (green→amber over 0–50%, amber→red over 50–85%) instead of the 3-color step. The limit bars are always a step. Defaults to `false`.
+- `context_window_tokens` — context-window size per model, the denominator for the token counter's percentage. Keys match by longest prefix, so the defaults above cover every Claude model — add an exact model id (e.g. `"claude-sonnet-4-6": 1000000`) to override its family.
 
 ### Prompt classification
 

@@ -117,16 +117,32 @@ fn target_icon_px(app: &AppHandle) -> usize {
     ((base * scale).round() as usize).clamp(16, 64)
 }
 
-/// Pick a number color by urgency so the badge conveys severity at a glance,
-/// matching the green→amber→red progression of the in-app bars.
-fn urgency_color(pct: u32) -> [u8; 3] {
-    if pct >= 85 {
-        [255, 90, 90] // red
-    } else if pct >= 60 {
-        [240, 200, 70] // amber
+/// Pick a number color by urgency so the badge conveys severity at a glance —
+/// green below 50%, amber 50–84%, red at 85%+. Colors come from
+/// `config.usage_colors`, the same palette the in-app bars and token counter
+/// use, so the tray number and the widget agree; the default palette is tuned
+/// bright enough to read at ~16px.
+fn urgency_color(pct: u32, colors: &crate::config::UsageColors) -> [u8; 3] {
+    let hex = if pct >= 85 {
+        &colors.red
+    } else if pct >= 50 {
+        &colors.amber
     } else {
-        [90, 210, 120] // green
+        &colors.green
+    };
+    parse_hex(hex)
+}
+
+/// Parse a `#rrggbb` (or `rrggbb`) hex color to RGB, falling back to mid-gray on
+/// anything malformed so a bad config value degrades gracefully instead of
+/// panicking the tray render.
+fn parse_hex(s: &str) -> [u8; 3] {
+    let h = s.strip_prefix('#').unwrap_or(s);
+    if h.len() != 6 {
+        return [0x80, 0x80, 0x80];
     }
+    let b = |i: usize| u8::from_str_radix(&h[i..i + 2], 16).unwrap_or(0x80);
+    [b(0), b(2), b(4)]
 }
 
 /// Baseline-relative bounding box (minx, miny, maxx, maxy) of `text` laid out
@@ -523,7 +539,7 @@ pub fn refresh(app: &AppHandle) {
         // instead of a number.
         Some(pct) if badge.is_light() || pct >= 100 => render_light_badge(&base, pct, size, alert),
         Some(pct) if alert => render_badge_alert(&badge_text(pct), size),
-        Some(pct) => render_badge(&badge_text(pct), urgency_color(pct), size),
+        Some(pct) => render_badge(&badge_text(pct), urgency_color(pct, &config.usage_colors), size),
         None => render_plain_icon(&base, size, alert),
     };
     let _ = tray.set_icon(Some(img));
@@ -583,12 +599,22 @@ mod tests {
 
     #[test]
     fn urgency_color_thresholds() {
-        assert_eq!(urgency_color(0), [90, 210, 120]);
-        assert_eq!(urgency_color(59), [90, 210, 120]);
-        assert_eq!(urgency_color(60), [240, 200, 70]);
-        assert_eq!(urgency_color(84), [240, 200, 70]);
-        assert_eq!(urgency_color(85), [255, 90, 90]);
-        assert_eq!(urgency_color(100), [255, 90, 90]);
+        // The default palette is the bright tray shades, shared with the in-app.
+        let c = crate::config::UsageColors::default();
+        assert_eq!(urgency_color(0, &c), [90, 210, 120]);
+        assert_eq!(urgency_color(49, &c), [90, 210, 120]);
+        assert_eq!(urgency_color(50, &c), [240, 200, 70]);
+        assert_eq!(urgency_color(84, &c), [240, 200, 70]);
+        assert_eq!(urgency_color(85, &c), [255, 90, 90]);
+        assert_eq!(urgency_color(100, &c), [255, 90, 90]);
+    }
+
+    #[test]
+    fn parse_hex_handles_valid_and_malformed() {
+        assert_eq!(parse_hex("#5ad278"), [90, 210, 120]);
+        assert_eq!(parse_hex("f0c846"), [240, 200, 70]);
+        assert_eq!(parse_hex("bad"), [0x80, 0x80, 0x80], "wrong length → gray");
+        assert_eq!(parse_hex("#zzzzzz"), [0x80, 0x80, 0x80], "non-hex → gray");
     }
 
     #[test]
@@ -619,7 +645,7 @@ mod tests {
     fn render_badge_renders_at_requested_size_and_draws_pixels() {
         // Renders at the requested tray size (24px = 150% DPI here), with the
         // urgency color on a transparent background.
-        let out = render_badge("85", urgency_color(85), 24);
+        let out = render_badge("85", urgency_color(85, &crate::config::UsageColors::default()), 24);
         assert_eq!((out.width(), out.height()), (24, 24));
         let rgba = out.rgba();
         let has_red = rgba

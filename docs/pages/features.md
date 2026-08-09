@@ -30,7 +30,7 @@ Each badge is color-coded, and BLOCK and ERROR pulse to draw your eye when a ses
 
 ## Compact view
 
-Turn on the tray's **Compact view** toggle for a denser widget: each row drops its current prompt and time-in-state, and the 5-hour / 7-day usage bars collapse to their bare percentage, dropping the segmented track. What's left is the state badge, token count, and usage numbers — nothing that needs reading, just glanceable figures. Off by default.
+Turn on the tray's **Compact view** toggle for a denser widget: each row drops its current prompt and time-in-state, and the 5-hour / 7-day usage bars shrink to just their percentage and reset time — the segmented track giving way to a slim border that fills left-to-right and shifts green → amber → red as each limit climbs. What's left is the state badge, token count, and usage figures — nothing that needs reading, just glanceable numbers. Off by default.
 
 ## Color terminal tabs
 
@@ -100,6 +100,6 @@ The devices need to reach each other over the network — the simplest way acros
 
 ## Configuration
 
-The common toggles — always on top, save position on exit, start with the system, history font size, and more — are right-click items in the tray menu. They're backed by a `config.json` file in the app data directory, which the widget reloads as soon as you save it (no restart needed, except for the server port). The file also holds settings that aren't in the tray, like color thresholds, notification options, and conversation-parsing tweaks.
+The common toggles — always on top, save position on exit, start with the system, history font size, and more — are right-click items in the tray menu. They're backed by a `config.json` file in the app data directory, which the widget reloads as soon as you save it (no restart needed, except for the server port). The file also holds settings that aren't in the tray, like the usage color palette, notification options, and conversation-parsing tweaks.
 
 See [Settings](settings) for the tray menu and the full `config.json` reference.

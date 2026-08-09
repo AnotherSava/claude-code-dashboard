@@ -44,9 +44,10 @@ export interface AgentSession {
   canary?: 'off' | 'pending' | 'alive' | 'dead'
 }
 
-export interface ContextBarThreshold {
-  percent: number
-  color: string
+export interface UsageColors {
+  green: string
+  amber: string
+  red: string
 }
 
 export type AutoResize = 'none' | 'up' | 'down'
@@ -59,7 +60,8 @@ export interface Config {
   save_window_position: boolean
   window_position: { x: number; y: number } | null
   context_window_tokens: Record<string, number>
-  context_bar_thresholds: ContextBarThreshold[]
+  usage_colors: UsageColors
+  token_gradient: boolean
   benign_closers: string[]
   benign_openers: string[]
   usage_limits_poll_interval_seconds: number
@@ -186,23 +188,31 @@ export function tokenColor(session: AgentSession, config: Config): string {
   const max = windowFor(session.model, config.context_window_tokens)
   if (!max) return '#8a8a8e'
   const pct = Math.min(100, (session.input_tokens / max) * 100)
-  return colorAtPercent(pct, config.context_bar_thresholds)
+  return config.token_gradient
+    ? usageColorGradient(pct, config.usage_colors)
+    : usageColor(pct, config.usage_colors)
 }
 
-export function colorAtPercent(p: number, stops: ContextBarThreshold[]): string {
-  if (stops.length === 0) return '#3a7c4a'
-  const sorted = [...stops].sort((a, b) => a.percent - b.percent)
-  if (p <= sorted[0].percent) return sorted[0].color
-  if (p >= sorted[sorted.length - 1].percent) return sorted[sorted.length - 1].color
-  for (let i = 0; i < sorted.length - 1; i++) {
-    const a = sorted[i]
-    const b = sorted[i + 1]
-    if (p >= a.percent && p <= b.percent) {
-      const t = (p - a.percent) / (b.percent - a.percent)
-      return lerpHex(a.color, b.color, t)
-    }
-  }
-  return sorted[0].color
+// Single source for the usage color palette. `usageColor` is the 3-color step —
+// green below 50%, amber 50–84%, red at 85%+ — used by the limit bars (fill +
+// percentage) and, by default, the token counter. Colors come from
+// `config.usage_colors` so they're tunable, and the tray icon reads the same
+// palette in Rust (`urgency_color`), so every usage number — widget and tray —
+// agrees. The default palette is tuned bright enough to read as a ~16px icon.
+export function usageColor(pct: number, c: UsageColors): string {
+  if (pct >= 85) return c.red
+  if (pct >= 50) return c.amber
+  return c.green
+}
+
+// Smooth variant for the token counter when `token_gradient` is on: interpolate
+// green→amber over 0–50% and amber→red over 50–85%, red beyond. The limit bars
+// always use the step above.
+export function usageColorGradient(pct: number, c: UsageColors): string {
+  if (pct <= 0) return c.green
+  if (pct >= 85) return c.red
+  if (pct <= 50) return lerpHex(c.green, c.amber, pct / 50)
+  return lerpHex(c.amber, c.red, (pct - 50) / 35)
 }
 
 function lerpHex(a: string, b: string, t: number): string {

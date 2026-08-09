@@ -1,4 +1,4 @@
-use tauri::{PhysicalPosition, PhysicalSize, WebviewWindow};
+use tauri::{Manager, PhysicalPosition, PhysicalSize, WebviewWindow};
 
 use crate::config::AutoResize;
 
@@ -212,6 +212,68 @@ pub fn install_resize_lock(window: &WebviewWindow) {
     resize_lock::install(window);
 }
 
+/// Logical-pixel minimum width enforced while the widget is in compact view,
+/// below the non-compact `minWidth` from `tauri.conf.json`. Low enough that the
+/// auto-fitted header width (what actually sizes the window in compact) is
+/// reachable, high enough that a manual drag can't squash the widget to a
+/// sliver. The non-compact floor stays the declared `minWidth` (single source),
+/// restored when compact turns off.
+const COMPACT_MIN_WIDTH: f64 = 140.0;
+
+/// The window's declared `minWidth` from `tauri.conf.json` (the non-compact
+/// floor), or 0.0 when the window has no entry / no declared minimum.
+fn declared_min_width(window: &WebviewWindow) -> f64 {
+    let app = window.app_handle();
+    app.config()
+        .app
+        .windows
+        .iter()
+        .find(|w| w.label == window.label())
+        .and_then(|w| w.min_width)
+        .unwrap_or(0.0)
+}
+
+/// Relax (compact) or restore (non-compact) the window's minimum width so
+/// compact view can shrink below the non-compact `minWidth` floor.
+///
+/// Each platform enforces the minimum through a different owner, so each is set
+/// where it actually takes effect:
+/// - Windows/Linux: tao's stored min inner size via `set_min_size` — nothing
+///   else writes it, so this sticks until restored.
+/// - macOS: the min width is one of the four bounds [`resize_lock`] rewrites
+///   atomically on every height apply, so a bare `set_min_size` would be undone
+///   on the next measure. Route through `resize_lock::refresh`, which rebuilds
+///   the constraints reading the *current* `compact_mode` (the value the caller
+///   persisted before invoking this).
+pub fn set_compact_min_width(window: &WebviewWindow, compact: bool) {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = compact; // resize_lock reads compact_mode from config itself
+        resize_lock::refresh(window);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let min_w = if compact { COMPACT_MIN_WIDTH } else { declared_min_width(window) };
+        if let Err(e) = window.set_min_size(Some(tauri::LogicalSize::new(min_w, 0.0))) {
+            tracing::warn!(?e, compact, "set_compact_min_width failed");
+        }
+    }
+}
+
+/// Clamp an outer rect `(x, y, w, h)` into the work area of the monitor it most
+/// overlaps (primary as fallback), returning the adjusted top-left. Shared by
+/// the compact-width resize so a width change (which moves the anchored edge)
+/// can't push the widget off-screen — the same clamp `apply` uses for height.
+pub(crate) fn clamp_to_work_area(
+    window: &WebviewWindow,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+) -> (i32, i32) {
+    clamp_bounds(window, x, y, w, h).clamp(x, y, w, h)
+}
+
 /// Replace the window class's background brush with our dark theme color so
 /// the OS-managed paint during a horizontal resize uses `#1c1c1e` instead
 /// of the default white. Without this, growing the window to the side
@@ -394,26 +456,54 @@ mod resize_lock {
 
 #[cfg(target_os = "macos")]
 mod resize_lock {
+    use std::sync::atomic::{AtomicI32, Ordering};
     use tauri::utils::config::WindowConfig;
     use tauri::{LogicalUnit, Manager, PhysicalUnit, PixelUnit, WebviewWindow, WindowSizeConstraints};
+
+    /// The height currently pinned by the lock, or `i32::MIN` when released.
+    /// Remembered so [`refresh`] can rebuild the constraints — after a
+    /// compact-mode min-width change — without a fresh height to pin. Stays a
+    /// no-op sentinel until `engage` runs, so a refresh before any height apply
+    /// simply leaves the height unpinned.
+    static PINNED_HEIGHT: AtomicI32 = AtomicI32::new(i32::MIN);
 
     /// Nothing to install — the pin is applied per resize by `engage`.
     pub fn install(_window: &WebviewWindow) {}
 
     pub fn engage(window: &WebviewWindow, height_phys: i32) {
+        PINNED_HEIGHT.store(height_phys, Ordering::Relaxed);
         set_constraints(window, Some(height_phys));
     }
 
     pub fn release(window: &WebviewWindow) {
+        PINNED_HEIGHT.store(i32::MIN, Ordering::Relaxed);
         set_constraints(window, None);
+    }
+
+    /// Re-apply the constraints with the currently-pinned height (if any),
+    /// picking up a changed `compact_mode` for the min-width bound. Called when
+    /// compact view toggles so the min-width relaxes/restores immediately
+    /// instead of waiting for the next height apply to rebuild the four bounds.
+    pub fn refresh(window: &WebviewWindow) {
+        let pinned = PINNED_HEIGHT.load(Ordering::Relaxed);
+        let pin = (pinned != i32::MIN).then_some(pinned);
+        set_constraints(window, pin);
     }
 
     fn set_constraints(window: &WebviewWindow, pinned_height_phys: Option<i32>) {
         let app = window.app_handle();
         let declared = app.config().app.windows.iter().find(|w| w.label == window.label());
-        let constraints = constraints_with_pin(declared, pinned_height_phys);
+        // Compact view is allowed below the declared floor; every other mode
+        // keeps it. Reading `compact_mode` here (rather than passing it in) lets
+        // both the per-resize path and `refresh` stay in sync with one source.
+        let compact = window
+            .try_state::<crate::config::ConfigState>()
+            .map(|s| s.snapshot().compact_mode)
+            .unwrap_or(false);
+        let min_width = if compact { super::COMPACT_MIN_WIDTH } else { super::declared_min_width(window) };
+        let constraints = constraints_with_pin(declared, min_width, pinned_height_phys);
         if let Err(e) = window.set_size_constraints(constraints) {
-            tracing::warn!(?e, ?pinned_height_phys, "resize lock: set_size_constraints failed");
+            tracing::warn!(?e, ?pinned_height_phys, compact, "resize lock: set_size_constraints failed");
         }
     }
 
@@ -439,6 +529,7 @@ mod resize_lock {
     /// lock leaves the window in exactly the state tao would have.
     fn constraints_with_pin(
         declared: Option<&WindowConfig>,
+        min_width: f64,
         pinned_height_phys: Option<i32>,
     ) -> WindowSizeConstraints {
         let logical = |v: f64| PixelUnit::Logical(LogicalUnit::new(v));
@@ -447,7 +538,9 @@ mod resize_lock {
             Some(logical(declared.unwrap_or(fallback)))
         };
         WindowSizeConstraints {
-            min_width: declared_or(declared.and_then(|d| d.min_width), 0.0),
+            // Caller-resolved (compact view relaxes it below the declared floor);
+            // the other three bounds still come from `tauri.conf.json`.
+            min_width: Some(logical(min_width)),
             min_height: pin()
                 .or_else(|| declared_or(declared.and_then(|d| d.min_height), 0.0)),
             max_width: declared_or(declared.and_then(|d| d.max_width), UNBOUNDED_MAX),
@@ -481,7 +574,7 @@ mod resize_lock {
 
         #[test]
         fn engaging_pins_both_height_bounds_to_the_applied_height() {
-            let c = constraints_with_pin(Some(&declared()), Some(341));
+            let c = constraints_with_pin(Some(&declared()), 300.0, Some(341));
             assert_eq!(c.min_height, pinned(341), "min height pinned");
             assert_eq!(c.max_height, pinned(341), "max height pinned — min == max is the lock");
         }
@@ -491,14 +584,14 @@ mod resize_lock {
             // The whole point of rebuilding from the config: writing all four
             // bounds must not quietly drop the configured minimum width, which
             // would let the user squash the widget to nothing horizontally.
-            let c = constraints_with_pin(Some(&declared()), Some(341));
+            let c = constraints_with_pin(Some(&declared()), 300.0, Some(341));
             assert_eq!(c.min_width, logical(300.0));
             assert_eq!(c.max_width, logical(UNBOUNDED_MAX), "no max width declared, none imposed");
         }
 
         #[test]
         fn releasing_frees_the_height_and_keeps_the_declared_width_bounds() {
-            let c = constraints_with_pin(Some(&declared()), None);
+            let c = constraints_with_pin(Some(&declared()), 300.0, None);
             assert_eq!(c.min_height, logical(0.0), "height free again");
             assert_eq!(c.max_height, logical(UNBOUNDED_MAX), "height free again");
             assert_eq!(c.min_width, logical(300.0));
@@ -508,7 +601,7 @@ mod resize_lock {
         fn every_bound_is_spelled_out_rather_than_left_unset() {
             // A None field is not "leave it alone" — tao expands it to
             // f64::MIN/f64::MAX and hands that straight to NSWindow.
-            let c = constraints_with_pin(None, None);
+            let c = constraints_with_pin(None, 0.0, None);
             assert!(
                 [c.min_width, c.min_height, c.max_width, c.max_height]
                     .iter()
@@ -523,7 +616,7 @@ mod resize_lock {
             // a release rather than being cleared by it.
             let declared =
                 WindowConfig { min_height: Some(120.0), max_height: Some(900.0), ..declared() };
-            let c = constraints_with_pin(Some(&declared), None);
+            let c = constraints_with_pin(Some(&declared), 300.0, None);
             assert_eq!(c.min_height, logical(120.0));
             assert_eq!(c.max_height, logical(900.0));
         }
@@ -532,7 +625,7 @@ mod resize_lock {
         fn pin_wins_over_declared_height_bounds() {
             let declared =
                 WindowConfig { min_height: Some(120.0), max_height: Some(900.0), ..declared() };
-            let c = constraints_with_pin(Some(&declared), Some(341));
+            let c = constraints_with_pin(Some(&declared), 300.0, Some(341));
             assert_eq!(c.min_height, pinned(341), "the applied height overrides the declared floor");
             assert_eq!(c.max_height, pinned(341), "…and the declared ceiling");
         }
@@ -541,9 +634,20 @@ mod resize_lock {
         fn undeclared_window_still_gets_the_pin() {
             // A window missing from the config (renamed label) must still lock,
             // just without any width bounds to preserve.
-            let c = constraints_with_pin(None, Some(341));
+            let c = constraints_with_pin(None, 0.0, Some(341));
             assert_eq!(c.min_height, pinned(341));
             assert_eq!(c.min_width, logical(0.0));
+        }
+
+        #[test]
+        fn compact_min_width_relaxes_below_the_declared_floor() {
+            // Compact view resolves a min width below the declared 300 floor so
+            // the widget can shrink to fit just the header; the height pin and
+            // the other bounds are untouched by that.
+            let c = constraints_with_pin(Some(&declared()), super::super::COMPACT_MIN_WIDTH, Some(341));
+            assert_eq!(c.min_width, logical(super::super::COMPACT_MIN_WIDTH), "compact floor passes through, below declared 300");
+            assert!(super::super::COMPACT_MIN_WIDTH < 300.0, "compact floor is genuinely below the declared minimum");
+            assert_eq!(c.min_height, pinned(341), "height pin unaffected by the width relax");
         }
     }
 }
