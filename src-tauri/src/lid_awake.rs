@@ -103,13 +103,16 @@ const ARM_RETRY_BACKOFF_MS: i64 = 60_000;
 /// `/etc/sudoers.d` entry name. **Must not contain a dot** — sudo silently skips
 /// files in an include directory whose names contain `.` or end in `~`, so
 /// naming this after the bundle id would leave the grant permanently inert.
+#[cfg(target_os = "macos")]
 const SUDOERS_FILE: &str = "claude-code-dashboard-lidawake";
 
 /// Boot-time reset job. Its `Program` is `/usr/bin/pmset` — an Apple platform
 /// binary on the sealed system volume — so this app's own (ad-hoc) signature is
 /// irrelevant to launchd, unlike `SMAppService`.
+#[cfg(target_os = "macos")]
 const DAEMON_LABEL: &str = "com.anothersava.claude-code-dashboard.sleepreset";
 
+#[cfg(target_os = "macos")]
 const PMSET_BIN: &str = "/usr/bin/pmset";
 
 /// The exact argv pinned by the sudoers rule. sudo matches arguments literally
@@ -117,18 +120,22 @@ const PMSET_BIN: &str = "/usr/bin/pmset";
 /// — but it also means the rule and every call site must agree character for
 /// character. This function is the single source all three build from (the
 /// sudoers generator, the runtime toggle, and the deadman script).
+#[cfg(target_os = "macos")]
 fn pmset_args(on: bool) -> [&'static str; 3] {
     ["-a", "disablesleep", if on { "1" } else { "0" }]
 }
 
+#[cfg(target_os = "macos")]
 fn pmset_cmdline(on: bool) -> String {
     format!("{PMSET_BIN} {}", pmset_args(on).join(" "))
 }
 
+#[cfg(target_os = "macos")]
 fn sudoers_path() -> String {
     format!("/etc/sudoers.d/{SUDOERS_FILE}")
 }
 
+#[cfg(target_os = "macos")]
 fn daemon_path() -> String {
     format!("/Library/LaunchDaemons/{DAEMON_LABEL}.plist")
 }
