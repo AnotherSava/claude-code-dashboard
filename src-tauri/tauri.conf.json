@@ -21,6 +21,7 @@
         "alwaysOnTop": true,
         "skipTaskbar": true,
         "resizable": true,
+        "maximizable": false,
         "transparent": false,
         "visible": false,
         "backgroundColor": "#1c1c1e",

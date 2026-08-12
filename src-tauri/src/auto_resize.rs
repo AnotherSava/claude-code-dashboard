@@ -265,6 +265,25 @@ impl WorkAreaBounds {
 /// One-time startup wiring for the vertical resize lock (see [`resize_lock`]).
 /// The lock starts released and is engaged by `apply()` once a fit mode is in
 /// effect, so this is inert until the user picks Up or Down.
+///
+/// Maximizing is the other way the window's height leaves our hands, and the
+/// lock never sees it: neither of its two routes is an edge drag. Windows' snap
+/// maximizes on a header drag to the top edge (the move loop, not a resize
+/// loop), and Tauri's drag-region script maximizes on a double-click by
+/// invoking `internal_toggle_maximize` straight from the webview. Both are shut
+/// off declaratively by `"maximizable": false` on the main window in
+/// `tauri.conf.json` instead of by more message filtering here: snap-to-top is
+/// gated on `WS_MAXIMIZEBOX`, which tao drops for a non-maximizable window
+/// (verified against the live widget — with the bit restored the same synthetic
+/// drag maximizes, without it the window keeps its size), and
+/// `internal_toggle_maximize` guards only its *maximize* branch on
+/// `is_maximizable()`, so a double-click can still un-maximize a window left
+/// maximized by an older build. It is unconditional rather than tied to a fit
+/// mode because the widget is a chrome-less always-on-top overlay with no
+/// maximize affordance and no title bar to restore from — a full-screen widget
+/// is an accident under `None` too. macOS was never affected: an undecorated
+/// `NSWindow` has no zoom button, and tao reports `is_maximizable() == false`
+/// when that button is absent.
 pub fn install_resize_lock(window: &WebviewWindow) {
     resize_lock::install(window);
 }
