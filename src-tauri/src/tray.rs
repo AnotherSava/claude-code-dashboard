@@ -336,7 +336,7 @@ pub fn setup(app: &AppHandle) -> tauri::Result<()> {
                     let _ = tray.with_inner_tray_icon(|inner| inner.show_menu());
                     return;
                 }
-                toggle_window(tray.app_handle());
+                crate::commands::toggle_main(tray.app_handle());
             }
         })
         .build(app)?;
@@ -346,7 +346,7 @@ pub fn setup(app: &AppHandle) -> tauri::Result<()> {
 
 fn handle_menu_event(app: &AppHandle, id: &str) {
     match id {
-        MENU_SHOW_HIDE => toggle_window(app),
+        MENU_SHOW_HIDE => crate::commands::toggle_main(app),
         MENU_ALWAYS_ON_TOP => toggle_always_on_top(app),
         MENU_SAVE_POSITION => toggle_save_position(app),
         MENU_TERMINAL_TITLES => toggle_terminal_titles(app),
@@ -387,26 +387,6 @@ fn handle_menu_event(app: &AppHandle, id: &str) {
             std::process::exit(0);
         }
         _ => {}
-    }
-}
-
-fn toggle_window(app: &AppHandle) {
-    let Some(window) = app.get_webview_window("main") else {
-        return;
-    };
-    if window.is_visible().unwrap_or(true) {
-        let _ = window.hide();
-        // Carry the About modal with the dashboard — leaving it visible
-        // after the tray hides main produces a stray floating window.
-        if let Some(about) = app.get_webview_window("about") {
-            let _ = about.hide();
-        }
-    } else {
-        // Recover a window stranded off-screen by a monitor change while the
-        // app was running — otherwise "show" reveals it where it can't be seen.
-        crate::commands::ensure_window_on_screen(&window);
-        let _ = window.show();
-        let _ = window.set_focus();
     }
 }
 
@@ -763,8 +743,10 @@ fn open_data_dir(app: &AppHandle) {
 fn show_setup_instructions(app: &AppHandle) {
     use tauri::Emitter;
     if let Some(window) = app.get_webview_window("main") {
-        let _ = window.show();
-        let _ = window.set_focus();
+        // Through `reveal` rather than a bare `show()`: on a minimized widget
+        // `show()` redisplays the icon and `set_focus` no-ops outright, so the
+        // panel would be emitted into a window the user can't see.
+        let _ = crate::commands::reveal(&window);
     }
     let _ = app.emit("show_setup_instructions", ());
 }

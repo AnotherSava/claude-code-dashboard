@@ -1,6 +1,45 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use tauri::{Manager, PhysicalPosition, PhysicalSize, WebviewWindow};
 
 use crate::config::AutoResize;
+
+/// Is the window currently minimized? Wrapped so the "can't tell" case has one
+/// definition — treat it as not minimized, which leaves the pre-existing
+/// behaviour intact rather than silently freezing the widget's height on a
+/// platform whose answer we failed to read.
+pub fn is_minimized(window: &WebviewWindow) -> bool {
+    window.is_minimized().unwrap_or(false)
+}
+
+/// Last observed minimized state, so the `WindowEvent::Resized` stream can be
+/// reduced to the single edge that matters. See [`resized_is_restore`].
+static WAS_MINIMIZED: AtomicBool = AtomicBool::new(false);
+
+/// Fold a `WindowEvent::Resized` into the minimized-state tracker and report
+/// whether this event is the *restore* edge (minimized → not minimized).
+///
+/// Windows sends `WM_SIZE` for the minimize and again for the restore, and tao
+/// emits `Resized` for every one of them — including the ordinary resizes we
+/// cause ourselves. Only the restore edge may trigger a re-fit: re-fitting on
+/// every `Resized` would loop, since the re-fit resizes the window, which emits
+/// another `Resized`.
+///
+/// Windows-only in practice, and that is fine rather than a gap: tao registers
+/// no `windowDidMiniaturize:`/`windowDidDeminiaturize:`, and AppKit doesn't
+/// resize a window to miniaturize it (the miniwindow is a separate entity), so
+/// no `Resized` fires on either macOS edge and this never returns true there.
+/// Nothing is missing, because a miniaturized `NSWindow` keeps its real frame —
+/// macOS never corrupts the geometry, so there is nothing to recover from.
+///
+/// The state is one process-global bit while the signature takes a window. That
+/// holds only because the sole caller resolves `main` itself; adding a second
+/// window here would interleave one window's minimize with another's restore.
+pub fn resized_is_restore(window: &WebviewWindow) -> bool {
+    let now = is_minimized(window);
+    let was = WAS_MINIMIZED.swap(now, Ordering::SeqCst);
+    was && !now
+}
 
 /// Resize the window to a physical inner height of `desired_height_phys` while
 /// preserving the edge anchored by `mode`. The height arrives already in
@@ -19,6 +58,24 @@ pub fn apply(
 ) -> tauri::Result<()> {
     if matches!(mode, AutoResize::None) {
         resize_lock::release(window);
+        return Ok(());
+    }
+
+    // A minimized window does not report its own geometry. Windows substitutes
+    // the iconic rect: `outer_position` reads (-32000, -32000) and `inner_size`
+    // reads SM_CXMINIMIZED x SM_CYMINIMIZED (237x39 at 144 DPI). Every input
+    // below is then meaningless — the anchor arithmetic, the work-area clamp
+    // (which always resolves to a corner, since the iconic rect overlaps no
+    // monitor) and the width we carry over — and the resize lands on the real
+    // window when it comes back. That is how a full-screen game, which
+    // minimizes the always-on-top widget, left it collapsed to a header sliver.
+    //
+    // Deliberately keyed on minimized and NOT on visibility: a window hidden to
+    // the tray keeps a real rect, and skipping there would bring the widget back
+    // stale on every tray toggle. `lib.rs` re-fits on the restore edge, when the
+    // geometry means something again.
+    if is_minimized(window) {
+        tracing::debug!(desired_height_phys, reason = "minimized", "auto_resize::apply skipped");
         return Ok(());
     }
 

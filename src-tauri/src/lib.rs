@@ -146,7 +146,6 @@ pub fn run() {
             commands::frontend_log,
             commands::hide_window,
             commands::show_window,
-            commands::toggle_window,
             commands::quit_app,
             commands::open_history,
             commands::get_window_label,
@@ -293,6 +292,9 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(|window, event| {
+            if matches!(event, tauri::WindowEvent::Resized(_)) && window.label() == "main" {
+                refit_after_restore(window);
+            }
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 match window.label() {
                     "main" => save_window_position_if_enabled(window),
@@ -402,10 +404,41 @@ pub fn run() {
     app.run(|_app, _event| {});
 }
 
+/// Ask the frontend for a fresh measurement once the OS hands the widget's
+/// geometry back, i.e. on the minimized → restored edge.
+///
+/// Recovery cannot start in the frontend. Minimizing does not resize the
+/// WebView2 child, so `window.innerHeight` stays frozen at its pre-minimize
+/// value for the whole minimized stretch and across the restore — which makes
+/// every frontend heuristic keyed on it read the window as already fitting, the
+/// collapse self-heal (`vh * 2 < desired`) included. Observed in widget.jsonl:
+/// `inner_height: 118` and `heal: 0` on every measure while the real client area
+/// was 26px. Rust holds the only honest signal that the window came back, so it
+/// is Rust that has to ask. Without this the widget kept whatever height the
+/// restore produced until some unrelated session update happened to fire a
+/// measure — indefinitely, if the agents were idle.
+fn refit_after_restore(window: &tauri::Window) {
+    use tauri::{Emitter, Manager};
+    let app = window.app_handle();
+    let Some(main) = app.get_webview_window("main") else { return };
+    if !auto_resize::resized_is_restore(&main) {
+        return;
+    }
+    tracing::debug!("window restored from minimized — requesting re-fit");
+    let _ = app.emit("refit_window", ());
+}
+
 fn save_history_position_if_enabled(window: &tauri::Window) {
     use tauri::Manager;
     let Some(state) = window.try_state::<ConfigState>() else { return };
     if !state.snapshot().save_window_position { return }
+    // Minimized windows report the iconic rect, not their own bounds — the same
+    // trap the main window's save guards against. This one is decorated and
+    // user-minimizable, so it is reachable without a full-screen app involved.
+    if window.is_minimized().unwrap_or(false) {
+        tracing::debug!("history window minimized at close — keeping the previously saved position");
+        return;
+    }
     let maximized = window.is_maximized().unwrap_or(false);
     state.with_mut(|c| c.history_window_maximized = maximized);
     // Only capture bounds while unmaximized. A maximized window's outer rect
@@ -434,6 +467,24 @@ fn save_window_position_if_enabled(window: &tauri::Window) {
     };
     let should_save = state.snapshot().save_window_position;
     if !should_save {
+        return;
+    }
+    // Same rule as `auto_resize::is_minimized` (see its doc comment for why
+    // "can't tell" means not minimized): a minimized window reports the OS's
+    // iconic rect, so saving here would persist a 237x39 sliver at
+    // (-32000, -32000) as the widget's restore bounds — and `apply_window_position`
+    // writes that size back on the next launch. The height self-corrects on the
+    // first measure, but nothing ever rewrites the width, so the widget would
+    // come back clamped to the declared `minWidth` instead of the user's own.
+    // Narrow but real. Both quit paths call `std::process::exit(0)` and never
+    // reach this; Alt+F4 needs focus, which a minimized window can't have; and
+    // shutdown/logoff doesn't reach it either, since tao leaves
+    // WM_QUERYENDSESSION deliberately unhandled. What remains is a WM_CLOSE
+    // that needs no focus — Task Manager "End task", `taskkill` without `/F` —
+    // arriving while a full-screen app has the widget minimized. Keeping the
+    // previously saved geometry beats overwriting it with the icon's.
+    if window.is_minimized().unwrap_or(false) {
+        tracing::debug!("window minimized at close — keeping the previously saved position");
         return;
     }
     let Ok(pos) = window.outer_position() else {

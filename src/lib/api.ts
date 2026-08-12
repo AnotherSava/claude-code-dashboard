@@ -64,10 +64,6 @@ export function showWindow(): Promise<void> {
   return invoke('show_window')
 }
 
-export function toggleWindow(): Promise<void> {
-  return invoke('toggle_window')
-}
-
 export function quitApp(): Promise<void> {
   return invoke('quit_app')
 }
@@ -160,6 +156,14 @@ export function onUsageLimitsUpdated(
 
 export function onShowSetupInstructions(handler: () => void): Promise<UnlistenFn> {
   return listen('show_setup_instructions', () => handler())
+}
+
+// The backend saw the window come back from being minimized and is asking for a
+// fresh measurement. The webview can't notice that on its own — minimizing
+// doesn't resize it, so `window.innerHeight` stays frozen across the whole
+// minimize/restore round trip.
+export function onRefitWindow(handler: () => void): Promise<UnlistenFn> {
+  return listen('refit_window', () => handler())
 }
 
 export function onHistoryLoading(

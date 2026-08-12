@@ -17,6 +17,7 @@
     getWindowLabelSync,
     hideWindow,
     onConfigUpdated,
+    onRefitWindow,
     onSessionsUpdated,
     onShowSetupInstructions,
     onUsageLimitsUpdated,
@@ -112,6 +113,21 @@
   function scheduleMeasure() {
     if (measureTimer !== null) clearTimeout(measureTimer)
     measureTimer = setTimeout(measureAndSend, 50)
+  }
+
+  // Measure with the dedup disarmed. A plain scheduleMeasure() is not enough
+  // after the window comes back from being minimized: minimizing never resizes
+  // the webview, so `window.innerHeight` is still the pre-minimize value while
+  // the real window is whatever height the restore produced. `desired` then
+  // matches both `lastSentHeight` and the stale viewport, the pass dedups, and
+  // nothing is applied — the window keeps the wrong height. Clearing the keys
+  // forces one real apply through; the backend is the side that knows the two
+  // disagree (see lib.rs refit_after_restore).
+  function forceMeasure() {
+    lastSentHeight = -1
+    lastSentScale = 0
+    cancelHeal()
+    scheduleMeasure()
   }
 
   function scheduleHeal() {
@@ -424,6 +440,7 @@
     let unlistenConfig: (() => void) | undefined
     let unlistenUsage: (() => void) | undefined
     let unlistenShowSetup: (() => void) | undefined
+    let unlistenRefit: (() => void) | undefined
 
     ;(async () => {
       try {
@@ -454,6 +471,14 @@
           sessions = s
         })
         unlistenConfig = await onConfigUpdated((c) => (config = c))
+        unlistenRefit = await onRefitWindow(() => {
+          frontendLog('debug', 'refit_window', { inner_height: window.innerHeight }).catch(() => {})
+          forceMeasure()
+          // The width is fitted from the header's own content, which a
+          // minimize/restore doesn't change — but it is applied against the
+          // window's live geometry, so re-run it for the same reason.
+          scheduleWidthAdjust()
+        })
         unlistenShowSetup = await onShowSetupInstructions(() => {
           // Help menu → Instructions: force the panel visible regardless of
           // history state. Clears any prior dismiss.
@@ -561,6 +586,7 @@
       unlistenConfig?.()
       unlistenUsage?.()
       unlistenShowSetup?.()
+      unlistenRefit?.()
       if (measureTimer !== null) clearTimeout(measureTimer)
       if (healTimer !== null) clearTimeout(healTimer)
       if (widthTimer !== null) clearTimeout(widthTimer)

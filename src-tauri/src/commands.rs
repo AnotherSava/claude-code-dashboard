@@ -195,7 +195,8 @@ pub fn hide_window(window: WebviewWindow, app: AppHandle) -> Result<(), String> 
 /// it stays set, the two automatic reveal paths — the frontend's mount-time
 /// `show_window` call and the safety-net timer in `lib.rs` — keep the main
 /// window hidden, so the app lives in the tray. The tray "Show / Hide" entry
-/// and `toggle_window` call `window.show()` directly and are unaffected.
+/// goes through `toggle_main` -> `reveal`, which doesn't consult this flag, so
+/// the user can still surface the window whenever they ask for it.
 pub struct SuppressInitialShow(pub std::sync::atomic::AtomicBool);
 
 #[tauri::command]
@@ -206,9 +207,7 @@ pub fn show_window(window: WebviewWindow, app: AppHandle) -> Result<(), String> 
             return Ok(());
         }
     }
-    ensure_window_on_screen(&window);
-    window.show().map_err(|e| e.to_string())?;
-    window.set_focus().map_err(|e| e.to_string())?;
+    reveal(&window)?;
     // No state re-push: every store the frontend reads at mount (ConfigState,
     // PromptHistoryStore, …) is managed before the webview exists (see lib.rs
     // run()'s build()/run() gap), so get_config / get_setup_state can't race a
@@ -216,15 +215,50 @@ pub fn show_window(window: WebviewWindow, app: AppHandle) -> Result<(), String> 
     Ok(())
 }
 
-#[tauri::command]
-pub fn toggle_window(window: WebviewWindow) -> Result<(), String> {
-    let visible = window.is_visible().map_err(|e| e.to_string())?;
-    if visible {
-        window.hide().map_err(|e| e.to_string())
-    } else {
-        ensure_window_on_screen(&window);
-        window.show().map_err(|e| e.to_string())?;
-        window.set_focus().map_err(|e| e.to_string())
+/// Bring a window fully back into view.
+///
+/// `show()` alone is not enough for a *minimized* window: on Windows it maps to
+/// `ShowWindow(SW_SHOW)`, which redisplays the window in its current state — so
+/// an iconic window is revealed as the iconic rect, a header-sized strip. That
+/// is what the tray's Show produced after a full-screen game had minimized the
+/// widget. Un-minimize first, which also gives `ensure_window_on_screen` a real
+/// rect to judge instead of the off-every-monitor iconic one.
+pub(crate) fn reveal(window: &WebviewWindow) -> Result<(), String> {
+    if crate::auto_resize::is_minimized(window) {
+        window.unminimize().map_err(|e| e.to_string())?;
+    }
+    ensure_window_on_screen(window);
+    window.show().map_err(|e| e.to_string())?;
+    window.set_focus().map_err(|e| e.to_string())
+}
+
+/// Show or hide the widget — the one implementation behind both entry points.
+///
+/// This deliberately lives here rather than next to either caller, because there
+/// used to be two copies of it: this one behind the `toggle_window` command, and
+/// a private twin in `tray.rs`. They drifted, and the drift was invisible — the
+/// command has no frontend caller, so every real click went through the tray's
+/// copy, and a fix applied here reached nothing the user could trigger.
+pub(crate) fn toggle_main(app: &AppHandle) {
+    let Some(window) = app.get_webview_window("main") else {
+        return;
+    };
+    // A minimized window still reports itself visible — minimizing doesn't clear
+    // WS_VISIBLE — so the bare visibility check reads a widget some full-screen
+    // app had minimized as "already showing" and hides it, costing two tray
+    // clicks to get it back (and the second one only revealing the icon, since
+    // `show()` alone doesn't un-minimize). Minimized counts as not showing.
+    let showing =
+        window.is_visible().unwrap_or(true) && !crate::auto_resize::is_minimized(&window);
+    if showing {
+        let _ = window.hide();
+        // Carry the About modal with the dashboard — leaving it visible after
+        // the tray hides main produces a stray floating window.
+        if let Some(about) = app.get_webview_window("about") {
+            let _ = about.hide();
+        }
+    } else if let Err(e) = reveal(&window) {
+        tracing::warn!(error = %e, "toggle_main: reveal failed");
     }
 }
 
@@ -356,6 +390,14 @@ const MIN_ONSCREEN_OVERLAP: i32 = 64;
 /// true if it moved. Call after any position restore and on every show path.
 pub fn ensure_window_on_screen(window: &WebviewWindow) -> bool {
     use crate::auto_resize::WorkAreaBounds;
+    // A minimized window is off every monitor by construction — the OS parks it
+    // at the iconic rect, (-32000, -32000) on Windows — so the rescue below
+    // would fire on every show-while-minimized and write a position derived
+    // from a rect that isn't the window's. There is nothing stranded: the real
+    // position comes back with the restore.
+    if crate::auto_resize::is_minimized(window) {
+        return false;
+    }
     let (Ok(pos), Ok(size)) = (window.outer_position(), window.outer_size()) else {
         return false;
     };
@@ -528,6 +570,18 @@ pub fn set_compact_width(
     let Some(window) = app.get_webview_window("main") else {
         return Ok(());
     };
+    // Same invariant as `auto_resize::apply`: never derive geometry from a
+    // minimized window, which reports the OS's iconic rect instead of its own.
+    // This is genuinely reachable rather than theoretical — the frontend's
+    // width `$effect` keys on `usage`, so a usage poll re-fires it on its own
+    // cadence for as long as the widget stays minimized (widget.jsonl recorded
+    // exactly that during the incident: `cur_inner_w: 215`, the iconic client
+    // width, with `new_x: 0` from the clamp). The width is re-fitted on the
+    // restore edge along with the height, so nothing is lost by skipping.
+    if crate::auto_resize::is_minimized(&window) {
+        tracing::debug!(compact, reason = "minimized", "set_compact_width skipped");
+        return Ok(());
+    }
     let state = app.state::<CompactWidth>();
     let (Ok(pos), Ok(outer), Ok(inner)) =
         (window.outer_position(), window.outer_size(), window.inner_size())

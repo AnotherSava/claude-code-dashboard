@@ -68,7 +68,7 @@ Every mutation to **local** session state funnels through `state::apply_set` or 
 
 The initial drain on watcher startup suppresses the inferred **state** AND the **latest assistant text** — a resume would otherwise snap to a stale "done" from the prior turn and duplicate the last assistant entry already in the restored dialog. Model and token counts still surface.
 
-Tauri commands target native window/tray APIs (`hide_window`, `show_window`, `toggle_window`, `quit_app`); session state is only read from the frontend (`get_sessions`) — every local-session mutation arrives through the HTTP event path above, and remote sessions only through the sync path below.
+Tauri commands target native window/tray APIs (`hide_window`, `show_window`, `quit_app`); session state is only read from the frontend (`get_sessions`) — every local-session mutation arrives through the HTTP event path above, and remote sessions only through the sync path below.
 
 ## Path 3 — Tray toggles
 
