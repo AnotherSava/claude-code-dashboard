@@ -186,11 +186,13 @@ The first hold asks for your password once and installs two files: a rule in `/e
 Setting the mode to **Off** stops the feature and leaves both in place, so turning it back on costs no password. To remove them altogether:
 
 ```bash
+sudo pmset -a disablesleep 0
 sudo launchctl bootout system /Library/LaunchDaemons/com.anothersava.claude-code-dashboard.sleepreset.plist
 sudo rm /Library/LaunchDaemons/com.anothersava.claude-code-dashboard.sleepreset.plist
 sudo rm /etc/sudoers.d/claude-code-dashboard-lidawake
-sudo pmset -a disablesleep 0
 ```
+
+Run them in that order. Sleep is switched back on first because the setting survives restarts, and the two files you're about to remove are what would otherwise clear it — take them away while it's still on and the Mac won't sleep at all.
 
 Using the feature again afterwards reinstalls them, with one more password prompt.
 
