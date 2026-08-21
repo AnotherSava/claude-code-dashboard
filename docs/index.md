@@ -26,7 +26,7 @@ A desktop app for Windows and macOS — a compact always-on-top widget that list
 
 ## What's next?
 
-- **[Installation](pages/install)** — download the widget and connect it to your Claude Code sessions.
+- **[Installation](pages/install)** — install the widget and connect it to your Claude Code sessions.
 - **[Features](pages/features)** — a closer look at everything in the list above, and a few extras.
 - **[Settings](pages/settings)** — tune every option in the config file, with tray shortcuts for the ones you change most.
 - **[Development](pages/development)** — build from source and dig into the architecture and internals.

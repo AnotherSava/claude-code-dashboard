@@ -9,7 +9,7 @@ Two steps: install the widget, then point Claude Code at the lifecycle hook.
 
 ## 1. Install the widget
 
-Download the latest installer for your platform from the [Releases page](https://github.com/AnotherSava/claude-code-dashboard/releases) and run it.
+On Windows, download the installer from the [Releases page](https://github.com/AnotherSava/claude-code-dashboard/releases) and run it. On macOS, install with Homebrew or use the DMG.
 
 ### Windows
 
@@ -20,9 +20,19 @@ Download the latest installer for your platform from the [Releases page](https:/
 
 ### macOS
 
-- File: `Claude Code Dashboard_<version>_aarch64.dmg`
-- Requirements: macOS 11+ on Apple Silicon.
-- The build is ad-hoc signed but not Apple-notarized, so on first launch macOS will say *"damaged and can't be opened"*. Open **System Settings → Privacy & Security**, scroll to the blocked-app notice, and click **Open Anyway**. Power users can instead run `xattr -cr "/Applications/Claude Code Dashboard.app"` in Terminal once after install.
+Requirements: macOS 11+ on Apple Silicon.
+
+The easiest route is Homebrew:
+
+```sh
+brew install --cask AnotherSava/tap/claude-code-dashboard
+```
+
+That installs the widget with no Gatekeeper prompt, and `brew upgrade --cask` picks up later releases. Because the build isn't notarized by Apple, the cask removes the quarantine attribute for you — the same step the manual install below asks you to do by hand. If you'd rather macOS check the app itself, use the DMG.
+
+Already installed the DMG? Quit the widget from the tray icon and delete `/Applications/Claude Code Dashboard.app` before the first `brew install`, or Homebrew will refuse to overwrite it.
+
+**Manual install:** download `Claude.Code.Dashboard_<version>_aarch64.dmg` from the [Releases page](https://github.com/AnotherSava/claude-code-dashboard/releases) and drag the app to Applications. On first launch macOS will say *"damaged and can't be opened"* — open **System Settings → Privacy & Security**, scroll to the blocked-app notice, and click **Open Anyway**. Power users can instead run `xattr -dr com.apple.quarantine "/Applications/Claude Code Dashboard.app"` in Terminal once after install.
 
 After install, the widget lives in the system tray — left-click the tray icon to show or hide it. Until you wire the hook in step 2, no sessions will appear.
 

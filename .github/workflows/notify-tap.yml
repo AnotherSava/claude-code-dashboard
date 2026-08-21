@@ -1,0 +1,36 @@
+name: Notify tap
+
+# Release.yml creates a draft; this fires only once that draft is published by
+# hand, which is the first moment the DMG has a public download URL and a
+# resolvable digest. Keying it on build completion instead would bump the cask
+# to a version nobody can download yet.
+
+on:
+  release:
+    types: [published]
+  # Manual trigger for backfills, and for checking the token works without
+  # waiting for a release. Re-dispatching a version already in the cask is
+  # safe: the tap side diffs before committing and no-ops.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to bump the cask to, e.g. v1.8.0
+        required: true
+
+jobs:
+  dispatch:
+    if: ${{ github.event_name == 'workflow_dispatch' || !github.event.release.prerelease }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Tell the Homebrew tap to bump the cask
+        env:
+          # Fine-grained PAT with Contents: read and write on
+          # AnotherSava/homebrew-tap. The built-in GITHUB_TOKEN cannot reach
+          # another repository.
+          GH_TOKEN: ${{ secrets.TAP_DISPATCH_TOKEN }}
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          set -euo pipefail
+          gh api --method POST repos/AnotherSava/homebrew-tap/dispatches \
+            -f event_type=claude-code-dashboard-release \
+            -f "client_payload[version]=${TAG#v}"

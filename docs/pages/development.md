@@ -98,6 +98,7 @@ Under the repo root `claude-code-dashboard/`:
 - `.github/workflows/`
   - `build.yml` — CI: check + cargo test + frontend build on push/PR (Windows + macOS matrix)
   - `release.yml` — CI: build NSIS + DMG installers on tag push (Windows + macOS matrix)
+  - `notify-tap.yml` — CI: on a published release, tells the `AnotherSava/homebrew-tap` repo to bump its cask to the new version
 
 ### Where state lives at runtime
 
