@@ -100,6 +100,14 @@ To see sessions from your other computers in every dashboard (see [Features → 
 
 Each device's sessions now appear on the others, tagged with a badge showing the device's name. See [Settings → multi-device sync](settings#multi-device-sync) for all fields.
 
+## Uninstalling
+
+Remove the app the same way you installed it — `brew uninstall --cask claude-code-dashboard` on macOS if you used Homebrew, otherwise drag it to the Trash or run the Windows uninstaller.
+
+Then open `~/.claude/settings.json` and delete the `claude_hook.py` entries you added in step 2. Nothing else removes them, and Claude Code will report an error on every lifecycle event once the script they point at is gone.
+
+If you used **Keep awake with the lid closed** on macOS, see [Settings → undoing the one-time setup](settings#undoing-the-one-time-setup) — that feature installs two system files that a normal uninstall leaves behind.
+
 ## Next
 
 See [Features](features) for what each row shows once sessions start flowing in, and [Settings](settings) for the full `config.json` reference.
