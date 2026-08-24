@@ -352,11 +352,39 @@ pub fn run() {
     let (log_guard, frontend_logger) = logging::init(&app_data);
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "widget starting");
 
-    // First-run: enable autostart by default (opt out via the tray; the choice
-    // lives in the OS registry / LaunchAgent, so re-enabling here would fight it).
-    if is_first_run {
+    // Autostart: `config.autostart` records the *intent*, the OS entry is only
+    // the mechanism. First run enables it by default; afterwards a missing OS
+    // entry is re-created, because the Homebrew cask's `uninstall launchctl:`
+    // stanza deletes the LaunchAgent on every uninstall *and* every upgrade,
+    // which used to leave autostart silently off with nothing to restore it.
+    //
+    // Repair is deliberately one-directional. Turning a login item off in
+    // System Settings leaves the plist on disk (auto-launch reports enabled
+    // purely from file existence), so a `false` here cannot distinguish that
+    // from a user opt-out — removing the entry would fight the OS-level choice.
+    {
         use tauri_plugin_autostart::ManagerExt;
-        let _ = app.autolaunch().enable();
+        let enabled_now = app.autolaunch().is_enabled().unwrap_or(false);
+        match config_state.snapshot().autostart {
+            // Never recorded: first run wants it on; an existing install
+            // inherits whatever the OS already says, so someone who opted out
+            // before this field existed is not switched back on.
+            None => {
+                let want = is_first_run || enabled_now;
+                if want && !enabled_now {
+                    let _ = app.autolaunch().enable();
+                }
+                config_state.with_mut(|c| c.autostart = Some(want));
+                let _ = config_state.save_to_disk();
+            }
+            Some(true) if !enabled_now => {
+                match app.autolaunch().enable() {
+                    Ok(()) => tracing::info!("autostart entry was missing; re-created it"),
+                    Err(e) => tracing::warn!(?e, "failed to re-create the autostart entry"),
+                }
+            }
+            _ => {}
+        }
     }
 
     // Drop the embedded Python hook next to config.json so users can point

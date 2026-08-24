@@ -56,6 +56,7 @@ Every field is optional — omit one and the built-in default applies. A complet
   "window_position": null,
   "history_window_position": null,
   "history_window_maximized": false,
+  "autostart": true,
   "start_minimized": false,
   "projects_root": null,
   "notifications": {
@@ -99,12 +100,13 @@ Every field is optional — omit one and the built-in default applies. A complet
 
 ### Window and startup
 
-Whether autostart is enabled isn't a config field — it lives in the OS launch entry (Windows registry / macOS LaunchAgent), so the tray's **On system start** submenu is the way to turn it on or off. `config.json` only persists `start_minimized`, the "open to tray" vs "open window" distinction.
+Set autostart through the tray's **On system start** submenu — it writes both the OS launch entry (Windows registry / macOS LaunchAgent) and the `autostart` field below, so there's no need to edit the file by hand.
 
 - `always_on_top` — keep the widget above other windows.
 - `history_font_size` — history-window text size, one of `"smallest"`, `"small"`, `"regular"`, `"large"`, `"largest"`.
 - `auto_resize` — fit the window height to its content: `"up"` grows from a fixed bottom edge, `"down"` from a fixed top edge, `"none"` leaves the window manually sized. Under `"up"` and `"down"` the height stops being draggable; the width doesn't.
 - `save_window_position` — remember each window's position and size on close. The saved geometry lives in `window_position`, `history_window_position`, and `history_window_maximized`, which the widget manages for you — no need to edit them by hand. If the monitor a window was saved on is later disconnected or rearranged, the widget pulls it back onto a visible screen so it can't get stranded off-screen.
+- `autostart` — whether to launch at login. The OS launch entry does the actual starting; this records that you asked for it, so the widget can put the entry back if something else removes it. On macOS an app update through Homebrew does exactly that. Turning autostart off in your system's own login-items settings is left alone.
 - `start_minimized` — when launched at login, stay hidden in the tray. Set it through the tray's **On system start → Open to tray**; it's ignored on a manual launch.
 
 ### Session identity

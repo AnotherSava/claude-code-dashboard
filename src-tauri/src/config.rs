@@ -71,9 +71,23 @@ pub struct Config {
     /// the main window hidden so only the tray icon appears. Read at startup in
     /// `lib.rs`, but only honored when the launch actually came from autostart
     /// (signaled by the `--autostarted` arg) — a manual launch always reveals
-    /// the window regardless of this flag. Autostart on/off itself lives in the
-    /// OS (registry / LaunchAgent), so this is the only extra bit we persist.
+    /// the window regardless of this flag.
     pub start_minimized: bool,
+    /// Whether autostart is *wanted*. The OS entry (registry / LaunchAgent) is
+    /// still the mechanism, but it is no longer the only record of the choice:
+    /// `brew uninstall`/`brew upgrade` delete the LaunchAgent via the cask's
+    /// `uninstall launchctl:` stanza, and without this field the app had no way
+    /// to tell "the user turned it off" from "something else removed it", so
+    /// autostart silently stayed off after every brew cycle.
+    ///
+    /// `None` means "not yet recorded" — `lib.rs` seeds it from the live OS
+    /// state on first launch after upgrading, so an existing user who had
+    /// deliberately turned autostart off does not get it switched back on.
+    /// Once set, `lib.rs` re-creates a missing OS entry when this is `true`;
+    /// it deliberately never removes one when this is `false`, since disabling
+    /// via System Settings → Login Items leaves the plist in place and would
+    /// otherwise be fought.
+    pub autostart: Option<bool>,
     /// Read by `state::apply_set`: prompts that suppress the `done`/`idle` →
     /// `working` task boundary. When the user types one of these as a fresh
     /// prompt after the agent has finished, treat it as a continuation of
@@ -465,6 +479,7 @@ impl Default for Config {
             history_window_position: None,
             history_window_maximized: false,
             start_minimized: false,
+            autostart: None,
             continuation_prompts: ["go", "continue", "proceed", "yes", "y", "yeah", "yep", "yup", "ok", "okay", "sure", "go ahead", "do it"].iter().map(|s| s.to_string()).collect(),
             terminal_titles: true,
             terminal_title_context_percent: Some(50.0),

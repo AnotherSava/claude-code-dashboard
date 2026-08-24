@@ -703,8 +703,17 @@ fn select_autostart_mode(app: &AppHandle, mode: AutostartMode) {
     };
     if let Some(state) = app.try_state::<ConfigState>() {
         let minimized = mode == AutostartMode::OpenToTray;
-        if state.snapshot().start_minimized != minimized {
-            state.with_mut(|c| c.start_minimized = minimized);
+        // `autostart` has to be written here too, not just the OS entry:
+        // startup re-creates a missing entry when it is `true`, so an Off
+        // chosen here would be undone on the next launch if only the OS side
+        // were updated.
+        let wanted = mode != AutostartMode::Off;
+        let snap = state.snapshot();
+        if snap.start_minimized != minimized || snap.autostart != Some(wanted) {
+            state.with_mut(|c| {
+                c.start_minimized = minimized;
+                c.autostart = Some(wanted);
+            });
             let _ = state.save_to_disk();
         }
     }
