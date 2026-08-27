@@ -100,46 +100,53 @@ def _win_proc_maps():
     return parents, images
 
 
-def agent_pid():
-    """Pid of the owning Claude Code process (claude.exe / claude), found by
-    walking this hook's ancestor chain to the nearest claude image. Reported on
-    every event so the dashboard can detect a session that exited without a
-    SessionEnd — which Claude Code fails to deliver on exit / Ctrl-D / terminal
-    close — and remove the stranded row. None when not resolvable (e.g. a
-    node-based install whose image is node, not claude); the dashboard then keeps
-    today's behavior for that row."""
+def _unix_proc_maps():
+    """(parents pid->ppid, images pid->argv[0]) from one `ps` snapshot.
+    macOS/Linux; empty dicts on any failure. Mirrors `_win_proc_maps` so
+    `ancestors` can read the process table once per hook event."""
+    parents, images = {}, {}
     try:
-        if os.name == "nt":
-            parents, images = _win_proc_maps()
-            pid = os.getpid()
-            for _ in range(8):
-                pid = parents.get(pid)
-                if not pid:
-                    break
-                if _is_claude_image(images.get(pid, "")):
-                    return pid
-            return None
         out = subprocess.run(["ps", "-axo", "pid=,ppid=,comm="], capture_output=True, text=True, timeout=2).stdout
-        parents, comms = {}, {}
-        for line in out.splitlines():
-            parts = line.split(None, 2)
-            if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
-                p = int(parts[0])
-                parents[p] = int(parts[1])
-                comms[p] = parts[2] if len(parts) == 3 else ""
-        pid = os.getpid()
+    except Exception:
+        return parents, images
+    for line in out.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
+            pid = int(parts[0])
+            parents[pid] = int(parts[1])
+            images[pid] = parts[2] if len(parts) == 3 else ""
+    return parents, images
+
+
+def ancestors():
+    """`(chain, agent)` from one process-table snapshot.
+
+    `chain` is this hook's ancestor pids, nearest first, stopping at the owning
+    Claude Code process (inclusive). `agent` is that process's pid — the
+    `claude.exe` / `claude` image the chain stopped on — or None when the walk
+    ran out first (e.g. a node-based install, whose image is node, not claude).
+
+    Both values the widget needs come off the same walk: `agent` lets it detect
+    a session that exited without a SessionEnd — which Claude Code fails to
+    deliver on exit / Ctrl-D / terminal close — and remove the stranded row,
+    while `chain` is where `console_pids` starts. Pure environment gathering,
+    no state logic."""
+    try:
+        parents, images = _win_proc_maps() if os.name == "nt" else _unix_proc_maps()
+        chain, pid = [], os.getpid()
         for _ in range(8):
             pid = parents.get(pid)
             if not pid or pid <= 1:
-                break
-            if _is_claude_image(comms.get(pid, "")):
-                return pid
-        return None
+                return chain, None
+            chain.append(pid)
+            if _is_claude_image(images.get(pid, "")):
+                return chain, pid
+        return chain, None
     except Exception:
-        return None
+        return [], None
 
 
-def console_pids() -> list:
+def console_pids(chain: list) -> list:
     """Candidate pids for the widget's terminal-tab-title writes.
 
     The widget sets a session's tab title through one of these pids — on
@@ -156,56 +163,38 @@ def console_pids() -> list:
     - this process's ancestor chain — the long-lived Claude Code process an
       ancestor or two up holds the visible terminal console.
 
-    macOS gathers only the ancestor chain (one `ps` snapshot): the hook's
-    own pid is transient, but Claude Code an ancestor or two up shares the
-    controlling tty of the visible tab.
+    macOS gathers only the ancestor chain: the hook's own pid is transient
+    and Claude Code detaches every child it spawns from the controlling
+    terminal (a hook's own `ps -o tty=` always reads `??`), but Claude Code
+    itself an ancestor or two up holds the tty of the visible tab.
+
+    `chain` from `ancestors` STOPS at the owning Claude Code process, and that
+    bound is what keeps the title on the right tab. A Claude Code desktop-app
+    session runs under a tty-less subtree whose own ancestors are whatever
+    terminal session happened to launch it — so an unbounded walk climbs out of
+    the session entirely and titles a NEIGHBOUR's tab with this agent's status,
+    overwriting the status that tab should show. Bounded, a session with no tty
+    of its own reports only tty-less pids and the widget correctly writes
+    nothing: there is no tab to title.
 
     Order matters: nearest first. The widget walks far-to-near on Windows
-    (transient hook-side pids hold the invisible console, so they go last)
-    and near-to-far on macOS (dead transients and tty-less GUI ancestors
-    are skipped). Pure environment gathering, no state logic.
+    (transient hook-side pids hold the invisible console, so they go last;
+    the bound puts claude.exe — which holds the real console — first) and
+    near-to-far on macOS (dead transients and tty-less ancestors are
+    skipped). Pure environment gathering, no state logic.
     """
     if os.name != "nt":
-        # macOS/Linux: ancestor pid chain, nearest first.
-        try:
-            out = subprocess.run(["ps", "-axo", "pid=,ppid="], capture_output=True, text=True, timeout=2).stdout
-            parents = {}
-            for line in out.splitlines():
-                parts = line.split()
-                if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
-                    parents[int(parts[0])] = int(parts[1])
-            pids = []
-            pid = os.getpid()
-            for _ in range(6):
-                pid = parents.get(pid)
-                if not pid or pid <= 1:
-                    break
-                pids.append(pid)
-            return pids
-        except Exception:
-            return []
+        return chain
     try:
         import ctypes
 
         k32 = ctypes.windll.kernel32
-        me = os.getpid()
-
         buf = (ctypes.c_uint32 * 64)()
         n = k32.GetConsoleProcessList(buf, 64)
-        pids = [p for p in buf[: min(n, 64)] if p != me]
-
-        # Ancestor chain via a Toolhelp snapshot (stdlib-only pid→ppid map).
-        parents, _ = _win_proc_maps()
-        pid = me
-        for _ in range(6):
-            pid = parents.get(pid)
-            if not pid:
-                break
-            pids.append(pid)
-
-        return list(dict.fromkeys(pids))
+        console = [p for p in buf[: min(n, 64)] if p != os.getpid()]
     except Exception:
-        return []
+        console = []
+    return list(dict.fromkeys(console + chain))
 
 
 def main() -> None:
@@ -224,7 +213,8 @@ def main() -> None:
     if not event:
         return
     url = os.environ.get("TAURI_DASHBOARD_URL", DEFAULT_URL).rstrip("/") + "/api/event"
-    body = {"client": "claude", "event": event, "payload": payload, "console_pids": console_pids(), "agent_pid": agent_pid()}
+    chain, agent = ancestors()
+    body = {"client": "claude", "event": event, "payload": payload, "console_pids": console_pids(chain), "agent_pid": agent}
     try:
         with urllib.request.urlopen(
             urllib.request.Request(

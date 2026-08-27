@@ -10,6 +10,13 @@
 //! (`ps -o tty=`) and write an OSC 0 escape to the device — Terminal.app,
 //! iTerm2, and kitty all map it onto the tab.
 //!
+//! The candidate list is the hook's ancestor chain **bounded at its own
+//! Claude Code process** — see `console_pids` in `integrations/claude_hook.py`
+//! for why that bound is load-bearing. Every candidate being unreachable is a
+//! legitimate outcome, not a failure: a session with no terminal of its own
+//! (the Claude Code desktop app) has no tab to title, and writing anyway
+//! would land this agent's status on an unrelated session's tab.
+//!
 //! Everything is best-effort — a dead pid, a closed terminal, or a disabled
 //! config flag degrade to "title doesn't change", never to an error the
 //! caller sees.
@@ -226,9 +233,12 @@ fn push_title(candidates: &[u32], title: &str) -> bool {
 /// write an OSC 0 (icon + window title) escape to the device. Near-to-far,
 /// unlike Windows: there is no attach dance whose first success must be the
 /// real console — transient per-hook pids are usually dead by now (`ps`
-/// prints nothing) and GUI ancestors (the terminal emulator itself) report
-/// `??`, so both fall through to the long-lived Claude Code / shell pids,
-/// which share the controlling tty of the visible tab.
+/// prints nothing) and Claude Code detaches every child it spawns from the
+/// controlling terminal, so the hook-side pids report `??` and fall through
+/// to Claude Code itself, which holds the tty of the visible tab. Skipping
+/// past `??` is only safe because the chain stops at that process: an
+/// all-`??` chain means this session owns no terminal, and returning false
+/// leaves the title unwritten rather than climbing into someone else's tab.
 #[cfg(not(windows))]
 fn push_title(candidates: &[u32], title: &str) -> bool {
     use std::io::Write;
