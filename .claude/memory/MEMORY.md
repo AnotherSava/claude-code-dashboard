@@ -56,3 +56,4 @@
 - [Indicators must not over-claim certainty](feedback_indicator_certainty.md) — green/"healthy" needs confirmed evidence (canary `seen` bit); unconfirmed → distinct pending color, never green (false +) nor off (false −)
 - [Context-window map needs generation updates](context_window_map_needs_generation_updates.md) — Claude 5 gen (opus/sonnet/fable) defaults to 1M, not a beta opt-in like 4.x; add specific keys, don't broaden prefixes
 - [Homebrew tap distribution](homebrew_tap_distribution.md) — macOS also ships via AnotherSava/homebrew-tap; cask strips quarantine on purpose, zap path UNTESTED and can disable sleep, never `brew audit --new`
+- [agterm status co-existence](agterm_status_coexistence.md) — dashboard owns status in agterm (glyph can't express WAIT/ERROR); agterm-side mechanics in learnings/agterm.md
