@@ -91,6 +91,24 @@ fn session_start_nonce(ns: &NonceStore, chat_id: &str, source: &str, now_ms: i64
     }
 }
 
+/// Whether an end signal may remove the row it names. A cwd-derived chat_id is
+/// shared by every Claude Code instance in that directory, so a `SessionEnd`
+/// from one can arrive for a row another is still writing — canonically after a
+/// `--fork-session --resume` migrates a terminal session into a background one,
+/// leaving both resident. The row's owner is the `agent_pid` of whichever
+/// instance wrote it last (`liveness::AgentPids`, overwrite semantics).
+///
+/// Permitted unless both pids are known *and* differ: an unresolvable pid (a
+/// node-based install) or an empty store (nothing written since a restart) means
+/// ownership is unknown, and an authoritative end signal beats a guess. False
+/// only for the case we can positively identify as a sibling's row.
+fn clear_permitted(owner_pid: Option<u32>, event_pid: Option<u32>) -> bool {
+    match (owner_pid, event_pid) {
+        (Some(owner), Some(event)) => owner == event,
+        _ => true,
+    }
+}
+
 /// What the per-`Stop` canary check should do to the surfaced `instruction_drift`
 /// flag. `Clear`/`Confirm` write it; `Hold` leaves it exactly as-is.
 #[derive(Debug, PartialEq, Eq)]
@@ -284,6 +302,28 @@ async fn post_event(
             emit_sessions_updated(&app);
         }
         AdapterOutput::Clear { id } => {
+            // Two Claude Code instances can hold one cwd — canonically a terminal
+            // session forked into a background/desktop one (`--fork-session
+            // --resume`) — and the chat_id is cwd-derived, so both address the
+            // same row. Whoever wrote last owns it: refuse an end signal from the
+            // *other* instance, which would otherwise flush and drop a row a live
+            // sibling is still using. Ownership is the `agent_pid` the hook
+            // already reports on every event; an unknown pid on either side means
+            // we can't tell, and the authoritative end signal wins.
+            let owner_pid = app.try_state::<crate::liveness::AgentPids>().and_then(|p| p.get(&id));
+            if !clear_permitted(owner_pid, req.agent_pid) {
+                tracing::debug!(
+                    client = %req.client,
+                    event = %req.event,
+                    chat_id = %id,
+                    decision = "clear_ignored",
+                    reason = "end signal from a non-owning session sharing this cwd",
+                    owner_pid = ?owner_pid,
+                    event_pid = ?req.agent_pid,
+                    "event -> clear"
+                );
+                return (StatusCode::OK, Json(resp));
+            }
             tracing::debug!(
                 client = %req.client,
                 event = %req.event,
@@ -353,6 +393,30 @@ async fn post_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clear_permitted_when_the_owning_session_ends_it() {
+        // The ordinary case, `/clear` included: one instance holds the cwd, so
+        // the end signal carries the same pid that last wrote the row.
+        assert!(clear_permitted(Some(93331), Some(93331)));
+    }
+
+    #[test]
+    fn clear_refused_from_a_sibling_sharing_the_cwd() {
+        // A terminal session forked into a background one: both derive the same
+        // cwd chat_id, so exiting the abandoned tab must not drop the live row.
+        assert!(!clear_permitted(Some(72194), Some(83820)));
+    }
+
+    #[test]
+    fn clear_permitted_when_ownership_is_unknown() {
+        // No pid on either side — a node-based install, or nothing written since
+        // a restart. Unknown ownership defers to the authoritative end signal
+        // rather than stranding the row.
+        assert!(clear_permitted(None, Some(93331)));
+        assert!(clear_permitted(Some(93331), None));
+        assert!(clear_permitted(None, None));
+    }
 
     #[test]
     fn drift_present_clears_regardless_of_turn_shape() {
