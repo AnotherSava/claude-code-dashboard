@@ -41,6 +41,8 @@ Every field is optional — omit one and the built-in default applies. A complet
 {
   "always_on_top": true,
   "history_font_size": "regular",
+  "intensity_unit": "percent",
+  "intensity_axis_max_tokens": 1000000,
   "auto_resize": "none",
   "compact_mode": false,
   "tray_badge": "none",
@@ -104,6 +106,8 @@ Set autostart through the tray's **On system start** submenu — it writes both 
 
 - `always_on_top` — keep the widget above other windows.
 - `history_font_size` — history-window text size, one of `"smallest"`, `"small"`, `"regular"`, `"large"`, `"largest"`.
+- `intensity_unit` — which unit the [Work intensity](features#work-intensity) chart plots: `"percent"` (share of the 5-hour limit) or `"tokens"` (work done, unaffected by plan changes). The chart's own Percent | Tokens switch writes this, so there's rarely a reason to edit it here.
+- `intensity_axis_max_tokens` — how many tokens in a 10-minute slice make a full-height bar in the Tokens view. Bars at or above it are flagged red. Lower it to give ordinary work more of the height, at the cost of flattening the top of a busy day; raise it to keep the peaks distinct. `null` or `0` restores the default.
 - `auto_resize` — fit the window height to its content: `"up"` grows from a fixed bottom edge, `"down"` from a fixed top edge, `"none"` leaves the window manually sized. Under `"up"` and `"down"` the height stops being draggable; the width doesn't.
 - `save_window_position` — remember each window's position and size on close. The saved geometry lives in `window_position`, `history_window_position`, and `history_window_maximized`, which the widget manages for you — no need to edit them by hand. If the monitor a window was saved on is later disconnected or rearranged, the widget pulls it back onto a visible screen so it can't get stranded off-screen.
 - `autostart` — whether to launch at login. The OS launch entry does the actual starting; this records that you asked for it, so the widget can put the entry back if something else removes it. On macOS an app update through Homebrew does exactly that. Turning autostart off in your system's own login-items settings is left alone.

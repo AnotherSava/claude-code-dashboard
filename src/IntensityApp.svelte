@@ -1,8 +1,17 @@
 <script lang="ts">
   import { onMount } from 'svelte'
   import type { UnlistenFn } from '@tauri-apps/api/event'
-  import { closeWindow, getUsageIntensityWeek, getUsageIntensityWeeks, onUsageLimitsUpdated } from './lib/api'
-  import type { WeekChart } from './lib/types'
+  import {
+    closeWindow,
+    getConfig,
+    getTokenIntensityWeek,
+    getTokenIntensityWeeks,
+    getUsageIntensityWeek,
+    getUsageIntensityWeeks,
+    onUsageLimitsUpdated,
+    setIntensityUnit,
+  } from './lib/api'
+  import type { IntensityUnit, TokenWeekChart, WeekChart } from './lib/types'
 
   const BUCKET_MS = 10 * 60 * 1000
   const SLOTS_PER_DAY = 144 // 6 per hour × 24
@@ -16,6 +25,12 @@
   let weekOffset = $state(0)
   let chart = $state<WeekChart | null>(null)
   let weeks = $state<WeekChart[] | null>(null)
+  // 'percent' = share of the 5h quota (breaks across a plan change); 'tokens' =
+  // real work, plan-independent but only as far back as transcripts reach.
+  // Separate caches so switching units doesn't refetch the other one.
+  let unit = $state<IntensityUnit>('percent')
+  let tokChart = $state<TokenWeekChart | null>(null)
+  let tokWeeks = $state<TokenWeekChart[] | null>(null)
   // How many weeks back from the newest the window's *bottom* row sits. 0 keeps
   // the most recent week pinned to the bottom (newest-at-bottom, like the days).
   let weekBottomOffset = $state(0)
@@ -23,24 +38,38 @@
   let canvasEl: HTMLCanvasElement | undefined = $state()
   let hover = $state<{ x: number; y: number; text: string } | null>(null)
 
+  // The chart currently on screen, whichever unit is selected.
+  let active = $derived<WeekChart | TokenWeekChart | null>(unit === 'tokens' ? tokChart : chart)
+
   let prevDisabled = $derived(
-    chart === null || chart.data_min_ms === null || chart.week_start_ms <= chart.data_min_ms,
+    active === null || active.data_min_ms === null || active.week_start_ms <= active.data_min_ms,
   )
   let nextDisabled = $derived(weekOffset >= 0)
 
   async function load(offset: number) {
     error = null
     try {
-      chart = await getUsageIntensityWeek(offset)
+      if (unit === 'tokens') tokChart = await getTokenIntensityWeek(offset)
+      else chart = await getUsageIntensityWeek(offset)
       weekOffset = offset
     } catch (e) {
       error = String(e)
     }
   }
 
+  async function switchUnit(next: IntensityUnit) {
+    if (next === unit) return
+    unit = next
+    setIntensityUnit(next).catch(() => {}) // persistence is best-effort
+    if (view === 'week') await loadWeeks()
+    else await load(weekOffset)
+    draw()
+  }
+
   async function loadWeeks() {
     try {
-      weeks = await getUsageIntensityWeeks()
+      if (unit === 'tokens') tokWeeks = await getTokenIntensityWeeks()
+      else weeks = await getUsageIntensityWeeks()
       const w = weekWindow()
       if (w) weekBottomOffset = Math.min(weekBottomOffset, w.maxOffset)
     } catch (e) {
@@ -50,14 +79,14 @@
 
   function setView(v: 'day' | 'week') {
     view = v
-    if (v === 'week' && weeks === null) loadWeeks()
+    if (v === 'week' && (unit === 'tokens' ? tokWeeks : weeks) === null) loadWeeks()
   }
 
   // The visible slice of the (newest-first) weeks array. `count` is constant
   // once there are at least a screenful of weeks, so rows keep a steady height.
   // `offset` is the clamped `weekBottomOffset`; the bottom row is `all[offset]`.
-  function weekWindow(): { all: WeekChart[]; count: number; offset: number; maxOffset: number } | null {
-    const all = weeks
+  function weekWindow(): { all: (WeekChart | TokenWeekChart)[]; count: number; offset: number; maxOffset: number } | null {
+    const all: (WeekChart | TokenWeekChart)[] | null = unit === 'tokens' ? tokWeeks : weeks
     if (!all || all.length === 0) return null
     const count = Math.min(WEEKS_PER_SCREEN, all.length)
     const maxOffset = Math.max(0, all.length - count)
@@ -130,8 +159,9 @@
 
   // Week totals shown beside the selector: active time and the share of the
   // weekly (7-day) quota consumed across the displayed week.
-  const weekActiveMin = $derived(chart ? chart.days.reduce((s, d) => s + d.active_minutes, 0) : 0)
+  const weekActiveMin = $derived(active ? active.days.reduce((s: number, d: { active_minutes: number }) => s + d.active_minutes, 0) : 0)
   const weekWeeklyPct = $derived(chart ? chart.days.reduce((s, d) => s + d.weekly_pct, 0) : 0)
+  const weekTokens = $derived(tokChart ? tokChart.days.reduce((s, d) => s + d.tokens, 0) : 0)
 
   // Week-view nav: the visible span (oldest-top week start → newest-bottom week
   // end) and whether each scroll direction has anywhere left to go. Reading
@@ -166,23 +196,28 @@
     if (!w) return null
     const inView = w.all.slice(w.offset, w.offset + w.count)
     if (inView.length === 0) return null
-    const active = inView.reduce((s, wk) => s + wk.days.reduce((a, d) => a + d.active_minutes, 0), 0) / inView.length
-    const pct = inView.reduce((s, wk) => s + wk.days.reduce((a, d) => a + d.weekly_pct, 0), 0) / inView.length
-    return { active, pct }
+    const activeAvg = inView.reduce((s, wk) => s + wk.days.reduce((a: number, d: { active_minutes: number }) => a + d.active_minutes, 0), 0) / inView.length
+    const pct = inView.reduce((s, wk) => s + (isTokens(wk) ? 0 : wk.days.reduce((a, d) => a + d.weekly_pct, 0)), 0) / inView.length
+    const tokens = inView.reduce((s, wk) => s + (isTokens(wk) ? wk.days.reduce((a, d) => a + d.tokens, 0) : 0), 0) / inView.length
+    return { active: activeAvg, pct, tokens }
   })
 
   // Bars at/above 2× the full pace are clipped and painted this red to flag them.
   const CLIP_RED = '#e0443a'
 
-  // green → gold → amber, keyed on intensity / full-5h-pace (0..2). Red is
-  // reserved for clipped bars so "red" unambiguously means "over the 2× cap".
+  // green → gold → amber, keyed on value / scaleMax (0..1). Red is reserved for
+  // clipped bars so "red" unambiguously means "at or over the top of the scale".
+  // Expressed against the scale rather than against the quota pace so the same
+  // ramp serves the token view, which has no pace to be a multiple of; for the
+  // percentage view scaleMax is exactly 2× full, so the midpoint stop still sits
+  // on the full-5h pace and the rendering is unchanged.
   function barColor(ratio: number): string {
     const stops: [number, [number, number, number]][] = [
-      [0, [58, 124, 74]],   // green
-      [1, [214, 161, 58]],  // gold at full pace
-      [2, [216, 132, 58]],  // deep amber at the 2× cap
+      [0, [58, 124, 74]],     // green
+      [0.5, [214, 161, 58]],  // gold at half scale (= full pace in the % view)
+      [1, [216, 132, 58]],    // deep amber at the top of the scale
     ]
-    const r = Math.max(0, Math.min(2, ratio))
+    const r = Math.max(0, Math.min(1, ratio))
     for (let i = 0; i < stops.length - 1; i++) {
       const [pa, ca] = stops[i]
       const [pb, cb] = stops[i + 1]
@@ -277,11 +312,34 @@
     ctx.fillRect(0, rowTop, cssW, rowH)
   }
 
-  function drawBars(ctx: CanvasRenderingContext2D, buckets: WeekChart['buckets'], offset: number, count: number, plotLeft: number, plotW: number, rowTop: number, rowH: number, full: number, scaleMax: number, hatch: CanvasPattern | null) {
+  // A bar is just a value and whether we have data for its slot, so this draws
+  // either unit. `Bar[]` is what each view maps its own buckets down to.
+  type Bar = { value: number; has_data: boolean }
+
+  const pctBars = (buckets: WeekChart['buckets']): Bar[] => buckets.map((b) => ({ value: b.intensity, has_data: b.has_data }))
+  const tokBars = (buckets: TokenWeekChart['buckets']): Bar[] => buckets.map((b) => ({ value: b.tokens, has_data: b.has_data }))
+
+  const isTokens = (c: WeekChart | TokenWeekChart): c is TokenWeekChart => 'axis_max_tokens' in c
+
+  // Bars for whichever unit a chart carries, so the draw paths stay unit-blind.
+  const barsOf = (c: WeekChart | TokenWeekChart): Bar[] => (isTokens(c) ? tokBars(c.buckets) : pctBars(c.buckets))
+
+  // Full-height value for one 10-min bar. Percent uses 2x the sustainable pace
+  // (so the pace line sits mid-row); tokens use the configured ceiling.
+  const scaleOf = (c: WeekChart | TokenWeekChart): number => (isTokens(c) ? c.axis_max_tokens : c.full_intensity * 2)
+
+  // Compact token counts: 1.2M / 340k / 900.
+  function fmtTokens(n: number): string {
+    if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(n >= 10_000_000 ? 0 : 1)}M`
+    if (n >= 1_000) return `${Math.round(n / 1_000)}k`
+    return `${Math.round(n)}`
+  }
+
+  function drawBars(ctx: CanvasRenderingContext2D, bars: Bar[], offset: number, count: number, plotLeft: number, plotW: number, rowTop: number, rowH: number, scaleMax: number, hatch: CanvasPattern | null) {
     const colW = plotW / count
     const rowBottom = rowTop + rowH
     for (let s = 0; s < count; s++) {
-      const b = buckets[offset + s]
+      const b = bars[offset + s]
       if (!b) continue
       const x = plotLeft + s * colW
       if (!b.has_data) {
@@ -291,10 +349,10 @@
         }
         continue
       }
-      if (b.intensity <= 0) continue // idle: baseline only
-      const clipped = b.intensity >= scaleMax // over 2× the full pace
-      const barH = Math.max(1, Math.min(rowH, (b.intensity / scaleMax) * rowH))
-      ctx.fillStyle = clipped ? CLIP_RED : barColor(b.intensity / full)
+      if (b.value <= 0) continue // idle: baseline only
+      const clipped = b.value >= scaleMax
+      const barH = Math.max(1, Math.min(rowH, (b.value / scaleMax) * rowH))
+      ctx.fillStyle = clipped ? CLIP_RED : barColor(b.value / scaleMax)
       ctx.fillRect(x + 0.3, rowBottom - barH, Math.max(0.6, colW - 0.6), barH)
     }
   }
@@ -335,6 +393,7 @@
 
   // Day-rows: one week, seven day-rows, x = time of day.
   function drawDayView() {
+    const chart = active
     if (!chart) return
     const s = setupCanvas()
     if (!s) return
@@ -342,8 +401,10 @@
     const { gutterLeft, rowGap, plotLeft, plotTop, plotRight, plotBottom, plotW, plotH, rowH, colW } =
       computeLayout(cssW, cssH)
     if (plotW <= 0 || plotH <= 0) return
-    const full = chart.full_intensity
-    const scaleMax = full * 2
+    const tokens = isTokens(chart)
+    const full = tokens ? 0 : chart.full_intensity
+    const scaleMax = scaleOf(chart)
+    const bars = barsOf(chart)
     const hatch = ensureHatch(ctx)
     ctx.textBaseline = 'middle'
 
@@ -381,34 +442,44 @@
       ctx.fillStyle = '#b6b6ba'
       ctx.fillText(dayDate.toLocaleDateString(undefined, { month: 'short', day: 'numeric' }), lx, midY + 9)
 
-      drawBars(ctx, chart.buckets, d * SLOTS_PER_DAY, SLOTS_PER_DAY, plotLeft, plotW, rowTop, rowH, full, scaleMax, hatch)
-      drawReference(ctx, plotLeft, plotRight, rowTop, rowH, full, scaleMax, d === 0 ? 'full 5h pace' : '')
+      drawBars(ctx, bars, d * SLOTS_PER_DAY, SLOTS_PER_DAY, plotLeft, plotW, rowTop, rowH, scaleMax, hatch)
+      // No reference line in token mode: there is no quota to be a fraction of,
+      // and a line derived from the user's own history would drift with their
+      // baseline while reading as an absolute marker.
+      if (!tokens) drawReference(ctx, plotLeft, plotRight, rowTop, rowH, full, scaleMax, d === 0 ? 'full 5h pace' : '')
 
-      // Active time + the day's usage as a % of a daily quota (= the day's share
-      // of the 7-day quota × 7; may exceed 100%). Hidden for inactive/future days.
+      // Active time, plus either the day's share of a daily quota (= its share of
+      // the 7-day quota × 7; may exceed 100%) or its token total. Hidden for
+      // inactive/future days.
       const sum = chart.days?.[d]
       if (sum && sum.active_minutes > 0) {
-        gutterStats(ctx, cssW, rowTop, rowH, `${fmtActive(sum.active_minutes)} active`, `${Math.round(sum.weekly_pct * 7)}% daily`)
+        const second = isTokens(chart) ? `${fmtTokens((sum as TokenWeekChart['days'][number]).tokens)} tokens` : `${Math.round((sum as WeekChart['days'][number]).weekly_pct * 7)}% daily`
+        gutterStats(ctx, cssW, rowTop, rowH, `${fmtActive(sum.active_minutes)} active`, second)
       }
     }
   }
 
-  // Coarsen a bucket series by averaging each group of `factor` buckets. The
-  // mean is taken over the present (non-gap) buckets only, so a gap dilutes
-  // nothing; a group with no data at all stays a gap. Averaging (not summing)
-  // keeps the per-10-min scale, so scaleMax / the reference line are unchanged.
-  function downsample(buckets: WeekChart['buckets'], factor: number): WeekChart['buckets'] {
-    const out: WeekChart['buckets'] = []
-    for (let i = 0; i < buckets.length; i += factor) {
+  // Coarsen a bar series by combining each group of `factor` bars, over the
+  // present (non-gap) bars only — so a gap dilutes nothing and a group with no
+  // data at all stays a gap.
+  //
+  // 'avg' keeps the per-10-min scale, so the percentage view's scaleMax and
+  // reference line carry over unchanged. 'sum' makes a token bar read as the
+  // volume of the whole group, which is what the unit is for; its scaleMax is
+  // multiplied by the same factor, so a full-height bar still means the same
+  // rate in both views.
+  function downsample(bars: Bar[], factor: number, mode: 'avg' | 'sum'): Bar[] {
+    const out: Bar[] = []
+    for (let i = 0; i < bars.length; i += factor) {
       let sum = 0
       let n = 0
-      for (let j = i; j < i + factor && j < buckets.length; j++) {
-        if (buckets[j].has_data) {
-          sum += buckets[j].intensity
+      for (let j = i; j < i + factor && j < bars.length; j++) {
+        if (bars[j].has_data) {
+          sum += bars[j].value
           n += 1
         }
       }
-      out.push({ intensity: n > 0 ? sum / n : 0, has_data: n > 0 })
+      out.push({ value: n > 0 ? (mode === 'sum' ? sum : sum / n) : 0, has_data: n > 0 })
     }
     return out
   }
@@ -427,8 +498,11 @@
     const { gutterLeft, rowGap, plotLeft, plotTop, plotRight, plotBottom, plotW, plotH, rowH } =
       computeLayout(cssW, s.cssH, win.count)
     if (plotW <= 0 || plotH <= 0) return
-    const full = win.all[0].full_intensity
-    const scaleMax = full * 2
+    const tokens = isTokens(win.all[0])
+    const full = tokens ? 0 : (win.all[0] as WeekChart).full_intensity
+    // Summed groups need a proportionally taller scale, so a full-height week bar
+    // means the same rate as a full-height day bar.
+    const scaleMax = tokens ? scaleOf(win.all[0]) * WEEK_GROUP : full * 2
     const hatch = ensureHatch(ctx)
     ctx.textBaseline = 'middle'
 
@@ -472,8 +546,8 @@
       ctx.fillStyle = '#b6b6ba'
       ctx.fillText(endStr, lx, midY + 14)
 
-      const slots = downsample(week.buckets, WEEK_GROUP)
-      drawBars(ctx, slots, 0, slots.length, plotLeft, plotW, rowTop, rowH, full, scaleMax, hatch)
+      const slots = downsample(barsOf(week), WEEK_GROUP, tokens ? 'sum' : 'avg')
+      drawBars(ctx, slots, 0, slots.length, plotLeft, plotW, rowTop, rowH, scaleMax, hatch)
 
       // Faint day separators over the dense bars, to keep the week readable.
       for (let d = 1; d < 7; d++) {
@@ -486,24 +560,34 @@
         ctx.stroke()
       }
 
-      drawReference(ctx, plotLeft, plotRight, rowTop, rowH, full, scaleMax, r === 0 ? 'full 5h pace' : '')
+      if (!tokens) drawReference(ctx, plotLeft, plotRight, rowTop, rowH, full, scaleMax, r === 0 ? 'full 5h pace' : '')
 
-      const active = week.days.reduce((a, d) => a + d.active_minutes, 0)
-      const wk = week.days.reduce((a, d) => a + d.weekly_pct, 0)
-      if (active > 0) {
-        gutterStats(ctx, cssW, rowTop, rowH, `${fmtActive(active)} active`, `${Math.round(wk)}% week`)
+      const activeMin = week.days.reduce((a: number, d: { active_minutes: number }) => a + d.active_minutes, 0)
+      if (activeMin > 0) {
+        const second = isTokens(week)
+          ? `${fmtTokens(week.days.reduce((a, d) => a + d.tokens, 0))} tokens`
+          : `${Math.round((week as WeekChart).days.reduce((a, d) => a + d.weekly_pct, 0))}% week`
+        gutterStats(ctx, cssW, rowTop, rowH, `${fmtActive(activeMin)} active`, second)
       }
     }
   }
 
   // Tooltip text for one bar spanning [startMs, startMs+durationMs).
-  function bucketTip(startMs: number, durationMs: number, b: WeekChart['buckets'][number]): string {
+  function bucketTip(startMs: number, durationMs: number, b: Bar): string {
     const start = new Date(startMs)
     const end = new Date(startMs + durationMs)
     const hhmm = (dt: Date) =>
       `${dt.getHours().toString().padStart(2, '0')}:${dt.getMinutes().toString().padStart(2, '0')}`
     const when = `${start.toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' })} ${hhmm(start)}–${hhmm(end)}`
-    const what = !b.has_data ? 'no data' : b.intensity <= 0 ? 'idle' : `${b.intensity.toFixed(1)}% of 5h limit`
+    // "no data" is deliberately distinct from "idle": outside the range we hold
+    // records for, we don't know that nothing happened.
+    const what = !b.has_data
+      ? 'no data'
+      : b.value <= 0
+        ? 'idle'
+        : unit === 'tokens'
+          ? `${fmtTokens(b.value)} tokens`
+          : `${b.value.toFixed(1)}% of 5h limit`
     return `${when} · ${what}`
   }
 
@@ -537,7 +621,7 @@
         return
       }
       const week = win.all[win.offset + (win.count - 1 - r)]
-      const grouped = downsample(week.buckets, WEEK_GROUP)
+      const grouped = downsample(barsOf(week), WEEK_GROUP, isTokens(week) ? 'sum' : 'avg')
       const s = Math.floor((mx - plotLeft) / (plotW / grouped.length))
       if (s < 0 || s >= grouped.length) {
         hover = null
@@ -548,6 +632,7 @@
       return
     }
 
+    const chart = active
     if (!chart) {
       hover = null
       return
@@ -569,7 +654,7 @@
       return
     }
     const idx = d * SLOTS_PER_DAY + s
-    hover = { x: mx, y: my, text: bucketTip(chart.week_start_ms + idx * BUCKET_MS, BUCKET_MS, chart.buckets[idx]) }
+    hover = { x: mx, y: my, text: bucketTip(chart.week_start_ms + idx * BUCKET_MS, BUCKET_MS, barsOf(chart)[idx]) }
   }
 
   function onMouseLeave() {
@@ -579,15 +664,27 @@
   // Redraw whenever the active view or its data changes.
   $effect(() => {
     view
+    unit
     chart
     weeks
+    tokChart
+    tokWeeks
     weekBottomOffset
     draw()
   })
 
   onMount(() => {
     let unlistenUsage: UnlistenFn | undefined
-    load(0)
+    // Read the persisted unit before the first fetch, so opening the window
+    // doesn't render the percentage view and then swap.
+    ;(async () => {
+      try {
+        unit = (await getConfig()).intensity_unit ?? 'percent'
+      } catch {
+        // fall through on the default
+      }
+      load(0)
+    })()
     const ro = new ResizeObserver(() => draw())
     if (canvasEl) ro.observe(canvasEl)
     ;(async () => {
@@ -595,7 +692,7 @@
       // been loaded, the weeks overview. Older single weeks are frozen.
       unlistenUsage = await onUsageLimitsUpdated(() => {
         if (weekOffset === 0) load(0)
-        if (weeks !== null) loadWeeks()
+        if ((unit === 'tokens' ? tokWeeks : weeks) !== null) loadWeeks()
       })
     })()
     return () => {
@@ -615,13 +712,17 @@
         <span class="range">{rangeLabel || 'Loading…'}</span>
         <button class="nav" onclick={() => step(1)} disabled={nextDisabled} title="Next week (→)">→</button>
       </div>
-      {#if chart}
+      {#if active}
         <div class="totals">
           {#if weekActiveMin === 0}
             <span>no activity this week</span>
           {:else}
             <span><span class="field-label">Active:</span> <strong>{fmtActive(weekActiveMin)}</strong></span>
-            <span><span class="field-label">Weekly quota usage:</span> <strong>{weekWeeklyPct.toFixed(0)}%</strong></span>
+            {#if unit === 'tokens'}
+              <span><span class="field-label">Tokens:</span> <strong>{fmtTokens(weekTokens)}</strong></span>
+            {:else}
+              <span><span class="field-label">Weekly quota usage:</span> <strong>{weekWeeklyPct.toFixed(0)}%</strong></span>
+            {/if}
           {/if}
         </div>
       {/if}
@@ -636,7 +737,11 @@
       {#if weekAvg}
         <div class="totals">
           <span><span class="field-label">Active avg:</span> <strong>{fmtActive(Math.round(weekAvg.active))}</strong></span>
-          <span><span class="field-label">Weekly quota usage avg:</span> <strong>{weekAvg.pct.toFixed(0)}%</strong></span>
+          {#if unit === 'tokens'}
+            <span><span class="field-label">Tokens avg:</span> <strong>{fmtTokens(weekAvg.tokens)}</strong></span>
+          {:else}
+            <span><span class="field-label">Weekly quota usage avg:</span> <strong>{weekAvg.pct.toFixed(0)}%</strong></span>
+          {/if}
         </div>
       {/if}
     {/if}
@@ -650,6 +755,10 @@
         <span class="hint-group"><span class="field-label">Legend:</span> <span class="hint-rest">red = over 2× pace</span></span>
       {/if}
     </span>
+    <div class="switch">
+      <button class:active={unit === 'percent'} onclick={() => switchUnit('percent')} title="Share of the 5h quota">Percent</button>
+      <button class:active={unit === 'tokens'} onclick={() => switchUnit('tokens')} title="Tokens generated — unaffected by plan changes">Tokens</button>
+    </div>
     <div class="switch">
       <button class:active={view === 'day'} onclick={() => setView('day')}>Days</button>
       <button class:active={view === 'week'} onclick={() => setView('week')}>Weeks</button>

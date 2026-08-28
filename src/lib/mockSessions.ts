@@ -135,5 +135,7 @@ export const mockConfig: Config = {
   limit_bar_segments: 16,
   auto_resize: 'none',
   history_font_size: 'regular',
+  intensity_unit: 'percent',
+  intensity_axis_max_tokens: 500000,
   compact_mode: false,
 }

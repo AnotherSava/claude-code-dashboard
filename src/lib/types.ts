@@ -53,6 +53,8 @@ export interface UsageColors {
 export type AutoResize = 'none' | 'up' | 'down'
 
 export type HistoryFontSize = 'smallest' | 'small' | 'regular' | 'large' | 'largest'
+// Which unit the Work intensity chart plots, orthogonal to its Days/Weeks view.
+export type IntensityUnit = 'percent' | 'tokens'
 
 export interface Config {
   server_port: number
@@ -68,6 +70,8 @@ export interface Config {
   limit_bar_segments: number
   auto_resize: AutoResize
   history_font_size: HistoryFontSize
+  intensity_unit: IntensityUnit
+  intensity_axis_max_tokens: number | null
   // Compact view: hide each row's current prompt and time-in-state, and
   // collapse the usage bars down to their bare percentage. Toggled from the
   // tray's "Compact view" checkbox.
@@ -118,6 +122,35 @@ export interface WeekChart {
   data_min_ms: number | null
   data_max_ms: number | null
   full_intensity: number
+}
+
+// Token-unit twins of the three above, mirroring the Rust `TokenBucket` /
+// `TokenDaySummary` / `TokenWeekChart`. `tokens` is input + cache creation +
+// output — cache reads are stored but excluded, being 97% of the raw sum and a
+// measure of conversation length rather than work. `has_data` here means "inside
+// the span we hold token records for"; unlike the percentage chart it does not
+// track whether the dashboard was running, since transcripts are written by
+// Claude Code itself and the scanner catches up afterwards.
+export interface TokenBucket {
+  tokens: number
+  has_data: boolean
+}
+
+export interface TokenDaySummary {
+  active_minutes: number
+  tokens: number
+}
+
+export interface TokenWeekChart {
+  week_start_ms: number
+  week_end_ms: number
+  buckets: TokenBucket[]
+  days: TokenDaySummary[]
+  data_min_ms: number | null
+  data_max_ms: number | null
+  // Full-height value for one 10-min bar. A stated ceiling, not a derived one:
+  // tokens have no quota to be a fraction of.
+  axis_max_tokens: number
 }
 
 export const stateLabel: Record<Status, string> = {

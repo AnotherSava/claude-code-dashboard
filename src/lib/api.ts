@@ -1,7 +1,7 @@
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow'
-import type { AgentSession, Config, SetupState, UsageLimits, WeekChart } from './types'
+import type { AgentSession, Config, IntensityUnit, SetupState, TokenWeekChart, UsageLimits, WeekChart } from './types'
 
 export function getSessions(): Promise<AgentSession[]> {
   return invoke<AgentSession[]>('get_sessions')
@@ -27,6 +27,20 @@ export function getUsageIntensityWeek(weekOffset: number): Promise<WeekChart> {
 // Every week from the current one back to the oldest record, newest first.
 export function getUsageIntensityWeeks(): Promise<WeekChart[]> {
   return invoke<WeekChart[]>('get_usage_intensity_weeks')
+}
+
+// Token-unit twins of the two above, for the chart's Tokens view.
+export function getTokenIntensityWeek(weekOffset: number): Promise<TokenWeekChart> {
+  return invoke<TokenWeekChart>('get_token_intensity_week', { weekOffset })
+}
+
+export function getTokenIntensityWeeks(): Promise<TokenWeekChart[]> {
+  return invoke<TokenWeekChart[]>('get_token_intensity_weeks')
+}
+
+// Persist which unit the intensity chart plots.
+export function setIntensityUnit(unit: IntensityUnit): Promise<void> {
+  return invoke('set_intensity_unit', { unit })
 }
 
 // Resize the main window to fit `physicalHeight` physical px. Fire-and-forget:
