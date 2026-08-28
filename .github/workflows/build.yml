@@ -22,12 +22,9 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      # aws-lc-sys (pulled in by reqwest's rustls/aws-lc-rs backend) needs NASM
-      # to assemble its crypto on the Windows MSVC target; no-op elsewhere.
-      - name: Install NASM (Windows, for aws-lc-sys)
-        if: runner.os == 'Windows'
-        uses: ilammy/setup-nasm@v1
-
+      # No NASM step on purpose — see the note in release.yml: aws-lc-sys ships
+      # pre-assembled Windows objects, and installing an assembler is what
+      # stopped it using them.
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri -> target

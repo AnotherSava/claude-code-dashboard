@@ -27,12 +27,13 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
-      # aws-lc-sys (via reqwest's rustls/aws-lc-rs backend) needs NASM to
-      # assemble its crypto on the Windows MSVC target; no-op on macOS.
-      - name: Install NASM (Windows, for aws-lc-sys)
-        if: runner.os == 'Windows'
-        uses: ilammy/setup-nasm@v1
-
+      # No NASM step on purpose. aws-lc-sys ships pre-assembled Windows objects
+      # and rustls turns them on for us (its `aws_lc_rs` feature pulls
+      # `aws-lc-rs/prebuilt-nasm`), but the builder only falls back to them when
+      # it finds no assembler — "if a NASM assembler is detected in your build
+      # environment, it is always used". Installing NASM was therefore the one
+      # thing forcing the slower assemble-from-source path, and the action doing
+      # it was also the workflow's last Node-20 dependency.
       - name: Cache Cargo registry and target
         uses: Swatinem/rust-cache@v2
         with:
