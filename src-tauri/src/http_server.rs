@@ -95,16 +95,25 @@ fn session_start_nonce(ns: &NonceStore, chat_id: &str, source: &str, now_ms: i64
 /// shared by every Claude Code instance in that directory, so a `SessionEnd`
 /// from one can arrive for a row another is still writing — canonically after a
 /// `--fork-session --resume` migrates a terminal session into a background one,
-/// leaving both resident. The row's owner is the `agent_pid` of whichever
-/// instance wrote it last (`liveness::AgentPids`, overwrite semantics).
+/// leaving both resident. The row's owner is the `session_id` of whichever
+/// instance wrote it last (`ChatIdRegistry::claim`).
 ///
-/// Permitted unless both pids are known *and* differ: an unresolvable pid (a
-/// node-based install) or an empty store (nothing written since a restart) means
-/// ownership is unknown, and an authoritative end signal beats a guess. False
-/// only for the case we can positively identify as a sibling's row.
-fn clear_permitted(owner_pid: Option<u32>, event_pid: Option<u32>) -> bool {
-    match (owner_pid, event_pid) {
-        (Some(owner), Some(event)) => owner == event,
+/// Ownership is deliberately keyed on the payload's `session_id` rather than
+/// the hook's `agent_pid`. The pid is resolved by walking the hook's ancestors
+/// for a live `claude` image, so it comes back `None` for a session that is
+/// *shutting down* — precisely when this guard has to hold. A real `SessionEnd`
+/// from a killed sibling was let through that way; `session_id` is in the
+/// payload unconditionally and needs no live process to read.
+///
+/// Permitted unless both ids are known *and* differ: nothing claimed since a
+/// restart, or a payload without a `session_id`, means ownership is unknown and
+/// an authoritative end signal beats a guess. `/clear` still removes its own
+/// row — it fires `SessionEnd` under the *old* session_id, which is the one
+/// that claimed the row, and mints the new id only on the following
+/// `SessionStart`.
+fn clear_permitted(owner: Option<&str>, ending: &str) -> bool {
+    match owner {
+        Some(owner) if !ending.is_empty() => owner == ending,
         _ => true,
     }
 }
@@ -222,6 +231,11 @@ async fn post_event(
                     pids.set(&chat_id, pid);
                 }
             }
+            // Claim the row for this session, so a `SessionEnd` from another
+            // instance sharing the cwd can't remove it (see `clear_permitted`).
+            if let Some(registry) = app.try_state::<ChatIdRegistry>() {
+                registry.claim(&chat_id, session_id);
+            }
             let history = app.try_state::<PromptHistoryStore>();
             let restored = history.as_ref().and_then(|h| h.get(&chat_id));
             let now = now_ms();
@@ -307,22 +321,23 @@ async fn post_event(
             // --resume`) — and the chat_id is cwd-derived, so both address the
             // same row. Whoever wrote last owns it: refuse an end signal from the
             // *other* instance, which would otherwise flush and drop a row a live
-            // sibling is still using. Ownership is the `agent_pid` the hook
-            // already reports on every event; an unknown pid on either side means
-            // we can't tell, and the authoritative end signal wins.
-            let owner_pid = app.try_state::<crate::liveness::AgentPids>().and_then(|p| p.get(&id));
-            if !clear_permitted(owner_pid, req.agent_pid) {
+            // sibling is still using.
+            let owner = app.try_state::<ChatIdRegistry>().and_then(|r| r.owner_of(&id));
+            if !clear_permitted(owner.as_deref(), session_id) {
                 tracing::debug!(
                     client = %req.client,
                     event = %req.event,
                     chat_id = %id,
                     decision = "clear_ignored",
                     reason = "end signal from a non-owning session sharing this cwd",
-                    owner_pid = ?owner_pid,
-                    event_pid = ?req.agent_pid,
+                    owner = ?owner,
+                    ending = %session_id,
                     "event -> clear"
                 );
                 return (StatusCode::OK, Json(resp));
+            }
+            if let Some(registry) = app.try_state::<ChatIdRegistry>() {
+                registry.disown(&id);
             }
             tracing::debug!(
                 client = %req.client,
@@ -397,25 +412,37 @@ mod tests {
     #[test]
     fn clear_permitted_when_the_owning_session_ends_it() {
         // The ordinary case, `/clear` included: one instance holds the cwd, so
-        // the end signal carries the same pid that last wrote the row.
-        assert!(clear_permitted(Some(93331), Some(93331)));
+        // the end signal carries the same session_id that claimed the row.
+        // (`/clear` fires SessionEnd under the old id and mints the new one on
+        // the following SessionStart, so it matches here.)
+        assert!(clear_permitted(Some("cc152457"), "cc152457"));
     }
 
     #[test]
     fn clear_refused_from_a_sibling_sharing_the_cwd() {
         // A terminal session forked into a background one: both derive the same
         // cwd chat_id, so exiting the abandoned tab must not drop the live row.
-        assert!(!clear_permitted(Some(72194), Some(83820)));
+        assert!(!clear_permitted(Some("add18820"), "cc152457"));
+    }
+
+    #[test]
+    fn clear_refused_even_when_the_ending_session_is_already_dying() {
+        // The regression this guard exists for. Keying on `agent_pid` let a real
+        // SessionEnd through: the hook resolves that pid by walking its ancestors
+        // for a live `claude` image, and a session being killed has none, so it
+        // reported null and "unknown ownership" waved the removal past. The
+        // session_id is in the payload either way.
+        assert!(!clear_permitted(Some("add18820"), "83820-is-dying"));
     }
 
     #[test]
     fn clear_permitted_when_ownership_is_unknown() {
-        // No pid on either side — a node-based install, or nothing written since
-        // a restart. Unknown ownership defers to the authoritative end signal
-        // rather than stranding the row.
-        assert!(clear_permitted(None, Some(93331)));
-        assert!(clear_permitted(Some(93331), None));
-        assert!(clear_permitted(None, None));
+        // Nothing claimed since a restart, or a payload with no session_id.
+        // Unknown ownership defers to the authoritative end signal rather than
+        // stranding the row.
+        assert!(clear_permitted(None, "cc152457"));
+        assert!(clear_permitted(Some("cc152457"), ""));
+        assert!(clear_permitted(None, ""));
     }
 
     #[test]

@@ -11,6 +11,13 @@ use std::sync::Mutex;
 pub struct ChatIdRegistry {
     path: PathBuf,
     data: Mutex<HashMap<String, String>>,
+    /// Inverse view: which `session_id` most recently *wrote* each chat_id.
+    /// `data` can't answer this — several sessions legitimately map to one
+    /// cwd-derived row and it carries no recency — so ownership is tracked
+    /// separately, claimed on every `Set` and read by the `Clear` guard.
+    /// In-memory only: a restart leaves ownership unknown, which the guard
+    /// treats as "defer to the end signal", i.e. today's behavior.
+    owners: Mutex<HashMap<String, String>>,
 }
 
 impl ChatIdRegistry {
@@ -30,7 +37,30 @@ impl ChatIdRegistry {
         Self {
             path,
             data: Mutex::new(data),
+            owners: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Record that `session_id` wrote `chat_id`, making it the row's owner.
+    /// Called on every `Set` — never on `Clear`, or a departing session would
+    /// claim the row moments before the guard asks who owns it.
+    pub fn claim(&self, chat_id: &str, session_id: &str) {
+        if session_id.is_empty() {
+            return;
+        }
+        self.owners.lock().unwrap().insert(chat_id.to_string(), session_id.to_string());
+    }
+
+    /// The `session_id` that last wrote `chat_id`, or `None` when nothing has
+    /// been written since startup.
+    pub fn owner_of(&self, chat_id: &str) -> Option<String> {
+        self.owners.lock().unwrap().get(chat_id).cloned()
+    }
+
+    /// Drops ownership of a row that is going away, so a later session reusing
+    /// the same cwd-derived id isn't measured against a departed owner.
+    pub fn disown(&self, chat_id: &str) {
+        self.owners.lock().unwrap().remove(chat_id);
     }
 
     /// Returns the stable chat_id for `session_id`. On first sight, locks in
