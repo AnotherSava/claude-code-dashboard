@@ -151,6 +151,68 @@ pub fn get_usage_intensity_weeks(app: AppHandle) -> Result<Vec<crate::usage_hist
     Ok(weeks)
 }
 
+/// Every token record this device holds, reduced to one row per `message.id`.
+///
+/// Reduction is mandatory rather than defensive: Claude Code writes one
+/// transcript line per content block of a response, each repeating the whole
+/// usage object, so summing the stored rows inflates a total by ~2x.
+/// Unions this device's records with every peer's, since the chart is meant to
+/// show account-wide work and transcripts are per-machine.
+fn merged_token_records(app: &AppHandle) -> Vec<crate::token_history::TokenRecord> {
+    let mut all = match app.try_state::<crate::token_history::TokenHistoryStore>() {
+        Some(store) => store.read_all(),
+        None => Vec::new(),
+    };
+    if let Some(remote) = app.try_state::<crate::remote_tokens::RemoteTokenStore>() {
+        all.extend(remote.all_records());
+    }
+    // Reducing after the union matters: the same `message.id` can arrive from
+    // two devices (one scanned it, one received it), and only a reduction over
+    // the combined set collapses that.
+    crate::token_history::reduce_by_id(&all)
+}
+
+/// Full-height value for one 10-minute token bar, from config.
+fn token_axis_max(app: &AppHandle) -> f64 {
+    app.try_state::<ConfigState>()
+        .and_then(|c| c.snapshot().intensity_axis_max_tokens)
+        .filter(|v| *v > 0.0)
+        .unwrap_or(crate::token_history::DEFAULT_AXIS_MAX_TOKENS)
+}
+
+/// Token-unit twin of [`get_usage_intensity_week`], for the chart's Tokens view.
+#[tauri::command]
+pub fn get_token_intensity_week(week_offset: i32, app: AppHandle) -> Result<crate::token_history::TokenWeekChart, String> {
+    let week_start_ms = local_week_start_ms(week_offset)?;
+    let records = merged_token_records(&app);
+    Ok(crate::token_history::build_token_week_chart(&records, week_start_ms, token_axis_max(&app)))
+}
+
+/// Token-unit twin of [`get_usage_intensity_weeks`]. Reads and reduces the
+/// history once, then reuses it across every week.
+#[tauri::command]
+pub fn get_token_intensity_weeks(app: AppHandle) -> Result<Vec<crate::token_history::TokenWeekChart>, String> {
+    let records = merged_token_records(&app);
+    let Some(data_min) = records.iter().map(|r| r.ts).min() else {
+        return Ok(Vec::new());
+    };
+    let axis_max = token_axis_max(&app);
+    let mut weeks = Vec::new();
+    let mut offset = 0;
+    loop {
+        let week_start_ms = local_week_start_ms(offset)?;
+        weeks.push(crate::token_history::build_token_week_chart(&records, week_start_ms, axis_max));
+        if week_start_ms <= data_min {
+            break;
+        }
+        offset -= 1;
+        if offset < -520 {
+            break; // ~10-year safety cap against an absurd clock
+        }
+    }
+    Ok(weeks)
+}
+
 /// Resize the main window to fit `physical_height` physical px. The frontend
 /// sizes against the webview's own `devicePixelRatio` (the ratio it rasterizes
 /// content at), which — unlike Rust's `window.scale_factor()` — tracks the
@@ -750,6 +812,18 @@ pub fn set_history_font_size(size: crate::config::HistoryFontSize, app: AppHandl
         let _ = state.save_to_disk();
     }
     crate::tray::sync_history_font_checks(&app, size);
+    emit_config_updated(&app);
+}
+
+/// Switch the Work intensity chart between the percent-of-quota and token
+/// units. Persisted so the choice survives closing the window; no tray item,
+/// since the chart carries its own control.
+#[tauri::command]
+pub fn set_intensity_unit(unit: crate::config::IntensityUnit, app: AppHandle) {
+    if let Some(state) = app.try_state::<crate::config::ConfigState>() {
+        state.with_mut(|c| c.intensity_unit = unit);
+        let _ = state.save_to_disk();
+    }
     emit_config_updated(&app);
 }
 

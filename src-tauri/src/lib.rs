@@ -17,12 +17,15 @@ mod nonce_store;
 mod notifications;
 mod prompt_history;
 mod remote_history;
+mod remote_tokens;
 mod remote_usage;
 mod setup;
 mod state;
 mod sync;
 mod telegram;
 mod terminal_title;
+mod token_history;
+mod token_scan;
 mod tray;
 mod tray_badge;
 mod usage_history;
@@ -142,6 +145,8 @@ pub fn run() {
             commands::refresh_usage_limits,
             commands::get_usage_intensity_week,
             commands::get_usage_intensity_weeks,
+            commands::get_token_intensity_week,
+            commands::get_token_intensity_weeks,
             commands::apply_auto_resize,
             commands::frontend_log,
             commands::hide_window,
@@ -153,6 +158,7 @@ pub fn run() {
             commands::close_window,
             commands::hide_history,
             commands::set_history_font_size,
+            commands::set_intensity_unit,
             commands::set_chat_name,
             commands::test_telegram_notification,
             commands::get_setup_state,
@@ -256,6 +262,7 @@ pub fn run() {
             UsageLimitsPoller::spawn(app.handle().clone());
             liveness_reaper::spawn(app.handle().clone());
             waiting_settle::spawn(app.handle().clone());
+            token_scan::spawn(app.handle().clone());
             // Clear any `disablesleep` left set by a crash the deadman missed,
             // before the watcher can arm on top of it. `disablesleep` survives
             // reboot, so a stranded flag would otherwise persist indefinitely.
@@ -421,8 +428,14 @@ pub fn run() {
     app.manage(usage_history::UsageHistoryStore::new(
         app_data.join("usage_history.jsonl"),
     ));
+    app.manage(token_history::TokenHistoryStore::new(
+        app_data.join("token_history.jsonl"),
+    ));
     app.manage(remote_usage::RemoteUsageStore::new(
         app_data.join("remote_usage"),
+    ));
+    app.manage(remote_tokens::RemoteTokenStore::new(
+        app_data.join("remote_tokens"),
     ));
     // Compact-view width memory (runtime-only). Managed before the webview so
     // the mount-time compact-width command and the close-time save can't race a

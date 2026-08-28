@@ -77,6 +77,13 @@ pub struct SyncPush {
     /// whatever it already holds for this device.
     #[serde(default)]
     pub usage_tip: i64,
+    /// Highest local token-record `seq`, or `0` when there are none. Deliberately
+    /// a sequence rather than a timestamp: token records are appended in scan
+    /// order, so a `ts` tip would go backwards and silently strand everything
+    /// below it — see `remote_tokens`. `serde(default)` keeps a peer running an
+    /// older build parseable; it simply advertises 0 and contributes nothing.
+    #[serde(default)]
+    pub token_tip: u64,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -197,6 +204,7 @@ async fn post_sync(
     let store = app.try_state::<RemoteHistoryStore>();
     let persisted = store.as_ref().map(|s| s.device_dialogs(&push.device_name)).unwrap_or_default();
     let usage_tip = push.usage_tip;
+    let token_tip = push.token_tip;
     let device_name = push.device_name.clone();
     let pulls = {
         let mut remote = state.remote.lock().unwrap();
@@ -217,7 +225,14 @@ async fn post_sync(
         .map(|s| s.newest_ts(&device_name))
         .unwrap_or(0);
     if usage_tip > usage_held {
-        fetch_usage_range(app.clone(), device_name, origin_addr, usage_held);
+        fetch_usage_range(app.clone(), device_name.clone(), origin_addr.clone(), usage_held);
+    }
+    let token_held = app
+        .try_state::<crate::remote_tokens::RemoteTokenStore>()
+        .map(|s| s.newest_seq(&device_name))
+        .unwrap_or(0);
+    if token_tip > token_held {
+        fetch_token_range(app.clone(), device_name, origin_addr, token_held);
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -277,6 +292,37 @@ async fn get_usage(
     Ok(Json(usage_since(&records, q.since)))
 }
 
+#[derive(Deserialize)]
+struct TokenQuery {
+    #[serde(default)]
+    since: u64,
+}
+
+/// Cap on one token-range response. The peer re-asks from its new watermark on
+/// the next push, so a large backlog drains over several cycles instead of one
+/// multi-megabyte body.
+const MAX_TOKEN_RANGE: usize = 5_000;
+
+/// Catch-up endpoint: a peer asks for our *local* token records above the `seq`
+/// it already holds for us.
+async fn get_tokens(
+    State(app): State<AppHandle>,
+    headers: HeaderMap,
+    Query(q): Query<TokenQuery>,
+) -> Result<Json<Vec<crate::token_history::TokenRecord>>, StatusCode> {
+    let Some(cfg_state) = app.try_state::<ConfigState>() else {
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    };
+    if !bearer_ok(&headers, cfg_state.snapshot().sync.token.as_deref()) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let records = app
+        .try_state::<crate::token_history::TokenHistoryStore>()
+        .map(|s| s.records_since_seq(q.since, MAX_TOKEN_RANGE))
+        .unwrap_or_default();
+    Ok(Json(records))
+}
+
 /// Sync listener on all interfaces — see module docs for why that's safe.
 pub async fn run_listener(app: AppHandle, port: u16) {
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
@@ -293,6 +339,7 @@ pub async fn run_listener(app: AppHandle, port: u16) {
         .route("/api/sync", post(post_sync))
         .route("/api/sync/dialog", get(get_dialog))
         .route("/api/sync/usage", get(get_usage))
+        .route("/api/sync/tokens", get(get_tokens))
         .with_state(app);
 
     if let Err(e) = axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>()).await {
@@ -315,7 +362,7 @@ fn usage_since(records: &[UsageHistoryRecord], since: i64) -> Vec<UsageHistoryRe
 /// bookkeeping to go stale, no backlog to chunk, and a failed push costs
 /// nothing but a retry. Content moves on the pull side, where the party that
 /// knows what it is missing does the asking.
-fn build_push(device_name: &str, listen_port: u16, sessions: &[AgentSession], usage_tip: i64) -> SyncPush {
+fn build_push(device_name: &str, listen_port: u16, sessions: &[AgentSession], usage_tip: i64, token_tip: u64) -> SyncPush {
     SyncPush {
         device_name: device_name.to_string(),
         listen_port,
@@ -329,6 +376,7 @@ fn build_push(device_name: &str, listen_port: u16, sessions: &[AgentSession], us
             })
             .collect(),
         usage_tip,
+        token_tip,
     }
 }
 
@@ -352,7 +400,11 @@ async fn push_all(app: &AppHandle, client: &reqwest::Client) {
         .try_state::<UsageHistoryStore>()
         .and_then(|s| s.read_all().last().map(|r| r.ts))
         .unwrap_or(0);
-    let push = build_push(&cfg.sync.device_name, cfg.sync.listen_port, &sessions, usage_tip);
+    let token_tip = app
+        .try_state::<crate::token_history::TokenHistoryStore>()
+        .and_then(|s| s.newest_seq())
+        .unwrap_or(0);
+    let push = build_push(&cfg.sync.device_name, cfg.sync.listen_port, &sessions, usage_tip, token_tip);
     // Cycle breadcrumb: push cadence should never silently stop while peers
     // are configured — if the failure logs go quiet, this shows whether the
     // pusher loop itself is still alive.
@@ -491,6 +543,32 @@ fn fetch_usage_range(app: AppHandle, device: String, origin_addr: String, since:
         if let Some(store) = app.try_state::<RemoteUsageStore>() {
             store.merge_device(&device, &records);
             tracing::debug!(device = %device, records = records.len(), since, "usage range pulled");
+            // Nudge an open Work-intensity window to re-fetch the merged chart.
+            emit_usage_limits_updated(&app);
+        }
+    });
+}
+
+/// Pull a peer's token records above `since` (its `seq`, not a timestamp) and
+/// merge them. Mirrors [`fetch_usage_range`]; the `MAX_TOKEN_RANGE` cap bounds
+/// one response, and the peer's next push re-advertises the same tip so a
+/// truncated range is simply asked for again.
+fn fetch_token_range(app: AppHandle, device: String, origin_addr: String, since: u64) {
+    tauri::async_runtime::spawn(async move {
+        let Some(token) = app.try_state::<ConfigState>().and_then(|c| c.snapshot().sync.token) else {
+            return;
+        };
+        let url = format!("{origin_addr}/api/sync/tokens");
+        let query = [("since", since.to_string())];
+        let Some(records): Option<Vec<crate::token_history::TokenRecord>> = get_json(&url, &query, &token, "token pull").await else {
+            return;
+        };
+        if records.is_empty() {
+            return;
+        }
+        if let Some(store) = app.try_state::<crate::remote_tokens::RemoteTokenStore>() {
+            let accepted = store.merge_device(&device, &records);
+            tracing::debug!(device = %device, records = records.len(), accepted, since, "token range pulled");
             // Nudge an open Work-intensity window to re-fetch the merged chart.
             emit_usage_limits_updated(&app);
         }
@@ -708,18 +786,30 @@ mod tests {
             "proj",
             vec![entry(DialogRole::User, "old", 10), entry(DialogRole::User, "new", 100)],
         )];
-        let push = build_push("desktop", 9078, &sessions, 4242);
+        let push = build_push("desktop", 9078, &sessions, 4242, 77);
         assert_eq!(push.device_name, "desktop");
         assert_eq!(push.listen_port, 9078);
         assert!(push.sessions[0].session.dialog.is_empty(), "no dialog content on the wire");
         assert_eq!(push.sessions[0].dialog_tip, 100, "tip is our newest entry");
         assert_eq!(push.usage_tip, 4242);
+        assert_eq!(push.token_tip, 77, "token tip is a seq, advertised alongside the usage timestamp");
+    }
+
+    #[test]
+    fn a_push_from_an_older_peer_parses_with_no_token_tip() {
+        // Rollout skew: a peer that predates token sync sends no `token_tip`.
+        // It must still parse and simply contribute nothing, rather than
+        // failing the whole push and taking session sync down with it.
+        let body = r#"{"device_name":"old","listen_port":9078,"sessions":[],"usage_tip":5}"#;
+        let push: SyncPush = serde_json::from_str(body).expect("older push should parse");
+        assert_eq!(push.token_tip, 0);
+        assert_eq!(push.usage_tip, 5);
     }
 
     #[test]
     fn build_push_empty_dialog_tips_zero() {
         let sessions = vec![session("proj", Vec::new())];
-        assert_eq!(build_push("desktop", 9078, &sessions, 0).sessions[0].dialog_tip, 0);
+        assert_eq!(build_push("desktop", 9078, &sessions, 0, 0).sessions[0].dialog_tip, 0);
     }
 
     #[test]
@@ -728,8 +818,8 @@ mod tests {
         // there is no per-peer bookkeeping that can go stale, and re-sending is
         // free. A peer that missed ten cycles is caught up by the next one.
         let sessions = vec![session("proj", vec![entry(DialogRole::User, "u", 10)])];
-        let a = build_push("desktop", 9078, &sessions, 7);
-        let b = build_push("desktop", 9078, &sessions, 7);
+        let a = build_push("desktop", 9078, &sessions, 7, 3);
+        let b = build_push("desktop", 9078, &sessions, 7, 3);
         assert_eq!(serde_json::to_string(&a).unwrap(), serde_json::to_string(&b).unwrap());
     }
 
