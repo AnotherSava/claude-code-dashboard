@@ -455,6 +455,7 @@ dependencies = [
  "notify",
  "open",
  "reqwest",
+ "rustls",
  "serde",
  "serde_json",
  "tauri",

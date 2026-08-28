@@ -26,6 +26,15 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 tracing-appender = "0.2"
 reqwest = { version = "0.13", default-features = false, features = ["json", "query", "rustls"] }
+# Not imported anywhere — declared solely to add one feature to the rustls that
+# reqwest already pulls in. reqwest asks for rustls with `default-features =
+# false, features = ["std", "tls12"]`, which leaves X25519MLKEM768 offered but
+# ranked last, so every full handshake to api.anthropic.com /
+# console.anthropic.com / api.telegram.org (all three negotiate it today) costs
+# a HelloRetryRequest round trip. Cargo unifies features additively, so naming
+# `prefer-post-quantum` here promotes the hybrid group to first choice and drops
+# that extra round trip. Keep the version in step with reqwest's own pin.
+rustls = { version = "0.23.4", default-features = false, features = ["prefer-post-quantum"] }
 async-trait = "0.1"
 anyhow = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
