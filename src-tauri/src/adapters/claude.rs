@@ -191,7 +191,7 @@ pub fn dispatch(event: &str, payload: &Value, cfg: &Config) -> AdapterOutput {
 /// - cwd under projects_root → relative path with `/`, `-`, `_` replaced by spaces
 /// - cwd outside projects_root or no projects_root → basename of cwd
 /// - no cwd → `claude-unknown` (defensive; Claude Code payloads always carry `cwd`)
-fn derive_chat_id(cwd: Option<&str>, projects_root: Option<&str>) -> String {
+pub(crate) fn derive_chat_id(cwd: Option<&str>, projects_root: Option<&str>) -> String {
     if let Some(cwd) = cwd.map(str::trim).filter(|s| !s.is_empty()) {
         let normalized = cwd.replace('\\', "/");
         let normalized = normalized.trim_end_matches('/');

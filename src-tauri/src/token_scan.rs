@@ -46,8 +46,9 @@ pub struct ScanCursor {
 /// `~/.claude`. The env var is the documented override (it appears in the
 /// 2.1.238 binary) but a GUI app on macOS inherits no shell profile, so the
 /// home-relative form is the path that actually resolves in production — hence
-/// the resolved root is logged on every pass rather than assumed.
-fn config_dir() -> Option<PathBuf> {
+/// the scan logs the root it resolved on every pass rather than assuming it.
+/// Shared with `session_registry`, which reads `sessions/` under the same root.
+pub(crate) fn config_dir() -> Option<PathBuf> {
     if let Ok(dir) = std::env::var("CLAUDE_CONFIG_DIR") {
         if !dir.trim().is_empty() {
             return Some(PathBuf::from(dir));

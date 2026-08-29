@@ -19,6 +19,7 @@ mod prompt_history;
 mod remote_history;
 mod remote_tokens;
 mod remote_usage;
+mod session_registry;
 mod setup;
 mod state;
 mod sync;
@@ -134,6 +135,7 @@ pub fn run() {
         .manage(UsageLimitsState::new())
         .manage(commands::HistoryTarget(std::sync::Mutex::new(None)))
         .manage(terminal_title::TerminalTitles::new())
+        .manage(session_registry::SessionRegistry::new())
         .manage(liveness::AgentPids::new())
         .manage(nonce_store::NonceStore::new())
         .manage(lid_awake::LidAwakeState::default())

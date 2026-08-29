@@ -10,12 +10,15 @@
 //! (`ps -o tty=`) and write an OSC 0 escape to the device — Terminal.app,
 //! iTerm2, and kitty all map it onto the tab.
 //!
-//! The candidate list is the hook's ancestor chain **bounded at its own
-//! Claude Code process** — see `console_pids` in `integrations/claude_hook.py`
-//! for why that bound is load-bearing. Every candidate being unreachable is a
-//! legitimate outcome, not a failure: a session with no terminal of its own
-//! (the Claude Code desktop app) has no tab to title, and writing anyway
-//! would land this agent's status on an unrelated session's tab.
+//! The target pid comes from `session_registry`, which matches the row's cwd
+//! against Claude Code's own list of live sessions — see that module for why
+//! the process tree cannot answer this. The hook's ancestor chain
+//! (`console_pids`, bounded at its own Claude Code process) remains only as the
+//! fallback for a row the registry cannot place, and the two are never mixed:
+//! once the registry names a pid it is the sole candidate, because falling
+//! through to the chain after a failed write is exactly how one agent's status
+//! reaches another's tab. No candidate at all is a legitimate outcome, not a
+//! failure — a session with no terminal of its own has no tab to title.
 //!
 //! Everything is best-effort — a dead pid, a closed terminal, or a disabled
 //! config flag degrade to "title doesn't change", never to an error the
@@ -136,13 +139,30 @@ pub fn sync(app: &AppHandle, sessions: &[AgentSession]) {
     let enabled = cfg.as_ref().map(|c| c.terminal_titles).unwrap_or(true);
     let mut pids = titles.pids.lock().unwrap();
     let mut last = titles.last.lock().unwrap();
+    let now = crate::commands::now_ms();
+
+    // Claude Code's own session registry answers "which process owns this row's
+    // terminal" directly; the hook's ancestor chain only answers "what is above
+    // the hook", which diverges the moment a conversation runs somewhere other
+    // than its tab. Prefer the registry, and when it has an answer use *only*
+    // it — falling through to the chain on a failed write is how a status
+    // reaches a neighbour's tab. No answer (an older Claude Code, an
+    // unreadable registry, an ambiguous cwd) keeps the chain as it was.
+    let registry = app.try_state::<crate::session_registry::SessionRegistry>();
+    let root = cfg.as_ref().and_then(|c| c.projects_root.clone());
+    let resolve = |chat_id: &str, chain: &[u32]| -> Vec<u32> {
+        match registry.as_ref().and_then(|r| r.tab_pid(chat_id, root.as_deref(), now)) {
+            Some(pid) => vec![pid],
+            None => chain.to_vec(),
+        }
+    };
 
     if !enabled {
         // Toggled off: blank every title we have written, keep the pid map so
         // re-enabling resumes without waiting for the next hook event.
         for (chat_id, candidates) in pids.iter() {
             if last.remove(chat_id).is_some() {
-                push_title(candidates, "");
+                push_title(&resolve(chat_id, candidates), "");
             }
         }
         return;
@@ -154,7 +174,7 @@ pub fn sync(app: &AppHandle, sessions: &[AgentSession]) {
             return true;
         }
         if last.remove(chat_id).is_some() {
-            push_title(candidates, "");
+            push_title(&resolve(chat_id, candidates), "");
         }
         false
     });
@@ -163,18 +183,18 @@ pub fn sync(app: &AppHandle, sessions: &[AgentSession]) {
     let empty_tokens = HashMap::new();
     let window_tokens = cfg.as_ref().map(|c| &c.context_window_tokens).unwrap_or(&empty_tokens);
 
-    let now = crate::commands::now_ms();
     for s in sessions {
-        let Some(candidates) = pids.get(&s.id) else {
+        let candidates = resolve(&s.id, pids.get(&s.id).map_or(&[][..], Vec::as_slice));
+        if candidates.is_empty() {
             continue;
-        };
+        }
         let title = build_title(s, context_threshold, window_tokens);
         if let Some((prev, at)) = last.get(&s.id) {
             if *prev == title && now - at < REASSERT_MS {
                 continue;
             }
         }
-        if push_title(candidates, &title) {
+        if push_title(&candidates, &title) {
             last.insert(s.id.clone(), (title, now));
         }
     }
