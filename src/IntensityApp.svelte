@@ -163,6 +163,18 @@
   const weekWeeklyPct = $derived(chart ? chart.days.reduce((s, d) => s + d.weekly_pct, 0) : 0)
   const weekTokens = $derived(tokChart ? tokChart.days.reduce((s, d) => s + d.tokens, 0) : 0)
 
+  // What a red bar means, which differs by unit: the percentage view has a
+  // quota pace to be a multiple of, the token view only has the stated ceiling
+  // its bars are drawn against. The Weeks view sums groups of buckets and
+  // scales to match, so the ceiling it names is higher.
+  const legend = $derived.by(() => {
+    if (unit !== 'tokens') return 'red = over 2× pace'
+    const chart = view === 'week' ? (tokWeeks?.[0] ?? null) : tokChart
+    if (!chart) return 'red = at the top of the scale'
+    const max = chart.axis_max_tokens * (view === 'week' ? WEEK_GROUP : 1)
+    return `red = ${fmtTokens(max)}+`
+  })
+
   // Week-view nav: the visible span (oldest-top week start → newest-bottom week
   // end) and whether each scroll direction has anywhere left to go. Reading
   // `weekBottomOffset` keeps these reactive as the window scrolls.
@@ -328,9 +340,10 @@
   // (so the pace line sits mid-row); tokens use the configured ceiling.
   const scaleOf = (c: WeekChart | TokenWeekChart): number => (isTokens(c) ? c.axis_max_tokens : c.full_intensity * 2)
 
-  // Compact token counts: 1.2M / 340k / 900.
+  // Compact token counts: 1.2M / 1M / 340k / 900. A whole number of millions
+  // drops the trailing ".0" — "1M" rather than "1.0M".
   function fmtTokens(n: number): string {
-    if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(n >= 10_000_000 ? 0 : 1)}M`
+    if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(n >= 10_000_000 ? 0 : 1).replace(/\.0$/, '')}M`
     if (n >= 1_000) return `${Math.round(n / 1_000)}k`
     return `${Math.round(n)}`
   }
@@ -749,10 +762,10 @@
     <span class="hint">
       {#if view === 'day'}
         <span class="hint-group"><span class="field-label">Navigation:</span> <span class="hint-rest"><span class="keycap">←</span><span class="keycap">→</span> one week</span></span>
-        <span class="hint-group"><span class="field-label">Legend:</span> <span class="hint-rest">red = over 2× pace</span></span>
+        <span class="hint-group"><span class="field-label">Legend:</span> <span class="hint-rest">{legend}</span></span>
       {:else}
         <span class="hint-group"><span class="field-label">Navigation:</span> <span class="hint-rest"><span class="keycap">↑</span><span class="keycap">↓</span> one week, <span class="keycap">←</span><span class="keycap">→</span> a screen</span></span>
-        <span class="hint-group"><span class="field-label">Legend:</span> <span class="hint-rest">red = over 2× pace</span></span>
+        <span class="hint-group"><span class="field-label">Legend:</span> <span class="hint-rest">{legend}</span></span>
       {/if}
     </span>
     <div class="switch">
