@@ -113,7 +113,7 @@ Under the repo root `claude-code-dashboard/`:
 - [Classification](development/classification) — how the Claude adapter turns a raw lifecycle payload into the `(chat_id, status, label)` tuple the widget renders.
 - [Sticky labels](development/sticky-labels) — the state machine that keeps a meaningful caption next to a session row across approval cycles, cancellations, and continuation prompts.
 - [Data flow](development/data-flow) — end-to-end paths from a Python hook POST or a transcript file change to a rendered pixel.
-- [HTTP API](development/http-api) — `POST /api/event` envelope shape and how to write a new adapter for a non-Claude agent.
+- [HTTP API](development/http-api) — `POST /api/event` envelope shape, how to write a new adapter for a non-Claude agent, and the read-only `GET /api/agents` roster of every tracked session across devices.
 
 ## Testing
 

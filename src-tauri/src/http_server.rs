@@ -1,21 +1,23 @@
 use axum::{
     extract::State,
     http::{HeaderMap, StatusCode},
-    routing::post,
+    routing::{get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use tauri::{AppHandle, Manager};
 
 use crate::adapters::{self, AdapterOutput};
 use crate::chat_id_registry::ChatIdRegistry;
-use crate::commands::{emit_sessions_updated, now_ms};
+use crate::commands::{emit_sessions_updated, now_ms, resolved_snapshot};
 use crate::config::ConfigState;
 use crate::log_watcher::WatcherRegistry;
 use crate::nonce_store::NonceStore;
 use crate::prompt_history::PromptHistoryStore;
-use crate::state::AppState;
+use crate::state::{AgentSession, AppState, Status};
+use crate::sync::SyncListening;
 
 pub async fn run(app: AppHandle, port: u16) {
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
@@ -30,6 +32,7 @@ pub async fn run(app: AppHandle, port: u16) {
 
     let router = Router::new()
         .route("/api/event", post(post_event))
+        .route("/api/agents", get(get_agents))
         .with_state(app);
 
     if let Err(e) = axum::serve(listener, router).await {
@@ -150,18 +153,215 @@ fn drift_action(present: bool, seen: bool, is_handback: bool) -> (DriftAction, &
     }
 }
 
+/// CSRF guard for every route on this server: block browser-originated requests.
+/// urllib / curl don't send `Origin`; browser XHRs do. `"null"` is allowed
+/// (`file://` / `data:`). The server is loopback-only and unauthenticated, so a
+/// page the user happens to have open is the whole threat model.
+///
+/// **This is CSRF only, and does not close DNS rebinding.** An attacker page
+/// whose domain is rebound to `127.0.0.1` becomes same-origin with this server,
+/// so the browser sends no `Origin` at all and the request is allowed. That was
+/// close to worthless when the only route was a write; `GET /api/agents` makes it
+/// a read of every project name, status and label. Closing it means also
+/// requiring a loopback `Host`, which is deliberately *not* done here: the hook's
+/// target is overridable via `TAURI_DASHBOARD_URL`, so a host alias that resolves
+/// to loopback is a supported setup that such a check would break. Recorded
+/// rather than papered over — the gap is a known, accepted one.
+///
+/// Extracted rather than copied into the second handler: the guard is per-handler
+/// (there is no tower layer on this router), so every new route is unprotected
+/// until it repeats the check, and two copies of the rule would be two places to
+/// forget when it changes.
+fn origin_blocked(headers: &HeaderMap) -> bool {
+    match headers.get("origin") {
+        None => false,
+        Some(origin) => !matches!(origin.to_str(), Ok("null")),
+    }
+}
+
+/// Body of `GET /api/agents` — the roster an agent reads to answer "does a
+/// session for project X exist, on which machine, in what state, and how fresh
+/// is that answer?". Claude Code's own session listing sees only the local
+/// machine; this dashboard already merges local + synced-from-peer rows, so it
+/// can answer across both.
+///
+/// `peers` is not redundant with the rows: it is the only place a *device* with
+/// zero sessions can appear, which is what separates "the other machine is up
+/// and has nothing for project X" from "the other machine has said nothing in
+/// 80 s". Both arrays are always present and never null.
+#[derive(Serialize, Debug, PartialEq)]
+struct AgentsResponse {
+    /// The machine being queried, so one merged roster is self-describing.
+    /// `null` — never a sentinel — when `sync.device_name` was never
+    /// bootstrapped; inventing a `"local"` could collide with a real peer name.
+    device: Option<String>,
+    /// Whether this dashboard can receive peer rows at all
+    /// (`sync.listen` + a token). When false, an empty `peers` says *nothing*
+    /// about the other machine and the caller must not read it as "no sessions
+    /// there".
+    sync_listening: bool,
+    peers: Vec<PeerRow>,
+    agents: Vec<AgentRow>,
+}
+
+/// One synced peer dashboard. `sessions` counts the rows attributed to it in
+/// `agents`, so a device that is live but idle is visible as itself.
+#[derive(Serialize, Debug, PartialEq)]
+struct PeerRow {
+    device: String,
+    last_seen_age_ms: i64,
+    sessions: usize,
+}
+
+/// One tracked session, local or synced.
+///
+/// Deliberately absent, and not to be re-added: **no `deliverable` / `sendable`
+/// boolean.** A remote row's status can be up to a reap window old, so a green
+/// light computed here would state as fact something derived from possibly-stale
+/// data — this returns the facts and the age of each, and lets the caller judge.
+/// **No user-presence / idle-ms either**: a message to a peer agent starts a turn
+/// in it whether or not a human is watching that screen, so presence changes no
+/// decision the caller makes. Also omitted for size and for the trust boundary:
+/// the dialog, the canary/drift flags, tokens and model.
+#[derive(Serialize, Debug, PartialEq)]
+struct AgentRow {
+    /// Dashboard-canonical id, namespaced exactly as everything else in this
+    /// repo addresses a row (`chrome/transcripts`).
+    id: String,
+    /// The de-namespaced cwd-derived id (equal to `id` for a local row). This is
+    /// the cross-machine comparable key: `derive_chat_id` normalizes backslashes
+    /// and strips the projects root, so one project yields the same string on
+    /// macOS and on Windows — which is what makes "does project X exist anywhere"
+    /// answerable from this body alone.
+    project: String,
+    /// Which machine it runs on. `null` only when this box has no device name;
+    /// kept separate from `local` for exactly that case.
+    device: Option<String>,
+    local: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    display_name: Option<String>,
+    status: Status,
+    /// What the dashboard row itself shows — the "what is it doing" line. Withheld
+    /// it would force the caller to guess from `status` alone, and it is already on
+    /// the sync wire; this route is loopback-only, the same trust boundary.
+    label: String,
+    /// Time in the current `status`. An *age*, not a timestamp, everywhere in this
+    /// body: a remote row's clocks are the sender's, so no absolute stamp here would
+    /// mean anything without clock agreement, while every question the caller has is
+    /// "how old is this". For a remote row this age still carries the sender/receiver
+    /// skew (it is derived from the sender's `state_entered_at`); it is clamped at 0
+    /// so skew can never read as negative, and `last_seen_age_ms` — which is
+    /// skew-free — bounds how much of it to trust.
+    status_age_ms: i64,
+    /// How long since this row's device last pushed, on the receiver's clock at both
+    /// ends, so it is free of clock skew. **This is the field that makes a remote
+    /// reading judgeable**: a peer that slept keeps its last-pushed status frozen
+    /// until the TTL reaper drops it a heartbeat later, so a bare `"idle"` is
+    /// otherwise indistinguishable from a dead machine's last words. Omitted for a
+    /// local row, where a `0` would claim freshness on a channel that doesn't exist.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_seen_age_ms: Option<i64>,
+}
+
+/// Shape the merged roster. All the judgment lives here so it is testable without
+/// a router or an `AppHandle`; the handler is a thin assembler.
+///
+/// A remote row's device prefix is stripped by its `origin` field, never by
+/// splitting on the first `/` — a device name may itself contain a slash, and
+/// `sync::resolve_fetch_target` already matches whole names for the same reason.
+/// A remote row whose `origin` is missing from `last_seen` is dropped rather than
+/// reported: the sessions and the device map are read under two separate locks, so
+/// a device reaped between them leaves a phantom row, and a row with no freshness
+/// number is precisely the thing this route exists to never emit.
+fn agent_roster(
+    sessions: &[AgentSession],
+    last_seen: &BTreeMap<String, i64>,
+    this_device: Option<&str>,
+    sync_listening: bool,
+    now_ms: i64,
+) -> AgentsResponse {
+    let age_since = |then: i64| (now_ms - then).max(0);
+
+    let agents: Vec<AgentRow> = sessions
+        .iter()
+        .filter_map(|s| {
+            let (device, project, seen) = match s.origin.as_deref() {
+                None => (this_device.map(str::to_string), s.id.clone(), None),
+                Some(origin) => {
+                    let seen = last_seen.get(origin)?;
+                    let project = s.id.strip_prefix(&format!("{origin}/")).unwrap_or(&s.id).to_string();
+                    (Some(origin.to_string()), project, Some(age_since(*seen)))
+                }
+            };
+            Some(AgentRow {
+                id: s.id.clone(),
+                project,
+                device,
+                local: s.origin.is_none(),
+                display_name: s.display_name.clone(),
+                status: s.status,
+                label: s.label.clone(),
+                status_age_ms: age_since(s.state_entered_at),
+                last_seen_age_ms: seen,
+            })
+        })
+        .collect();
+
+    let peers = last_seen
+        .iter()
+        .map(|(device, seen)| PeerRow {
+            device: device.clone(),
+            last_seen_age_ms: age_since(*seen),
+            // `!a.local` matters: a local row carries this device's own name, so
+            // matching on the name alone folds every local session into a peer's
+            // count whenever the two machines share a name — which they do by
+            // default, since `device_name` bootstraps from the hostname, and in
+            // the repo's own localhost-observer sync test setup.
+            sessions: agents.iter().filter(|a| !a.local && a.device.as_deref() == Some(device.as_str())).count(),
+        })
+        .collect();
+
+    AgentsResponse { device: this_device.map(str::to_string), sync_listening, peers, agents }
+}
+
+/// Read-only roster of every session this dashboard tracks, local and synced.
+/// Mutates nothing — no `apply_set`, no emit, no `SyncDirty` poke, no store
+/// write — which is also why it writes no `decision` line: every one of those
+/// tags marks a state change and the `investigate` skill replays them to
+/// reconstruct a row, so a polling reader would bury the real decisions under
+/// entries that explain no state.
+async fn get_agents(
+    State(app): State<AppHandle>,
+    headers: HeaderMap,
+) -> Result<Json<AgentsResponse>, StatusCode> {
+    if origin_blocked(&headers) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let Some(state) = app.try_state::<AppState>() else {
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    };
+    let Some(cfg_state) = app.try_state::<ConfigState>() else {
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    };
+    let cfg = cfg_state.snapshot();
+    let sessions = resolved_snapshot(&app);
+    let last_seen = state.remote_last_seen();
+    let this_device = Some(cfg.sync.device_name.trim()).filter(|d| !d.is_empty());
+    // Read the running listener, never the config predicate that was supposed to
+    // produce it: an empty-string token, a hot-reloaded `sync.listen`, and a
+    // failed bind each make config claim a listener that isn't there. See
+    // `sync::SyncListening`.
+    let sync_listening = app.try_state::<SyncListening>().is_some_and(|f| f.get());
+    Ok(Json(agent_roster(&sessions, &last_seen, this_device, sync_listening, now_ms())))
+}
+
 async fn post_event(
     State(app): State<AppHandle>,
     headers: HeaderMap,
     Json(req): Json<EventRequest>,
 ) -> (StatusCode, Json<EventResponse>) {
-    // CSRF guard: block browser-originated requests. urllib / curl don't send
-    // Origin; browser XHRs do. "null" is allowed (file:// / data:).
-    if let Some(origin) = headers.get("origin") {
-        match origin.to_str() {
-            Ok("null") => {}
-            _ => return (StatusCode::FORBIDDEN, Json(EventResponse::default())),
-        }
+    if origin_blocked(&headers) {
+        return (StatusCode::FORBIDDEN, Json(EventResponse::default()));
     }
 
     let Some(state) = app.try_state::<AppState>() else {
@@ -408,6 +608,190 @@ async fn post_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn session(id: &str, status: Status, origin: Option<&str>, state_entered_at: i64) -> AgentSession {
+        AgentSession {
+            id: id.to_string(),
+            status,
+            status_before_working: Status::Idle,
+            label: "label".into(),
+            original_prompt: None,
+            task_started_at: 0,
+            dialog: Vec::new(),
+            source: "claude".into(),
+            model: None,
+            input_tokens: None,
+            updated: 0,
+            state_entered_at,
+            working_accumulated_ms: 0,
+            waiting_backstop_armed: false,
+            display_name: None,
+            origin: origin.map(str::to_string),
+            instruction_drift: false,
+            canary: crate::state::Canary::Off,
+        }
+    }
+
+    fn devices(entries: &[(&str, i64)]) -> BTreeMap<String, i64> {
+        entries.iter().map(|(d, seen)| (d.to_string(), *seen)).collect()
+    }
+
+    #[test]
+    fn a_local_row_reports_no_last_seen_age() {
+        // There is no sync channel behind a local row, so a `0` there would claim a
+        // freshness that means nothing. The field is absent instead.
+        let rows = agent_roster(&[session("transcripts", Status::Working, None, 900)], &devices(&[]), Some("air"), false, 1_000);
+        let row = &rows.agents[0];
+        assert!(row.local, "origin.is_none() is the authoritative local test");
+        assert_eq!(row.last_seen_age_ms, None, "a local row has no device push to age against");
+        assert_eq!(row.device.as_deref(), Some("air"), "a local row is attributed to this machine");
+        assert_eq!(row.status_age_ms, 100);
+    }
+
+    #[test]
+    fn a_remote_row_ages_against_its_devices_last_seen() {
+        // The freshness number comes from the *device's* last push, not from
+        // anything on the row — the row's own stamps are on the sender's clock.
+        let sessions = [session("chrome/transcripts", Status::Blocked, Some("chrome"), 763_500)];
+        let rows = agent_roster(&sessions, &devices(&[("chrome", 995_880)]), Some("air"), true, 1_000_000);
+        let row = &rows.agents[0];
+        assert_eq!(row.last_seen_age_ms, Some(4_120));
+        assert!(!row.local);
+        assert_eq!(row.status_age_ms, 236_500);
+    }
+
+    #[test]
+    fn a_stale_remote_row_is_still_listed_with_its_age() {
+        // Past the 90 s TTL but not yet reaped (the reaper ticks on the heartbeat
+        // period, so the drop lands 90-120 s after the last push). Report it with
+        // its age; hiding it, or turning the age into a verdict, is the caller's
+        // call to make and not ours.
+        let sessions = [session("chrome/transcripts", Status::Idle, Some("chrome"), 0)];
+        let rows = agent_roster(&sessions, &devices(&[("chrome", 870_000)]), Some("air"), true, 1_000_000);
+        assert_eq!(rows.agents.len(), 1, "a stale row is still a fact about the roster");
+        assert_eq!(rows.agents[0].last_seen_age_ms, Some(130_000));
+    }
+
+    #[test]
+    fn a_remote_row_whose_device_was_reaped_is_dropped() {
+        // The two-lock race: the session list and the device map are read
+        // separately, so a reap in between leaves a row with no freshness number.
+        // Emitting it would be exactly the unjudgeable "idle" this route exists to
+        // avoid.
+        let sessions = [
+            session("transcripts", Status::Working, None, 0),
+            session("chrome/transcripts", Status::Idle, Some("chrome"), 0),
+        ];
+        let rows = agent_roster(&sessions, &devices(&[]), Some("air"), true, 1_000);
+        assert_eq!(rows.agents.len(), 1, "the phantom remote row is dropped, the local one stays");
+        assert!(rows.agents[0].local);
+    }
+
+    #[test]
+    fn project_strips_the_device_prefix_by_origin_not_by_slash() {
+        // A device name may contain a slash, so splitting on the first one would
+        // hand back a project of "box/transcripts" and break the cross-machine
+        // comparison this field exists for.
+        let sessions = [
+            session("win/box/transcripts", Status::Done, Some("win/box"), 0),
+            session("tauri dashboard", Status::Working, None, 0),
+        ];
+        let rows = agent_roster(&sessions, &devices(&[("win/box", 1_000)]), Some("air"), true, 1_000);
+        assert_eq!(rows.agents[0].project, "transcripts");
+        assert_eq!(rows.agents[1].project, "tauri dashboard", "a local id is already de-namespaced");
+    }
+
+    #[test]
+    fn sender_clock_skew_cannot_produce_a_negative_age() {
+        // A remote row's `state_entered_at` is the sender's clock; a fast peer clock
+        // puts it in our future. Clamp rather than emit a negative age.
+        let sessions = [session("chrome/transcripts", Status::Working, Some("chrome"), 5_000)];
+        let rows = agent_roster(&sessions, &devices(&[("chrome", 1_100)]), Some("air"), true, 1_000);
+        assert_eq!(rows.agents[0].status_age_ms, 0);
+        assert_eq!(rows.agents[0].last_seen_age_ms, Some(0));
+    }
+
+    #[test]
+    fn no_peers_still_yields_both_arrays_and_the_local_rows() {
+        // Sync off. `peers: []` here means "this dashboard cannot receive rows",
+        // which is why `sync_listening` ships alongside it — the caller must not
+        // read the empty list as "the other machine has nothing". The flag itself
+        // is not asserted here: it is a pass-through parameter, sourced from the
+        // running listener (`sync::SyncListening`) rather than derived, so there
+        // is no predicate at this level that could be wrong.
+        let rows = agent_roster(&[session("transcripts", Status::Idle, None, 0)], &devices(&[]), Some("air"), false, 1_000);
+        assert!(rows.peers.is_empty());
+        assert!(!rows.sync_listening);
+        assert_eq!(rows.agents.len(), 1);
+    }
+
+    #[test]
+    fn a_peer_row_counts_the_sessions_attributed_to_it() {
+        // A live peer with zero sessions still appears — that is the only way to
+        // tell "up and idle" from "silent", and no row can express it.
+        let sessions = [
+            session("transcripts", Status::Working, None, 0),
+            session("chrome/transcripts", Status::Idle, Some("chrome"), 0),
+            session("chrome/whats next", Status::Done, Some("chrome"), 0),
+        ];
+        let rows = agent_roster(&sessions, &devices(&[("chrome", 900), ("mini", 500)]), Some("air"), true, 1_000);
+        assert_eq!(rows.peers.len(), 2);
+        assert_eq!(rows.peers[0].device, "chrome");
+        assert_eq!(rows.peers[0].sessions, 2, "local rows are not attributed to a peer");
+        assert_eq!(rows.peers[1].sessions, 0, "a live peer with no sessions is still a peer");
+        assert_eq!(rows.peers[1].last_seen_age_ms, 500);
+    }
+
+    #[test]
+    fn a_peer_sharing_this_devices_name_is_not_credited_with_local_rows() {
+        // `device_name` bootstraps from the hostname, so two boxes can genuinely
+        // carry the same name — and the repo's own localhost-observer sync setup
+        // makes this device its own peer on purpose. Matching a peer's rows by
+        // name alone folds every local session into its count, inflating a number
+        // the caller reads as "how much is over there".
+        let sessions = [
+            session("transcripts", Status::Working, None, 0),
+            session("air/whats next", Status::Idle, Some("air"), 0),
+        ];
+        let rows = agent_roster(&sessions, &devices(&[("air", 900)]), Some("air"), true, 1_000);
+        assert_eq!(rows.peers.len(), 1);
+        assert_eq!(rows.peers[0].sessions, 1, "only the remote row counts, not the local one sharing the name");
+    }
+
+    #[test]
+    fn an_unnamed_local_device_reports_null_rather_than_a_sentinel() {
+        // `sync.device_name` is bootstrapped from the hostname at startup, but a
+        // bypassed bootstrap must not invent a name: a stand-in like "local" could
+        // collide with a real peer's name and mis-attribute rows.
+        let rows = agent_roster(&[session("transcripts", Status::Idle, None, 0)], &devices(&[]), None, false, 1_000);
+        assert_eq!(rows.device, None);
+        assert_eq!(rows.agents[0].device, None);
+        assert!(rows.agents[0].local, "unnamed is still unambiguously local");
+    }
+
+    #[test]
+    fn origin_blocked_lets_the_hook_and_curl_through() {
+        // Neither sends an Origin header at all.
+        assert!(!origin_blocked(&HeaderMap::new()));
+    }
+
+    #[test]
+    fn origin_blocked_stops_a_browser_page_reading_the_roster() {
+        // The roster carries project names and labels, so a page the user has open
+        // is an exfiltration path even though the route mutates nothing.
+        let mut headers = HeaderMap::new();
+        headers.insert("origin", "http://evil.example".parse().unwrap());
+        assert!(origin_blocked(&headers));
+    }
+
+    #[test]
+    fn origin_blocked_allows_the_null_origin() {
+        // file:// and data: documents send "null"; the guard has always let them by.
+        let mut headers = HeaderMap::new();
+        headers.insert("origin", "null".parse().unwrap());
+        assert!(!origin_blocked(&headers));
+    }
+
 
     #[test]
     fn clear_permitted_when_the_owning_session_ends_it() {

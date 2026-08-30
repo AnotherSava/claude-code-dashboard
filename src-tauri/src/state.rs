@@ -259,6 +259,18 @@ impl AppState {
         self.remote.lock().unwrap().values().flat_map(|d| d.sessions.iter().cloned()).collect()
     }
 
+    /// Device name → the receiver-clock ms of that device's last push. Exists
+    /// because freshness lives on the *device*, not on [`AgentSession`], so a
+    /// caller holding a merged session list has no way to reach it — the
+    /// `/api/agents` roster needs both and gets them from two accessors.
+    ///
+    /// It is not an optimization: the roster's other half is `resolved_snapshot`,
+    /// which does clone every session including its dialog. Saying otherwise
+    /// here would misdescribe the only path that calls this.
+    pub fn remote_last_seen(&self) -> BTreeMap<String, i64> {
+        self.remote.lock().unwrap().iter().map(|(device, d)| (device.clone(), d.last_seen)).collect()
+    }
+
     /// Drop remote devices not heard from within `ttl_ms`. Returns `true`
     /// when anything was dropped (caller re-emits).
     pub fn reap_remote(&self, now_ms: i64, ttl_ms: i64) -> bool {

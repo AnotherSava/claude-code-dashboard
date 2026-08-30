@@ -33,6 +33,8 @@
 //! practice) and every route requires the shared bearer token; with no token
 //! configured sync is fully disabled — never run unauthenticated.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use axum::{
     extract::{ConnectInfo, Query, State},
     http::{HeaderMap, StatusCode},
@@ -324,16 +326,44 @@ async fn get_tokens(
 }
 
 /// Sync listener on all interfaces — see module docs for why that's safe.
+/// Whether a sync listener is actually bound and serving right now.
+///
+/// Deliberately *not* re-derived from config by its readers. The config
+/// predicate and the running listener disagree in three reachable ways: an
+/// empty-string token passes `token.is_some()` while `lib.rs` refuses to start
+/// on it, `sync.listen` hot-reloads through `config_watcher` while the listener
+/// is start-only, and the bind below can simply fail on a taken port. Every one
+/// of those makes config say "listening" while nothing is bound — and
+/// `/api/agents` reports this to a caller that reads an empty `peers` as "the
+/// other machine has nothing", which is the exact over-claim that route exists
+/// to avoid. So the flag records the outcome, set at the one place that knows it.
+#[derive(Debug, Default)]
+pub struct SyncListening(pub AtomicBool);
+
+impl SyncListening {
+    pub fn get(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+    fn set(app: &AppHandle, v: bool) {
+        if let Some(f) = app.try_state::<SyncListening>() {
+            f.0.store(v, Ordering::Relaxed);
+        }
+    }
+}
+
 pub async fn run_listener(app: AppHandle, port: u16) {
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     let listener = match tokio::net::TcpListener::bind(addr).await {
         Ok(l) => l,
         Err(e) => {
             tracing::error!(%addr, error = %e, "sync bind failed");
+            SyncListening::set(&app, false);
             return;
         }
     };
     tracing::info!(%addr, "sync listening");
+    SyncListening::set(&app, true);
+    let app_for_flag = app.clone();
 
     let router = Router::new()
         .route("/api/sync", post(post_sync))
@@ -345,6 +375,7 @@ pub async fn run_listener(app: AppHandle, port: u16) {
     if let Err(e) = axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>()).await {
         tracing::error!(error = %e, "sync serve ended");
     }
+    SyncListening::set(&app_for_flag, false);
 }
 
 /// Local usage samples newer than `since`, ascending (the store already

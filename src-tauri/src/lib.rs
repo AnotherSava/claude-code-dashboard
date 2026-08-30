@@ -140,6 +140,7 @@ pub fn run() {
         .manage(nonce_store::NonceStore::new())
         .manage(lid_awake::LidAwakeState::default())
         .manage(sync::SyncDirty(std::sync::Arc::new(tokio::sync::Notify::new())))
+        .manage(sync::SyncListening::default())
         .invoke_handler(tauri::generate_handler![
             commands::get_sessions,
             commands::get_config,

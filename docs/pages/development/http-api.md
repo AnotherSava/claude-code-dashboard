@@ -5,7 +5,7 @@ parent: Development
 nav_order: 4
 ---
 
-The widget listens on `http://127.0.0.1:9077` (default) for lifecycle events from external agents. One endpoint, one envelope shape, adapter-dispatched on the server side.
+The widget listens on `http://127.0.0.1:9077` (default) for lifecycle events from external agents. One write endpoint, one envelope shape, adapter-dispatched on the server side — plus a read-only [agent roster](#agent-roster) an agent can query to see what is running, here and on the user's other machines.
 
 A second, separate listener serves the [multi-device sync](#sync-api) API when enabled — the hook API below stays loopback-only and unauthenticated regardless.
 
@@ -42,6 +42,63 @@ The widget listens on `server_port` from `config.json` (default 9077). The Claud
 ## Adding a new client
 
 Writing a new adapter is a ~100 LOC pure Rust function: `src-tauri/src/adapters/<your_client>.rs` exposing `dispatch(event, payload, cfg) -> AdapterOutput`, plus a match arm in `adapters::dispatch`. See `src-tauri/src/adapters/claude.rs` for the reference implementation. No HTTP layer changes — the envelope already carries `client` as the discriminator.
+
+## Agent roster
+
+`GET /api/agents` — the sessions this dashboard tracks, on this machine *and* synced from peers, as one merged list. It exists because Claude Code's own session listing sees only the local machine; the dashboard already merges both worlds, so it can answer "does a session for project X exist, on which machine, in what state, and how fresh is that answer?" without reaching the other box.
+
+Read-only: it mutates nothing, emits no event, writes no `decision` line, and takes no query parameters. Same loopback bind and same `Origin` guard as `POST /api/event` — `403` for a real browser origin, `500` if the app's state isn't up yet. Like `server_port` itself, the route is wired once at startup, so a new build needs an app restart before it answers.
+
+```json
+{
+  "device": "air",
+  "sync_listening": true,
+  "peers": [ { "device": "chrome", "last_seen_age_ms": 4120, "sessions": 2 } ],
+  "agents": [
+    {
+      "id": "tauri dashboard",
+      "project": "tauri dashboard",
+      "device": "air",
+      "local": true,
+      "status": "working",
+      "label": "add the /api/agents route",
+      "status_age_ms": 18400
+    },
+    {
+      "id": "chrome/transcripts",
+      "project": "transcripts",
+      "device": "chrome",
+      "local": false,
+      "display_name": "transcripts (win)",
+      "status": "blocked",
+      "label": "Should I drop the legacy column?",
+      "status_age_ms": 236500,
+      "last_seen_age_ms": 4120
+    }
+  ]
+}
+```
+
+- `device` — the machine being queried, so one merged roster is self-describing. `null`, never a stand-in name, when `sync.device_name` was never bootstrapped.
+- `sync_listening` — whether a sync listener is actually bound and serving right now. Deliberately the *running* state rather than the config that was meant to produce it: an empty-string token, a `sync.listen` toggled after startup, and a failed bind each leave the config saying yes while nothing listens. When `false`, an empty `peers` says nothing about the other machine; don't read it as "no sessions there".
+- `peers[]` — one entry per synced device, whether or not it currently has rows. This is the only place a live-but-idle machine can appear, which is what separates "the peer is up and has nothing for project X" from "the peer has said nothing in 80 s".
+- `id` — the dashboard-canonical id, namespaced exactly as everything else here addresses a row (`chrome/transcripts`).
+- `project` — the same id with the device prefix stripped (identical to `id` for a local row). Chat ids are derived from the cwd with backslashes normalized and the projects root removed, so one project yields the same string on macOS and on Windows — this is the field to compare across machines.
+- `device` / `local` — which machine the session runs on, and the authoritative local test. Kept separate because `device` can be `null` for an unnamed local box.
+- `display_name` — omitted rather than `null` when unset, so a caller falls back to `id` exactly as the app does.
+- `status` — `idle` / `working` / `waiting` / `blocked` / `error` / `done`, the same values [Classification](classification) assigns.
+- `label` — the "what is it doing" line the dashboard row itself shows.
+- `status_age_ms` — time in the current status. Both arrays are always present and never `null`.
+
+### Judging staleness
+
+Every time in this body is an **age**, never a timestamp: a remote row's stamps come off the sender's clock, so an absolute time would need clock agreement the two machines don't have, while every question a caller actually has is "how old is this".
+
+A peer pushes on every state change (coalesced 300 ms) and at worst every 30 s as a heartbeat; the receiver drops a device that has been silent past a 90 s TTL, checked on that same 30 s tick — so the drop lands 90–120 s after the last push. In between, that device's rows sit in the roster with their last-pushed status **frozen**. A peer that closed its lid keeps reading `working`, and a bare `idle` is indistinguishable from a dead machine's last words.
+
+`last_seen_age_ms` is the number to judge on. It is measured on the receiver's clock at both ends, so it carries no skew — unlike `status_age_ms`, which for a remote row is the sender's arithmetic and is only clamped at zero. A few seconds means the row was pushed on a live connection; anything past ~35 s means at least one heartbeat went missing. It is omitted for local rows, where a `0` would claim freshness on a channel that doesn't exist.
+
+The route deliberately returns **facts, not a verdict**. There is no `deliverable` / `sendable` boolean: a green light computed from data that may be 90 s old would state as certain something that isn't, and the caller — which knows what it wants to do with the answer — is the one that should weigh the age. There is likewise no user-presence or idle time: a message to a peer agent starts a turn in it whether or not a human is watching that screen, so presence changes no decision.
 
 ## Sync API
 

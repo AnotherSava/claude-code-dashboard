@@ -15,7 +15,7 @@ use tauri::{AppHandle, Emitter, Manager, State, WebviewWindow};
 /// local and synced-from-peers worlds combine — remote rows get the overlay
 /// too (keyed by their namespaced "{device}/{id}"), so renaming a remote row
 /// works and stays a local-only decoration.
-fn resolved_snapshot(app: &AppHandle) -> Vec<AgentSession> {
+pub(crate) fn resolved_snapshot(app: &AppHandle) -> Vec<AgentSession> {
     let Some(state) = app.try_state::<AppState>() else {
         return Vec::new();
     };
