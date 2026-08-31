@@ -53,7 +53,8 @@
 - [Context-% features need watcher-resolved tokens](context_percent_tokens_watcher_only.md) — input_tokens is watcher-only (None post-restart, can't be faked via hooks); config reload doesn't re-sync terminal titles
 - [Background-task kill is silent](background-task-kill-is-silent.md) — a user-killed bg task (dev server) fires no hook and writes nothing to the transcript; WAIT can't self-clear → waiting_settle backstop
 - [Measure background-task duration](measure-background-task-duration.md) — task-notification ts is flush-time not completion; use the output-file mtime; finite shell tasks + subagents cap ~9 min
-- [Indicators must not over-claim certainty](feedback_indicator_certainty.md) — green/"healthy" needs confirmed evidence (canary `seen` bit); unconfirmed → distinct pending color, never green (false +) nor off (false −)
 - [Context-window map needs generation updates](context_window_map_needs_generation_updates.md) — Claude 5 gen (opus/sonnet/fable) defaults to 1M, not a beta opt-in like 4.x; add specific keys, don't broaden prefixes
 - [Homebrew tap distribution](homebrew_tap_distribution.md) — macOS also ships via AnotherSava/homebrew-tap; cask strips quarantine on purpose, zap path UNTESTED and can disable sleep, never `brew audit --new`
 - [agterm status co-existence](agterm_status_coexistence.md) — dashboard owns status in agterm (glyph can't express WAIT/ERROR); agterm-side mechanics in learnings/agterm.md
+- [CLAUDE.md is one 75k-char line](claude_md_single_line_merge.md) — cross-machine edits always conflict; never resolve markers, stash + ff + re-apply edits onto the pulled text
+- [Verify a relayed message's target](verify_peer_message_delivery.md) — `peer_write` logs a pid, not an agent; map it via `~/.claude/sessions/<pid>.json` to see which session got the bytes
