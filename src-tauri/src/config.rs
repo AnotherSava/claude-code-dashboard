@@ -331,6 +331,22 @@ pub struct SyncConfig {
     /// `token`: it is an additional gate, never a replacement for them.
     #[serde(default)]
     pub accept_messages: bool,
+    /// `device_name` → Tailscale node name, binding a name this dashboard
+    /// *addresses* to a machine Tailscale can *identify*.
+    ///
+    /// It has to live here, in local config on the receiver, rather than ride
+    /// the wire: a sender controls every field of its own envelope, so a hostile
+    /// node would claim `device_name = "CHROME"` beside its own truthful node
+    /// name and attest itself. An out-of-band binding is what makes the check
+    /// non-circular.
+    ///
+    /// Empty by default, and an unlisted device is `Claimed` rather than
+    /// refused — see `tailnet::attest`. The names genuinely differ in practice
+    /// (`CHROME` against node `chrome`, `Some-Laptop.local` against node
+    /// `some-laptop`), which is why this is explicit config and not a
+    /// derivation.
+    #[serde(default)]
+    pub peer_identity: std::collections::BTreeMap<String, String>,
 }
 
 impl Default for SyncConfig {
@@ -343,6 +359,7 @@ impl Default for SyncConfig {
             peers: Vec::new(),
             token: None,
             accept_messages: false,
+            peer_identity: std::collections::BTreeMap::new(),
         }
     }
 }

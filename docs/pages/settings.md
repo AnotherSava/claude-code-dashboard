@@ -96,7 +96,8 @@ Every field is optional — omit one and the built-in default applies. A complet
     "bind_scope": "tailnet",
     "peers": [],
     "token": null,
-    "accept_messages": false
+    "accept_messages": false,
+    "peer_identity": {}
   },
   "server_port": 9077
 }
@@ -213,6 +214,13 @@ The `sync` block shows sessions from your other computers — see [Features → 
 - `listen_port` — port the sync listener uses (peers connect here). Also restart-required.
 - `bind_scope` — how far the listener opens up. `"tailnet"` (the default) keeps it on your Tailscale network and your own computer, and turns away anything else; `"any"` opens it to every network this computer is on, leaving the `token` as the only protection — use it only if your devices reach each other some other way. Also restart-required. On `"tailnet"`, if Tailscale isn't running when the widget starts, the listener still comes up on all networks and says so in the log, and it still turns away anything that isn't on your tailnet; start Tailscale first, or restart the widget afterwards, to get the narrower setup back.
 - `accept_messages` — whether this device accepts *messages* relayed from another device's agents, which start a turn in the named local session. **Off by default, and separate from `listen` on purpose:** turning sync on buys a read-only view of what your sessions are doing, while this lets the shared password start prompts running inside them. Leaving it folded into `listen` would widen an existing setup the moment the widget updated, without you choosing it. Both devices need it on for messages to flow in that direction; a device with it off still syncs state normally and answers a relayed message with a refusal saying so.
+- `peer_identity` — which Tailscale machine each of your other devices actually is, written as `{"CHROME": "chrome"}`: the name on the left is the other device's `device_name`, the one on the right is its name on your Tailscale network. Empty by default.
+
+  Without it, the widget takes another device's word for who it is. The shared `token` can't settle that — every device uses the same one, so it proves *somebody with the password* is calling, not *which computer*. With a binding written, the widget asks Tailscale which machine the connection actually came from and turns away anything that doesn't match, so nothing can push sessions onto your laptop's name by claiming it.
+
+  You need it on both devices, each naming the other. The two names are usually *not* the same — a Mac may call itself `Some-Laptop.local` while Tailscale knows it as `some-laptop` — which is why it is written down rather than guessed. Find the Tailscale name with `tailscale status` (on macOS the command lives inside the app: `/Applications/Tailscale.app/Contents/MacOS/Tailscale status`).
+
+  A device you leave out isn't blocked, just unchecked. The widget shows which is which: `/api/agents` reports each peer as `attested` or `claimed`.
 - `peers` — addresses of the other devices' sync listeners, e.g. `["http://my-laptop:9078"]`.
 - `token` — a shared secret, the same string on every device; pushes without it are rejected. Sync stays fully off while it's `null`.
 

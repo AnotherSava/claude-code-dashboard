@@ -75,7 +75,7 @@ use tokio::task::JoinSet;
 
 use crate::commands::{emit_sessions_updated_remote, emit_usage_limits_updated, now_ms};
 use crate::config::{ConfigState, SyncBindScope};
-use crate::peer_message::{claim_header, deliver_to_inbox, from_id, MessageDedupe, Outcome, Receipt};
+use crate::peer_message::{build_content, deliver_to_inbox, from_id, MessageDedupe, Outcome, Receipt, Relayed};
 use crate::remote_history::RemoteHistoryStore;
 use crate::session_registry::InboxLookup;
 use crate::remote_usage::RemoteUsageStore;
@@ -112,6 +112,49 @@ pub struct SyncPush {
     /// older build parseable; it simply advertises 0 and contributes nothing.
     #[serde(default)]
     pub token_tip: u64,
+    /// Live local sessions from Claude Code's own registry — the *second*
+    /// session source, mirrored across the wire so a peer's roster can see
+    /// them.
+    ///
+    /// Without this, discovery is strictly narrower than delivery, which is the
+    /// wrong way round and cost a real message: on 2026-08-30 a live session was
+    /// absent from `/api/agents` while the relay could reach it perfectly well,
+    /// because `agent_roster` unions the registry for *this* machine only. An
+    /// agent following the documented "check the roster first" concludes the
+    /// target is gone.
+    ///
+    /// `None` means "this device has no registry answer", which covers both an
+    /// unreadable registry and a peer old enough not to send the field. Those
+    /// are the same fact for the receiver — no answer — so collapsing them
+    /// over-claims nothing.
+    #[serde(default)]
+    pub registry_sessions: Option<Vec<RegistrySync>>,
+}
+
+/// One live session from a peer's Claude Code registry.
+///
+/// Carries no `status` or `label`, because the registry has neither: it knows
+/// `idle`/`busy` only, which cannot express `blocked`, `waiting` or `error`.
+/// That is why these stay a separate array all the way through rather than
+/// being folded into `sessions` — see `http_server::RegistryRow`.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct RegistrySync {
+    /// The sender's cwd-derived id, *not* namespaced — the receiver stamps its
+    /// own device prefix, exactly as it does for `SessionSync`.
+    pub chat_id: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    pub activity: crate::session_registry::Activity,
+    /// Age of the activity reading **as measured by the sender at push time**.
+    ///
+    /// A duration rather than the absolute stamp `AgentSession` ships, and this
+    /// one is the better shape: the receiver reports `age_at_push + (now -
+    /// last_seen)`, which is two durations added, so it needs no clock agreement
+    /// and carries **no skew at all**. `AgentRow::status_age_ms` has to document
+    /// a skew it cannot remove; this does not.
+    #[serde(default)]
+    pub activity_age_ms: Option<i64>,
+    pub sessions: usize,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -172,6 +215,27 @@ pub struct MessageEnvelope {
     pub from_label: Option<String>,
     #[serde(default)]
     pub text: String,
+    /// The exact `{device}/{project}` address a reply goes to, minted by the
+    /// sending dashboard in `http_server::post_message` — the only place holding
+    /// both halves *exactly*.
+    ///
+    /// **Carried rather than derived**, and that is the whole point of the
+    /// field. The obvious alternative is for the receiver to reconstruct it from
+    /// the frame's `from` (`did:ccdash-{device}-{agent}`), which is impossible:
+    /// `peer_message::from_id` lowercases and collapses both halves to
+    /// `[a-z0-9-]`, while `peer_message::resolve_message_target` compares
+    /// exactly, deliberately. `Some-Laptop.local` arrives as
+    /// `some-laptop-local` and project `tauri dashboard` as
+    /// `tauri-dashboard`; neither round-trips. A receiver that derived an
+    /// address would produce a confident wrong one.
+    #[serde(default)]
+    pub reply_to: Option<String>,
+    /// The `message_id` this message answers, when it is a reply. Rendered into
+    /// the envelope and otherwise **inert** — nothing here branches on it. It
+    /// exists so two overlapping exchanges with one session are distinguishable
+    /// by the agents, not so the dashboard can match them up.
+    #[serde(default)]
+    pub in_reply_to: Option<String>,
 }
 
 /// One dialog range the receiver decided it is missing: `since` is its newest
@@ -334,6 +398,8 @@ fn source_allowed(scope: SyncBindScope, ip: IpAddr) -> bool {
 fn ingest(
     device: &str,
     sessions: Vec<SessionSync>,
+    registry_sessions: Option<Vec<RegistrySync>>,
+    identity: crate::tailnet::Attestation,
     prev: Option<&RemoteDevice>,
     persisted: &HashMap<String, Vec<DialogEntry>>,
     now: i64,
@@ -361,7 +427,7 @@ fn ingest(
         s.dialog = dialog;
         out.push(s);
     }
-    (RemoteDevice { sessions: out, last_seen: now, origin_addr }, pulls)
+    (RemoteDevice { sessions: out, last_seen: now, origin_addr, registry_sessions, identity }, pulls)
 }
 
 /// Auth and source scope are already settled by [`guard`]; this handler only
@@ -369,7 +435,7 @@ fn ingest(
 async fn post_sync(
     State(app): State<AppHandle>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    Json(push): Json<SyncPush>,
+    Json(mut push): Json<SyncPush>,
 ) -> Result<StatusCode, StatusCode> {
     let Some(cfg_state) = app.try_state::<ConfigState>() else {
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
@@ -381,6 +447,20 @@ async fn post_sync(
     if push.device_name.is_empty() || push.device_name == cfg.sync.device_name {
         tracing::warn!(device = %push.device_name, "sync push rejected: empty or same device_name as ours");
         return Err(StatusCode::BAD_REQUEST);
+    }
+    // The same check the message route makes, and it belongs here for a reason
+    // that has nothing to do with messaging: `device_name` decides which device's
+    // rows these become, and it is a field the sender picks. Any token-holder
+    // could therefore push sessions attributed to the user's own laptop. Only a
+    // binding that is *contradicted* refuses; an unbound device stays `Claimed`,
+    // which is exactly today's behaviour.
+    let identity = match app.try_state::<crate::tailnet::TailnetResolver>() {
+        Some(r) => r.attest_peer(addr.ip(), &push.device_name, &cfg.sync.peer_identity).0,
+        None => crate::tailnet::Attestation::Claimed,
+    };
+    if identity == crate::tailnet::Attestation::Mismatch {
+        tracing::warn!(device = %push.device_name, peer_ip = %addr.ip(), "sync push rejected: device is bound to a different Tailscale node");
+        return Err(StatusCode::FORBIDDEN);
     }
     tracing::debug!(
         device = %push.device_name,
@@ -394,10 +474,11 @@ async fn post_sync(
     let usage_tip = push.usage_tip;
     let token_tip = push.token_tip;
     let device_name = push.device_name.clone();
+    let registry_sessions = push.registry_sessions.take();
     let pulls = {
         let mut remote = state.remote.lock().unwrap();
         let prev = remote.get(&push.device_name);
-        let (device, pulls) = ingest(&push.device_name, push.sessions, prev, &persisted, now, origin_addr.clone());
+        let (device, pulls) = ingest(&push.device_name, push.sessions, registry_sessions, identity, prev, &persisted, now, origin_addr.clone());
         remote.insert(push.device_name.clone(), device);
         pulls
     };
@@ -564,6 +645,29 @@ async fn post_message(
     let cfg = cfg_state.snapshot();
     let now = now_ms();
 
+    // Ask Tailscale which machine this actually came from, rather than believing
+    // `origin_device`. The token cannot answer this — it is one shared secret
+    // for the fleet, so it proves a token-holder and not a machine.
+    //
+    // Only a *contradicted* claim refuses. No answer, or no configured binding,
+    // is `Claimed`: that is today's behaviour, and refusing there would break
+    // every deployment that has not written a `peer_identity` map yet — which,
+    // on the day this ships, is all of them.
+    let (attestation, peer_id) = match app.try_state::<crate::tailnet::TailnetResolver>() {
+        Some(r) => r.attest_peer(peer.ip(), &env.origin_device, &cfg.sync.peer_identity),
+        None => (crate::tailnet::Attestation::Claimed, None),
+    };
+    if attestation == crate::tailnet::Attestation::Mismatch {
+        return refuse(
+            "device_mismatch",
+            StatusCode::FORBIDDEN,
+            Some(format!(
+                "claimed device \"{}\" is bound to a different Tailscale node than the one this connection came from",
+                env.origin_device
+            )),
+        );
+    }
+
     let inbox = registry.inbox_for(&env.target_project, cfg.projects_root.as_deref(), now);
     let (pid, socket_path) = match inbox {
         InboxLookup::Found { pid, socket_path } => (pid, socket_path),
@@ -587,7 +691,20 @@ async fn post_message(
         return (StatusCode::OK, Json(receipt(Outcome::Duplicate)));
     }
 
-    let content = format!("{}{}", claim_header(&env.origin_device, &env.from_agent, env.from_label.as_deref()), env.text);
+    // The reply port is *this* machine's dashboard: a reply is POSTed by the
+    // receiving agent to its own loopback, which is here.
+    let content = build_content(&Relayed {
+        origin_device: &env.origin_device,
+        from_agent: &env.from_agent,
+        from_label: env.from_label.as_deref(),
+        text: &env.text,
+        reply_to: env.reply_to.as_deref(),
+        message_id: &env.message_id,
+        in_reply_to: env.in_reply_to.as_deref(),
+        reply_port: cfg.server_port,
+        attestation,
+        tailnet_user: peer_id.as_ref().and_then(|p| p.user.as_deref()),
+    });
     let from = from_id(&env.origin_device, &env.from_agent);
     // Connecting, reading the key file and writing all block. Off the async
     // workers rather than accepted inline (as `get_agents`' registry read is):
@@ -1042,7 +1159,14 @@ fn usage_since(records: &[UsageHistoryRecord], since: i64) -> Vec<UsageHistoryRe
 /// bookkeeping to go stale, no backlog to chunk, and a failed push costs
 /// nothing but a retry. Content moves on the pull side, where the party that
 /// knows what it is missing does the asking.
-fn build_push(device_name: &str, listen_port: u16, sessions: &[AgentSession], usage_tip: i64, token_tip: u64) -> SyncPush {
+fn build_push(
+    device_name: &str,
+    listen_port: u16,
+    sessions: &[AgentSession],
+    usage_tip: i64,
+    token_tip: u64,
+    registry: Option<&[crate::session_registry::LiveSession]>,
+) -> SyncPush {
     SyncPush {
         device_name: device_name.to_string(),
         listen_port,
@@ -1057,6 +1181,21 @@ fn build_push(device_name: &str, listen_port: u16, sessions: &[AgentSession], us
             .collect(),
         usage_tip,
         token_tip,
+        // `None` stays `None` all the way to the peer's roster: an unreadable
+        // registry must not arrive as an empty one, which would read as "that
+        // machine has no live sessions" — the exact absence-that-was-never-
+        // established this whole path exists to avoid.
+        registry_sessions: registry.map(|regs| {
+            regs.iter()
+                .map(|s| RegistrySync {
+                    chat_id: s.chat_id.clone(),
+                    name: s.name.clone(),
+                    activity: s.activity,
+                    activity_age_ms: s.activity_age_ms,
+                    sessions: s.sessions,
+                })
+                .collect()
+        }),
     }
 }
 
@@ -1084,7 +1223,12 @@ async fn push_all(app: &AppHandle, client: &reqwest::Client) {
         .try_state::<crate::token_history::TokenHistoryStore>()
         .and_then(|s| s.newest_seq())
         .unwrap_or(0);
-    let push = build_push(&cfg.sync.device_name, cfg.sync.listen_port, &sessions, usage_tip, token_tip);
+    // Same 5 s cache `/api/agents` and message delivery read, so a push costs no
+    // extra directory read and the three cannot disagree about what is live.
+    let registry = app
+        .try_state::<crate::session_registry::SessionRegistry>()
+        .and_then(|r| r.live_sessions(cfg.projects_root.as_deref(), now_ms()));
+    let push = build_push(&cfg.sync.device_name, cfg.sync.listen_port, &sessions, usage_tip, token_tip, registry.as_deref());
     // Cycle breadcrumb: push cadence should never silently stop while peers
     // are configured — if the failure logs go quiet, this shows whether the
     // pusher loop itself is still alive.
@@ -1466,7 +1610,7 @@ mod tests {
 
     #[test]
     fn ingest_namespaces_and_stamps_origin() {
-        let (dev, _) = ingest("laptop", vec![push_item("proj", 0)], None, &no_persisted(), 100, "http://1.2.3.4:9078".into());
+        let (dev, _) = ingest("laptop", vec![push_item("proj", 0)], None, crate::tailnet::Attestation::Claimed, None, &no_persisted(), 100, "http://1.2.3.4:9078".into());
         assert_eq!(dev.sessions.len(), 1);
         assert_eq!(dev.sessions[0].id, "laptop/proj");
         assert_eq!(dev.sessions[0].origin.as_deref(), Some("laptop"));
@@ -1478,13 +1622,13 @@ mod tests {
     fn ingest_requests_the_range_above_what_is_held() {
         let mut persisted = HashMap::new();
         persisted.insert("laptop/proj".to_string(), vec![entry(DialogRole::User, "held", 10)]);
-        let (_dev, pulls) = ingest("laptop", vec![push_item("proj", 70)], None, &persisted, 100, String::new());
+        let (_dev, pulls) = ingest("laptop", vec![push_item("proj", 70)], None, crate::tailnet::Attestation::Claimed, None, &persisted, 100, String::new());
         assert_eq!(pulls, vec![DialogPull { raw_id: "proj".into(), since: 10 }]);
     }
 
     #[test]
     fn ingest_requests_everything_when_nothing_is_held() {
-        let (_dev, pulls) = ingest("laptop", vec![push_item("proj", 70)], None, &no_persisted(), 100, String::new());
+        let (_dev, pulls) = ingest("laptop", vec![push_item("proj", 70)], None, crate::tailnet::Attestation::Claimed, None, &no_persisted(), 100, String::new());
         assert_eq!(pulls, vec![DialogPull { raw_id: "proj".into(), since: 0 }], "since 0 is the complete dialog");
     }
 
@@ -1492,17 +1636,17 @@ mod tests {
     fn ingest_requests_nothing_when_caught_up() {
         let mut persisted = HashMap::new();
         persisted.insert("laptop/proj".to_string(), vec![entry(DialogRole::Assistant, "a", 70)]);
-        let (_dev, pulls) = ingest("laptop", vec![push_item("proj", 70)], None, &persisted, 100, String::new());
+        let (_dev, pulls) = ingest("laptop", vec![push_item("proj", 70)], None, crate::tailnet::Attestation::Claimed, None, &persisted, 100, String::new());
         assert!(pulls.is_empty(), "tip equal to held needs no fetch — this is the steady state");
     }
 
     #[test]
     fn ingest_carries_held_dialog_across_the_metadata_replace() {
-        let (first, _) = ingest("laptop", vec![push_item("proj", 0)], None, &no_persisted(), 100, String::new());
+        let (first, _) = ingest("laptop", vec![push_item("proj", 0)], None, crate::tailnet::Attestation::Claimed, None, &no_persisted(), 100, String::new());
         let mut seeded = first;
         seeded.sessions[0].dialog = vec![entry(DialogRole::User, "u1", 10)];
         // A later metadata-only push must not wipe the dialog we accumulated.
-        let (second, pulls) = ingest("laptop", vec![push_item("proj", 10)], Some(&seeded), &no_persisted(), 200, String::new());
+        let (second, pulls) = ingest("laptop", vec![push_item("proj", 10)], None, crate::tailnet::Attestation::Claimed, Some(&seeded), &no_persisted(), 200, String::new());
         assert_eq!(second.sessions[0].dialog.len(), 1);
         assert_eq!(second.sessions[0].dialog[0].text, "u1");
         assert!(pulls.is_empty());
@@ -1512,7 +1656,7 @@ mod tests {
     fn ingest_seeds_dialog_from_persisted_when_no_prev() {
         let mut persisted = HashMap::new();
         persisted.insert("laptop/proj".to_string(), vec![entry(DialogRole::User, "old", 10)]);
-        let (dev, _) = ingest("laptop", vec![push_item("proj", 10)], None, &persisted, 100, String::new());
+        let (dev, _) = ingest("laptop", vec![push_item("proj", 10)], None, crate::tailnet::Attestation::Claimed, None, &persisted, 100, String::new());
         assert_eq!(dev.sessions[0].dialog.len(), 1, "disk dialog restored after a restart");
         assert_eq!(dev.sessions[0].dialog[0].text, "old");
     }
@@ -1521,18 +1665,18 @@ mod tests {
     fn ingest_prefers_in_memory_dialog_over_persisted() {
         let mut persisted = HashMap::new();
         persisted.insert("laptop/proj".to_string(), vec![entry(DialogRole::User, "stale-disk", 10)]);
-        let (first, _) = ingest("laptop", vec![push_item("proj", 0)], None, &no_persisted(), 100, String::new());
+        let (first, _) = ingest("laptop", vec![push_item("proj", 0)], None, crate::tailnet::Attestation::Claimed, None, &no_persisted(), 100, String::new());
         let mut seeded = first;
         seeded.sessions[0].dialog = vec![entry(DialogRole::User, "live", 30)];
-        let (second, _) = ingest("laptop", vec![push_item("proj", 30)], Some(&seeded), &persisted, 200, String::new());
+        let (second, _) = ingest("laptop", vec![push_item("proj", 30)], None, crate::tailnet::Attestation::Claimed, Some(&seeded), &persisted, 200, String::new());
         assert_eq!(second.sessions[0].dialog.len(), 1, "accumulated in-memory dialog wins");
         assert_eq!(second.sessions[0].dialog[0].text, "live");
     }
 
     #[test]
     fn ingest_drops_sessions_absent_from_snapshot() {
-        let (first, _) = ingest("laptop", vec![push_item("alive", 0), push_item("gone", 0)], None, &no_persisted(), 100, String::new());
-        let (second, _) = ingest("laptop", vec![push_item("alive", 0)], Some(&first), &no_persisted(), 200, String::new());
+        let (first, _) = ingest("laptop", vec![push_item("alive", 0), push_item("gone", 0)], None, crate::tailnet::Attestation::Claimed, None, &no_persisted(), 100, String::new());
+        let (second, _) = ingest("laptop", vec![push_item("alive", 0)], None, crate::tailnet::Attestation::Claimed, Some(&first), &no_persisted(), 200, String::new());
         assert_eq!(second.sessions.len(), 1);
         assert_eq!(second.sessions[0].id, "laptop/alive");
     }
@@ -1541,7 +1685,7 @@ mod tests {
     fn ingest_clears_display_name_from_sender() {
         let mut item = push_item("proj", 0);
         item.session.display_name = Some("sender name".into());
-        let (dev, _) = ingest("laptop", vec![item], None, &no_persisted(), 100, String::new());
+        let (dev, _) = ingest("laptop", vec![item], None, crate::tailnet::Attestation::Claimed, None, &no_persisted(), 100, String::new());
         assert_eq!(dev.sessions[0].display_name, None, "receiver's custom names win");
     }
 
@@ -1553,13 +1697,71 @@ mod tests {
             "proj",
             vec![entry(DialogRole::User, "old", 10), entry(DialogRole::User, "new", 100)],
         )];
-        let push = build_push("desktop", 9078, &sessions, 4242, 77);
+        let push = build_push("desktop", 9078, &sessions, 4242, 77, None);
         assert_eq!(push.device_name, "desktop");
         assert_eq!(push.listen_port, 9078);
         assert!(push.sessions[0].session.dialog.is_empty(), "no dialog content on the wire");
         assert_eq!(push.sessions[0].dialog_tip, 100, "tip is our newest entry");
         assert_eq!(push.usage_tip, 4242);
         assert_eq!(push.token_tip, 77, "token tip is a seq, advertised alongside the usage timestamp");
+    }
+
+    /// Registry rows ride the push so a peer's roster can see sessions the hook
+    /// stream never reported. Without this, discovery is narrower than delivery.
+    #[test]
+    fn build_push_carries_the_registry_and_preserves_no_answer() {
+        let regs = vec![crate::session_registry::LiveSession {
+            chat_id: "transcripts".into(),
+            name: Some("transcripts-87".into()),
+            activity: crate::session_registry::Activity::Busy,
+            activity_age_ms: Some(1_500),
+            sessions: 2,
+            session_ids: vec!["abc".into()],
+        }];
+        let push = build_push("desktop", 9078, &[], 0, 0, Some(&regs));
+        let rows = push.registry_sessions.expect("registry rows ride the push");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].chat_id, "transcripts", "un-namespaced; the receiver stamps its own prefix");
+        assert_eq!(rows[0].activity, crate::session_registry::Activity::Busy);
+        assert_eq!(rows[0].activity_age_ms, Some(1_500));
+        assert_eq!(rows[0].sessions, 2);
+
+        // An unreadable registry must stay `None` all the way across, or the
+        // peer reads "that machine is running nothing" from our failure to look.
+        assert!(build_push("desktop", 9078, &[], 0, 0, None).registry_sessions.is_none());
+    }
+
+    #[test]
+    fn ingest_stores_the_registry_rows_verbatim() {
+        let rows = vec![RegistrySync {
+            chat_id: "transcripts".into(),
+            name: None,
+            activity: crate::session_registry::Activity::Idle,
+            activity_age_ms: Some(10),
+            sessions: 1,
+        }];
+        let (dev, _) = ingest("laptop", vec![], Some(rows.clone()), crate::tailnet::Attestation::Claimed, None, &no_persisted(), 100, String::new());
+        assert_eq!(dev.registry_sessions.as_deref(), Some(&rows[..]));
+        let (none, _) = ingest("laptop", vec![], None, crate::tailnet::Attestation::Claimed, None, &no_persisted(), 100, String::new());
+        assert!(none.registry_sessions.is_none(), "no answer stays no answer");
+    }
+
+    /// A peer old enough not to send the field parses, and lands in the same
+    /// "no answer" state as an unreadable registry — which is the truth for the
+    /// receiver either way.
+    #[test]
+    fn a_push_without_registry_sessions_parses_as_no_answer() {
+        let body = r#"{"device_name":"old","listen_port":9078,"sessions":[],"usage_tip":5}"#;
+        let push: SyncPush = serde_json::from_str(body).expect("older push should parse");
+        assert!(push.registry_sessions.is_none());
+    }
+
+    /// The registry's own vocabulary is `idle`/`busy`; anything else a future
+    /// build sends must land on `Unknown` rather than failing the whole push.
+    #[test]
+    fn an_unrecognized_activity_parses_as_unknown() {
+        let row: RegistrySync = serde_json::from_str(r#"{"chat_id":"p","activity":"compacting","sessions":1}"#).expect("parses");
+        assert_eq!(row.activity, crate::session_registry::Activity::Unknown);
     }
 
     #[test]
@@ -1576,7 +1778,7 @@ mod tests {
     #[test]
     fn build_push_empty_dialog_tips_zero() {
         let sessions = vec![session("proj", Vec::new())];
-        assert_eq!(build_push("desktop", 9078, &sessions, 0, 0).sessions[0].dialog_tip, 0);
+        assert_eq!(build_push("desktop", 9078, &sessions, 0, 0, None).sessions[0].dialog_tip, 0);
     }
 
     #[test]
@@ -1585,8 +1787,8 @@ mod tests {
         // there is no per-peer bookkeeping that can go stale, and re-sending is
         // free. A peer that missed ten cycles is caught up by the next one.
         let sessions = vec![session("proj", vec![entry(DialogRole::User, "u", 10)])];
-        let a = build_push("desktop", 9078, &sessions, 7, 3);
-        let b = build_push("desktop", 9078, &sessions, 7, 3);
+        let a = build_push("desktop", 9078, &sessions, 7, 3, None);
+        let b = build_push("desktop", 9078, &sessions, 7, 3, None);
         assert_eq!(serde_json::to_string(&a).unwrap(), serde_json::to_string(&b).unwrap());
     }
 
@@ -1613,7 +1815,7 @@ mod tests {
         let mut remote = std::collections::BTreeMap::new();
         let mut s = session("laptop/proj", vec![entry(DialogRole::User, "u", 10), entry(DialogRole::Assistant, "a", 70)]);
         s.origin = Some("laptop".into());
-        remote.insert("laptop".to_string(), RemoteDevice { sessions: vec![s], last_seen: 0, origin_addr: "http://1.2.3.4:9078".into() });
+        remote.insert("laptop".to_string(), RemoteDevice { sessions: vec![s], last_seen: 0, origin_addr: "http://1.2.3.4:9078".into(), registry_sessions: None, identity: crate::tailnet::Attestation::Claimed });
         let (device, raw_id, addr) = resolve_fetch_target(&remote, "laptop/proj").expect("target");
         assert_eq!(device, "laptop");
         assert_eq!(raw_id, "proj");
@@ -1629,7 +1831,7 @@ mod tests {
     fn resolve_fetch_target_prefers_the_longest_device_name() {
         let mut remote = std::collections::BTreeMap::new();
         for d in ["win", "win/box"] {
-            remote.insert(d.to_string(), RemoteDevice { sessions: Vec::new(), last_seen: 0, origin_addr: format!("http://{}:9078", d.replace('/', "-")) });
+            remote.insert(d.to_string(), RemoteDevice { sessions: Vec::new(), last_seen: 0, origin_addr: format!("http://{}:9078", d.replace('/', "-")), registry_sessions: None, identity: crate::tailnet::Attestation::Claimed });
         }
         let (device, raw_id, _) = resolve_fetch_target(&remote, "win/box/transcripts").expect("target");
         assert_eq!((device.as_str(), raw_id.as_str()), ("win/box", "transcripts"));
@@ -1640,7 +1842,7 @@ mod tests {
     #[test]
     fn resolve_fetch_target_is_none_for_local_ids() {
         let mut remote = std::collections::BTreeMap::new();
-        remote.insert("laptop".to_string(), RemoteDevice { sessions: Vec::new(), last_seen: 0, origin_addr: String::new() });
+        remote.insert("laptop".to_string(), RemoteDevice { sessions: Vec::new(), last_seen: 0, origin_addr: String::new(), registry_sessions: None, identity: crate::tailnet::Attestation::Claimed });
         assert!(resolve_fetch_target(&remote, "my-local-project").is_none());
         assert!(resolve_fetch_target(&remote, "laptopish/proj").is_none(), "prefix must match a whole device name");
     }

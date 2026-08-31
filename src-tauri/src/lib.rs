@@ -24,6 +24,7 @@ mod session_registry;
 mod setup;
 mod state;
 mod sync;
+mod tailnet;
 mod telegram;
 mod terminal_title;
 mod token_history;
@@ -147,6 +148,7 @@ pub fn run() {
         // a webview can race at mount.
         .manage(peer_message::MessageDedupe::default())
         .manage(peer_message::MessageIds::default())
+        .manage(tailnet::TailnetResolver::default())
         .invoke_handler(tauri::generate_handler![
             commands::get_sessions,
             commands::get_config,
@@ -664,6 +666,8 @@ fn seed_dev_sessions(app: &tauri::AppHandle) {
             }],
             last_seen: now,
             origin_addr: "http://127.0.0.1:9078".into(),
+            registry_sessions: None,
+            identity: crate::tailnet::Attestation::Claimed,
         },
     );
 

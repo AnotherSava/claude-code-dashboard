@@ -210,6 +210,41 @@ pub struct RemoteDevice {
     /// Base URL for catch-up dialog fetches, derived from the push's socket
     /// peer IP + advertised listen_port (e.g. "http://100.1.2.3:9078").
     pub origin_addr: String,
+    /// The device's live sessions as Claude Code's own registry sees them, from
+    /// the last push. `None` = that device gave no registry answer (unreadable
+    /// there, or a build predating the field), which the roster reports as such
+    /// rather than as an empty machine.
+    ///
+    /// Kept as the raw wire rows rather than merged into `sessions`: the
+    /// registry knows `idle`/`busy` only, which cannot express `blocked`,
+    /// `waiting` or `error`, so folding them in would require inventing a
+    /// `Status` no record supports.
+    pub registry_sessions: Option<Vec<crate::sync::RegistrySync>>,
+    /// How this device's claimed name stood up to Tailscale on its last push.
+    ///
+    /// Stored rather than recomputed on read, because it is a fact about a
+    /// *connection that happened* — the source address it arrived from — and
+    /// nothing on the read path has that address. Recomputing it later would be
+    /// the "record the outcome, don't recompute the decision" mistake: a
+    /// predicate over config cannot observe which socket the push came in on.
+    ///
+    /// Never `Mismatch` here: a mismatched push is refused and never ingested.
+    pub identity: crate::tailnet::Attestation,
+}
+
+impl AppState {
+    /// Each known device's last-pushed registry rows, or `None` where that
+    /// device gave no answer. A sibling of [`Self::remote_last_seen`] and
+    /// separate for the same reason: the roster needs it while holding no lock
+    /// on `remote`, and pairing it with the freshness map is the caller's job.
+    pub fn remote_registry(&self) -> BTreeMap<String, Option<Vec<crate::sync::RegistrySync>>> {
+        self.remote.lock().unwrap().iter().map(|(d, dev)| (d.clone(), dev.registry_sessions.clone())).collect()
+    }
+
+    /// Each known device's identity standing from its last push.
+    pub fn remote_identity(&self) -> BTreeMap<String, crate::tailnet::Attestation> {
+        self.remote.lock().unwrap().iter().map(|(d, dev)| (d.clone(), dev.identity)).collect()
+    }
 }
 
 #[derive(Default)]
@@ -1683,8 +1718,8 @@ mod tests {
     fn remote_snapshot_is_ordered_by_device_name() {
         let state = AppState::new();
         let mut remote = state.remote.lock().unwrap();
-        remote.insert("zeta".into(), RemoteDevice { sessions: vec![remote_session("zeta/p", "zeta")], last_seen: 0, origin_addr: String::new() });
-        remote.insert("alpha".into(), RemoteDevice { sessions: vec![remote_session("alpha/p", "alpha")], last_seen: 0, origin_addr: String::new() });
+        remote.insert("zeta".into(), RemoteDevice { sessions: vec![remote_session("zeta/p", "zeta")], last_seen: 0, origin_addr: String::new(), registry_sessions: None, identity: crate::tailnet::Attestation::Claimed });
+        remote.insert("alpha".into(), RemoteDevice { sessions: vec![remote_session("alpha/p", "alpha")], last_seen: 0, origin_addr: String::new(), registry_sessions: None, identity: crate::tailnet::Attestation::Claimed });
         drop(remote);
         let snap = state.remote_snapshot();
         let ids: Vec<&str> = snap.iter().map(|s| s.id.as_str()).collect();
@@ -1695,8 +1730,8 @@ mod tests {
     fn reap_remote_drops_only_silent_devices() {
         let state = AppState::new();
         let mut remote = state.remote.lock().unwrap();
-        remote.insert("fresh".into(), RemoteDevice { sessions: Vec::new(), last_seen: 1000, origin_addr: String::new() });
-        remote.insert("stale".into(), RemoteDevice { sessions: Vec::new(), last_seen: 0, origin_addr: String::new() });
+        remote.insert("fresh".into(), RemoteDevice { sessions: Vec::new(), last_seen: 1000, origin_addr: String::new(), registry_sessions: None, identity: crate::tailnet::Attestation::Claimed });
+        remote.insert("stale".into(), RemoteDevice { sessions: Vec::new(), last_seen: 0, origin_addr: String::new(), registry_sessions: None, identity: crate::tailnet::Attestation::Claimed });
         drop(remote);
         assert!(state.reap_remote(1500, 1000), "stale device dropped");
         assert!(state.remote.lock().unwrap().contains_key("fresh"));

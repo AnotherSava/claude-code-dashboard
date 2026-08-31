@@ -235,10 +235,28 @@ struct AgentsResponse {
     sync_listening: bool,
     peers: Vec<PeerRow>,
     agents: Vec<AgentRow>,
-    /// Live local sessions Claude Code's own registry knows about and the hook
-    /// stream does not — see `RegistryRow`. A project present in both arrays
-    /// appears only in `agents`, so the name states the precedence rule.
-    registry_only: Option<Vec<RegistryRow>>,
+    /// Live sessions Claude Code's own registry knows about and the hook stream
+    /// does not — see `RegistryRow`. A project present in both arrays for the
+    /// same device appears only in `agents`, so the name states the precedence
+    /// rule.
+    ///
+    /// Covers **every** device, not just this one. It was local-only at first,
+    /// and that made discovery strictly narrower than delivery: on 2026-08-30 a
+    /// live session on the other machine was absent here while the relay could
+    /// reach it perfectly well, so an agent following the documented "check the
+    /// roster first" concluded the target was gone and gave up.
+    registry_only: Vec<RegistryRow>,
+    /// Devices whose live-session list could not be obtained: the registry was
+    /// unreadable there, or the peer has not pushed one.
+    ///
+    /// A **list of devices rather than a flag**, because that is the shape that
+    /// stays honest with more than one machine. This replaced a
+    /// `registry_only: Option<…>` whose `None` meant "this device's registry was
+    /// unreadable" — which could not survive the array covering several devices,
+    /// since one unreadable machine would have had to null the whole array and
+    /// hide every other machine's rows. Empty here means every known device
+    /// answered; a device named here is one whose silence proves nothing.
+    registry_unreadable: Vec<String>,
 }
 
 /// One synced peer dashboard. `sessions` counts the rows attributed to it in
@@ -248,6 +266,17 @@ struct PeerRow {
     device: String,
     last_seen_age_ms: i64,
     sessions: usize,
+    /// Whether that device's *name* was corroborated by Tailscale on its last
+    /// push (`attested`), or merely taken at its word (`claimed`).
+    ///
+    /// Reported because a check that silently succeeds is indistinguishable
+    /// from one that silently no-ops — the failure mode this project has paid
+    /// for before. `attested` is deliberately not called "verified": it is as
+    /// good as the tailnet's ACLs and says nothing about the *agent* half of any
+    /// sender's identity, which nothing can check.
+    ///
+    /// Never `mismatch`: such a push is refused and never becomes a row.
+    identity: crate::tailnet::Attestation,
 }
 
 /// One tracked session, local or synced.
@@ -317,10 +346,8 @@ struct AgentRow {
 /// `row.label.toLowerCase()` would break on a row it has no vocabulary for,
 /// while a separate array cannot reach that caller at all.
 ///
-/// Local by construction: the registry describes this machine, so there is no
-/// `local` field (a constant true is not information) and no `last_seen_age_ms`
-/// (there is no push channel behind it). Remote rows keep coming from sync and
-/// are untouched by this array.
+/// Rows for a **peer's** registry ride the sync push and land here too, so this
+/// array answers "does that session exist, and where" for the whole fleet.
 #[derive(Serialize, Debug, PartialEq)]
 struct RegistryRow {
     /// Same cwd-derivation as `AgentRow::id`, which is what makes the union
@@ -341,12 +368,26 @@ struct RegistryRow {
     /// parked on a question is `blocked` here and `idle` there.
     activity: Activity,
     /// Time since the registry last wrote that activity. Omitted when the
-    /// record carries no stamp; skew-free, since the registry is local.
+    /// record carries no stamp.
+    ///
+    /// **Skew-free on both paths**, unlike `AgentRow::status_age_ms`. A local
+    /// row measures it here; a remote row arrives as an age measured by the
+    /// sender at push time and has this receiver's own since-the-push elapsed
+    /// added to it. Two durations summed need no clock agreement, so there is no
+    /// skew to disclose.
     #[serde(skip_serializing_if = "Option::is_none")]
     activity_age_ms: Option<i64>,
     /// How many interactive sessions collapsed into this row (2 after a fork
     /// migration left two tabs in one directory).
     sessions: usize,
+    /// Whether the session runs on this machine. Present because this array is
+    /// no longer local-only.
+    local: bool,
+    /// How long since this row's device last pushed. Omitted for a local row,
+    /// where a `0` would claim freshness on a channel that doesn't exist — the
+    /// same rule `AgentRow` follows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_seen_age_ms: Option<i64>,
 }
 
 /// Shape the merged roster. All the judgment lives here so it is testable without
@@ -373,6 +414,8 @@ struct RegistryRow {
 fn agent_roster(
     sessions: &[AgentSession],
     registry: Option<&[LiveSession]>,
+    remote_registry: &BTreeMap<String, Option<Vec<crate::sync::RegistrySync>>>,
+    remote_identity: &BTreeMap<String, crate::tailnet::Attestation>,
     anchored: &dyn Fn(&str) -> Option<String>,
     last_seen: &BTreeMap<String, i64>,
     this_device: Option<&str>,
@@ -422,21 +465,63 @@ fn agent_roster(
     // nothing marking them as the same session — handing a caller a project that
     // does not exist. `anchored` is a read-only lookup: it inserts nothing, so
     // this stays a read path.
-    let hook_local: HashSet<&str> = agents.iter().filter(|a| a.local).map(|a| a.id.as_str()).collect();
-    let registry_only: Option<Vec<RegistryRow>> = registry.map(|regs| regs
-        .iter()
-        .map(|s| (s, s.session_ids.iter().find_map(|sid| anchored(sid)).unwrap_or_else(|| s.chat_id.clone())))
-        .filter(|(_, id)| !hook_local.contains(id.as_str()))
-        .map(|(s, id)| RegistryRow {
-            project: id.clone(),
-            id,
-            device: this_device.map(str::to_string),
-            name: s.name.clone(),
-            activity: s.activity,
-            activity_age_ms: s.activity_age_ms,
-            sessions: s.sessions,
-        })
-        .collect());
+    // Keyed by (device, project) rather than by id alone, now that the array
+    // spans machines: deduping on the bare project would delete a peer's row
+    // because *this* box happens to run the same project, which is precisely the
+    // cross-machine evidence the roster exists to carry.
+    let hook_rows: HashSet<(Option<&str>, &str)> = agents.iter().map(|a| (a.device.as_deref(), a.project.as_str())).collect();
+    let mut registry_only: Vec<RegistryRow> = Vec::new();
+    let mut registry_unreadable: Vec<String> = Vec::new();
+
+    match registry {
+        Some(regs) => registry_only.extend(
+            regs.iter()
+                .map(|s| (s, s.session_ids.iter().find_map(|sid| anchored(sid)).unwrap_or_else(|| s.chat_id.clone())))
+                .filter(|(_, id)| !hook_rows.contains(&(this_device, id.as_str())))
+                .map(|(s, id)| RegistryRow {
+                    project: id.clone(),
+                    id,
+                    device: this_device.map(str::to_string),
+                    name: s.name.clone(),
+                    activity: s.activity,
+                    activity_age_ms: s.activity_age_ms,
+                    sessions: s.sessions,
+                    local: true,
+                    last_seen_age_ms: None,
+                }),
+        ),
+        None => registry_unreadable.push(this_device.unwrap_or("this device").to_string()),
+    }
+
+    for (device, rows) in remote_registry {
+        // A device reaped between the two locks has no freshness number, and a
+        // row without one is the thing this route exists never to emit — the
+        // same rule the `agents` loop applies.
+        let Some(seen) = last_seen.get(device) else { continue };
+        let push_age = age_since(*seen);
+        let Some(rows) = rows else {
+            registry_unreadable.push(device.clone());
+            continue;
+        };
+        registry_only.extend(
+            rows.iter()
+                .filter(|s| !hook_rows.contains(&(Some(device.as_str()), s.chat_id.as_str())))
+                .map(|s| RegistryRow {
+                    id: format!("{device}/{}", s.chat_id),
+                    project: s.chat_id.clone(),
+                    device: Some(device.clone()),
+                    name: s.name.clone(),
+                    activity: s.activity,
+                    // Two durations summed: the sender's age at push time, plus
+                    // how long ago that push arrived here. No clock agreement
+                    // needed, so unlike `status_age_ms` this carries no skew.
+                    activity_age_ms: s.activity_age_ms.map(|age| age + push_age),
+                    sessions: s.sessions,
+                    local: false,
+                    last_seen_age_ms: Some(push_age),
+                }),
+        );
+    }
 
     let peers = last_seen
         .iter()
@@ -449,10 +534,13 @@ fn agent_roster(
             // default, since `device_name` bootstraps from the hostname, and in
             // the repo's own localhost-observer sync test setup.
             sessions: agents.iter().filter(|a| !a.local && a.device.as_deref() == Some(device.as_str())).count(),
+            // A device present in `last_seen` but absent here was reaped between
+            // the reads; `Claimed` is the safe reading, never `Attested`.
+            identity: remote_identity.get(device).copied().unwrap_or(crate::tailnet::Attestation::Claimed),
         })
         .collect();
 
-    AgentsResponse { device: this_device.map(str::to_string), sync_listening, peers, agents, registry_only }
+    AgentsResponse { device: this_device.map(str::to_string), sync_listening, peers, agents, registry_only, registry_unreadable }
 }
 
 /// Read-only roster of every session this dashboard tracks, local and synced.
@@ -493,7 +581,7 @@ async fn get_agents(
     // `sync::SyncListening`.
     let sync_listening = app.try_state::<SyncListening>().is_some_and(|f| f.get());
     let chat_ids = app.try_state::<ChatIdRegistry>();
-    Ok(Json(agent_roster(&sessions, registry.as_deref(), &|sid| chat_ids.as_ref().and_then(|r| r.anchored(sid)), &last_seen, this_device, sync_listening, now)))
+    Ok(Json(agent_roster(&sessions, registry.as_deref(), &state.remote_registry(), &state.remote_identity(), &|sid| chat_ids.as_ref().and_then(|r| r.anchored(sid)), &last_seen, this_device, sync_listening, now)))
 }
 
 /// Body of `POST /api/message` — a local agent asking this dashboard to relay a
@@ -512,6 +600,11 @@ struct MessageRequest {
     from_agent: Option<String>,
     #[serde(default)]
     from_label: Option<String>,
+    /// Set when this send answers a message that arrived here, echoing the
+    /// `message_id` the envelope showed. Passed straight through; nothing in the
+    /// dashboard branches on it.
+    #[serde(default)]
+    in_reply_to: Option<String>,
 }
 
 /// Relay one message to an agent on another machine.
@@ -629,6 +722,13 @@ async fn post_message(State(app): State<AppHandle>, headers: HeaderMap, Json(req
         );
     };
 
+    // Minted here because this is the only place that holds *both* halves
+    // exactly — this machine's own `device_name` and the caller's own id. An
+    // unidentified caller gets `None` rather than a plausible address: the
+    // envelope then says there is no reply address, which is the truth, instead
+    // of printing one that would fail an exact match one hop later.
+    let reply_to = (from_agent != "unknown").then(|| format!("{this_device}/{from_agent}"));
+
     let envelope = crate::sync::MessageEnvelope {
         origin_device: this_device.to_string(),
         message_id: peer_message::mint_message_id(this_device, now, ids.next()),
@@ -636,6 +736,8 @@ async fn post_message(State(app): State<AppHandle>, headers: HeaderMap, Json(req
         from_agent: from_agent.to_string(),
         from_label: req.from_label.clone(),
         text: req.text.clone(),
+        reply_to,
+        in_reply_to: req.in_reply_to.clone(),
     };
     let receipt = crate::sync::send_message_hop(&app, &origin_addr, &envelope, &req.target, &device).await;
     log_send(&receipt, from_agent, &req.target, Some(&device), req.text.len());
@@ -964,7 +1066,7 @@ mod tests {
     fn a_local_row_reports_no_last_seen_age() {
         // There is no sync channel behind a local row, so a `0` there would claim a
         // freshness that means nothing. The field is absent instead.
-        let rows = agent_roster(&[session("transcripts", Status::Working, None, 900)], Some(&[]), &|_| None, &devices(&[]), Some("air"), false, 1_000);
+        let rows = agent_roster(&[session("transcripts", Status::Working, None, 900)], Some(&[]), &BTreeMap::new(), &BTreeMap::new(), &|_| None, &devices(&[]), Some("air"), false, 1_000);
         let row = &rows.agents[0];
         assert!(row.local, "origin.is_none() is the authoritative local test");
         assert_eq!(row.last_seen_age_ms, None, "a local row has no device push to age against");
@@ -977,7 +1079,7 @@ mod tests {
         // The freshness number comes from the *device's* last push, not from
         // anything on the row — the row's own stamps are on the sender's clock.
         let sessions = [session("chrome/transcripts", Status::Blocked, Some("chrome"), 763_500)];
-        let rows = agent_roster(&sessions, Some(&[]), &|_| None, &devices(&[("chrome", 995_880)]), Some("air"), true, 1_000_000);
+        let rows = agent_roster(&sessions, Some(&[]), &BTreeMap::new(), &BTreeMap::new(), &|_| None, &devices(&[("chrome", 995_880)]), Some("air"), true, 1_000_000);
         let row = &rows.agents[0];
         assert_eq!(row.last_seen_age_ms, Some(4_120));
         assert!(!row.local);
@@ -991,7 +1093,7 @@ mod tests {
         // its age; hiding it, or turning the age into a verdict, is the caller's
         // call to make and not ours.
         let sessions = [session("chrome/transcripts", Status::Idle, Some("chrome"), 0)];
-        let rows = agent_roster(&sessions, Some(&[]), &|_| None, &devices(&[("chrome", 870_000)]), Some("air"), true, 1_000_000);
+        let rows = agent_roster(&sessions, Some(&[]), &BTreeMap::new(), &BTreeMap::new(), &|_| None, &devices(&[("chrome", 870_000)]), Some("air"), true, 1_000_000);
         assert_eq!(rows.agents.len(), 1, "a stale row is still a fact about the roster");
         assert_eq!(rows.agents[0].last_seen_age_ms, Some(130_000));
     }
@@ -1006,7 +1108,7 @@ mod tests {
             session("transcripts", Status::Working, None, 0),
             session("chrome/transcripts", Status::Idle, Some("chrome"), 0),
         ];
-        let rows = agent_roster(&sessions, Some(&[]), &|_| None, &devices(&[]), Some("air"), true, 1_000);
+        let rows = agent_roster(&sessions, Some(&[]), &BTreeMap::new(), &BTreeMap::new(), &|_| None, &devices(&[]), Some("air"), true, 1_000);
         assert_eq!(rows.agents.len(), 1, "the phantom remote row is dropped, the local one stays");
         assert!(rows.agents[0].local);
     }
@@ -1020,7 +1122,7 @@ mod tests {
             session("win/box/transcripts", Status::Done, Some("win/box"), 0),
             session("tauri dashboard", Status::Working, None, 0),
         ];
-        let rows = agent_roster(&sessions, Some(&[]), &|_| None, &devices(&[("win/box", 1_000)]), Some("air"), true, 1_000);
+        let rows = agent_roster(&sessions, Some(&[]), &BTreeMap::new(), &BTreeMap::new(), &|_| None, &devices(&[("win/box", 1_000)]), Some("air"), true, 1_000);
         assert_eq!(rows.agents[0].project, "transcripts");
         assert_eq!(rows.agents[1].project, "tauri dashboard", "a local id is already de-namespaced");
     }
@@ -1030,7 +1132,7 @@ mod tests {
         // A remote row's `state_entered_at` is the sender's clock; a fast peer clock
         // puts it in our future. Clamp rather than emit a negative age.
         let sessions = [session("chrome/transcripts", Status::Working, Some("chrome"), 5_000)];
-        let rows = agent_roster(&sessions, Some(&[]), &|_| None, &devices(&[("chrome", 1_100)]), Some("air"), true, 1_000);
+        let rows = agent_roster(&sessions, Some(&[]), &BTreeMap::new(), &BTreeMap::new(), &|_| None, &devices(&[("chrome", 1_100)]), Some("air"), true, 1_000);
         assert_eq!(rows.agents[0].status_age_ms, 0);
         assert_eq!(rows.agents[0].last_seen_age_ms, Some(0));
     }
@@ -1043,7 +1145,7 @@ mod tests {
         // is not asserted here: it is a pass-through parameter, sourced from the
         // running listener (`sync::SyncListening`) rather than derived, so there
         // is no predicate at this level that could be wrong.
-        let rows = agent_roster(&[session("transcripts", Status::Idle, None, 0)], Some(&[]), &|_| None, &devices(&[]), Some("air"), false, 1_000);
+        let rows = agent_roster(&[session("transcripts", Status::Idle, None, 0)], Some(&[]), &BTreeMap::new(), &BTreeMap::new(), &|_| None, &devices(&[]), Some("air"), false, 1_000);
         assert!(rows.peers.is_empty());
         assert!(!rows.sync_listening);
         assert_eq!(rows.agents.len(), 1);
@@ -1058,7 +1160,7 @@ mod tests {
             session("chrome/transcripts", Status::Idle, Some("chrome"), 0),
             session("chrome/whats next", Status::Done, Some("chrome"), 0),
         ];
-        let rows = agent_roster(&sessions, Some(&[]), &|_| None, &devices(&[("chrome", 900), ("mini", 500)]), Some("air"), true, 1_000);
+        let rows = agent_roster(&sessions, Some(&[]), &BTreeMap::new(), &BTreeMap::new(), &|_| None, &devices(&[("chrome", 900), ("mini", 500)]), Some("air"), true, 1_000);
         assert_eq!(rows.peers.len(), 2);
         assert_eq!(rows.peers[0].device, "chrome");
         assert_eq!(rows.peers[0].sessions, 2, "local rows are not attributed to a peer");
@@ -1077,7 +1179,7 @@ mod tests {
             session("transcripts", Status::Working, None, 0),
             session("air/whats next", Status::Idle, Some("air"), 0),
         ];
-        let rows = agent_roster(&sessions, Some(&[]), &|_| None, &devices(&[("air", 900)]), Some("air"), true, 1_000);
+        let rows = agent_roster(&sessions, Some(&[]), &BTreeMap::new(), &BTreeMap::new(), &|_| None, &devices(&[("air", 900)]), Some("air"), true, 1_000);
         assert_eq!(rows.peers.len(), 1);
         assert_eq!(rows.peers[0].sessions, 1, "only the remote row counts, not the local one sharing the name");
     }
@@ -1087,7 +1189,7 @@ mod tests {
         // `sync.device_name` is bootstrapped from the hostname at startup, but a
         // bypassed bootstrap must not invent a name: a stand-in like "local" could
         // collide with a real peer's name and mis-attribute rows.
-        let rows = agent_roster(&[session("transcripts", Status::Idle, None, 0)], Some(&[]), &|_| None, &devices(&[]), None, false, 1_000);
+        let rows = agent_roster(&[session("transcripts", Status::Idle, None, 0)], Some(&[]), &BTreeMap::new(), &BTreeMap::new(), &|_| None, &devices(&[]), None, false, 1_000);
         assert_eq!(rows.device, None);
         assert_eq!(rows.agents[0].device, None);
         assert!(rows.agents[0].local, "unnamed is still unambiguously local");
@@ -1097,25 +1199,32 @@ mod tests {
         LiveSession { chat_id: chat_id.to_string(), name: Some(chat_id.to_string()), activity, activity_age_ms: Some(600), sessions, session_ids: Vec::new() }
     }
 
+    fn reg_sync(chat_id: &str, activity: Activity, activity_age_ms: Option<i64>, sessions: usize) -> crate::sync::RegistrySync {
+        crate::sync::RegistrySync { chat_id: chat_id.to_string(), name: Some(chat_id.to_string()), activity, activity_age_ms, sessions }
+    }
+
     #[test]
-    fn an_unreadable_registry_is_null_not_an_empty_list() {
-        // The distinction the whole `Option` exists for. `[]` asserts this
-        // machine is running nothing; `null` says we could not look. They are
+    fn an_unreadable_registry_names_the_device_rather_than_reading_as_empty() {
+        // The distinction the whole thing exists for. An empty array asserts the
+        // machine is running nothing; naming it in `registry_unreadable` says we
+        // could not look. They are
         // reachable by ordinary means — no `sessions/` directory, or a
         // node-based install whose records never survive the image check — and
         // collapsing them would let the roster claim an absence it never
         // established, which is precisely what a delivery caller would act on.
-        let unreadable = agent_roster(&[], None, &|_| None, &devices(&[]), Some("air"), false, 1_000);
-        assert!(unreadable.registry_only.is_none(), "an unreadable registry must not read as an empty machine");
+        let unreadable = agent_roster(&[], None, &BTreeMap::new(), &BTreeMap::new(), &|_| None, &devices(&[]), Some("air"), false, 1_000);
+        assert!(unreadable.registry_only.is_empty());
+        assert_eq!(unreadable.registry_unreadable, vec!["air".to_string()], "an unreadable registry must name the device, not read as an empty machine");
 
-        let empty = agent_roster(&[], Some(&[]), &|_| None, &devices(&[]), Some("air"), false, 1_000);
-        assert_eq!(empty.registry_only.as_deref(), Some(&[][..]), "a readable but empty registry is a real answer");
+        let empty = agent_roster(&[], Some(&[]), &BTreeMap::new(), &BTreeMap::new(), &|_| None, &devices(&[]), Some("air"), false, 1_000);
+        assert!(empty.registry_only.is_empty());
+        assert!(empty.registry_unreadable.is_empty(), "a readable but empty registry is a real answer");
 
         // And the two must serialize differently, or the distinction dies at the wire.
         let unreadable_json = serde_json::to_string(&unreadable).unwrap();
         let empty_json = serde_json::to_string(&empty).unwrap();
-        assert!(unreadable_json.contains("\"registry_only\":null"), "got {unreadable_json}");
-        assert!(empty_json.contains("\"registry_only\":[]"), "got {empty_json}");
+        assert!(unreadable_json.contains("\"registry_unreadable\":[\"air\"]"), "got {unreadable_json}");
+        assert!(empty_json.contains("\"registry_unreadable\":[]"), "got {empty_json}");
     }
 
     #[test]
@@ -1123,10 +1232,10 @@ mod tests {
         // The whole point of the stage: a session idle since before the dashboard
         // started fires no hook, so it was invisible for as long as it stayed idle.
         // Claude Code's registry knows it the whole time.
-        let rows = agent_roster(&[], Some(&[live("printlab", Activity::Idle, 1)]), &|_| None, &devices(&[]), Some("air"), false, 1_000);
+        let rows = agent_roster(&[], Some(&[live("printlab", Activity::Idle, 1)]), &BTreeMap::new(), &BTreeMap::new(), &|_| None, &devices(&[]), Some("air"), false, 1_000);
         assert!(rows.agents.is_empty());
-        assert_eq!(rows.registry_only.as_ref().unwrap().len(), 1);
-        let row = &rows.registry_only.as_ref().unwrap()[0];
+        assert_eq!(rows.registry_only.len(), 1);
+        let row = &rows.registry_only[0];
         assert_eq!(row.id, "printlab");
         assert_eq!(row.project, "printlab", "a local id is never namespaced, so the two keys agree");
         assert_eq!(row.device.as_deref(), Some("air"), "the registry describes this machine");
@@ -1142,11 +1251,11 @@ mod tests {
         // registry's id derivation is the same cwd derivation, which is what makes
         // the dedupe plain equality.
         let sessions = [session("transcripts", Status::Working, None, 900)];
-        let rows = agent_roster(&sessions, Some(&[live("transcripts", Activity::Idle, 1)]), &|_| None, &devices(&[]), Some("air"), false, 1_000);
+        let rows = agent_roster(&sessions, Some(&[live("transcripts", Activity::Idle, 1)]), &BTreeMap::new(), &BTreeMap::new(), &|_| None, &devices(&[]), Some("air"), false, 1_000);
         assert_eq!(rows.agents.len(), 1);
         assert_eq!(rows.agents[0].status, Status::Working);
         assert_eq!(rows.agents[0].label, "label");
-        assert!(rows.registry_only.as_ref().unwrap().is_empty(), "the project is already in `agents`");
+        assert!(rows.registry_only.is_empty(), "the project is already in `agents`");
     }
 
     #[test]
@@ -1156,10 +1265,10 @@ mod tests {
         // `idle`) there, and `blocked` is the state a caller most needs not to
         // misread. Nothing about the hook row moves.
         let sessions = [session("transcripts", Status::Blocked, None, 500)];
-        let rows = agent_roster(&sessions, Some(&[live("transcripts", Activity::Busy, 1)]), &|_| None, &devices(&[]), Some("air"), false, 1_000);
+        let rows = agent_roster(&sessions, Some(&[live("transcripts", Activity::Busy, 1)]), &BTreeMap::new(), &BTreeMap::new(), &|_| None, &devices(&[]), Some("air"), false, 1_000);
         assert_eq!(rows.agents[0].status, Status::Blocked);
         assert_eq!(rows.agents[0].status_age_ms, 500);
-        assert!(rows.registry_only.as_ref().unwrap().is_empty());
+        assert!(rows.registry_only.is_empty());
     }
 
     #[test]
@@ -1167,13 +1276,89 @@ mod tests {
         // Serialized rather than field-checked: the guarantee is about the wire,
         // where a caller reading `status`/`label` off a row that has neither would
         // be reading a state the registry cannot express.
-        let rows = agent_roster(&[], Some(&[live("printlab", Activity::Busy, 1)]), &|_| None, &devices(&[]), Some("air"), false, 1_000);
+        let rows = agent_roster(&[], Some(&[live("printlab", Activity::Busy, 1)]), &BTreeMap::new(), &BTreeMap::new(), &|_| None, &devices(&[]), Some("air"), false, 1_000);
         let body = serde_json::to_string(&rows).unwrap();
         assert!(body.contains(r#""activity":"busy""#), "the registry's own word, under its own key");
         assert!(!body.contains(r#""status""#), "no dashboard status anywhere in this body");
         assert!(!body.contains(r#""label""#));
         assert!(!body.contains("last_seen_age_ms"), "there is no push channel behind a local row");
-        assert!(!body.contains(r#""local""#), "the array is local by construction; a constant is not information");
+        assert!(body.contains(r#""local":true"#), "the array spans machines now, so a row has to say which it is on");
+    }
+
+    /// The gap that cost a real message: a live session on the other machine was
+    /// absent here while the relay could reach it, so discovery was narrower
+    /// than delivery and "check the roster first" said the target was gone.
+    #[test]
+    fn a_peers_registry_sessions_reach_the_roster() {
+        let remote = [("chrome".to_string(), Some(vec![reg_sync("transcripts", Activity::Busy, Some(200), 1)]))].into_iter().collect();
+        let rows = agent_roster(&[], Some(&[]), &remote, &BTreeMap::new(), &|_| None, &devices(&[("chrome", 700)]), Some("air"), true, 1_000);
+
+        assert_eq!(rows.registry_only.len(), 1);
+        let row = &rows.registry_only[0];
+        assert_eq!(row.id, "chrome/transcripts", "namespaced by the receiver, exactly like an agents row");
+        assert_eq!(row.project, "transcripts");
+        assert!(!row.local);
+        assert_eq!(row.last_seen_age_ms, Some(300), "the age of the push that carried it");
+        // The sender measured 200ms of activity age at push time; the push
+        // arrived 300ms ago. Two durations summed — no clock agreement needed,
+        // so unlike `status_age_ms` this carries no skew at all.
+        assert_eq!(row.activity_age_ms, Some(500));
+    }
+
+    /// A peer that gave no registry answer must be named, not silently absent:
+    /// otherwise "no rows for chrome" reads as "chrome is running nothing".
+    #[test]
+    fn a_peer_with_no_registry_answer_is_named_rather_than_read_as_empty() {
+        let remote = [("chrome".to_string(), None)].into_iter().collect();
+        let rows = agent_roster(&[], Some(&[]), &remote, &BTreeMap::new(), &|_| None, &devices(&[("chrome", 700)]), Some("air"), true, 1_000);
+        assert!(rows.registry_only.is_empty());
+        assert_eq!(rows.registry_unreadable, vec!["chrome".to_string()]);
+    }
+
+    /// Precedence is per device, not global. A hook row for `chrome/transcripts`
+    /// hides chrome's registry row for it — and must not hide *this* machine's.
+    #[test]
+    fn hook_rows_hide_registry_rows_only_on_their_own_device() {
+        let sessions = [session("chrome/transcripts", Status::Working, Some("chrome"), 0)];
+        let remote = [("chrome".to_string(), Some(vec![reg_sync("transcripts", Activity::Busy, None, 1)]))].into_iter().collect();
+        let rows = agent_roster(&sessions, Some(&[live("transcripts", Activity::Idle, 1)]), &remote, &BTreeMap::new(), &|_| None, &devices(&[("chrome", 900)]), Some("air"), true, 1_000);
+
+        assert_eq!(rows.agents.len(), 1);
+        assert_eq!(rows.registry_only.len(), 1, "chrome's is hidden by its hook row; air's survives");
+        assert_eq!(rows.registry_only[0].device.as_deref(), Some("air"));
+    }
+
+    /// A successful attestation that is invisible is indistinguishable from one
+    /// that silently no-opped, so the standing has to reach the wire.
+    #[test]
+    fn a_peers_identity_standing_reaches_the_roster() {
+        use crate::tailnet::Attestation;
+        let ident = [("chrome".to_string(), Attestation::Attested), ("mini".to_string(), Attestation::Claimed)].into_iter().collect();
+        let rows = agent_roster(&[], Some(&[]), &BTreeMap::new(), &ident, &|_| None, &devices(&[("chrome", 900), ("mini", 900)]), Some("air"), true, 1_000);
+
+        let by = |d: &str| rows.peers.iter().find(|p| p.device == d).map(|p| p.identity).unwrap();
+        assert_eq!(by("chrome"), Attestation::Attested);
+        assert_eq!(by("mini"), Attestation::Claimed);
+        assert!(serde_json::to_string(&rows).unwrap().contains(r#""identity":"attested""#));
+    }
+
+    /// A device heard from but absent from the identity map was reaped between
+    /// the two reads. `Claimed` is the safe reading; `Attested` would be a
+    /// standing nothing established.
+    #[test]
+    fn an_unknown_identity_reads_as_claimed_never_attested() {
+        let rows = agent_roster(&[], Some(&[]), &BTreeMap::new(), &BTreeMap::new(), &|_| None, &devices(&[("chrome", 900)]), Some("air"), true, 1_000);
+        assert_eq!(rows.peers[0].identity, crate::tailnet::Attestation::Claimed);
+    }
+
+    /// A device reaped between the two locks has no freshness number, and a row
+    /// without one is what this route exists never to emit.
+    #[test]
+    fn a_registry_row_for_a_reaped_device_is_dropped_rather_than_reported_ageless() {
+        let remote = [("ghost".to_string(), Some(vec![reg_sync("p", Activity::Idle, None, 1)]))].into_iter().collect();
+        let rows = agent_roster(&[], Some(&[]), &remote, &BTreeMap::new(), &|_| None, &devices(&[]), Some("air"), true, 1_000);
+        assert!(rows.registry_only.is_empty());
+        assert!(rows.registry_unreadable.is_empty(), "a phantom device is not an unanswered one");
     }
 
     #[test]
@@ -1182,11 +1367,11 @@ mod tests {
         // machines is *supposed* to collide. Deduping across machines would delete
         // the remote row's evidence that the project also runs over there.
         let sessions = [session("chrome/transcripts", Status::Working, Some("chrome"), 0)];
-        let rows = agent_roster(&sessions, Some(&[live("transcripts", Activity::Idle, 1)]), &|_| None, &devices(&[("chrome", 900)]), Some("air"), true, 1_000);
+        let rows = agent_roster(&sessions, Some(&[live("transcripts", Activity::Idle, 1)]), &BTreeMap::new(), &BTreeMap::new(), &|_| None, &devices(&[("chrome", 900)]), Some("air"), true, 1_000);
         assert_eq!(rows.agents.len(), 1, "the remote row survives");
         assert_eq!(rows.agents[0].project, "transcripts");
-        assert_eq!(rows.registry_only.as_ref().unwrap().len(), 1, "so does the local registry row for the same project");
-        assert_eq!(rows.registry_only.as_ref().unwrap()[0].project, "transcripts");
+        assert_eq!(rows.registry_only.len(), 1, "so does the local registry row for the same project");
+        assert_eq!(rows.registry_only[0].project, "transcripts");
     }
 
     #[test]
@@ -1196,9 +1381,9 @@ mod tests {
         // that already broke the count once.
         let sessions = [session("air/whats next", Status::Idle, Some("air"), 0)];
         let registry = [live("transcripts", Activity::Idle, 1), live("printlab", Activity::Busy, 1)];
-        let rows = agent_roster(&sessions, Some(&registry), &|_| None, &devices(&[("air", 900)]), Some("air"), true, 1_000);
+        let rows = agent_roster(&sessions, Some(&registry), &BTreeMap::new(), &BTreeMap::new(), &|_| None, &devices(&[("air", 900)]), Some("air"), true, 1_000);
         assert_eq!(rows.peers[0].sessions, 1, "only the remote row counts");
-        assert_eq!(rows.registry_only.as_ref().unwrap().len(), 2);
+        assert_eq!(rows.registry_only.len(), 2);
     }
 
     #[test]
@@ -1206,17 +1391,17 @@ mod tests {
         // Two interactive sessions in one directory (a fork migration) are one
         // dashboard row, since a row's identity is the cwd. The count is reported
         // so the collapse is stated rather than emergent.
-        let rows = agent_roster(&[], Some(&[live("landlord", Activity::Busy, 2)]), &|_| None, &devices(&[]), Some("air"), false, 1_000);
-        assert_eq!(rows.registry_only.as_ref().unwrap().len(), 1);
-        assert_eq!(rows.registry_only.as_ref().unwrap()[0].sessions, 2);
+        let rows = agent_roster(&[], Some(&[live("landlord", Activity::Busy, 2)]), &BTreeMap::new(), &BTreeMap::new(), &|_| None, &devices(&[]), Some("air"), false, 1_000);
+        assert_eq!(rows.registry_only.len(), 1);
+        assert_eq!(rows.registry_only[0].sessions, 2);
     }
 
     #[test]
     fn an_unnamed_local_device_leaves_a_registry_rows_device_null() {
         // Same rule as an `agents` row: no invented stand-in name, which could
         // collide with a real peer's.
-        let rows = agent_roster(&[], Some(&[live("printlab", Activity::Idle, 1)]), &|_| None, &devices(&[]), None, false, 1_000);
-        assert_eq!(rows.registry_only.as_ref().unwrap()[0].device, None);
+        let rows = agent_roster(&[], Some(&[live("printlab", Activity::Idle, 1)]), &BTreeMap::new(), &BTreeMap::new(), &|_| None, &devices(&[]), None, false, 1_000);
+        assert_eq!(rows.registry_only[0].device, None);
     }
 
     #[test]

@@ -154,11 +154,15 @@ struct Record {
 /// `Status::Idle`, so it is the distinct *field name* and the distinct array
 /// that stop a caller's `row.status ?? row.activity` from producing a confident
 /// false state.
-#[derive(Serialize, Clone, Copy, PartialEq, Eq, Debug)]
+/// `Deserialize` as well as `Serialize` because a peer's registry rows cross the
+/// sync wire (`sync::RegistrySync`); `Unknown` is the landing place for anything
+/// a future build sends that this one does not know.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 #[serde(rename_all = "lowercase")]
 pub enum Activity {
     Idle,
     Busy,
+    #[serde(other)]
     Unknown,
 }
 
