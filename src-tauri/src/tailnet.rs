@@ -181,13 +181,24 @@ fn whois_uncached(ip: IpAddr) -> Option<TailnetPeer> {
         IpAddr::V4(v4) => format!("{v4}:0"),
         IpAddr::V6(v6) => format!("[{v6}]:0"),
     };
-    let mut child = Command::new(&bin)
-        .args(["whois", "--json", &addr])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .stdin(Stdio::null())
-        .spawn()
-        .ok()?;
+    let mut cmd = Command::new(&bin);
+    cmd.args(["whois", "--json", &addr]).stdout(Stdio::piped()).stderr(Stdio::null()).stdin(Stdio::null());
+    // Redirecting all three stdio handles is NOT enough on Windows. The
+    // dashboard is a GUI process and owns no console, so spawning a console
+    // binary makes Windows allocate a fresh one for the child — which under
+    // Windows Terminal is a real window that flashes open and shut. Reported
+    // from the Windows box 2026-08-31: one window per minute, in lockstep with
+    // `CACHE_TTL` expiring against the peer's 30 s sync heartbeat. Invisible
+    // from macOS, where a spawn has no console to allocate.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        /// `CREATE_NO_WINDOW` — spelled out rather than pulled from `winapi`,
+        /// which this crate does not depend on for one constant.
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let mut child = cmd.spawn().ok()?;
 
     // `Command` has no timeout, and a wedged daemon would otherwise hold a
     // blocking thread indefinitely. Poll, then kill.
@@ -291,6 +302,26 @@ mod tests {
     fn a_binding_overrides_incidental_name_agreement() {
         let b = bindings(&[("chrome", "some-other-node")]);
         assert_eq!(attest("chrome", Some(&peer("chrome")), &b), Attestation::Mismatch);
+    }
+
+    /// A console spawn from this GUI process must carry `CREATE_NO_WINDOW` on
+    /// Windows, or it flashes a terminal window at the user — the bug reported
+    /// 2026-08-31, once a minute, for a subprocess whose output nobody sees.
+    ///
+    /// Asserted over the source text rather than behind a helper: this is the
+    /// *only* Windows-reachable `Command::new` in the crate (every other one is
+    /// `#[cfg(not(windows))]` or macOS-only), and wrapping a single call site
+    /// would be abstraction ahead of need. A test scales to the next one without
+    /// that — and unlike a helper, it cannot be bypassed by someone calling
+    /// `Command::new` directly, which is exactly how this would recur.
+    #[test]
+    fn the_whois_spawn_creates_no_console_window() {
+        let src = include_str!("tailnet.rs");
+        let at = src.find("let mut cmd = Command::new(&bin);").expect("the whois spawn moved — update this test");
+        let spawn_at = src[at..].find(".spawn()").expect("spawn call") + at;
+        let body = &src[at..spawn_at];
+        assert!(body.contains("creation_flags(CREATE_NO_WINDOW)"), "the whois spawn must set CREATE_NO_WINDOW, or it flashes a console window on Windows once per cache expiry");
+        assert!(body.contains("#[cfg(windows)]"), "the flag is Windows-only API and must stay cfg-gated");
     }
 
     /// Parsed against the real output shape, captured from a live peer.
