@@ -29,28 +29,52 @@
 //! Everything the receiver stores is therefore derived from data it can see:
 //! its own newest held timestamp, never a number tracked alongside it.
 //!
-//! The listener binds all interfaces (only the tailnet routes here in
-//! practice) and every route requires the shared bearer token; with no token
-//! configured sync is fully disabled — never run unauthenticated.
+//! **Two gates, not one.** Every request passes [`guard`] before any route
+//! runs: its source address must be inside the scope (`config.sync.bind_scope`,
+//! by default the tailnet plus loopback) *and* it must carry the shared bearer
+//! token. With no token configured sync is fully disabled — never run
+//! unauthenticated.
+//!
+//! The listener is bound as narrowly as it can be — this device's Tailscale
+//! addresses, not `0.0.0.0` — for the same reason the user's sshd is scoped to
+//! the tailnet: a home router should not be the last line of defence, and a
+//! socket that was never on the LAN interface cannot be scanned, handshaken or
+//! fed a malformed request from it. But a narrow bind fails outright when
+//! Tailscale is not up yet (the dashboard and the VPN both start at login, so
+//! that race is ordinary, not exotic), and a listener that never started is
+//! silent, permanent and worse than a wide one. So the bind degrades to all
+//! interfaces and says so at `warn!` — while [`guard`] keeps rejecting every
+//! non-tailnet source, so the degrade widens the *socket*, never the trust.
+//!
+//! That is the whole reason both gates exist. The bind decides what can reach
+//! us and cannot self-heal (it is chosen once at startup — see
+//! [`run_listener`]); the source check decides what we will answer, re-evaluates
+//! per request, and covers the degraded bind, a stale socket left behind by a
+//! tailnet address change, and any route added to this router later. Neither
+//! replaces the bearer token: they bound *who may attempt* auth, and buy nothing
+//! against an attacker who already holds the token or sits on the tailnet.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use axum::{
-    extract::{ConnectInfo, Query, State},
+    extract::{ConnectInfo, Query, Request, State},
     http::{HeaderMap, StatusCode},
+    middleware::{self, Next},
+    response::Response,
     routing::{get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::net::SocketAddr;
-use std::sync::Arc;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::Notify;
+use tokio::task::JoinSet;
 
 use crate::commands::{emit_sessions_updated_remote, emit_usage_limits_updated, now_ms};
-use crate::config::ConfigState;
+use crate::config::{ConfigState, SyncBindScope};
 use crate::remote_history::RemoteHistoryStore;
 use crate::remote_usage::RemoteUsageStore;
 use crate::state::{merge_dialog_entries, AgentSession, AppState, DialogEntry, RemoteDevice};
@@ -119,15 +143,138 @@ struct DialogPull {
 
 /// True when the request carries `Authorization: Bearer <token>` matching the
 /// configured shared secret. No configured token = reject everything.
+///
+/// The credential comparison goes through [`tokens_match`], never `==`: `str`
+/// equality tests the lengths and then hands off to `memcmp`, which returns at
+/// the first differing word, so the rejection latency encodes how much of the
+/// secret the caller already guessed.
 fn bearer_ok(headers: &HeaderMap, token: Option<&str>) -> bool {
     let Some(expected) = token else {
         return false;
     };
+    // Checked before the comparison rather than folded into it. An empty
+    // configured token is a *config* state, not attacker input, so returning
+    // early on it leaks nothing about any secret — there is none. `lib.rs`
+    // already refuses to start the listener on one; this is the second gate,
+    // for a token emptied by hot-reload under a listener that is already up.
+    if expected.is_empty() {
+        return false;
+    }
     headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
-        .is_some_and(|t| !expected.is_empty() && t == expected)
+        .is_some_and(|t| tokens_match(t.as_bytes(), expected.as_bytes()))
+}
+
+/// Byte-string equality with no data-dependent early exit: every difference —
+/// byte *and* length — folds into one accumulator, so every rejection walks one
+/// path at one cost, whether the first byte was wrong or only the last.
+///
+/// The trip count is the *presented* token's length, never the secret's; bytes
+/// past the end of `expected` fold in `p ^ 0` instead of ending the loop, so the
+/// loop cannot be timed to size the secret. That is exactly what the vetted
+/// crates decline to do — `subtle`'s `ConstantTimeEq for [T]` and `ring`'s
+/// `verify_slices_are_equal` both short-circuit on unequal lengths, treating
+/// length as public — so neither was added as a dependency; each would leave the
+/// leak this replaces while adding a version to keep in step with `rustls`.
+///
+/// `black_box` is best-effort insurance, not a guarantee: nothing in the
+/// language stops LLVM recognising an OR-accumulate over two byte strings as the
+/// `bcmp` idiom and restoring the early exit. Only checked-in assembly would
+/// prove otherwise, which is not worth it at this stake.
+///
+/// Honest scope: across a tailnet the noise floor (WireGuard, scheduling, Wi-Fi)
+/// is microseconds against a per-word difference of about a nanosecond, so the
+/// `==` this replaces was not realistically exploitable from off-box. This
+/// removes the class; it does not close a live hole.
+fn tokens_match(presented: &[u8], expected: &[u8]) -> bool {
+    let mut diff = (presented.len() ^ expected.len()) as u64;
+    for (i, &p) in presented.iter().enumerate() {
+        diff |= u64::from(p ^ expected.get(i).copied().unwrap_or(0));
+    }
+    std::hint::black_box(diff) == 0
+}
+
+/// Unwrap `::ffff:a.b.c.d` to the v4 address it carries. Every classification
+/// below runs on the result: a dual-stack socket reports v4 peers in the mapped
+/// form, and a v4-shaped check applied to the mapped form matches nothing —
+/// which would reject every tailnet peer and every loopback caller with no
+/// branch and no log.
+/// Base URL for pulling content back from the peer that just pushed to us.
+///
+/// An IPv6 literal **must** be bracketed in a URL, or the trailing `:<port>`
+/// reads as another hextet and the whole thing fails to parse. This was latent
+/// and unreachable while the listener bound `0.0.0.0` (v4-only, so `addr.ip()`
+/// could never be v6); binding the tailnet's `fd7a:115c:a1e0::/48` address made
+/// it reachable, and the failure is silent in the worst way — the push itself
+/// answers 204 so metadata and statuses look healthy, while every dialog, usage
+/// and token pull built from this string dies in `reqwest` with the remote
+/// content simply never arriving. Mapped v4 is unwrapped first so a
+/// `::ffff:100.x.x.x` arrival yields the plain dotted form rather than a
+/// bracketed mapped literal.
+fn origin_url(ip: IpAddr, port: u16) -> String {
+    match unmap(ip) {
+        IpAddr::V6(v6) => format!("http://[{v6}]:{port}"),
+        IpAddr::V4(v4) => format!("http://{v4}:{port}"),
+    }
+}
+
+fn unmap(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(ip),
+        v4 => v4,
+    }
+}
+
+/// True for an address Tailscale hands out: the CGNAT block 100.64.0.0/10 for
+/// v4, the ULA prefix fd7a:115c:a1e0::/48 for v6. Both are checked because a
+/// tailnet node has both and a peer dialled by MagicDNS name can arrive over
+/// either — a v4-only test would reject a v6 peer silently.
+///
+/// The v4 test is the /10 mask, not a `"100."` string prefix and not a /8:
+/// 100.0.0.1 and 100.128.0.1 are ordinary public addresses.
+///
+/// This is a filter, not proof of tailnet membership. 100.64.0.0/10 is the real
+/// CGNAT range and carriers assign it directly (Starlink, T-Mobile Home, most
+/// mobile hotspots), so on such a network an unrelated host can present an
+/// allowed source; `local_tailnet_addrs` cross-checks the default route for the
+/// same reason. A Tailscale subnet router also puts every host behind it in
+/// range. The bearer token, not this check, is what authenticates a peer — and
+/// who is on the tailnet at all is a Tailscale ACL question.
+fn is_tailnet(ip: IpAddr) -> bool {
+    match unmap(ip) {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            o[0] == 100 && (64..=127).contains(&o[1])
+        }
+        IpAddr::V6(v6) => {
+            let s = v6.segments();
+            s[0] == 0xfd7a && s[1] == 0x115c && s[2] == 0xa1e0
+        }
+    }
+}
+
+/// Whether a request from `ip` may be answered at all — evaluated in [`guard`]
+/// *before* the token is read, so an out-of-scope caller never reaches the
+/// comparison and gets no oracle from it, timing or otherwise.
+///
+/// Loopback stays accepted under every scope: the documented sync test harness
+/// runs an observer peer on 127.0.0.1 (see the `debug_sync_fake_peer` project
+/// memory), and the alternative — special-casing it in the test setup — would
+/// mean the tested path is not the shipped one.
+///
+/// The source address is the kernel's TCP peer address, not a header. There is
+/// no proxy in front of this listener, so there is no `X-Forwarded-For` shape
+/// to spoof; an attacker would have to forge a whole TCP handshake off-path.
+fn source_allowed(scope: SyncBindScope, ip: IpAddr) -> bool {
+    match scope {
+        SyncBindScope::Any => true,
+        SyncBindScope::Tailnet => {
+            let ip = unmap(ip);
+            ip.is_loopback() || is_tailnet(ip)
+        }
+    }
 }
 
 /// Build the receiver-side state for one device from an incoming push:
@@ -176,19 +323,17 @@ fn ingest(
     (RemoteDevice { sessions: out, last_seen: now, origin_addr }, pulls)
 }
 
+/// Auth and source scope are already settled by [`guard`]; this handler only
+/// has to trust the address, which it uses to build the pull-back URL.
 async fn post_sync(
     State(app): State<AppHandle>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
     Json(push): Json<SyncPush>,
 ) -> Result<StatusCode, StatusCode> {
     let Some(cfg_state) = app.try_state::<ConfigState>() else {
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     };
     let cfg = cfg_state.snapshot();
-    if !bearer_ok(&headers, cfg.sync.token.as_deref()) {
-        return Err(StatusCode::UNAUTHORIZED);
-    }
     let Some(state) = app.try_state::<AppState>() else {
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     };
@@ -201,7 +346,7 @@ async fn post_sync(
         sessions = push.sessions.len(),
         "sync push received"
     );
-    let origin_addr = format!("http://{}:{}", addr.ip(), push.listen_port);
+    let origin_addr = origin_url(addr.ip(), push.listen_port);
     let now = now_ms();
     let store = app.try_state::<RemoteHistoryStore>();
     let persisted = store.as_ref().map(|s| s.device_dialogs(&push.device_name)).unwrap_or_default();
@@ -248,17 +393,7 @@ struct DialogQuery {
 
 /// Catch-up endpoint: a peer that lost its accumulated copy (restart) asks
 /// for our *local* session's dialog entries newer than `since`.
-async fn get_dialog(
-    State(app): State<AppHandle>,
-    headers: HeaderMap,
-    Query(q): Query<DialogQuery>,
-) -> Result<Json<Vec<DialogEntry>>, StatusCode> {
-    let Some(cfg_state) = app.try_state::<ConfigState>() else {
-        return Err(StatusCode::INTERNAL_SERVER_ERROR);
-    };
-    if !bearer_ok(&headers, cfg_state.snapshot().sync.token.as_deref()) {
-        return Err(StatusCode::UNAUTHORIZED);
-    }
+async fn get_dialog(State(app): State<AppHandle>, Query(q): Query<DialogQuery>) -> Result<Json<Vec<DialogEntry>>, StatusCode> {
     let Some(state) = app.try_state::<AppState>() else {
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     };
@@ -279,17 +414,7 @@ struct UsageQuery {
 /// than `since`. Gives `remote_usage/` the repair path dialog always had — a
 /// peer that lost its copy asks again and refills it, instead of waiting for
 /// this device to restart and re-advertise from scratch.
-async fn get_usage(
-    State(app): State<AppHandle>,
-    headers: HeaderMap,
-    Query(q): Query<UsageQuery>,
-) -> Result<Json<Vec<UsageHistoryRecord>>, StatusCode> {
-    let Some(cfg_state) = app.try_state::<ConfigState>() else {
-        return Err(StatusCode::INTERNAL_SERVER_ERROR);
-    };
-    if !bearer_ok(&headers, cfg_state.snapshot().sync.token.as_deref()) {
-        return Err(StatusCode::UNAUTHORIZED);
-    }
+async fn get_usage(State(app): State<AppHandle>, Query(q): Query<UsageQuery>) -> Result<Json<Vec<UsageHistoryRecord>>, StatusCode> {
     let records = app.try_state::<UsageHistoryStore>().map(|s| s.read_all()).unwrap_or_default();
     Ok(Json(usage_since(&records, q.since)))
 }
@@ -307,17 +432,7 @@ const MAX_TOKEN_RANGE: usize = 5_000;
 
 /// Catch-up endpoint: a peer asks for our *local* token records above the `seq`
 /// it already holds for us.
-async fn get_tokens(
-    State(app): State<AppHandle>,
-    headers: HeaderMap,
-    Query(q): Query<TokenQuery>,
-) -> Result<Json<Vec<crate::token_history::TokenRecord>>, StatusCode> {
-    let Some(cfg_state) = app.try_state::<ConfigState>() else {
-        return Err(StatusCode::INTERNAL_SERVER_ERROR);
-    };
-    if !bearer_ok(&headers, cfg_state.snapshot().sync.token.as_deref()) {
-        return Err(StatusCode::UNAUTHORIZED);
-    }
+async fn get_tokens(State(app): State<AppHandle>, Query(q): Query<TokenQuery>) -> Result<Json<Vec<crate::token_history::TokenRecord>>, StatusCode> {
     let records = app
         .try_state::<crate::token_history::TokenHistoryStore>()
         .map(|s| s.records_since_seq(q.since, MAX_TOKEN_RANGE))
@@ -325,7 +440,6 @@ async fn get_tokens(
     Ok(Json(records))
 }
 
-/// Sync listener on all interfaces — see module docs for why that's safe.
 /// Whether a sync listener is actually bound and serving right now.
 ///
 /// Deliberately *not* re-derived from config by its readers. The config
@@ -337,6 +451,15 @@ async fn get_tokens(
 /// `/api/agents` reports this to a caller that reads an empty `peers` as "the
 /// other machine has nothing", which is the exact over-claim that route exists
 /// to avoid. So the flag records the outcome, set at the one place that knows it.
+///
+/// It means **bound at startup, still serving** — not *reachable*. A narrow bind
+/// introduces one gap it cannot see: if the Tailscale address it bound goes away
+/// (logout, node-key reset, tailnet switch), the socket stays bound to an address
+/// that no longer exists, this flag stays `true`, and every peer gets connection
+/// refused until the app restarts. Under the old wildcard bind that could not
+/// happen. `spawn_reaper` re-checks the bound set against the live tailnet
+/// addresses and warns on divergence, which is the observable half; there is
+/// deliberately no rebind (see `run_listener`).
 #[derive(Debug, Default)]
 pub struct SyncListening(pub AtomicBool);
 
@@ -351,31 +474,251 @@ impl SyncListening {
     }
 }
 
-pub async fn run_listener(app: AppHandle, port: u16) {
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
-    let listener = match tokio::net::TcpListener::bind(addr).await {
-        Ok(l) => l,
-        Err(e) => {
-            tracing::error!(%addr, error = %e, "sync bind failed");
-            SyncListening::set(&app, false);
-            return;
+/// The addresses one listener run will bind, and whether that set is the
+/// intended one. `degraded` is carried rather than re-derived by the caller so
+/// the warning cannot be forgotten: the only way to learn the bind is wide is
+/// to read the flag that also drives the log line.
+#[derive(Debug, PartialEq, Eq)]
+struct BindPlan {
+    addrs: Vec<SocketAddr>,
+    degraded: bool,
+}
+
+/// Pure half of the bind decision: given the local addresses we discovered,
+/// which sockets should this run open?
+///
+/// Under `Tailnet` the tailnet addresses are bound *plus* both loopbacks —
+/// binding a specific address does not serve 127.0.0.1, and the documented
+/// localhost observer-peer harness pushes there. Several sockets rather than one
+/// wildcard is the price of the narrowing; they share one router, so there is
+/// one code path behind all of them.
+///
+/// Non-tailnet candidates are dropped rather than bound: the route lookup that
+/// produces them answers with the LAN address when Tailscale is down, and
+/// binding that would be the opposite of the intent — it would serve the LAN
+/// and *not* the tailnet.
+///
+/// With no tailnet address the plan is the wildcard, flagged degraded. Refusing
+/// to bind was rejected outright: it turns "the VPN came up a few seconds late"
+/// into "sync is dead until the next restart", silently, which is the one
+/// failure this whole change must not introduce.
+fn select_binds(scope: SyncBindScope, candidates: &[IpAddr], port: u16) -> BindPlan {
+    if scope == SyncBindScope::Any {
+        return BindPlan { addrs: vec![SocketAddr::from((Ipv4Addr::UNSPECIFIED, port))], degraded: false };
+    }
+    let tailnet: Vec<IpAddr> = candidates.iter().copied().filter(|ip| is_tailnet(*ip)).collect();
+    if tailnet.is_empty() {
+        return BindPlan { addrs: vec![SocketAddr::from((Ipv4Addr::UNSPECIFIED, port))], degraded: true };
+    }
+    let mut addrs: Vec<SocketAddr> = tailnet.into_iter().map(|ip| SocketAddr::new(ip, port)).collect();
+    addrs.push(SocketAddr::from((Ipv4Addr::LOCALHOST, port)));
+    addrs.push(SocketAddr::from((Ipv6Addr::LOCALHOST, port)));
+    BindPlan { addrs, degraded: false }
+}
+
+/// This device's Tailscale addresses, or empty when the tailnet is not up.
+///
+/// Found by asking the routing table, not by enumerating interfaces: a
+/// connect(2) on an *unconnected UDP socket* sends no packet — it only resolves
+/// the route and pins the source address, which `local_addr` then reports. Six
+/// lines of `std`, identical on both platforms, against `getifaddrs` on macOS
+/// plus the two-pass `GetAdaptersAddresses` linked-list walk on Windows, or a
+/// new interface-enumeration crate. Shelling out to `tailscale ip` was rejected
+/// for the same reason it always is: PATH-dependent, absent on some installs,
+/// and a process spawn for one address.
+///
+/// The probe targets are inside the tailnet by construction (the MagicDNS
+/// resolver's v4 address; the tailnet's own v6 prefix), so a hit is routed over
+/// the tailnet interface. Every answer is still filtered through [`is_tailnet`]
+/// by the caller: with Tailscale down the default route answers instead and the
+/// lookup yields a LAN address, which must not be mistaken for a tailnet one.
+fn local_tailnet_addrs() -> Vec<IpAddr> {
+    fn route_source(bind: &str, probe: &str) -> Option<IpAddr> {
+        let sock = std::net::UdpSocket::bind(bind).ok()?;
+        sock.connect(probe).ok()?;
+        Some(sock.local_addr().ok()?.ip())
+    }
+    // The v4 probe alone is not enough to conclude Tailscale is up. 100.64/10 is
+    // the real CGNAT range, and carriers hand it out directly — Starlink, T-Mobile
+    // Home Internet, most mobile hotspots. On such a network with Tailscale DOWN,
+    // the probe returns the *LAN* address, `is_tailnet` accepts it, and we would
+    // bind that LAN address while reporting a clean (non-degraded) narrow bind —
+    // then accept every other host behind the same carrier NAT as a peer. So
+    // cross-check against the route to the public internet: with a real tailnet
+    // there is a separate route and the two sources differ; on carrier CGNAT they
+    // are the same address, which means there is no tailnet here.
+    //
+    // An exit node makes them match too, and that degrades to a wide bind rather
+    // than a wrong narrow one — the safe direction.
+    let public_route = route_source("0.0.0.0:0", "1.1.1.1:53");
+    [("0.0.0.0:0", "100.100.100.100:53"), ("[::]:0", "[fd7a:115c:a1e0::53]:53")]
+        .into_iter()
+        .filter_map(|(bind, probe)| route_source(bind, probe))
+        .filter(|ip| is_tailnet(*ip))
+        .filter(|ip| !(ip.is_ipv4() && public_route == Some(*ip)))
+        .collect()
+}
+
+/// How long to wait for a tailnet address before giving up and binding wide.
+/// The dashboard autostarts at login and so does Tailscale, so losing that race
+/// is ordinary. A short grace turns most of those launches into a narrow bind;
+/// past it we bind anyway, because sync being down is worse than a wide socket
+/// the source check still guards. Sync is eventually consistent — peers retry
+/// every heartbeat — so the wait itself costs a peer at most one cycle.
+const BIND_DISCOVERY_ATTEMPTS: u32 = 5;
+const BIND_DISCOVERY_INTERVAL_MS: u64 = 2_000;
+
+/// Impure half: poll for a tailnet address across the grace window, then plan.
+async fn resolve_binds(scope: SyncBindScope, port: u16) -> BindPlan {
+    let mut plan = select_binds(scope, &local_tailnet_addrs(), port);
+    let mut attempt = 1;
+    while plan.degraded && attempt < BIND_DISCOVERY_ATTEMPTS {
+        tracing::debug!(attempt, "no tailnet address yet — waiting for the VPN before binding sync");
+        tokio::time::sleep(Duration::from_millis(BIND_DISCOVERY_INTERVAL_MS)).await;
+        attempt += 1;
+        plan = select_binds(scope, &local_tailnet_addrs(), port);
+    }
+    plan
+}
+
+/// State the [`guard`] layer needs: the app (for the current token) and the
+/// scope the listener was started with. The scope is carried, not re-read from
+/// config, so the gate cannot contradict the socket it is guarding —
+/// `bind_scope` is start-only, and a hot-reload that widened only the check
+/// would be a silent, invisible widening.
+#[derive(Clone)]
+struct GuardState {
+    app: AppHandle,
+    scope: SyncBindScope,
+}
+
+/// The single gate in front of every sync route: source scope first, bearer
+/// token second, both before any handler runs.
+///
+/// One layer rather than a check per handler, replacing four copies that were
+/// already a maintenance hazard.
+///
+/// **It is ordering, not construction, that keeps a new route guarded.** axum
+/// applies a layer only to routes already registered: "additional routes added
+/// after `layer` is called will not have the middleware added". So a `.route(...)`
+/// appended *below* the `.layer(...)` call — the natural place to add one —
+/// compiles, type-checks, passes every test here, and serves with no source check
+/// and no token. Every route must be registered **above** the layer, and
+/// `guard_covers_every_route` fails if one is not.
+///
+/// Source before token on purpose: an out-of-scope caller is refused without the
+/// secret ever being compared, so it cannot even be probed from off the tailnet.
+async fn guard(State(gs): State<GuardState>, ConnectInfo(peer): ConnectInfo<SocketAddr>, req: Request, next: Next) -> Result<Response, StatusCode> {
+    if !source_allowed(gs.scope, peer.ip()) {
+        log_reject(peer.ip(), "source", req.uri().path());
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let token = gs.app.try_state::<ConfigState>().and_then(|c| c.snapshot().sync.token);
+    if !bearer_ok(req.headers(), token.as_deref()) {
+        log_reject(peer.ip(), "token", req.uri().path());
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    Ok(next.run(req).await)
+}
+
+/// Cooldown between logged rejections from one address, and the cap on how many
+/// addresses are remembered. A misconfigured peer retries every push cycle and a
+/// scanner far faster than that, so an unthrottled line per rejection would
+/// bury the log — the same failure the `sync push cycle` breadcrumb had in the
+/// other direction. The cap bounds the map under a scan sweeping source
+/// addresses; hitting it clears the whole map, which at worst re-logs an address
+/// once more than the cooldown asked for.
+const REJECT_LOG_COOLDOWN_MS: i64 = 60_000;
+const REJECT_LOG_CAP: usize = 256;
+
+static REJECT_SEEN: LazyLock<Mutex<HashMap<IpAddr, i64>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Pure throttle decision, so the "once per address per window" rule is
+/// testable without a clock or a log sink.
+fn reject_log_due(seen: &mut HashMap<IpAddr, i64>, ip: IpAddr, now: i64) -> bool {
+    if let Some(last) = seen.get(&ip) {
+        if now - *last < REJECT_LOG_COOLDOWN_MS {
+            return false;
         }
-    };
-    tracing::info!(%addr, "sync listening");
-    SyncListening::set(&app, true);
-    let app_for_flag = app.clone();
+    }
+    if seen.len() >= REJECT_LOG_CAP {
+        seen.clear();
+    }
+    seen.insert(ip, now);
+    true
+}
+
+/// A rejected request, at `warn!` and throttled per source. Not `debug!` like a
+/// failed push: an offline peer is routine, but a peer being refused is a
+/// misconfiguration (wrong token, wrong network, a `bind_scope` that does not
+/// match how the devices actually reach each other) that only the user can fix,
+/// and "sync went quiet" is unanswerable without knowing *which* gate closed.
+/// Never logs the token or any part of it.
+fn log_reject(ip: IpAddr, gate: &'static str, path: &str) {
+    let due = REJECT_SEEN.lock().map(|mut seen| reject_log_due(&mut seen, ip, now_ms())).unwrap_or(true);
+    if due {
+        tracing::warn!(peer = %ip, gate, path, "sync request rejected");
+    }
+}
+
+/// Bind and serve the sync routes. The bind set is chosen once, here: there is
+/// no rebind path, so a tailnet address that appears (or changes) after this
+/// point is picked up on the next app start, and `bind_scope`/`listen_port` are
+/// start-only for the same reason. Rebinding live was considered and rejected
+/// for Stage 1 — it needs graceful shutdown plus a re-bind that can fail on a
+/// port still held by lingering connections (Windows has no SO_REUSEADDR
+/// equivalent here), trading a rare narrow-bind miss for a rarer but total
+/// outage. The source check covers the interval either way.
+pub async fn run_listener(app: AppHandle, port: u16, scope: SyncBindScope) {
+    let plan = resolve_binds(scope, port).await;
+    if plan.degraded {
+        // The reliability escape hatch, made loud. Everything still works; the
+        // socket is simply wider than asked for until the next restart.
+        tracing::warn!(
+            wanted = "tailnet",
+            bound = %plan.addrs.first().map(|a| a.to_string()).unwrap_or_default(),
+            "no Tailscale address found — sync listening on all interfaces; non-tailnet sources are still refused"
+        );
+    }
+
+    // Record what we actually bound so the heartbeat can notice it vanishing.
+    *bound_tailnet().lock().unwrap() =
+        if plan.degraded { Vec::new() } else { plan.addrs.iter().map(|a| a.ip()).filter(|ip| is_tailnet(*ip)).collect() };
 
     let router = Router::new()
         .route("/api/sync", post(post_sync))
         .route("/api/sync/dialog", get(get_dialog))
         .route("/api/sync/usage", get(get_usage))
         .route("/api/sync/tokens", get(get_tokens))
-        .with_state(app);
+        .layer(middleware::from_fn_with_state(GuardState { app: app.clone(), scope }, guard))
+        .with_state(app.clone());
 
-    if let Err(e) = axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>()).await {
-        tracing::error!(error = %e, "sync serve ended");
+    // One task per bound address; they share the router, so all sockets run the
+    // same gate and the same handlers. A single failure is tolerated (an IPv6
+    // loopback on a host with IPv6 off, say) as long as something is serving.
+    let mut serving = JoinSet::new();
+    for addr in &plan.addrs {
+        match tokio::net::TcpListener::bind(addr).await {
+            Ok(listener) => {
+                tracing::info!(%addr, ?scope, degraded = plan.degraded, "sync listening");
+                let router = router.clone();
+                serving.spawn(async move {
+                    if let Err(e) = axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>()).await {
+                        tracing::error!(error = %e, "sync serve ended");
+                    }
+                });
+            }
+            Err(e) => tracing::warn!(%addr, error = %e, "sync bind failed on one address"),
+        }
     }
-    SyncListening::set(&app_for_flag, false);
+    if serving.is_empty() {
+        tracing::error!(port, ?scope, "sync bind failed on every address — listener not started");
+        SyncListening::set(&app, false);
+        return;
+    }
+    SyncListening::set(&app, true);
+    while serving.join_next().await.is_some() {}
+    SyncListening::set(&app, false);
 }
 
 /// Local usage samples newer than `since`, ascending (the store already
@@ -486,8 +829,45 @@ pub fn spawn_reaper(app: AppHandle) {
             if state.reap_remote(now_ms(), REMOTE_TTL_MS) {
                 emit_sessions_updated_remote(&app);
             }
+            warn_if_bound_address_vanished();
         }
     });
+}
+
+/// Tailnet addresses this process actually bound, recorded so the heartbeat can
+/// notice they stopped existing. Empty under `Any` / a degraded bind, where the
+/// wildcard socket cannot go stale.
+static BOUND_TAILNET: std::sync::OnceLock<std::sync::Mutex<Vec<IpAddr>>> = std::sync::OnceLock::new();
+
+fn bound_tailnet() -> &'static std::sync::Mutex<Vec<IpAddr>> {
+    BOUND_TAILNET.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+/// The one degradation a narrow bind adds and the socket itself cannot report:
+/// the bound Tailscale address goes away (logout, node-key reset, tailnet
+/// switch) and the listener keeps a socket on an address that no longer exists.
+/// Peers then get connection-refused until restart while this side looks
+/// healthy — `SyncListening` stays true, nothing errors, sync just goes quiet.
+/// There is no rebind (see `run_listener`), so the fix here is purely making it
+/// diagnosable from the log rather than leaving "sync stopped" unanswerable.
+/// Latched so a persistent divergence logs once, not every heartbeat.
+fn warn_if_bound_address_vanished() {
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    let bound = bound_tailnet().lock().unwrap().clone();
+    if bound.is_empty() {
+        return;
+    }
+    let live = local_tailnet_addrs();
+    let missing: Vec<_> = bound.iter().filter(|b| !live.contains(b)).collect();
+    if missing.is_empty() {
+        WARNED.store(false, Ordering::Relaxed);
+    } else if !WARNED.swap(true, Ordering::Relaxed) {
+        tracing::warn!(
+            gone = ?missing,
+            live = ?live,
+            "a bound tailnet address is no longer local — peers cannot reach this device until the app restarts"
+        );
+    }
 }
 
 /// Resolve a (possibly remote) session id into a catch-up fetch target:
@@ -728,6 +1108,44 @@ mod tests {
         HashMap::new()
     }
 
+    /// axum applies a layer only to routes registered *before* it, so a
+    /// `.route(...)` appended below `.layer(...)` serves with no source check and
+    /// no token — and compiles, type-checks and passes every other test here.
+    /// Nothing in the type system catches that, and the router needs an
+    /// `AppHandle` that a unit test cannot construct, so this asserts the
+    /// ordering invariant against the source text itself. Unusual, but it is the
+    /// only thing that fails when someone adds the natural next route in the
+    /// natural next place — which is exactly what a later stage will do.
+    #[test]
+    fn guard_covers_every_route() {
+        let src = include_str!("sync.rs");
+        let start = src.find("let router = Router::new()").expect("router construction moved — update this test");
+        let expr = &src[start..];
+        let end = expr.find(".with_state(").expect("router must end with .with_state");
+        let expr = &expr[..end];
+
+        let layer_at = expr.find(".layer(").expect("the guard layer is gone — every route is now unguarded");
+        let last_route_at = expr.rfind(".route(").expect("no routes found");
+        assert!(
+            last_route_at < layer_at,
+            "a route is registered BELOW the guard layer, so it serves with no source check and no bearer token. \
+             Move every .route(...) above the .layer(...) call."
+        );
+        // Guards the guard: if the routes ever stop being registered in this
+        // expression the assert above passes vacuously, so pin the count too.
+        assert_eq!(expr.matches(".route(").count(), 4, "route count changed — confirm the new route is above the layer, then update this number");
+    }
+
+    #[test]
+    fn origin_url_brackets_an_ipv6_literal() {
+        // Unbracketed, the trailing :port reads as another hextet and the URL
+        // fails to parse — silently, since the push itself still answers 204.
+        assert_eq!(origin_url("fd7a:115c:a1e0::8735:895b".parse().unwrap(), 9078), "http://[fd7a:115c:a1e0::8735:895b]:9078");
+        assert_eq!(origin_url("100.67.137.90".parse().unwrap(), 9078), "http://100.67.137.90:9078");
+        // A v4-mapped arrival yields the plain dotted form, not a bracketed literal.
+        assert_eq!(origin_url("::ffff:100.67.137.90".parse().unwrap(), 9078), "http://100.67.137.90:9078");
+    }
+
     #[test]
     fn ingest_namespaces_and_stamps_origin() {
         let (dev, _) = ingest("laptop", vec![push_item("proj", 0)], None, &no_persisted(), 100, "http://1.2.3.4:9078".into());
@@ -911,5 +1329,158 @@ mod tests {
         assert!(!bearer_ok(&HeaderMap::new(), Some("s3cret")));
         assert!(!bearer_ok(&headers_with("Bearer s3cret"), None), "no token = sync disabled");
         assert!(!bearer_ok(&headers_with("Bearer "), Some("")), "empty token never matches");
+    }
+
+    #[test]
+    fn bearer_rejects_a_prefix_or_a_trailing_byte() {
+        // Both length directions, because length is folded into the comparison
+        // rather than short-circuiting ahead of it — a wrong length must be as
+        // wrong as a wrong byte, and no cheaper to discover.
+        assert!(!bearer_ok(&headers_with("Bearer s3c"), Some("s3cret")));
+        assert!(!bearer_ok(&headers_with("Bearer s3crets"), Some("s3cret")));
+    }
+
+    #[test]
+    fn bearer_rejects_a_non_bearer_scheme() {
+        assert!(!bearer_ok(&headers_with("Basic s3cret"), Some("s3cret")));
+        assert!(!bearer_ok(&headers_with("s3cret"), Some("s3cret")), "credentials without the scheme");
+    }
+
+    #[test]
+    fn tokens_match_only_on_identical_bytes() {
+        assert!(tokens_match(b"s3cret", b"s3cret"));
+        assert!(!tokens_match(b"S3cret", b"s3cret"), "first byte, case-sensitive");
+        assert!(!tokens_match(b"s3creT", b"s3cret"), "last byte");
+        assert!(!tokens_match(b"s3cre", b"s3cret"), "a prefix of the secret");
+        assert!(!tokens_match(b"s3cretX", b"s3cret"), "the secret plus a suffix");
+        assert!(!tokens_match(b"", b"s3cret"));
+        // The helper is pure byte equality; "an empty configured token never
+        // matches" is `bearer_ok`'s rule and lives in exactly one place.
+        assert!(tokens_match(b"", b""));
+    }
+
+    // -------- source_allowed --------
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().expect("test address")
+    }
+    const TAILNET: SyncBindScope = SyncBindScope::Tailnet;
+
+    #[test]
+    fn source_allows_tailnet_v4() {
+        for a in ["100.64.0.1", "100.86.97.31", "100.67.137.90", "100.127.255.254"] {
+            assert!(source_allowed(TAILNET, ip(a)), "{a} is inside 100.64.0.0/10");
+        }
+    }
+
+    #[test]
+    fn source_rejects_addresses_just_outside_the_cgnat_range() {
+        // The mask is /10, not a "100." string prefix and not a /8: both of
+        // these are ordinary public addresses.
+        assert!(!source_allowed(TAILNET, ip("100.63.255.255")));
+        assert!(!source_allowed(TAILNET, ip("100.128.0.0")));
+    }
+
+    #[test]
+    fn source_allows_tailnet_v6_and_rejects_other_private_v6() {
+        assert!(source_allowed(TAILNET, ip("fd7a:115c:a1e0::1")), "Tailscale's ULA prefix");
+        assert!(source_allowed(TAILNET, ip("fd7a:115c:a1e0::8735:895b")));
+        assert!(!source_allowed(TAILNET, ip("fd00::1")), "matched on the /48, not on 'any ULA'");
+        assert!(!source_allowed(TAILNET, ip("fe80::1")), "link-local is not the tailnet");
+    }
+
+    #[test]
+    fn source_allows_loopback_v4_and_v6() {
+        // The documented localhost observer-peer harness pushes from here.
+        assert!(source_allowed(TAILNET, ip("127.0.0.1")));
+        assert!(source_allowed(TAILNET, ip("127.0.0.2")));
+        assert!(source_allowed(TAILNET, ip("::1")));
+    }
+
+    #[test]
+    fn source_allows_v4_mapped_addresses() {
+        // A dual-stack socket reports v4 peers mapped; classify after unmapping
+        // or every tailnet peer reads as an unknown v6 address.
+        assert!(source_allowed(TAILNET, ip("::ffff:100.86.97.31")));
+        assert!(source_allowed(TAILNET, ip("::ffff:127.0.0.1")));
+        assert!(!source_allowed(TAILNET, ip("::ffff:192.168.1.5")));
+    }
+
+    #[test]
+    fn source_rejects_lan_and_public_addresses() {
+        for a in ["192.168.1.5", "10.0.0.5", "172.16.0.9", "1.2.3.4"] {
+            assert!(!source_allowed(TAILNET, ip(a)), "{a}: a home router is not the boundary");
+        }
+    }
+
+    #[test]
+    fn source_check_allows_everything_under_the_any_scope() {
+        for a in ["1.2.3.4", "192.168.1.5", "fe80::1", "127.0.0.1"] {
+            assert!(source_allowed(SyncBindScope::Any, ip(a)), "`any` is the escape hatch, in both directions");
+        }
+    }
+
+    // -------- select_binds --------
+
+    #[test]
+    fn bind_prefers_the_tailnet_addresses_and_keeps_loopback() {
+        let plan = select_binds(TAILNET, &[ip("100.67.137.90"), ip("fd7a:115c:a1e0::1")], 9078);
+        assert!(!plan.degraded);
+        assert_eq!(
+            plan.addrs,
+            vec![
+                SocketAddr::new(ip("100.67.137.90"), 9078),
+                SocketAddr::new(ip("fd7a:115c:a1e0::1"), 9078),
+                SocketAddr::new(ip("127.0.0.1"), 9078),
+                SocketAddr::new(ip("::1"), 9078),
+            ],
+            "a narrow bind serves no loopback of its own — the observer-peer harness needs one"
+        );
+    }
+
+    #[test]
+    fn bind_falls_back_to_all_interfaces_when_no_tailnet_address() {
+        let plan = select_binds(TAILNET, &[], 9078);
+        assert_eq!(plan.addrs, vec![SocketAddr::new(ip("0.0.0.0"), 9078)]);
+        assert!(plan.degraded, "the flag is what makes the wide bind observable — sync must not simply fail to start");
+    }
+
+    #[test]
+    fn bind_ignores_lan_and_link_local_candidates() {
+        // The route lookup answers with the LAN address when Tailscale is down;
+        // binding that would serve the LAN and not the tailnet.
+        let plan = select_binds(TAILNET, &[ip("192.168.1.97"), ip("fe80::1")], 9078);
+        assert_eq!(plan.addrs, vec![SocketAddr::new(ip("0.0.0.0"), 9078)]);
+        assert!(plan.degraded);
+    }
+
+    #[test]
+    fn bind_any_scope_is_the_wildcard_and_not_degraded() {
+        let plan = select_binds(SyncBindScope::Any, &[ip("100.67.137.90")], 9078);
+        assert_eq!(plan.addrs, vec![SocketAddr::new(ip("0.0.0.0"), 9078)]);
+        assert!(!plan.degraded, "a wide bind that was asked for is not a degrade");
+    }
+
+    // -------- reject_log_due --------
+
+    #[test]
+    fn reject_log_is_throttled_per_address() {
+        let mut seen = HashMap::new();
+        let a = ip("1.2.3.4");
+        let b = ip("5.6.7.8");
+        assert!(reject_log_due(&mut seen, a, 0), "first sighting always logs");
+        assert!(!reject_log_due(&mut seen, a, 1_000), "a retrying peer must not flood the log");
+        assert!(reject_log_due(&mut seen, b, 1_000), "throttled per address, not globally");
+        assert!(reject_log_due(&mut seen, a, REJECT_LOG_COOLDOWN_MS), "still refused a minute later — say so once more");
+    }
+
+    #[test]
+    fn reject_log_memory_is_bounded() {
+        let mut seen = HashMap::new();
+        for i in 0..REJECT_LOG_CAP + 10 {
+            let ip = IpAddr::V4(std::net::Ipv4Addr::from(i as u32));
+            reject_log_due(&mut seen, ip, 0);
+        }
+        assert!(seen.len() <= REJECT_LOG_CAP, "a source-sweeping scan must not grow the map without bound");
     }
 }

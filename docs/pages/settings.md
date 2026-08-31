@@ -93,6 +93,7 @@ Every field is optional — omit one and the built-in default applies. A complet
     "device_name": "",
     "listen": false,
     "listen_port": 9078,
+    "bind_scope": "tailnet",
     "peers": [],
     "token": null
   },
@@ -209,6 +210,7 @@ The `sync` block shows sessions from your other computers — see [Features → 
 - `device_name` — the name other dashboards show on this device's session badges. Filled in from the computer's hostname on first launch; edit it if you'd like a friendlier label.
 - `listen` — accept session pushes from peers. Needs an app restart to change, like `server_port`.
 - `listen_port` — port the sync listener uses (peers connect here). Also restart-required.
+- `bind_scope` — how far the listener opens up. `"tailnet"` (the default) keeps it on your Tailscale network and your own computer, and turns away anything else; `"any"` opens it to every network this computer is on, leaving the `token` as the only protection — use it only if your devices reach each other some other way. Also restart-required. On `"tailnet"`, if Tailscale isn't running when the widget starts, the listener still comes up on all networks and says so in the log, and it still turns away anything that isn't on your tailnet; start Tailscale first, or restart the widget afterwards, to get the narrower setup back.
 - `peers` — addresses of the other devices' sync listeners, e.g. `["http://my-laptop:9078"]`.
 - `token` — a shared secret, the same string on every device; pushes without it are rejected. Sync stays fully off while it's `null`.
 

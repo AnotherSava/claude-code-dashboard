@@ -270,20 +270,47 @@ impl TrayBadge {
     }
 }
 
+/// How far the sync listener opens up: which interfaces it binds and which
+/// source addresses it will talk to. Both halves move together on purpose —
+/// a user who has to reach the listener from outside the tailnet needs the
+/// socket *and* the guard to agree, and two knobs that must be set to the same
+/// thing are one knob with a way to get it wrong.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncBindScope {
+    /// Default. Bind this device's Tailscale addresses (plus loopback) and
+    /// refuse any request whose source is outside 100.64.0.0/10,
+    /// fd7a:115c:a1e0::/48 or loopback. When no Tailscale address can be found
+    /// the listener still starts — bound to all interfaces, logged as degraded
+    /// — because a listener that silently never came up is a worse outcome than
+    /// a wide socket that still rejects every non-tailnet caller.
+    #[default]
+    Tailnet,
+    /// Bind all interfaces and accept any source, leaving the bearer token as
+    /// the only gate. For syncing over something that isn't Tailscale (another
+    /// VPN, a trusted LAN). It is an escape hatch, not a tuning knob: it puts
+    /// the port and the token in front of every host that can route here.
+    Any,
+}
+
 /// Settings for syncing sessions between dashboards on different devices
 /// (reachable over a VPN such as Tailscale). `peers`/`token`/`device_name`
-/// hot-reload (the pusher re-reads config each cycle); `listen`/`listen_port`
-/// need a restart, like `server_port`.
+/// hot-reload (the pusher re-reads config each cycle); `listen`/`listen_port`/
+/// `bind_scope` need a restart, like `server_port` — they are read once when
+/// the listener is spawned and there is no rebind path (see `sync::run_listener`).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SyncConfig {
     /// Name other dashboards show on this device's session badges. Empty =
     /// resolved once at startup from the hostname and written back.
     pub device_name: String,
-    /// Accept session pushes from peers on `listen_port`. Off by default —
-    /// the sync listener binds all interfaces (the bearer `token` gates it).
+    /// Accept session pushes from peers on `listen_port`. Off by default; when
+    /// on, `bind_scope` decides how far the listener opens up.
     pub listen: bool,
     pub listen_port: u16,
+    /// Interfaces the listener binds and sources it answers. Defaults to
+    /// `Tailnet` — the bearer `token` is the credential, not the perimeter.
+    pub bind_scope: SyncBindScope,
     /// Peer sync listeners to push local sessions to, e.g.
     /// "http://my-laptop:9078". Empty = push nothing.
     pub peers: Vec<String>,
@@ -299,6 +326,7 @@ impl Default for SyncConfig {
             device_name: String::new(),
             listen: false,
             listen_port: 9078,
+            bind_scope: SyncBindScope::Tailnet,
             peers: Vec::new(),
             token: None,
         }
@@ -803,6 +831,14 @@ mod tests {
     }
 
     #[test]
+    fn sync_bind_scope_defaults_to_tailnet() {
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(cfg.sync.bind_scope, SyncBindScope::Tailnet, "narrow by default; `any` is opt-in");
+        let opened: Config = serde_json::from_str(r#"{ "sync": { "bind_scope": "any" } }"#).unwrap();
+        assert_eq!(opened.sync.bind_scope, SyncBindScope::Any);
+    }
+
+    #[test]
     fn partial_sync_block_backfills_the_rest() {
         let partial = r#"{ "sync": { "peers": ["http://laptop:9078"], "token": "s3cret" } }"#;
         let cfg: Config = serde_json::from_str(partial).unwrap();
@@ -810,6 +846,9 @@ mod tests {
         assert_eq!(cfg.sync.token.as_deref(), Some("s3cret"));
         assert!(!cfg.sync.listen, "default listen survives");
         assert_eq!(cfg.sync.listen_port, 9078, "default port survives");
+        // A config.json written before bind_scope existed — deploy overwrites
+        // config.json, so an in-place upgrade must not fail to parse.
+        assert_eq!(cfg.sync.bind_scope, SyncBindScope::Tailnet, "a sync block without the key takes the narrow default");
         // unrelated defaults still survive
         assert_eq!(cfg.server_port, 9077);
     }

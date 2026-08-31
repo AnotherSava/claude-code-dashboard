@@ -280,8 +280,9 @@ pub fn run() {
             // Multi-device sync. Pusher + reaper always run — they no-op
             // without peers/token. The listener needs the opt-in *and* a
             // token (never accept pushes unauthenticated). Like server_port,
-            // changing sync.listen/listen_port needs a restart; peers, token
-            // and device_name hot-reload via the pusher's per-cycle re-read.
+            // changing sync.listen/listen_port/bind_scope needs a restart (the
+            // bind set is chosen once, at spawn); peers, token and device_name
+            // hot-reload via the pusher's per-cycle re-read.
             let dirty = app.state::<sync::SyncDirty>().inner().0.clone();
             sync::spawn_pusher(app.handle().clone(), dirty);
             sync::spawn_reaper(app.handle().clone());
@@ -289,8 +290,9 @@ pub fn run() {
                 if current_config.sync.token.as_deref().is_some_and(|t| !t.is_empty()) {
                     let handle = app.handle().clone();
                     let port = current_config.sync.listen_port;
+                    let scope = current_config.sync.bind_scope;
                     tauri::async_runtime::spawn(async move {
-                        sync::run_listener(handle, port).await;
+                        sync::run_listener(handle, port, scope).await;
                     });
                 } else {
                     tracing::warn!("sync.listen is on but sync.token is unset — listener not started");

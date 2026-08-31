@@ -98,11 +98,21 @@ A peer pushes on every state change (coalesced 300 ms) and at worst every 30 s a
 
 `last_seen_age_ms` is the number to judge on. It is measured on the receiver's clock at both ends, so it carries no skew — unlike `status_age_ms`, which for a remote row is the sender's arithmetic and is only clamped at zero. A few seconds means the row was pushed on a live connection; anything past ~35 s means at least one heartbeat went missing. It is omitted for local rows, where a `0` would claim freshness on a channel that doesn't exist.
 
+**A present row is strong evidence; what an absent row is worth depends on how long the dashboard has been up.** The dashboard learns a session exists only when that session fires a hook, and it restores nothing at startup — so a restart empties the roster and it refills as sessions emit events. On a dashboard up for days, which is the normal case since it is restarted only to deploy it, nearly everything live has emitted something and an absent row genuinely suggests no such session or that device's dashboard being down. Fresh from a restart it means nothing.
+
+The uptime is one command, so check it rather than assuming either way:
+
+```bash
+ps -o lstart= -p $(lsof -nP -iTCP:9077 -sTCP:LISTEN -t)
+```
+
+What makes the post-restart window worse than "wait a minute" is that the gap closes on session **activity**, not on a timer. Measured across one redeploy: 1 row of 9 live sessions immediately after, 2 of 9 six minutes later, 3 of 9 later still — the idle ones had no reason to emit anything. A session idle since before the dashboard started stays invisible for as long as it stays idle, however long the dashboard has been up, and that is exactly the kind of session a caller is most likely to be asking after. Fall back to another check when uptime is short or the target has been sitting idle.
+
 The route deliberately returns **facts, not a verdict**. There is no `deliverable` / `sendable` boolean: a green light computed from data that may be 90 s old would state as certain something that isn't, and the caller — which knows what it wants to do with the answer — is the one that should weigh the age. There is likewise no user-presence or idle time: a message to a peer agent starts a turn in it whether or not a human is watching that screen, so presence changes no decision.
 
 ## Sync API
 
-When `sync.listen` is on (and `sync.token` set), a second listener binds **all interfaces** on `sync.listen_port` (default 9078) for dashboard-to-dashboard session sync. Every route requires `Authorization: Bearer <sync.token>`; requests without it get `401`. Implementation: `src-tauri/src/sync.rs`.
+When `sync.listen` is on (and `sync.token` set), a second listener serves `sync.listen_port` (default 9078) for dashboard-to-dashboard session sync. Two gates sit in front of every route, in this order: the connection's source address must be inside `sync.bind_scope` — by default this device's tailnet (100.64.0.0/10, fd7a:115c:a1e0::/48) plus loopback, anything else gets `403` — and the request must carry `Authorization: Bearer <sync.token>`, or it gets `401`. Under the default scope the listener binds only this device's Tailscale addresses and loopback; if no Tailscale address is found at startup it binds all interfaces instead, logs that at `warn`, and keeps refusing non-tailnet sources. Implementation: `src-tauri/src/sync.rs`.
 
 ### `POST /api/sync`
 
@@ -121,7 +131,7 @@ A peer pushes its local sessions. The body is a full snapshot of the sender's se
 
 The push carries **no dialog or usage content** — only a full metadata snapshot plus, per session, the `dialog_tip` (the sender's newest dialog timestamp) and a device-wide `usage_tip`. The receiver compares each tip against what it already holds and fetches the difference itself from the `GET` endpoints below. This keeps the sender stateless: the same body goes to every peer on every cycle, so nothing has to be remembered about a peer's progress and a failed push costs only a retry.
 
-Returns `204` on ingest, `400` when `device_name` is empty or equals the receiver's own, `401` without a valid bearer token. The receiver namespaces ids to `{device_name}/{id}`, stamps `origin`, and carries over the dialog it has already accumulated (persisted per device, re-seeded after a restart). `listen_port` plus the connection's source IP becomes the address it pulls from. A device unheard from for 90 s is dropped.
+Returns `204` on ingest, `400` when `device_name` is empty or equals the receiver's own, `401` without a valid bearer token, `403` from a source outside `sync.bind_scope`. The receiver namespaces ids to `{device_name}/{id}`, stamps `origin`, and carries over the dialog it has already accumulated (persisted per device, re-seeded after a restart). `listen_port` plus the connection's source IP becomes the address it pulls from. A device unheard from for 90 s is dropped.
 
 ### `GET /api/sync/dialog?id=<raw_id>&since=<epoch_ms>`
 
