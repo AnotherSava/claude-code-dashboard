@@ -15,6 +15,7 @@ use crate::commands::{emit_sessions_updated, now_ms, resolved_snapshot};
 use crate::config::ConfigState;
 use crate::log_watcher::WatcherRegistry;
 use crate::nonce_store::NonceStore;
+use crate::peer_message::{self, Outcome, Receipt};
 use crate::prompt_history::PromptHistoryStore;
 use crate::session_registry::{Activity, LiveSession, SessionRegistry};
 use crate::state::{AgentSession, AppState, Status};
@@ -34,6 +35,7 @@ pub async fn run(app: AppHandle, port: u16) {
     let router = Router::new()
         .route("/api/event", post(post_event))
         .route("/api/agents", get(get_agents))
+        .route("/api/message", post(post_message))
         .with_state(app);
 
     if let Err(e) = axum::serve(listener, router).await {
@@ -169,15 +171,45 @@ fn drift_action(present: bool, seen: bool, is_handback: bool) -> (DriftAction, &
 /// to loopback is a supported setup that such a check would break. Recorded
 /// rather than papered over — the gap is a known, accepted one.
 ///
-/// Extracted rather than copied into the second handler: the guard is per-handler
-/// (there is no tower layer on this router), so every new route is unprotected
-/// until it repeats the check, and two copies of the rule would be two places to
-/// forget when it changes.
+/// **Reassessed for `POST /api/message`, and priced differently there.** That
+/// gap was accepted while every route on this server wrote a status or read a
+/// roster. The message route starts a turn inside a live agent *on another
+/// machine*, so the same rebound page would become a way to prompt a remote
+/// agent — a different order of consequence. It therefore adds
+/// [`host_is_loopback`] on top of this check. The hook routes keep the accepted
+/// gap, because the `TAURI_DASHBOARD_URL` alias they support is real and the
+/// stake there is unchanged.
+///
+/// Extracted rather than copied into the other handlers: the guard is
+/// per-handler (there is no tower layer on this router), so every new route is
+/// unprotected until it repeats the check, and two copies of the rule would be
+/// two places to forget when it changes.
 fn origin_blocked(headers: &HeaderMap) -> bool {
     match headers.get("origin") {
         None => false,
         Some(origin) => !matches!(origin.to_str(), Ok("null")),
     }
+}
+
+/// Whether the request addressed us by a loopback name — the second gate on the
+/// message route, and the half that closes DNS rebinding for it.
+///
+/// A rebound page reaches this server with the attacker's own hostname in
+/// `Host`, because that is the name the browser resolved; a genuine local caller
+/// has no reason to use anything but loopback. `localhost` is accepted because
+/// the default hook URL and every hand-typed `curl` use it. A missing `Host`
+/// is rejected: HTTP/1.1 requires it, so its absence is not a client we support.
+fn host_is_loopback(headers: &HeaderMap) -> bool {
+    let Some(host) = headers.get("host").and_then(|v| v.to_str().ok()) else {
+        return false;
+    };
+    let host = host.trim();
+    // Strip the port, honouring the bracketed form an IPv6 literal must use.
+    let name = match host.strip_prefix('[') {
+        Some(rest) => rest.split(']').next().unwrap_or_default(),
+        None => host.rsplit_once(':').map(|(h, _)| h).unwrap_or(host),
+    };
+    matches!(name, "localhost" | "127.0.0.1" | "::1") || name.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
 /// Body of `GET /api/agents` — the roster an agent reads to answer "does a
@@ -462,6 +494,189 @@ async fn get_agents(
     let sync_listening = app.try_state::<SyncListening>().is_some_and(|f| f.get());
     let chat_ids = app.try_state::<ChatIdRegistry>();
     Ok(Json(agent_roster(&sessions, registry.as_deref(), &|sid| chat_ids.as_ref().and_then(|r| r.anchored(sid)), &last_seen, this_device, sync_listening, now)))
+}
+
+/// Body of `POST /api/message` — a local agent asking this dashboard to relay a
+/// message to an agent on another machine.
+#[derive(Deserialize, Debug)]
+struct MessageRequest {
+    /// A `{device}/{project}` address, echoed from `/api/agents`. A bare project
+    /// name is refused rather than guessed at; see `resolve_message_target`.
+    target: String,
+    text: String,
+    /// The caller's own chat_id. A **claim** — this server is loopback and
+    /// unauthenticated, so nothing here is checked — carried so the receiving
+    /// model is told who says it sent this, and so each originating agent gets
+    /// its own admission bucket on the receiver.
+    #[serde(default)]
+    from_agent: Option<String>,
+    #[serde(default)]
+    from_label: Option<String>,
+}
+
+/// Relay one message to an agent on another machine.
+///
+/// **This is the only entry point that holds the originating agent's identity**,
+/// so it is where the message id is minted and where the claim is attached; by
+/// the time the frame reaches a socket, the writing process is a dashboard and
+/// the claim is all that is left of the sender.
+///
+/// It refuses exactly the two things it can know for certain and no more. A
+/// local target is certain (an exact local id, or this device's own name in the
+/// device half) and is refused with `SendMessage` named, because that tool
+/// carries a kernel-verified sender and a reply address this route destroys. An
+/// unheard-of device is certain (we hold no address for it at all). Everything
+/// else — above all *does that project exist over there* — is the receiving
+/// dashboard's answer, returned as a receipt outcome, because this side's roster
+/// is at best one push cycle old and asserting an existence from it would be
+/// stating a stale reading as fact.
+async fn post_message(State(app): State<AppHandle>, headers: HeaderMap, Json(req): Json<MessageRequest>) -> (StatusCode, Json<Receipt>) {
+    let from_agent = req.from_agent.as_deref().map(str::trim).filter(|a| !a.is_empty()).unwrap_or("unknown");
+    // Every exit from this handler goes through here, so no refusal can be the
+    // one that leaves no trace — including the two that happen before the
+    // dashboard's own state is even reachable.
+    let refused = |reason: &str, detail: String, status: StatusCode, device: Option<&str>| {
+        let r = Receipt::new(Outcome::Refused, "", &req.target, device).because(reason).detailed(detail);
+        log_send(&r, from_agent, &req.target, device, req.text.len());
+        (status, Json(r))
+    };
+    // CSRF, then the stricter rebinding check this route alone carries.
+    if origin_blocked(&headers) || !host_is_loopback(&headers) {
+        return refused("csrf", "this route answers only a loopback caller addressing it by a loopback name".into(), StatusCode::FORBIDDEN, None);
+    }
+    if req.text.trim().is_empty() {
+        return refused("empty_text", "there is nothing to relay".into(), StatusCode::BAD_REQUEST, None);
+    }
+    if req.text.len() > peer_message::MAX_TEXT_BYTES {
+        return refused("too_large", format!("{} bytes, cap is {}", req.text.len(), peer_message::MAX_TEXT_BYTES), StatusCode::PAYLOAD_TOO_LARGE, None);
+    }
+    let (Some(state), Some(cfg_state), Some(ids)) = (app.try_state::<AppState>(), app.try_state::<ConfigState>(), app.try_state::<peer_message::MessageIds>()) else {
+        return refused("state_unavailable", "the dashboard is still starting".into(), StatusCode::INTERNAL_SERVER_ERROR, None);
+    };
+    let cfg = cfg_state.snapshot();
+    let now = now_ms();
+    let this_device = Some(cfg.sync.device_name.trim()).filter(|d| !d.is_empty());
+
+    // Local ids come from both session sources, so a session the hook stream has
+    // not heard from this run is still recognized as local rather than being
+    // relayed to a machine it is not on.
+    let mut local_ids: Vec<String> = resolved_snapshot(&app).into_iter().filter(|s| s.origin.is_none()).map(|s| s.id).collect();
+    if let Some(registry) = app.try_state::<SessionRegistry>() {
+        if let Some(live) = registry.live_sessions(cfg.projects_root.as_deref(), now) {
+            local_ids.extend(live.into_iter().map(|s| s.chat_id));
+        }
+    }
+    let last_seen = state.remote_last_seen();
+    let devices: Vec<String> = last_seen.keys().cloned().collect();
+
+    let (device, project) = match peer_message::resolve_message_target(&req.target, &local_ids, &devices, this_device) {
+        peer_message::TargetResolution::Remote { device, project } => (device, project),
+        peer_message::TargetResolution::Local => {
+            return refused(
+                "local_target",
+                "this session is on this machine; use Claude Code's `SendMessage`, which carries a kernel-verified sender identity and a reply address this route destroys".into(),
+                StatusCode::BAD_REQUEST,
+                this_device,
+            );
+        }
+        peer_message::TargetResolution::UnknownDevice { device } => {
+            // Naming what we do know, plus whether we can hear a peer at all: an
+            // empty device list under a listener that never bound says nothing
+            // about the other machine, which is the same distinction
+            // `AgentsResponse.sync_listening` exists to make.
+            let sync_listening = app.try_state::<SyncListening>().is_some_and(|f| f.get());
+            let known = if devices.is_empty() { "none".to_string() } else { devices.join(", ") };
+            return refused(
+                "unknown_device",
+                format!("no address for device \"{device}\"; devices heard from: {known} (sync_listening={sync_listening})"),
+                StatusCode::NOT_FOUND,
+                None,
+            );
+        }
+        peer_message::TargetResolution::NotAnAddress => {
+            return refused(
+                "not_an_address",
+                format!("expected a \"{{device}}/{{project}}\" address from /api/agents; devices heard from: {}", if devices.is_empty() { "none".to_string() } else { devices.join(", ") }),
+                StatusCode::BAD_REQUEST,
+                None,
+            );
+        }
+    };
+
+    // A device in the roster always has an address, but it can age out between
+    // the two reads, and `origin_addr` is only ever populated by an inbound
+    // push — a peer we push to but have never heard from has none.
+    let origin_addr = state.remote.lock().unwrap().get(&device).map(|d| d.origin_addr.clone()).unwrap_or_default();
+    if origin_addr.is_empty() {
+        let age = last_seen.get(&device).map(|s| (now - s).max(0));
+        return refused(
+            "device_unheard",
+            format!("no address for \"{device}\" yet — it has not pushed to this device (last_seen_age_ms={age:?})"),
+            StatusCode::SERVICE_UNAVAILABLE,
+            Some(&device),
+        );
+    }
+
+    // A machine that cannot name itself cannot be deduped against or attributed
+    // to, so the peer would refuse the envelope one hop later with a vaguer
+    // reason. Refuse here, where the fix (set `sync.device_name`) is local.
+    let Some(this_device) = this_device else {
+        return refused(
+            "no_device_name",
+            "this machine has no sync.device_name, so a relayed message could not be attributed or deduplicated".into(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            Some(&device),
+        );
+    };
+
+    let envelope = crate::sync::MessageEnvelope {
+        origin_device: this_device.to_string(),
+        message_id: peer_message::mint_message_id(this_device, now, ids.next()),
+        target_project: project,
+        from_agent: from_agent.to_string(),
+        from_label: req.from_label.clone(),
+        text: req.text.clone(),
+    };
+    let receipt = crate::sync::send_message_hop(&app, &origin_addr, &envelope, &req.target, &device).await;
+    log_send(&receipt, from_agent, &req.target, Some(&device), req.text.len());
+    (crate::sync::receipt_status(&receipt), Json(receipt))
+}
+
+/// The permanent record of one relay attempt, keyed by the **sender's** chat_id
+/// so `/investigate` can reach it (`agent_of` resolves an entry by `chat_id`),
+/// with the target as its own field. Unlike `/api/agents`, which mutates nothing
+/// and so writes no `decision` line, a send changes state on another machine.
+///
+/// A refusal is tagged `peer_refused` at `warn` rather than folded into
+/// `peer_send`, so "it would not send" is greppable on its own — the states this
+/// route refuses (a target on the wrong machine, a device that never pushed) are
+/// misconfigurations only the user can fix, the same reasoning `sync::log_reject`
+/// follows.
+///
+/// The message body never appears here, in any branch.
+fn log_send(receipt: &Receipt, from_agent: &str, target: &str, device: Option<&str>, text_len: usize) {
+    let refused = receipt.outcome == Outcome::Refused;
+    let decision = if refused { "peer_refused" } else { "peer_send" };
+    macro_rules! line {
+        ($level:ident) => {
+            tracing::$level!(
+                chat_id = %from_agent,
+                decision,
+                target = %target,
+                device = ?device,
+                message_id = %receipt.message_id,
+                text_len,
+                outcome = ?receipt.outcome,
+                reason = ?receipt.reason,
+                "relay attempt"
+            )
+        };
+    }
+    if refused {
+        line!(warn);
+    } else {
+        line!(info);
+    }
 }
 
 async fn post_event(
@@ -1149,5 +1364,52 @@ mod tests {
         // silent reuse.
         let ns = NonceStore::new();
         assert!(session_start_nonce(&ns, "proj", "", 1000).is_some());
+    }
+
+    // -------- the message route's two gates --------
+
+    fn headers(pairs: &[(&'static str, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            h.insert(*k, v.parse().unwrap());
+        }
+        h
+    }
+
+    /// The CSRF check the message handler repeats: there is no tower layer on
+    /// this router, so a route that forgets it is simply unprotected.
+    #[test]
+    fn a_browser_origin_is_blocked_on_the_message_route() {
+        assert!(origin_blocked(&headers(&[("origin", "https://evil.example")])));
+        assert!(!origin_blocked(&headers(&[("origin", "null")])), "file:// and data: pages");
+        assert!(!origin_blocked(&HeaderMap::new()), "curl and the hook send no Origin");
+    }
+
+    /// The extra gate this route alone carries. A page rebound to loopback sends
+    /// no `Origin` — same-origin — so the CSRF check waves it through; it still
+    /// carries the attacker's own hostname in `Host`, which is what this
+    /// catches. The accepted rebinding gap stays accepted for the hook routes,
+    /// where the stake is a status write, not a turn started on another machine.
+    #[test]
+    fn a_rebound_hostname_is_refused_while_loopback_names_pass() {
+        for host in ["127.0.0.1:9077", "localhost:9077", "localhost", "[::1]:9077", "127.0.0.1", "127.0.0.2:9077"] {
+            assert!(host_is_loopback(&headers(&[("host", host)])), "{host}");
+        }
+        for host in ["evil.example:9077", "dashboard.internal", "10.0.0.5:9077", "[fd7a:115c:a1e0::1]:9077"] {
+            assert!(!host_is_loopback(&headers(&[("host", host)])), "{host}");
+        }
+        assert!(!host_is_loopback(&HeaderMap::new()), "HTTP/1.1 requires Host; its absence is not a client we serve");
+    }
+
+    /// The refusal has to name the tool that does the job properly, or a caller
+    /// learns only that it failed. `SendMessage` carries a kernel-verified
+    /// sender and a reply address; this route has neither.
+    #[test]
+    fn the_local_refusal_names_send_message() {
+        let detail = "this session is on this machine; use Claude Code's `SendMessage`, which carries a kernel-verified sender identity and a reply address this route destroys";
+        let receipt = Receipt::new(Outcome::Refused, "", "transcripts", None).because("local_target").detailed(detail);
+        assert!(receipt.detail.as_deref().is_some_and(|d| d.contains("SendMessage")));
+        assert_eq!(receipt.reason.as_deref(), Some("local_target"));
+        assert!(!receipt.observed.to_ascii_lowercase().contains("deliver"));
     }
 }

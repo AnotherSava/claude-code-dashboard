@@ -5,7 +5,7 @@ parent: Development
 nav_order: 4
 ---
 
-The widget listens on `http://127.0.0.1:9077` (default) for lifecycle events from external agents. One write endpoint, one envelope shape, adapter-dispatched on the server side — plus a read-only [agent roster](#agent-roster) an agent can query to see what is running, here and on the user's other machines.
+The widget listens on `http://127.0.0.1:9077` (default) for lifecycle events from external agents. One write endpoint, one envelope shape, adapter-dispatched on the server side — plus a read-only [agent roster](#agent-roster) an agent can query to see what is running, here and on the user's other machines, and a [message relay](#cross-machine-messaging) for reaching one of those agents on another machine.
 
 A second, separate listener serves the [multi-device sync](#sync-api) API when enabled — the hook API below stays loopback-only and unauthenticated regardless.
 
@@ -136,6 +136,62 @@ ps -o lstart= -p $(lsof -nP -iTCP:9077 -sTCP:LISTEN -t)
 
 The route deliberately returns **facts, not a verdict**. There is no `deliverable` / `sendable` boolean: a green light computed from data that may be 90 s old would state as certain something that isn't, and the caller — which knows what it wants to do with the answer — is the one that should weigh the age. There is likewise no user-presence or idle time: a message to a peer agent starts a turn in it whether or not a human is watching that screen, so presence changes no decision.
 
+## Cross-machine messaging
+
+`POST /api/message` — relay one message to an agent running on **another** machine. The dashboard on this box makes an authenticated hop to the peer dashboard, which resolves the target in its own session registry and writes one frame into that session's inbox. Same loopback bind as the routes above, plus one extra gate described below.
+
+```json
+{
+  "target": "chrome/transcripts",
+  "text": "The token schema changed — the seq field is now required.",
+  "from_agent": "tauri dashboard",
+  "from_label": "Oleg's Mac — dashboard session"
+}
+```
+
+- `target` — a `{device}/{project}` address, echoed from [the roster](#agent-roster). The device half is *matched* against the devices this dashboard has heard from, never split on the first `/`, because a device name may itself contain one. A bare project name is refused rather than guessed at: `project` is the cross-machine comparable key, and the same one can exist on several machines.
+- `text` — the message. Capped at 64 KiB.
+- `from_agent` — the caller's own chat id. A **claim**: this server is loopback and unauthenticated, so nothing about it is checked. It is carried anyway for two reasons, both below.
+- `from_label` — optional free description of the sender, shown to the receiving agent alongside the claim.
+
+### Why a local target is refused
+
+A session on this machine gets `400` and a pointer to Claude Code's own `SendMessage`. That is not a missing feature. `SendMessage` carries a sender identity the receiving Claude Code verifies from the connecting process, and a reply address the receiver can write back to; a relayed message has neither, because the process writing the frame is a dashboard. Brokering a same-machine message would hand the caller a strictly worse version of a tool it already has.
+
+### The sender's identity is presented as unverified
+
+The receiving Claude Code stamps the writing process, which is the peer dashboard — not the agent that composed the message. There is no way around that short of one machine reading another's credentials, which this design exists to avoid. So the originating agent's name travels **inside the message body**, above the text, labelled `UNVERIFIED` and telling the receiving model not to treat it as authorization. The claim also becomes the frame's sender address, which is what gives each originating agent its own rate-limit and repeat-detection slot on the receiver instead of every relayed message sharing one.
+
+### The receipt says what was observed, not what was achieved
+
+The reply is a receipt. Its `outcome` is one of five words, and none of them is "delivered":
+
+| `outcome` | what it promises |
+|---|---|
+| `written` | the peer connected to the target session's inbox and wrote the whole frame — a live listener owned by that session accepted the bytes |
+| `duplicate` | this `message_id` was already written by the peer inside the dedupe window, so nothing was written now |
+| `refused` | we declined before anything reached a socket; `reason` says which rule |
+| `unreachable` | nothing was written — the hop could not connect, or the peer found nothing listening at the inbox |
+| `unknown` | the hop's request went out and its answer was lost; the frame **may or may not** have been written |
+
+`written` is deliberately not "delivered". A raw writer to a Claude Code inbox can distinguish exactly two states — nothing is listening, and a listener accepted our bytes. Whether the frame parsed, survived the receiver's rate limiting, or was ever shown to the model is invisible: the receiver reports those outcomes on a *separate connection back to the sender's own inbox*, which a relay that binds none never receives. Every receipt carries an `observed` sentence saying this in plain words, so a caller that only prints the receipt cannot accidentally claim delivery.
+
+`unknown` answers `200`, not `5xx`, on purpose: a `5xx` reads as "it failed, retry", and retrying a message that may already have been written is how one message becomes two.
+
+`reason` values: `local_target`, `not_an_address`, `unknown_device`, `device_unheard`, `no_device_name`, `empty_text`, `too_large`, `csrf`, `no_such_session`, `ambiguous_target`, `registry_unreadable`, `no_inbox`, `inbox_dead`, `peer_unreachable`, `response_lost`. A refusal the *peer* made keeps its own status across the relay — `no_such_session` stays a `404`, `ambiguous_target` a `409` — so a caller is not told its request was malformed when the problem was on the other machine.
+
+Two refusals are the sender's own and are made with certainty: a local target, and a device it holds no address for (the refusal lists the devices it does know, and whether it is listening for peers at all). Everything else — above all *does that project exist over there* — is the receiving dashboard's answer, relayed verbatim, because this side's roster is at best one push cycle old.
+
+### The extra gate on this route
+
+The [`Origin` check](#endpoint) shared by the hook routes is CSRF only; a page whose domain is rebound to `127.0.0.1` becomes same-origin and sends no `Origin` at all. That gap is accepted for a status write and a roster read. It is not acceptable for a route that starts a turn inside a live agent on another machine, so this one **also requires a loopback `Host`** — `127.0.0.1`, `::1` or `localhost`. A rebound page carries the attacker's own hostname there. The hook routes keep the accepted gap, because the `TAURI_DASHBOARD_URL` host alias they support is a real setup and their stake is unchanged.
+
+### Idempotency
+
+Each send is stamped with a `message_id` minted here, and the *receiving* dashboard — the only party that knows whether bytes reached a socket — remembers the ids it has written for 10 minutes. A hop that times out after the peer already wrote the frame can therefore be retried without delivering twice. The entry expires, so a deliberate resend of the same words an hour later still gets through.
+
+Claude Code's own identical-repeat drop is not relied on: it compares only against the immediately previous message from one sender, so an interleaved message defeats it; its window is tunable from the server side; it drops a legitimate resend as readily as a retry; and it is invisible to a relay.
+
 ## Sync API
 
 When `sync.listen` is on (and `sync.token` set), a second listener serves `sync.listen_port` (default 9078) for dashboard-to-dashboard session sync. Two gates sit in front of every route, in this order: the connection's source address must be inside `sync.bind_scope` — by default this device's tailnet (100.64.0.0/10, fd7a:115c:a1e0::/48) plus loopback, anything else gets `403` — and the request must carry `Authorization: Bearer <sync.token>`, or it gets `401`. Under the default scope the listener binds only this device's Tailscale addresses and loopback; if no Tailscale address is found at startup it binds all interfaces instead, logs that at `warn`, and keeps refusing non-tailnet sources. Implementation: `src-tauri/src/sync.rs`.
@@ -167,3 +223,26 @@ Returns the *local* session's dialog entries with `timestamp > since` (the full 
 
 Returns the *local* usage-limit samples with `ts > since` (all of them when `since` is omitted or `0`). The usage counterpart of the dialog pull, requested when a push advertises a `usage_tip` newer than what the receiver holds for that device. Gives `remote_usage/` a repair path of its own: a peer that lost its copy asks again, rather than waiting for the origin to restart.
 
+
+### `POST /api/sync/message`
+
+The far half of [cross-machine messaging](#cross-machine-messaging), and the only sync route that writes outside the remote array. A peer relays one message; this dashboard resolves the target in **its own** session registry, reads that session's messaging key as the user who owns it, and writes one frame into its inbox.
+
+```json
+{
+  "origin_device": "air",
+  "message_id": "air-1756500000000-7",
+  "target_project": "transcripts",
+  "from_agent": "tauri dashboard",
+  "from_label": "Oleg's Mac — dashboard session",
+  "text": "The token schema changed — the seq field is now required."
+}
+```
+
+Every field is optional on the wire (`serde(default)`) so a peer on an older build parses a newer envelope rather than failing the whole request; the handler validates the three it cannot work without and answers `400`.
+
+Returns `200` and a receipt for anything it observed about the socket (`written`, `duplicate`, `unreachable`), and a `4xx` with a receipt for an envelope or target problem: `404` when no live interactive session on this machine derives that project id, `409` when two do. Two sessions in one directory are two inboxes and there is no way to choose between them, so it refuses rather than picking — the same rule terminal titles already follow, where the stake was only which tab got a title.
+
+**No credential crosses the wire.** The alternative shape — reaching into the other machine to read a session's key file and injecting it into that machine's IPC channel — is indistinguishable from exfiltration whatever the intent, and was refused when tried. This design exists so the only process that ever reads a messaging key is the dashboard already running as that user on that machine.
+
+**Windows is unverified.** Three things are open and are not assumed: that the Windows build writes the session registry at all, that it publishes `messagingSocketPath`, and the exact framing its named pipe requires. What is known is that the auth line is *required* there and that a connection whose first line is not valid auth is closed without a word — indistinguishable from a dead session. So on Windows even a `written` outcome is weaker than on macOS: the bytes left us, and nothing more. The socket path is always taken verbatim from the session's own record rather than composed from a pattern, which is what lets the Windows leg follow a path Claude Code chose for itself.

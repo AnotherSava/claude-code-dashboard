@@ -75,7 +75,9 @@ use tokio::task::JoinSet;
 
 use crate::commands::{emit_sessions_updated_remote, emit_usage_limits_updated, now_ms};
 use crate::config::{ConfigState, SyncBindScope};
+use crate::peer_message::{claim_header, deliver_to_inbox, from_id, MessageDedupe, Outcome, Receipt};
 use crate::remote_history::RemoteHistoryStore;
+use crate::session_registry::InboxLookup;
 use crate::remote_usage::RemoteUsageStore;
 use crate::state::{merge_dialog_entries, AgentSession, AppState, DialogEntry, RemoteDevice};
 use crate::usage_history::{UsageHistoryRecord, UsageHistoryStore};
@@ -131,6 +133,45 @@ pub struct SessionSync {
     /// one that can check it.
     #[serde(default)]
     pub dialog_tip: i64,
+}
+
+/// Wire shape for `POST /api/sync/message` — one cross-machine message on the
+/// dashboard-to-dashboard hop.
+///
+/// It lives here with `SyncPush` because both ends of the hop are in this file
+/// and one definition compiled into both binaries is what makes the shape
+/// unforgeable across a version skew. Its *reply*, `peer_message::Receipt`,
+/// deliberately lives elsewhere: the receipt's wording is bound to what a raw
+/// socket writer can observe, which is that module's whole subject.
+///
+/// Every field carries `#[serde(default)]` for the same reason `token_tip` does
+/// — a peer on an older build must parse a newer envelope rather than failing
+/// the request, and a peer on a newer build must not be broken by a field this
+/// one does not send.
+#[derive(Serialize, Deserialize, Debug, Default)]
+pub struct MessageEnvelope {
+    /// The sending *machine*, as it names itself. Used to namespace the dedupe
+    /// key and to build the claim header; never trusted as authentication —
+    /// nothing here is, which is exactly what the header says out loud.
+    #[serde(default)]
+    pub origin_device: String,
+    /// Minted by the sending dashboard, so a retried hop is recognizable as the
+    /// same message on the machine that owns the socket.
+    #[serde(default)]
+    pub message_id: String,
+    /// The de-namespaced project id, resolved against the *receiver's* own
+    /// registry. The sender never claims the session exists over here.
+    #[serde(default)]
+    pub target_project: String,
+    /// The originating agent's own id — a claim, presented to the receiving
+    /// model as one, and the key that gives each sender its own admission
+    /// bucket on the receiver (see `peer_message::from_id`).
+    #[serde(default)]
+    pub from_agent: String,
+    #[serde(default)]
+    pub from_label: Option<String>,
+    #[serde(default)]
+    pub text: String,
 }
 
 /// One dialog range the receiver decided it is missing: `since` is its newest
@@ -440,6 +481,270 @@ async fn get_tokens(State(app): State<AppHandle>, Query(q): Query<TokenQuery>) -
     Ok(Json(records))
 }
 
+/// How long the sending dashboard waits on the hop.
+///
+/// Its own constant rather than the pusher's 10 s: that one is tuned for
+/// fire-and-forget heartbeats where a miss costs a retry nobody waits for, while
+/// this is a synchronous wait a user is sitting through, and its expiry produces
+/// [`Outcome::Unknown`] — a genuinely worse answer than a slow one.
+const MESSAGE_HOP_TIMEOUT_SECS: u64 = 20;
+
+/// Deliver one relayed message into a local session's inbox.
+///
+/// The whole point of the architecture is concentrated here: this runs as the
+/// user who owns the target session, on the machine that owns it, so it is the
+/// only party entitled to read that session's messaging key — and no credential
+/// ever crossed the wire to get here. The sender told us a project name and some
+/// text; everything else (does the session exist, where does it listen, which
+/// key authenticates to it) is answered locally, from our own registry.
+///
+/// Auth and source scope are already settled by [`guard`].
+async fn post_message(
+    State(app): State<AppHandle>,
+    // The peer's real source address. `origin_device` is a field the *sender*
+    // chooses, so logging it alone lets anyone holding the token attribute a
+    // send to the user's own laptop. This is the one route that starts a turn
+    // inside a live agent; its success path owes the audit something the sender
+    // cannot pick.
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Json(env): Json<MessageEnvelope>,
+) -> (StatusCode, Json<Receipt>) {
+    let receipt = |o: Outcome| Receipt::new(o, &env.message_id, &env.target_project, Some(&env.origin_device));
+    let refuse = |reason: &str, status: StatusCode, detail: Option<String>| {
+        let mut r = receipt(Outcome::Refused).because(reason);
+        if let Some(d) = detail {
+            r = r.detailed(d);
+        }
+        tracing::warn!(
+            chat_id = %env.target_project,
+            decision = "peer_refused",
+            peer_ip = %peer.ip(),
+            origin_device = %env.origin_device,
+            message_id = %env.message_id,
+            reason,
+            "relayed message refused"
+        );
+        (status, Json(r))
+    };
+
+    // The opt-in, checked before anything else. Passing the guard proves the
+    // caller holds the sync token and comes from an allowed source — it does not
+    // prove this machine's owner agreed that peers may start turns in their
+    // agents. `listen` bought a read-only view of session state; this is a
+    // different grant and needs its own yes.
+    if !app.try_state::<ConfigState>().is_some_and(|c| c.snapshot().sync.accept_messages) {
+        return refuse(
+            "messages_not_accepted",
+            StatusCode::FORBIDDEN,
+            Some("this device has sync.accept_messages off, so it accepts state pushes but not relayed messages".into()),
+        );
+    }
+
+    if env.origin_device.is_empty() || env.message_id.is_empty() || env.target_project.is_empty() {
+        return refuse("malformed_envelope", StatusCode::BAD_REQUEST, Some("origin_device, message_id and target_project are all required".into()));
+    }
+    if env.text.trim().is_empty() {
+        // The receiver ignores a frame whose content is empty, without a word.
+        // Writing one anyway would report `written` for a message no agent will
+        // ever see — the exact over-claim this feature's vocabulary exists to
+        // prevent.
+        return refuse("empty_text", StatusCode::BAD_REQUEST, None);
+    }
+    if env.text.len() > crate::peer_message::MAX_TEXT_BYTES {
+        return refuse("too_large", StatusCode::PAYLOAD_TOO_LARGE, Some(format!("{} bytes, cap is {}", env.text.len(), crate::peer_message::MAX_TEXT_BYTES)));
+    }
+
+    let (Some(cfg_state), Some(registry), Some(dedupe)) = (
+        app.try_state::<ConfigState>(),
+        app.try_state::<crate::session_registry::SessionRegistry>(),
+        app.try_state::<MessageDedupe>(),
+    ) else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(receipt(Outcome::Refused).because("state_unavailable")));
+    };
+    let cfg = cfg_state.snapshot();
+    let now = now_ms();
+
+    let inbox = registry.inbox_for(&env.target_project, cfg.projects_root.as_deref(), now);
+    let (pid, socket_path) = match inbox {
+        InboxLookup::Found { pid, socket_path } => (pid, socket_path),
+        InboxLookup::Ambiguous { sessions } => {
+            return refuse("ambiguous_target", StatusCode::CONFLICT, Some(format!("{sessions} live interactive sessions share that directory; picking one would decide which agent reads this")));
+        }
+        InboxLookup::NotFound => return refuse("no_such_session", StatusCode::NOT_FOUND, Some("no live interactive session on this machine derives that project id".into())),
+        InboxLookup::Unreadable => return refuse("registry_unreadable", StatusCode::SERVICE_UNAVAILABLE, Some("this machine's session registry could not be read".into())),
+        InboxLookup::NoInbox => {
+            let r = receipt(Outcome::Unreachable).because("no_inbox").detailed("the session is live but publishes no messaging socket");
+            tracing::info!(chat_id = %env.target_project, decision = "peer_write", peer_ip = %peer.ip(), origin_device = %env.origin_device, message_id = %env.message_id, outcome = "unreachable", reason = "no_inbox", "relayed message not written");
+            return (StatusCode::OK, Json(r));
+        }
+    };
+
+    // Claimed before the write so two hops racing one retry cannot both write;
+    // released below if the write then fails, because the claim means "we
+    // already wrote this id" and a failed write did not.
+    if !dedupe.claim(&env.origin_device, &env.message_id, now) {
+        tracing::info!(chat_id = %env.target_project, decision = "peer_write", peer_ip = %peer.ip(), origin_device = %env.origin_device, message_id = %env.message_id, outcome = "duplicate", "relayed message already written under this id");
+        return (StatusCode::OK, Json(receipt(Outcome::Duplicate)));
+    }
+
+    let content = format!("{}{}", claim_header(&env.origin_device, &env.from_agent, env.from_label.as_deref()), env.text);
+    let from = from_id(&env.origin_device, &env.from_agent);
+    // Connecting, reading the key file and writing all block. Off the async
+    // workers rather than accepted inline (as `get_agents`' registry read is):
+    // that one is bounded by a 5 s cache, while a message write opens a socket
+    // whose peer may be a busy pipe, and its own write timeout is 5 s.
+    let message_id = env.message_id.clone();
+    let written = tokio::task::spawn_blocking(move || deliver_to_inbox(&socket_path, pid, &message_id, &from, &content)).await;
+    let written = match written {
+        Ok(result) => result,
+        Err(e) => Err(crate::peer_message::InboxError::WriteFailed(format!("the write task did not finish: {e}"))),
+    };
+    match written {
+        Ok(report) => {
+            tracing::info!(
+                chat_id = %env.target_project,
+                decision = "peer_write",
+            peer_ip = %peer.ip(),
+                origin_device = %env.origin_device,
+                message_id = %env.message_id,
+                pid,
+                bytes = report.bytes,
+                authenticated = report.authenticated,
+                outcome = "written",
+                "frame written to the session's inbox"
+            );
+            (StatusCode::OK, Json(receipt(Outcome::Written)))
+        }
+        Err(e) => {
+            dedupe.release(&env.origin_device, &env.message_id);
+            let detail = crate::peer_message::redact(&e.detail());
+            tracing::warn!(chat_id = %env.target_project, decision = "peer_write", peer_ip = %peer.ip(), origin_device = %env.origin_device, message_id = %env.message_id, pid, outcome = "unreachable", detail = %detail, "frame not written");
+            (StatusCode::OK, Json(receipt(Outcome::Unreachable).because("inbox_dead").detailed(detail)))
+        }
+    }
+}
+
+/// Which outcome a failed hop request is, given only what `reqwest` can tell us.
+///
+/// The distinction that matters is between "nothing was written" and "we cannot
+/// know". A refused connection is the first: the peer never received the
+/// request, so the frame certainly did not reach a socket. A timeout is the
+/// second — the peer may have written the frame and lost the answer on the way
+/// back, which is the repo's existing `SendError::maybe_delivered` shape. Every
+/// other transport failure (a connection broken mid-response, a body that never
+/// finished) is the same "sent, answer lost" position and is treated as such;
+/// guessing the safer-sounding `Unreachable` there would invite a blind retry
+/// that delivers twice.
+fn hop_failure_outcome(is_connect: bool, is_timeout: bool) -> Outcome {
+    if is_connect && !is_timeout {
+        Outcome::Unreachable
+    } else {
+        Outcome::Unknown
+    }
+}
+
+/// The HTTP status the *sender's* loopback route returns for a receipt.
+///
+/// `Unknown` is deliberately `200`, not a 5xx: a 5xx reads as "it failed, retry",
+/// and retrying a message that may already have been written is how one message
+/// becomes two. The body says what is and is not known; the status must not
+/// contradict it.
+///
+/// A refusal maps through its `reason` so the peer's own status survives the
+/// relay. Flattening every relayed refusal to `400` would tell a caller "your
+/// request was malformed" when the peer actually said "no such session over
+/// here" — a different problem with a different fix, and the caller only ever
+/// sees this leg.
+pub fn receipt_status(receipt: &Receipt) -> StatusCode {
+    match receipt.outcome {
+        Outcome::Written | Outcome::Duplicate | Outcome::Unknown => StatusCode::OK,
+        Outcome::Unreachable => StatusCode::BAD_GATEWAY,
+        Outcome::Refused => match receipt.reason.as_deref() {
+            Some("no_such_session") => StatusCode::NOT_FOUND,
+            Some("ambiguous_target") => StatusCode::CONFLICT,
+            Some("too_large") => StatusCode::PAYLOAD_TOO_LARGE,
+            Some("registry_unreadable") | Some("no_sync_token") => StatusCode::SERVICE_UNAVAILABLE,
+            Some("state_unavailable") => StatusCode::INTERNAL_SERVER_ERROR,
+            _ => StatusCode::BAD_REQUEST,
+        },
+    }
+}
+
+/// Make the dashboard-to-dashboard hop and relay whatever the peer observed.
+///
+/// The peer's *judgement* is passed through untouched when there is one: it is
+/// the only party that saw the socket, so re-deriving an outcome here would be
+/// this dashboard asserting something it did not witness. Only the transport
+/// failures — where no receipt exists — are judged locally, by
+/// [`hop_failure_outcome`].
+///
+/// The address fields are re-stamped, though, and that is not the same thing.
+/// The peer answers about the project id *it* resolved and stamps the device it
+/// heard from — its own view, correct from where it stands and backwards from
+/// the caller's. `target` and `device` here are the caller's own words, so the
+/// receipt echoes the address they typed rather than the peer's half of it.
+pub async fn send_message_hop(app: &AppHandle, origin_addr: &str, env: &MessageEnvelope, target: &str, device: &str) -> Receipt {
+    let receipt = |o: Outcome| Receipt::new(o, &env.message_id, target, Some(device));
+    let Some(token) = app.try_state::<ConfigState>().and_then(|c| c.snapshot().sync.token).filter(|t| !t.is_empty()) else {
+        return receipt(Outcome::Refused).because("no_sync_token").detailed("this device has no sync token, so it cannot authenticate to a peer");
+    };
+    let client = match reqwest::Client::builder().timeout(Duration::from_secs(MESSAGE_HOP_TIMEOUT_SECS)).build() {
+        Ok(c) => c,
+        Err(e) => return receipt(Outcome::Refused).because("client_build_failed").detailed(e.to_string()),
+    };
+    let url = format!("{}/api/sync/message", origin_addr.trim_end_matches('/'));
+    let started = now_ms();
+    let result = client.post(&url).bearer_auth(&token).json(env).send().await;
+    let elapsed_ms = now_ms() - started;
+    match result {
+        Ok(resp) => {
+            let status = resp.status();
+            tracing::debug!(peer = %origin_addr, decision = "peer_relay", message_id = %env.message_id, status = %status, elapsed_ms, "message hop answered");
+            // The guard rejects with a bare status and no body, so without this
+            // branch a refusal falls through to the unreadable-body arm and is
+            // reported `unknown` — "may or may not have been written" — when we
+            // know with certainty the handler never ran and nothing was written.
+            // That inverts this feature's own rule: it is built so it cannot
+            // over-claim delivery, and manufacturing doubt where there is none is
+            // the same defect mirrored. It also hides the two most likely
+            // real-world failures behind a success status: a mistyped
+            // `sync.token`, and a peer still on a build without this route, which
+            // every rollout passes through. A user would see `200 unknown`
+            // forever with no way to tell it had never once worked.
+            if !status.is_success() {
+                let (outcome, reason) = match status.as_u16() {
+                    401 => (Outcome::Refused, "peer_rejected_token"),
+                    403 => (Outcome::Refused, "peer_refused_source"),
+                    404 | 405 => (Outcome::Refused, "peer_lacks_route"),
+                    _ => (Outcome::Unreachable, "peer_error"),
+                };
+                return receipt(outcome).because(reason).detailed(format!("peer answered {status}"));
+            }
+            match resp.json::<Receipt>().await {
+                // The peer observed the socket; its judgement stands, restamped
+                // with the caller's own address.
+                Ok(peer_receipt) => Receipt {
+                    message_id: env.message_id.clone(),
+                    target: target.to_string(),
+                    device: Some(device.to_string()),
+                    ..peer_receipt
+                },
+                Err(e) => {
+                    // A body we could not read is the same position as a lost
+                    // response: the peer acted, we did not learn how.
+                    receipt(Outcome::Unknown).because("unreadable_receipt").detailed(format!("peer answered {status} with a body this build could not read: {e}"))
+                }
+            }
+        }
+        Err(e) => {
+            let outcome = hop_failure_outcome(e.is_connect(), e.is_timeout());
+            tracing::debug!(peer = %origin_addr, decision = "peer_relay", message_id = %env.message_id, elapsed_ms, error = %e, outcome = ?outcome, "message hop failed");
+            let reason = if outcome == Outcome::Unreachable { "peer_unreachable" } else { "response_lost" };
+            receipt(outcome).because(reason).detailed(crate::peer_message::redact(&e.to_string()))
+        }
+    }
+}
+
 /// Whether a sync listener is actually bound and serving right now.
 ///
 /// Deliberately *not* re-derived from config by its readers. The config
@@ -690,6 +995,7 @@ pub async fn run_listener(app: AppHandle, port: u16, scope: SyncBindScope) {
         .route("/api/sync/dialog", get(get_dialog))
         .route("/api/sync/usage", get(get_usage))
         .route("/api/sync/tokens", get(get_tokens))
+        .route("/api/sync/message", post(post_message))
         .layer(middleware::from_fn_with_state(GuardState { app: app.clone(), scope }, guard))
         .with_state(app.clone());
 
@@ -873,13 +1179,21 @@ fn warn_if_bound_address_vanished() {
 /// Resolve a (possibly remote) session id into a catch-up fetch target:
 /// the owning device, the raw id on the origin (prefix stripped), and the
 /// origin address. `None` for local ids: no remote device prefix matches.
+///
+/// Longest prefix wins. A device name may contain a slash (it is a user-editable
+/// config string), so with devices `win` and `win/box` present, the shortest
+/// match on `win/box/transcripts` yields device `win` and a raw id
+/// `box/transcripts` that exists on no machine — and the `BTreeMap` iteration
+/// order made that the answer, deterministically. Same rule as
+/// `peer_message::resolve_message_target`, which faces the identical collision.
 fn resolve_fetch_target(
     remote: &std::collections::BTreeMap<String, RemoteDevice>,
     session_id: &str,
 ) -> Option<(String, String, String)> {
     remote
         .iter()
-        .find(|(d, _)| session_id.starts_with(&format!("{d}/")))
+        .filter(|(d, _)| session_id.starts_with(&format!("{d}/")))
+        .max_by_key(|(d, _)| d.len())
         .map(|(d, dev)| (d.clone(), session_id[d.len() + 1..].to_string(), dev.origin_addr.clone()))
 }
 
@@ -1133,7 +1447,11 @@ mod tests {
         );
         // Guards the guard: if the routes ever stop being registered in this
         // expression the assert above passes vacuously, so pin the count too.
-        assert_eq!(expr.matches(".route(").count(), 4, "route count changed — confirm the new route is above the layer, then update this number");
+        // 4 -> 5 with `POST /api/sync/message`, the cross-machine message hop.
+        // It is the route the comment above predicted, and the one where an
+        // unguarded registration would be worst: it starts a turn inside a live
+        // agent rather than reading state.
+        assert_eq!(expr.matches(".route(").count(), 5, "route count changed — confirm the new route is above the layer, then update this number");
     }
 
     #[test]
@@ -1302,12 +1620,95 @@ mod tests {
         assert_eq!(addr, "http://1.2.3.4:9078");
     }
 
+    /// A device name may contain a slash, so the prefix match must be
+    /// longest-first. The `BTreeMap`'s `.find()` used to take `win` here and
+    /// hand back a raw id of `box/transcripts`, which exists on no machine —
+    /// deterministically wrong, and silent, since a pull for a nonexistent id
+    /// simply 404s and is logged as a routine miss.
+    #[test]
+    fn resolve_fetch_target_prefers_the_longest_device_name() {
+        let mut remote = std::collections::BTreeMap::new();
+        for d in ["win", "win/box"] {
+            remote.insert(d.to_string(), RemoteDevice { sessions: Vec::new(), last_seen: 0, origin_addr: format!("http://{}:9078", d.replace('/', "-")) });
+        }
+        let (device, raw_id, _) = resolve_fetch_target(&remote, "win/box/transcripts").expect("target");
+        assert_eq!((device.as_str(), raw_id.as_str()), ("win/box", "transcripts"));
+        let (device, raw_id, _) = resolve_fetch_target(&remote, "win/transcripts").expect("target");
+        assert_eq!((device.as_str(), raw_id.as_str()), ("win", "transcripts"));
+    }
+
     #[test]
     fn resolve_fetch_target_is_none_for_local_ids() {
         let mut remote = std::collections::BTreeMap::new();
         remote.insert("laptop".to_string(), RemoteDevice { sessions: Vec::new(), last_seen: 0, origin_addr: String::new() });
         assert!(resolve_fetch_target(&remote, "my-local-project").is_none());
         assert!(resolve_fetch_target(&remote, "laptopish/proj").is_none(), "prefix must match a whole device name");
+    }
+
+    // -------- the message hop --------
+
+    /// Rollout skew, the same rule `token_tip` follows: an envelope from a peer
+    /// that predates a field must parse and degrade, never fail the request.
+    /// Failing it would turn a version mismatch into an unexplained refusal on
+    /// the one route a user is watching synchronously.
+    #[test]
+    fn a_message_envelope_from_an_older_peer_parses() {
+        let body = r#"{"origin_device":"air","message_id":"air-1-0","target_project":"transcripts","text":"hi"}"#;
+        let env: MessageEnvelope = serde_json::from_str(body).expect("older envelope should parse");
+        assert_eq!(env.from_agent, "");
+        assert_eq!(env.from_label, None);
+        assert_eq!(env.text, "hi");
+    }
+
+    /// The distinction the whole receipt vocabulary turns on: a refused
+    /// connection proves nothing was written, a lost answer proves nothing at
+    /// all. Guessing `Unreachable` for a timeout would invite the retry that
+    /// writes the message twice.
+    #[test]
+    fn a_lost_hop_response_is_unknown_and_a_refused_connection_is_unreachable() {
+        assert_eq!(hop_failure_outcome(true, false), Outcome::Unreachable);
+        assert_eq!(hop_failure_outcome(false, true), Outcome::Unknown);
+        assert_eq!(hop_failure_outcome(false, false), Outcome::Unknown, "any other transport failure is also 'answer lost'");
+        assert_eq!(hop_failure_outcome(true, true), Outcome::Unknown, "a connect that timed out may still have been established");
+    }
+
+    /// `Unknown` must not be a 5xx. A 5xx reads as "it failed, retry", and this
+    /// is the one outcome where retrying can produce a second message.
+    #[test]
+    fn an_unknown_outcome_answers_200_not_an_error_status() {
+        let receipt = |o: Outcome| Receipt::new(o, "air-1-0", "chrome/p", Some("chrome"));
+        assert_eq!(receipt_status(&receipt(Outcome::Unknown)), StatusCode::OK);
+        assert_eq!(receipt_status(&receipt(Outcome::Written)), StatusCode::OK);
+        assert_eq!(receipt_status(&receipt(Outcome::Duplicate)), StatusCode::OK);
+        assert_eq!(receipt_status(&receipt(Outcome::Unreachable)), StatusCode::BAD_GATEWAY);
+        assert_eq!(receipt_status(&receipt(Outcome::Refused)), StatusCode::BAD_REQUEST);
+    }
+
+    /// The caller only ever sees this leg, so a refusal the *peer* made has to
+    /// keep its own status. Flattening them to 400 would report "your request
+    /// was malformed" for "no such session over here" — a different problem with
+    /// a different fix.
+    #[test]
+    fn a_peers_refusal_keeps_its_status_across_the_relay() {
+        let refused = |reason: &str| receipt_status(&Receipt::new(Outcome::Refused, "air-1-0", "chrome/p", Some("chrome")).because(reason));
+        assert_eq!(refused("no_such_session"), StatusCode::NOT_FOUND);
+        assert_eq!(refused("ambiguous_target"), StatusCode::CONFLICT);
+        assert_eq!(refused("too_large"), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(refused("registry_unreadable"), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(refused("local_target"), StatusCode::BAD_REQUEST, "an unmapped reason stays a plain client error");
+    }
+
+    /// The message route sits behind the same two gates as every other one —
+    /// asserted structurally by `guard_covers_every_route` (it is above the
+    /// layer) and behaviourally by the `source_allowed` / `bearer_ok` cases
+    /// below, which are the gate's whole logic. Restated here because this is
+    /// the first route that starts a turn rather than serving a read.
+    #[test]
+    fn the_message_route_is_refused_off_tailnet_and_without_a_bearer() {
+        assert!(!source_allowed(TAILNET, ip("192.168.1.5")), "an off-tailnet source never reaches the token compare");
+        assert!(!bearer_ok(&HeaderMap::new(), Some("s3cret")), "no credential, no relay");
+        assert!(!bearer_ok(&headers_with("Bearer nope"), Some("s3cret")));
+        assert!(bearer_ok(&headers_with("Bearer s3cret"), Some("s3cret")));
     }
 
     // -------- bearer_ok --------

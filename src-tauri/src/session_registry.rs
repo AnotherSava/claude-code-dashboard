@@ -121,6 +121,22 @@ struct Record {
     /// fresh cwd derivation; see `live_rows`.
     #[serde(default, rename = "sessionId")]
     session_id: Option<String>,
+    /// Where this session listens for cross-session messages: a Unix socket on
+    /// macOS/Linux, a named pipe (`\\.\pipe\LOCAL\cc-msg-<32hex>`) on Windows.
+    ///
+    /// Taken **verbatim**, never reconstructed from a template. The path is
+    /// Claude Code's to choose — it falls back to `cc-socks-<uid>` when the
+    /// primary directory is refused, and moves aside to `<pid>-<8hex>.sock` when
+    /// a sibling pid namespace already holds the name — so a path we built from
+    /// a pattern would address the wrong session, or nothing, exactly in the
+    /// cases the fallbacks exist for. On Windows the shape is unverified from
+    /// this machine, which is a second reason to copy rather than compose it.
+    ///
+    /// Read through [`SessionRegistry::inbox_for`] only; deliberately absent
+    /// from [`LiveSession`], which is serialized onto the loopback roster. The
+    /// address of a live agent's IPC channel is not a fact a roster reader needs.
+    #[serde(default, rename = "messagingSocketPath")]
+    messaging_socket_path: Option<String>,
 }
 
 /// What the registry says a session is doing — its own two words, unedited.
@@ -177,6 +193,44 @@ pub struct LiveSession {
     pub session_ids: Vec<String>,
 }
 
+/// What the registry can say about where to write a message for one row.
+///
+/// Five answers rather than an `Option`, because a caller that has to explain a
+/// refusal needs to know *which* wall it hit: "that project runs nothing here"
+/// and "two sessions run there and I will not choose" are different sentences to
+/// the sender, and "the registry itself was unreadable" is our failure, not a
+/// statement about the target. Collapsing them would produce the one answer this
+/// module exists to never produce — an absence that was never established.
+#[derive(Debug, PartialEq, Eq)]
+pub enum InboxLookup {
+    /// Exactly one live interactive session derives this id and publishes an
+    /// inbox. `socket_path` is the record's own string, uncomposed.
+    Found { pid: u32, socket_path: String },
+    /// Several live interactive sessions derive this id (a `--fork-session
+    /// --resume` migration leaves two). Refused, never guessed.
+    Ambiguous { sessions: usize },
+    /// The session is live but publishes no `messagingSocketPath` — an older
+    /// Claude Code, or one whose messaging failed to bind.
+    NoInbox,
+    /// No live interactive session on this machine derives this id.
+    NotFound,
+    /// The registry directory could not be read at all.
+    Unreadable,
+}
+
+/// Pure resolver behind [`SessionRegistry::inbox_for`].
+fn inbox_in(records: &[Record], chat_id: &str, projects_root: Option<&str>) -> InboxLookup {
+    let matches: Vec<&Record> = records.iter().filter(|r| derive_chat_id(Some(&r.cwd), projects_root) == chat_id).collect();
+    match matches.as_slice() {
+        [] => InboxLookup::NotFound,
+        [only] => match only.messaging_socket_path.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
+            Some(path) => InboxLookup::Found { pid: only.pid, socket_path: path.to_string() },
+            None => InboxLookup::NoInbox,
+        },
+        many => InboxLookup::Ambiguous { sessions: many.len() },
+    }
+}
+
 /// Managed state: the live interactive records as last read, and when.
 #[derive(Default)]
 pub struct SessionRegistry {
@@ -208,6 +262,26 @@ impl SessionRegistry {
         Self::refresh(&mut cached, now).map(|recs| live_rows(recs, projects_root, now))
     }
 
+    /// Where a cross-machine message for `chat_id` must be written, or why it
+    /// cannot be. Shares the same 5 s cache as the other two readings, so a
+    /// message delivery costs no extra directory read and no extra
+    /// process-table snapshot, and cannot disagree with the roster served
+    /// alongside it about which sessions exist.
+    ///
+    /// Ambiguity is answered like [`tab_pid`](Self::tab_pid) and **not** like
+    /// `live_sessions`: two interactive sessions in one directory are two
+    /// inboxes, and the roster's freshest-status tiebreak — acceptable when the
+    /// stake is which tab gets a title — would here decide *which agent reads a
+    /// stranger's message*. So it refuses and says so, and the receipt reports
+    /// the ambiguity rather than a coin flip.
+    pub fn inbox_for(&self, chat_id: &str, projects_root: Option<&str>, now: i64) -> InboxLookup {
+        let mut cached = self.cached.lock().unwrap();
+        match Self::refresh(&mut cached, now) {
+            Some(recs) => inbox_in(recs, chat_id, projects_root),
+            None => InboxLookup::Unreadable,
+        }
+    }
+
     /// The single place the directory and the process table are read, so both
     /// accessors share one snapshot rather than racing two. `None` propagates an
     /// unreadable registry; an unreadable one is not cached, so a directory that
@@ -224,7 +298,7 @@ impl SessionRegistry {
 
 /// `<claude-config>/sessions`, resolved the same way the transcript scan
 /// resolves its own root — `CLAUDE_CONFIG_DIR` when set, else `$HOME/.claude`.
-fn sessions_dir() -> Option<std::path::PathBuf> {
+pub(crate) fn sessions_dir() -> Option<std::path::PathBuf> {
     crate::token_scan::config_dir().map(|d| d.join("sessions"))
 }
 
@@ -322,7 +396,7 @@ mod tests {
     use super::*;
 
     fn rec(pid: u32, cwd: &str, kind: Option<&str>) -> Record {
-        Record { pid, cwd: cwd.to_string(), kind: kind.map(str::to_string), name: None, status: None, status_updated_at: None, session_id: None }
+        Record { pid, cwd: cwd.to_string(), kind: kind.map(str::to_string), name: None, status: None, status_updated_at: None, session_id: None, messaging_socket_path: None }
     }
 
     fn named(pid: u32, cwd: &str, name: &str, status: &str, status_updated_at: i64) -> Record {
@@ -334,6 +408,7 @@ mod tests {
             status: Some(status.to_string()),
             status_updated_at: Some(status_updated_at),
             session_id: None,
+            messaging_socket_path: None,
         }
     }
 
@@ -517,6 +592,102 @@ mod tests {
     fn an_activity_age_is_clamped_at_zero() {
         let recs = vec![named(93331, "/Users/x/Projects/printlab", "printlab", "idle", 5_000)];
         assert_eq!(rows(recs, Some("/Users/x/Projects"), None, 1_000)[0].activity_age_ms, Some(0));
+    }
+
+    // -------- inbox_for --------
+
+    fn with_inbox(pid: u32, cwd: &str, sock: Option<&str>) -> Record {
+        let mut r = rec(pid, cwd, Some("interactive"));
+        r.messaging_socket_path = sock.map(str::to_string);
+        r
+    }
+
+    fn inbox(records: Vec<Record>, chat_id: &str, images: Option<HashMap<u32, String>>) -> InboxLookup {
+        inbox_in(&live_interactive(records, images), chat_id, Some("/Users/x/Projects"))
+    }
+
+    /// The path is the record's own string, carried through untouched — never
+    /// rebuilt from `cc-socks/<pid>.sock`, which Claude Code itself abandons for
+    /// a uid-suffixed directory or a moved-aside name in exactly the cases the
+    /// fallbacks exist for.
+    #[test]
+    fn an_inbox_path_is_taken_verbatim_from_the_record() {
+        let recs = vec![with_inbox(93331, "/Users/x/Projects/printlab", Some("/private/tmp/cc-socks-501/93331-a1b2c3d4.sock"))];
+        assert_eq!(
+            inbox(recs, "printlab", all_claude(&[93331])),
+            InboxLookup::Found { pid: 93331, socket_path: "/private/tmp/cc-socks-501/93331-a1b2c3d4.sock".into() }
+        );
+    }
+
+    /// Two interactive sessions in one directory are two inboxes. The roster's
+    /// freshest-status tiebreak decides which tab gets a title; here it would
+    /// decide which agent reads a stranger's message, so this reading refuses
+    /// instead — and says how many it found, so the receipt can explain itself.
+    #[test]
+    fn two_sessions_in_one_cwd_refuse_rather_than_choose_an_inbox() {
+        let recs = vec![
+            with_inbox(100, "/Users/x/Projects/landlord", Some("/tmp/cc-socks/100.sock")),
+            with_inbox(200, "/Users/x/Projects/landlord", Some("/tmp/cc-socks/200.sock")),
+        ];
+        assert_eq!(inbox(recs, "landlord", all_claude(&[100, 200])), InboxLookup::Ambiguous { sessions: 2 });
+    }
+
+    /// A live session with no published inbox and a project with no session are
+    /// different answers: the first can be retried against the same machine, the
+    /// second means the caller addressed the wrong one.
+    #[test]
+    fn a_session_without_an_inbox_is_not_the_same_as_no_session() {
+        let recs = vec![with_inbox(93331, "/Users/x/Projects/printlab", None)];
+        assert_eq!(inbox(recs, "printlab", all_claude(&[93331])), InboxLookup::NoInbox);
+        assert_eq!(inbox(Vec::new(), "printlab", Some(HashMap::new())), InboxLookup::NotFound);
+        let blank = vec![with_inbox(93331, "/Users/x/Projects/printlab", Some("  "))];
+        assert_eq!(inbox(blank, "printlab", all_claude(&[93331])), InboxLookup::NoInbox, "a blank path is no path");
+    }
+
+    /// A background agent shares the row's cwd but is not a session a caller can
+    /// address, so the addressable set stays equal to the roster's.
+    #[test]
+    fn only_an_interactive_session_can_be_messaged() {
+        let mut bg = rec(4546, "/Users/x/Projects/printlab", Some("bg"));
+        bg.messaging_socket_path = Some("/tmp/cc-socks/4546.sock".into());
+        assert_eq!(inbox(vec![bg], "printlab", all_claude(&[4546])), InboxLookup::NotFound);
+    }
+
+    /// A recycled pid must not hand out an inbox — the same image test the
+    /// roster and the reaper already run, reached through the shared cache.
+    #[test]
+    fn a_reused_pid_publishes_no_inbox() {
+        let recs = vec![with_inbox(93331, "/Users/x/Projects/printlab", Some("/tmp/cc-socks/93331.sock"))];
+        assert_eq!(inbox(recs, "printlab", Some(HashMap::from([(93331u32, "node".to_string())]))), InboxLookup::NotFound);
+    }
+
+    /// The field name is an undocumented Claude Code internal, so it is pinned
+    /// against a real record's shape rather than against our own encoder. Held
+    /// as a literal fixture, not read from the live registry, so the test says
+    /// the same thing on a machine with no sessions running.
+    #[test]
+    fn messaging_socket_path_parses_out_of_a_real_record() {
+        let fixture = r#"{
+            "pid": 95256,
+            "sessionId": "eeeb554e-d85c-43a7-bbaf-836d299eee4a",
+            "cwd": "/Users/x/Projects/printlab",
+            "kind": "interactive",
+            "name": "printlab",
+            "status": "idle",
+            "statusUpdatedAt": 1780789975389,
+            "messagingSocketPath": "/tmp/cc-socks/95256.sock",
+            "peerProtocol": 1,
+            "peerFeatures": ["notify_idle", "reply_across_default_dirs", "artifact_yield"],
+            "pidDomain": "darwin",
+            "version": "2.1.251"
+        }"#;
+        let record: Record = serde_json::from_str(fixture).expect("a real record must parse");
+        assert_eq!(record.messaging_socket_path.as_deref(), Some("/tmp/cc-socks/95256.sock"));
+        assert_eq!(record.pid, 95256);
+        // The field is optional for the reason the struct doc gives: a rename
+        // upstream must cost the inbox, never the whole registry.
+        let without = serde_json::from_str::<Record>(r#"{"pid":1,"cwd":"/x","kind":"interactive"}"#).expect("still parses");
+        assert_eq!(without.messaging_socket_path, None);
     }
 
     /// Both readings are computed from one record slice — the property that

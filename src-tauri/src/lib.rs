@@ -15,6 +15,7 @@ mod log_watcher;
 mod logging;
 mod nonce_store;
 mod notifications;
+mod peer_message;
 mod prompt_history;
 mod remote_history;
 mod remote_tokens;
@@ -141,6 +142,11 @@ pub fn run() {
         .manage(lid_awake::LidAwakeState::default())
         .manage(sync::SyncDirty(std::sync::Arc::new(tokio::sync::Notify::new())))
         .manage(sync::SyncListening::default())
+        // Read only by the two message routes, never by the frontend, so
+        // the builder is early enough — the build()/run() gap is for state
+        // a webview can race at mount.
+        .manage(peer_message::MessageDedupe::default())
+        .manage(peer_message::MessageIds::default())
         .invoke_handler(tauri::generate_handler![
             commands::get_sessions,
             commands::get_config,

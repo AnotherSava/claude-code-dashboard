@@ -318,6 +318,19 @@ pub struct SyncConfig {
     /// fully disabled (no listener, no pushes) even if `listen`/`peers` are
     /// set — never run unauthenticated.
     pub token: Option<String>,
+    /// Accept relayed peer messages, which **start a turn** in a live local
+    /// agent at that agent's permission level.
+    ///
+    /// Separate from `listen`, and off by default, because the two grant
+    /// materially different things. A user who turned sync on was buying a
+    /// read-only view of session state on another screen; delivery turns the
+    /// same token into the power to run prompts inside their agents. Folding
+    /// that into `listen` would widen an existing deployment the moment it
+    /// updated, silently and without the user choosing it — which is precisely
+    /// the shape this project refuses elsewhere. Requires `listen` and a
+    /// `token`: it is an additional gate, never a replacement for them.
+    #[serde(default)]
+    pub accept_messages: bool,
 }
 
 impl Default for SyncConfig {
@@ -329,6 +342,7 @@ impl Default for SyncConfig {
             bind_scope: SyncBindScope::Tailnet,
             peers: Vec::new(),
             token: None,
+            accept_messages: false,
         }
     }
 }

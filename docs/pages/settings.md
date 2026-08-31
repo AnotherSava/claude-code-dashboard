@@ -95,7 +95,8 @@ Every field is optional — omit one and the built-in default applies. A complet
     "listen_port": 9078,
     "bind_scope": "tailnet",
     "peers": [],
-    "token": null
+    "token": null,
+    "accept_messages": false
   },
   "server_port": 9077
 }
@@ -211,6 +212,7 @@ The `sync` block shows sessions from your other computers — see [Features → 
 - `listen` — accept session pushes from peers. Needs an app restart to change, like `server_port`.
 - `listen_port` — port the sync listener uses (peers connect here). Also restart-required.
 - `bind_scope` — how far the listener opens up. `"tailnet"` (the default) keeps it on your Tailscale network and your own computer, and turns away anything else; `"any"` opens it to every network this computer is on, leaving the `token` as the only protection — use it only if your devices reach each other some other way. Also restart-required. On `"tailnet"`, if Tailscale isn't running when the widget starts, the listener still comes up on all networks and says so in the log, and it still turns away anything that isn't on your tailnet; start Tailscale first, or restart the widget afterwards, to get the narrower setup back.
+- `accept_messages` — whether this device accepts *messages* relayed from another device's agents, which start a turn in the named local session. **Off by default, and separate from `listen` on purpose:** turning sync on buys a read-only view of what your sessions are doing, while this lets the shared password start prompts running inside them. Leaving it folded into `listen` would widen an existing setup the moment the widget updated, without you choosing it. Both devices need it on for messages to flow in that direction; a device with it off still syncs state normally and answers a relayed message with a refusal saying so.
 - `peers` — addresses of the other devices' sync listeners, e.g. `["http://my-laptop:9078"]`.
 - `token` — a shared secret, the same string on every device; pushes without it are rejected. Sync stays fully off while it's `null`.
 
