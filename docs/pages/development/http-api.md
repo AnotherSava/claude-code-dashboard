@@ -47,6 +47,8 @@ Writing a new adapter is a ~100 LOC pure Rust function: `src-tauri/src/adapters/
 
 `GET /api/agents` — the sessions this dashboard tracks, on this machine *and* synced from peers, as one merged list. It exists because Claude Code's own session listing sees only the local machine; the dashboard already merges both worlds, so it can answer "does a session for project X exist, on which machine, in what state, and how fresh is that answer?" without reaching the other box.
 
+Two arrays, because there are two sources and they can say different amounts. `agents` is the dashboard's own tracking — a session it has classified from the hook stream, so it can say what that session is *doing*. `registry_only` is Claude Code's own list of live local sessions, read off disk on every request: proof that a session exists at a project, with no status behind it. A project present in both appears only in `agents`.
+
 Read-only: it mutates nothing, emits no event, writes no `decision` line, and takes no query parameters. Same loopback bind and same `Origin` guard as `POST /api/event` — `403` for a real browser origin, `500` if the app's state isn't up yet. Like `server_port` itself, the route is wired once at startup, so a new build needs an app restart before it answers.
 
 ```json
@@ -75,6 +77,17 @@ Read-only: it mutates nothing, emits no event, writes no `decision` line, and ta
       "status_age_ms": 236500,
       "last_seen_age_ms": 4120
     }
+  ],
+  "registry_only": [
+    {
+      "id": "printlab",
+      "project": "printlab",
+      "device": "air",
+      "name": "printlab",
+      "activity": "idle",
+      "activity_age_ms": 1840200,
+      "sessions": 1
+    }
   ]
 }
 ```
@@ -88,7 +101,16 @@ Read-only: it mutates nothing, emits no event, writes no `decision` line, and ta
 - `display_name` — omitted rather than `null` when unset, so a caller falls back to `id` exactly as the app does.
 - `status` — `idle` / `working` / `waiting` / `blocked` / `error` / `done`, the same values [Classification](classification) assigns.
 - `label` — the "what is it doing" line the dashboard row itself shows.
-- `status_age_ms` — time in the current status. Both arrays are always present and never `null`.
+- `status_age_ms` — time in the current status. All three arrays are always present and never `null`.
+
+The `registry_only` entries carry a deliberately smaller vocabulary:
+
+- `registry_only[]` — one entry per **project directory** on this machine that has at least one live interactive session and no row in `agents`; `sessions` says how many collapsed into it, so counting entries counts directories, not sessions. `null` rather than `[]` when the registry could not be read at all — see below. Always local: the registry describes this box, so there is no `local` flag (a constant carries no information) and no `last_seen_age_ms` (there is no push channel behind it). A peer's registry is not synced; its rows come from its hook stream as before.
+- `id` / `project` — the same cwd derivation as an `agents` row, which is what lets a caller compare across both arrays with one pair of keys. Equal to each other here, since a local id is never namespaced.
+- `name` — Claude Code's own name for the session (what the session picker shows). A different fact with a different owner than `display_name`, which is the dashboard's own rename; omitted rather than `null` when the session has none.
+- `activity` — `idle` / `busy` / `unknown`, the registry's own two words plus a degrade value. **This is not a `status` and must not be read as one.** Claude Code records only idle-versus-busy, which cannot express `blocked`, `waiting` or `error` — so `busy` → `working` would not be coarse but wrong: a session parked on a question or a permission dialog has a turn in flight and is what the dashboard calls `blocked`, while `idle` covers done, errored and a settled hand-back alike. An unrecognized or missing value reads `unknown` rather than being guessed at.
+- `activity_age_ms` — how long since the registry last wrote that activity. Free of skew, being this machine's own clock; omitted when the record carries no stamp.
+- `sessions` — how many interactive sessions collapsed into this row. A row's identity is its directory, so two sessions in one directory (what a `--fork-session --resume` migration leaves) are one row; the freshest of them speaks for it and this number says the collapse happened.
 
 ### Judging staleness
 
@@ -98,15 +120,19 @@ A peer pushes on every state change (coalesced 300 ms) and at worst every 30 s a
 
 `last_seen_age_ms` is the number to judge on. It is measured on the receiver's clock at both ends, so it carries no skew — unlike `status_age_ms`, which for a remote row is the sender's arithmetic and is only clamped at zero. A few seconds means the row was pushed on a live connection; anything past ~35 s means at least one heartbeat went missing. It is omitted for local rows, where a `0` would claim freshness on a channel that doesn't exist.
 
-**A present row is strong evidence; what an absent row is worth depends on how long the dashboard has been up.** The dashboard learns a session exists only when that session fires a hook, and it restores nothing at startup — so a restart empties the roster and it refills as sessions emit events. On a dashboard up for days, which is the normal case since it is restarted only to deploy it, nearly everything live has emitted something and an absent row genuinely suggests no such session or that device's dashboard being down. Fresh from a restart it means nothing.
+**Absence means different things on this machine and on a peer.** The dashboard learns a session exists only when that session fires a hook and restores nothing at startup, so its own tracking empties on every restart and refills on session **activity**, not on a timer. Measured across one redeploy: 1 row of 9 live sessions immediately after, 2 of 9 six minutes later, 3 of 9 later still — the idle ones had no reason to emit anything, and a session idle since before the restart stayed invisible for as long as it stayed idle. That is exactly the session a caller is most likely to be asking after.
 
-The uptime is one command, so check it rather than assuming either way:
+`registry_only` closes that gap **for local sessions only**. It is read from Claude Code's own list of live sessions on every request, so it is unaffected by how long the dashboard has been up: an idle interactive session is listed the moment the dashboard starts.
+
+**Check `registry_only` is not `null` before reading anything into a local absence.** `[]` means the list was read and this machine is running nothing; `null` means it could not be read, and the two are different answers. `null` is reached by ordinary means, not just exotic ones — no `sessions/` directory on a machine whose Claude Code predates it, an unreadable directory, or a node-based install whose records never survive the liveness check. Collapsing them would let this route assert an absence it never established, which is the one mistake a caller acting on the answer cannot recover from. When it is `[]`, a locally absent project does mean Claude Code has no live interactive session there. What a restart still costs locally is the *detail*, not the existence — a registry-only row has no status, no label and no history, because those are produced from the hook stream and nothing else.
+
+Two things the local list still cannot see, so absence is better evidence than before but not proof: a headless session (`claude -p`) writes no registry record at all, and a session killed outright (rather than exited) can leave its record behind briefly — the dashboard checks the recorded process is still a live Claude Code process, which catches the ordinary case but not a pid recycled by another `claude`.
+
+**For a peer's sessions the old caveat stands in full.** A peer pushes only what its own hook stream taught it — this local list is not synced — so a project missing from that device's rows may simply not have emitted anything since *that* dashboard was restarted. Its uptime is the thing to check, and it is one command run on the peer:
 
 ```bash
 ps -o lstart= -p $(lsof -nP -iTCP:9077 -sTCP:LISTEN -t)
 ```
-
-What makes the post-restart window worse than "wait a minute" is that the gap closes on session **activity**, not on a timer. Measured across one redeploy: 1 row of 9 live sessions immediately after, 2 of 9 six minutes later, 3 of 9 later still — the idle ones had no reason to emit anything. A session idle since before the dashboard started stays invisible for as long as it stays idle, however long the dashboard has been up, and that is exactly the kind of session a caller is most likely to be asking after. Fall back to another check when uptime is short or the target has been sitting idle.
 
 The route deliberately returns **facts, not a verdict**. There is no `deliverable` / `sendable` boolean: a green light computed from data that may be 90 s old would state as certain something that isn't, and the caller — which knows what it wants to do with the answer — is the one that should weigh the age. There is likewise no user-presence or idle time: a message to a peer agent starts a turn in it whether or not a human is watching that screen, so presence changes no decision.
 

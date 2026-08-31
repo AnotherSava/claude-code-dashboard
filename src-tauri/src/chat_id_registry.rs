@@ -81,6 +81,25 @@ impl ChatIdRegistry {
         derived.to_string()
     }
 
+    /// The chat_id already anchored to this session, or `None` if it has never
+    /// been seen. Read-only on purpose: unlike [`Self::resolve`] it inserts
+    /// nothing and never writes to disk, so a read path (the `/api/agents`
+    /// roster) can ask without creating the mapping it is asking about.
+    ///
+    /// The roster needs it because the two sides derive ids differently. A hook
+    /// row's id is anchored here at first sight and deliberately not
+    /// re-derived, so it absorbs a mid-session `cd`; Claude Code's session
+    /// registry re-serializes the session's *current* cwd. Deriving from that
+    /// cwd would give a different id after any `cd`, and the same live session
+    /// would appear twice — once under its anchored id and once under a new one,
+    /// with nothing marking them as the same session.
+    pub fn anchored(&self, session_id: &str) -> Option<String> {
+        if session_id.is_empty() {
+            return None;
+        }
+        self.data.lock().unwrap().get(session_id).cloned()
+    }
+
     /// Drops the mapping for a session that has ended (`SessionEnd`).
     pub fn forget(&self, session_id: &str) {
         if session_id.is_empty() {
