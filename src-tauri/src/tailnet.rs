@@ -317,6 +317,14 @@ mod tests {
     #[test]
     fn the_whois_spawn_creates_no_console_window() {
         let src = include_str!("tailnet.rs");
+        // Search the PRODUCTION half only. Every string this test navigates by
+        // — the anchor, `.spawn()`, and the flag it asserts on — also appears
+        // in the test's own body, so scanning the whole file lets a deleted
+        // call site be "found" inside this function and judged against this
+        // function. That reads as a pass while guarding nothing. It happens not
+        // to today, because the real spawn sits earlier and `find` takes the
+        // first match — positional luck, not a property worth relying on.
+        let src = &src[..src.find("#[cfg(test)]").expect("test module marker")];
         let at = src.find("let mut cmd = Command::new(&bin);").expect("the whois spawn moved — update this test");
         let spawn_at = src[at..].find(".spawn()").expect("spawn call") + at;
         let body = &src[at..spawn_at];
