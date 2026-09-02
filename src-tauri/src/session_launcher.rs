@@ -32,6 +32,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use crate::adapters::claude::derive_chat_id;
+#[cfg(target_os = "macos")]
+use crate::agterm::agtermctl;
+#[cfg(target_os = "macos")]
+use crate::agterm::session_node;
 use crate::session_registry::InboxLookup;
 
 /// How long a claimed start blocks another for. A start normally releases in
@@ -491,72 +495,6 @@ impl LaunchHandle {
 #[cfg(target_os = "macos")]
 const AGTERM_COMMAND: &str = "zsh -ilc 'claude; exec zsh -i'";
 
-/// How long any one `agtermctl` call may take before it is killed.
-///
-/// `Command` has no timeout and agtermctl talks to a control socket, so a
-/// wedged agterm would otherwise hold the calling thread indefinitely — the
-/// same hazard, and the same remedy, as `tailnet::whois_uncached`. Kept well
-/// under [`START_DEADLINE_MS`] so a hung launcher cannot eat the whole budget.
-#[cfg(target_os = "macos")]
-const AGTERMCTL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
-
-#[cfg(target_os = "macos")]
-fn agterm_bin() -> Option<PathBuf> {
-    // The bundle path first, for the same reason `tailnet::tailscale_bin`
-    // spells its own out: a Tauri app on macOS inherits no shell profile, so
-    // the Homebrew symlink on PATH is not reachable from here.
-    let candidates = ["/Applications/agterm.app/Contents/MacOS/agtermctl", "/opt/homebrew/bin/agtermctl", "/usr/local/bin/agtermctl"];
-    candidates.iter().map(PathBuf::from).find(|p| p.exists())
-}
-
-/// Run one `agtermctl` command and parse its JSON answer, or `None` if it could
-/// not be run, timed out, failed, or answered `ok: false`.
-#[cfg(target_os = "macos")]
-fn agtermctl(args: &[&str]) -> Option<serde_json::Value> {
-    use std::process::{Command, Stdio};
-
-    let bin = agterm_bin()?;
-    let mut child = Command::new(&bin).args(args).stdout(Stdio::piped()).stderr(Stdio::null()).stdin(Stdio::null()).spawn().ok()?;
-    let deadline = std::time::Instant::now() + AGTERMCTL_TIMEOUT;
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if std::time::Instant::now() < deadline => std::thread::sleep(std::time::Duration::from_millis(20)),
-            Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                tracing::warn!(?args, "agtermctl timed out");
-                return None;
-            }
-            Err(_) => return None,
-        }
-    }
-    let out = child.wait_with_output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let value: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
-    // `ok` is agterm's own verdict on the request. It says the request was
-    // served, never that the session it names is alive — see [`LaunchHandle`].
-    value.get("ok").and_then(serde_json::Value::as_bool).unwrap_or(false).then_some(value)
-}
-
-/// Find a session node by id in an `agtermctl tree --json` answer.
-///
-/// Pure, and separate from the query, so the shape this depends on is pinned by
-/// a test rather than by a live terminal.
-#[cfg(target_os = "macos")]
-fn session_node<'a>(tree: &'a serde_json::Value, id: &str) -> Option<&'a serde_json::Value> {
-    tree.get("result")?
-        .get("tree")?
-        .get("workspaces")?
-        .as_array()?
-        .iter()
-        .filter_map(|w| w.get("sessions")?.as_array())
-        .flatten()
-        .find(|s| s.get("id").and_then(serde_json::Value::as_str) == Some(id))
-}
-
 #[cfg(target_os = "macos")]
 fn launch_macos(dir: &Path) -> Result<LaunchHandle, StartRefusal> {
     let answer = agtermctl(&["session", "new", "--cwd", &dir.to_string_lossy(), "--no-select", "--json", "--command", AGTERM_COMMAND])
@@ -741,27 +679,6 @@ mod tests {
         assert!(candidates_in(&serde_json::json!({}), "nested", None).is_empty(), "no index, no suggestions");
 
         let _ = std::fs::remove_dir_all(&here);
-    }
-
-    /// The realized check reads a real `agtermctl tree --json` shape — captured
-    /// from the live 0.25.0 CLI — so a schema change breaks a test here rather
-    /// than silently making every unrealized session look healthy.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn a_session_node_is_found_across_workspaces() {
-        let tree: serde_json::Value = serde_json::json!({
-            "result": {"tree": {"workspaces": [
-                {"name": "common", "sessions": [{"id": "A57195F5", "cwd": "/p/agterm", "realized": true}]},
-                {"name": "apps", "sessions": [
-                    {"id": "D0558931", "cwd": "/p/dash", "realized": true},
-                    {"id": "C257D880", "cwd": "/tmp/probe", "realized": false},
-                ]},
-            ]}}
-        });
-        assert_eq!(session_node(&tree, "C257D880").and_then(|n| n.get("realized")).and_then(serde_json::Value::as_bool), Some(false));
-        assert_eq!(session_node(&tree, "A57195F5").and_then(|n| n.get("realized")).and_then(serde_json::Value::as_bool), Some(true));
-        assert!(session_node(&tree, "NOPE").is_none());
-        assert!(session_node(&serde_json::json!({"ok": true}), "C257D880").is_none(), "a shape we do not recognize yields no answer rather than a wrong one");
     }
 
     /// Positive knowledge only. A handle with no id, or a tree we cannot read,
