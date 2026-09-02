@@ -2,8 +2,8 @@
   import { onMount } from 'svelte'
   import { invoke } from '@tauri-apps/api/core'
   import { listen, type UnlistenFn } from '@tauri-apps/api/event'
-  import { closeWindow, getConfig, getPersistedDialog, getSessions, onConfigUpdated, onHistoryLoading, onSessionsUpdated, setHistoryFontSize, type DialogEntry } from './lib/api'
-  import type { AgentSession, HistoryFontSize } from './lib/types'
+  import { closeWindow, getConfig, getPersistedDialog, getSessions, onConfigUpdated, onHistoryLoading, onSessionsUpdated, setHistoryFontSize } from './lib/api'
+  import type { AgentSession, DialogEntry, HistoryFontSize } from './lib/types'
 
   const SIZE_ORDER: HistoryFontSize[] = ['smallest', 'small', 'regular', 'large', 'largest']
   const SIZE_PX: Record<HistoryFontSize, number> = { smallest: 11, small: 12, regular: 14, large: 16, largest: 18 }
