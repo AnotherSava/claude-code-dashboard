@@ -55,6 +55,9 @@
 - [Measure background-task duration](measure-background-task-duration.md) — task-notification ts is flush-time not completion; use the output-file mtime; finite shell tasks + subagents cap ~9 min
 - [Context-window map needs generation updates](context_window_map_needs_generation_updates.md) — Claude 5 gen (opus/sonnet/fable) defaults to 1M, not a beta opt-in like 4.x; add specific keys, don't broaden prefixes
 - [Homebrew tap distribution](homebrew_tap_distribution.md) — macOS also ships via AnotherSava/homebrew-tap; cask strips quarantine on purpose, zap path UNTESTED and can disable sleep, never `brew audit --new`
-- [agterm status co-existence](agterm_status_coexistence.md) — dashboard owns status in agterm (glyph can't express WAIT/ERROR); agterm-side mechanics in learnings/agterm.md
+- [agterm status co-existence](agterm_status_coexistence.md) — dashboard owns status via the OSC title (glyph can't express WAIT/ERROR); agterm is still *read* for per-session attention, never written; agterm-side mechanics in learnings/agterm.md
+- [Notification delivery channel](notification_delivery_channel.md) — write OSC 777 to the session tty (focus-gated, free); NOT agtermctl notify (re-raises the pill) or tauri-plugin-notification (desktop stub, can't dismiss)
+- [Notification engine never fired](notification_engine_never_fired.md) — zero fires ever; windows are compiled defaults, not tuned, and blocked's effective backstop is ~5.4min not 2min
+- [Attention visit detection design](attention_visit_detection_design.md) — polling a level can't catch a short visit; chosen fix is an fsevent watch on agterm's window snapshot + a gated 1s poll, no agterm changes; upstream asks withdrawn 2026-09-02
 - [CLAUDE.md is one 75k-char line](claude_md_single_line_merge.md) — cross-machine edits always conflict; never resolve markers, stash + ff + re-apply edits onto the pulled text
 - [Verify a relayed message's target](verify_peer_message_delivery.md) — diagnose relays on the RECEIVER: `peer_write` logs a pid to map via `~/.claude/sessions/<pid>.json`, `peer_refused` carries the true reason the sender's receipt may have mislabelled
