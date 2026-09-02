@@ -32,9 +32,13 @@ Each badge is color-coded, and BLOCK and ERROR pulse to draw your eye when a ses
 
 Turn on the tray's **Compact view** toggle for a denser widget: each row drops its current prompt and time-in-state, and the 5-hour / 7-day usage bars shrink to just their percentage and reset time — the segmented track giving way to a slim border that fills left-to-right and shifts green → amber → red as each limit climbs. What's left is the state badge, token count, and usage figures — nothing that needs reading, just glanceable numbers. Off by default.
 
+![The widget in compact view — rows without prompts or timers, and the usage bars reduced to their percentage](../screenshots/compact.png)
+
 ## Color terminal tabs
 
-Each session's status is mirrored onto the terminal tab it runs in, as a colored circle next to the session name — 🔵 working (also background-agent WAIT), 🟠 blocked on you, 🟢 done, 🔴 error. A glance at your terminal tabs shows which session needs attention, even without the widget on screen. The title updates the moment the status changes and clears when the session ends. On by default; the tray's **Color terminal tabs** toggle turns it off.
+Each session's status is mirrored onto the terminal tab it runs in, next to the session name — 🔵 working, ⏳ background work still running, ✋ blocked on you, 🟢 done, 🔴 error, ⚪ idle. Two of them deliberately aren't circles: an orange and a red circle read too alike at tab size, and no light-blue circle exists to mirror the widget's WAIT pill. A glance at your terminal tabs shows which session needs attention, even without the widget on screen. The title updates the moment the status changes and clears when the session ends. On by default; the tray's **Color terminal tabs** toggle turns it off.
+
+![Terminal sessions listed with a status glyph each — blue working, green done, grey idle, a raised hand for one blocked on the user — two carrying their context percentage](../screenshots/terminal-tabs.png)
 
 Once a session's context usage climbs past a threshold (50% by default), the tab title also shows it — `🔵 printlab [67%]` — so a tab that's filling toward a `/compact` stands out among the rest. The number falls off again when a new task or `/clear` frees the context. See [Settings](settings#color-terminal-tabs) to change the threshold or turn the number off.
 
@@ -61,6 +65,8 @@ The row shows the session's live context usage, updated as Claude works. The cou
 ## History window
 
 Hover a session row for a quick tooltip listing its task prompts so far — one per line, with the current task marked. For the whole story, click the text below a session's name to open a History window — a chronological recap of your prompts and Claude's reply to each, with a separator marking the start of a new session. Useful for scrolling back through a long-running conversation without leaving the dashboard. The window opens maximized on the dashboard's screen; with **Save window position** enabled it reopens where you last left it.
+
+![The History window, showing prompts and Claude's replies in order](../screenshots/history.png)
 
 Ctrl+`+` and Ctrl+`-` cycle through five font sizes; Esc closes the window. The choice persists to `config.json`.
 
@@ -92,6 +98,8 @@ When the badge is on, the tray icon also flags the moment any session's context 
 
 A separate window — opened from the tray's **Work intensity** item — charts how hard your agents have been working over time. Each bar covers a short slice of time and grows taller and warmer the busier that slice was. A **Days** view lays out one week as seven rows, one per day; a **Weeks** view gives one row per week and scrolls back through your history. Each view also totals the active time. With [multi-device sync](#multi-device-sync) configured, the chart covers your other devices too, so it shows the work done on the account as a whole rather than just here.
 
+![The Work intensity chart in its Days view — one row per day, ten-minute bars, red where a bar passes twice the pace, and a dashed line marking the full 5-hour pace](../screenshots/work-intensity.png)
+
 A **Percent | Tokens** switch picks what the bars measure, and the two answer different questions:
 
 - **Percent** — how much of your 5-hour limit each slice burned, with a reference line marking the pace that would use the whole limit in five hours straight; anything past twice that pace is flagged red. This is the view for "am I about to run out".
@@ -104,6 +112,10 @@ Run the dashboard on more than one computer and each one can show the sessions f
 The devices need to reach each other over the network — the simplest way across different networks is a VPN like [Tailscale](https://tailscale.com/). Sync stays off until you configure it, and once it's on the widget normally listens only on your Tailscale network and your own computer, so a shared cafe or hotel network can't reach it; a shared password is checked on top of that. If the widget starts before your VPN is up it falls back to listening more widely for that session, and says so in its log; it still turns away addresses outside your VPN's range, though on the handful of home and mobile networks that hand out addresses from that same range the shared password is what's protecting you there. If your devices reach each other some other way, `bind_scope` opens it up — see [Settings → multi-device sync](settings#multi-device-sync).
 
 Sync also carries an optional second capability: an agent on one machine can send a **message** to an agent on the other, which starts a turn in that session the way a prompt you typed would. This is off unless you turn on `accept_messages` on the receiving device — deliberately separate from sync itself, because seeing what your sessions are doing and letting the other machine set them working are different things to agree to. The agent that receives one is told where the message came from and how to answer it, so a reply comes back the same way — as a message that starts a turn on the original machine. There is nothing to wait on or check: an answer either arrives or it doesn't. How much of the sender it can trust depends on you. If you tell the widget which Tailscale machine each of your devices is (see [Settings](settings)), it confirms the message really came from that computer and says so. The name of the *agent* is never confirmed — anything running on that machine can claim it — so a message is never treated as you asking. What the sender gets back says only what was actually observed: that the message was written to the session's inbox. Whether the agent then accepts it isn't visible from the other machine, so nothing claims it was delivered.
+
+A message can only ever reach an agent that's already running, so one sent to a project you don't happen to have open would normally come back saying nothing was delivered. The widget can answer that differently: it opens a terminal in the project folder, starts the session, and delivers the message into it. The session is an ordinary one — it stays open after the conversation is over, and you'll find it waiting in a tab when you come back to the machine.
+
+Nothing starts without your say-so, and the asking happens where you actually are. The machine that would run the session is, by definition, the one nobody is sitting at — so the request appears in the widget on the machine you're *using*: who asked, what they wanted to reach, and the folders the other machine found matching that name. Allow it and the project is remembered over there, so it never asks again; the message that prompted it is delivered straight away. Ignore it and the asking agent gives up after a minute and a half and tells its own user that nothing arrived — nothing is queued and no message text is stored. The request stays in your widget either way, so a later yes still spares the next message the same trip. Allowing a project is a lasting decision, not a one-off: [Settings](settings) spells out what you're agreeing to.
 
 ## Configuration
 
