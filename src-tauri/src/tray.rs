@@ -36,6 +36,7 @@ const MENU_LID_AWAKE_ALWAYS: &str = "lid_awake_always";
 const MENU_CONTEXT_ALERT: &str = "context_alert";
 const MENU_HIGH_ALERT: &str = "high_alert";
 const MENU_OPEN_DATA_DIR: &str = "open_data_dir";
+const MENU_OPEN_AUTO_START: &str = "open_auto_start";
 const MENU_OPEN_INTENSITY: &str = "open_intensity";
 const MENU_HELP_ABOUT: &str = "help_about";
 const MENU_HELP_INSTRUCTIONS: &str = "help_instructions";
@@ -235,6 +236,7 @@ pub fn setup(app: &AppHandle) -> tauri::Result<()> {
     )?;
 
     let open_data_dir = MenuItem::with_id(app, MENU_OPEN_DATA_DIR, "Open config/logs location", true, None::<&str>)?;
+    let open_auto_start = MenuItem::with_id(app, MENU_OPEN_AUTO_START, "Startable projects", true, None::<&str>)?;
     let open_intensity = MenuItem::with_id(app, MENU_OPEN_INTENSITY, "Work intensity", true, None::<&str>)?;
     let help_about = MenuItem::with_id(app, MENU_HELP_ABOUT, "About", true, None::<&str>)?;
     let help_instructions = MenuItem::with_id(app, MENU_HELP_INSTRUCTIONS, "Connect instructions", true, None::<&str>)?;
@@ -267,6 +269,7 @@ pub fn setup(app: &AppHandle) -> tauri::Result<()> {
         &sep_tools,
         &open_intensity,
         &open_data_dir,
+        &open_auto_start,
         &sep_help,
         &help_submenu,
         &quit,
@@ -374,6 +377,7 @@ fn handle_menu_event(app: &AppHandle, id: &str) {
         MENU_CONTEXT_ALERT => toggle_context_alert(app),
         MENU_HIGH_ALERT => toggle_high_alert(app),
         MENU_OPEN_DATA_DIR => open_data_dir(app),
+        MENU_OPEN_AUTO_START => open_auto_start(app),
         MENU_OPEN_INTENSITY => show_intensity(app),
         MENU_HELP_ABOUT => show_about(app),
         MENU_HELP_INSTRUCTIONS => show_setup_instructions(app),
@@ -733,6 +737,31 @@ fn sync_autostart_checks(app: &AppHandle) {
     let _ = handles.autostart_off.set_checked(!enabled);
     let _ = handles.autostart_open.set_checked(enabled && !minimized);
     let _ = handles.autostart_tray.set_checked(enabled && minimized);
+}
+
+/// Open the list of projects a relayed message may start a session for.
+///
+/// The file *is* the list — there is no separate UI for it, because it is
+/// hand-editable by design and a second surface would be a second source of
+/// truth. Created empty on first open so the user sees the shape rather than a
+/// missing-file error, and so an entry can be added without inventing the
+/// filename.
+fn open_auto_start(app: &AppHandle) {
+    use tauri::Manager;
+    let Some(store) = app.try_state::<crate::auto_start_store::AutoStartStore>() else {
+        tracing::warn!("open_auto_start: store unavailable");
+        return;
+    };
+    let path = store.path().to_path_buf();
+    if !path.exists() {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(&path, "{}\n");
+    }
+    if let Err(e) = open::that(&path) {
+        tracing::warn!(?e, path = %path.display(), "open_auto_start failed");
+    }
 }
 
 fn open_data_dir(app: &AppHandle) {

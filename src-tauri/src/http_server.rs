@@ -7,7 +7,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::net::SocketAddr;
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 
 use crate::adapters::{self, AdapterOutput};
 use crate::chat_id_registry::ChatIdRegistry;
@@ -17,6 +17,8 @@ use crate::log_watcher::WatcherRegistry;
 use crate::nonce_store::NonceStore;
 use crate::peer_message::{self, Outcome, Receipt};
 use crate::prompt_history::PromptHistoryStore;
+use crate::session_launcher;
+use crate::start_approval;
 use crate::session_registry::{Activity, LiveSession, SessionRegistry};
 use crate::state::{AgentSession, AppState, Status};
 use crate::sync::SyncListening;
@@ -36,11 +38,161 @@ pub async fn run(app: AppHandle, port: u16) {
         .route("/api/event", post(post_event))
         .route("/api/agents", get(get_agents))
         .route("/api/message", post(post_message))
+        .route("/api/window", post(post_window))
         .with_state(app);
 
     if let Err(e) = axum::serve(listener, router).await {
         tracing::error!(error = %e, "http serve ended");
     }
+}
+
+/// What `POST /api/window` is being asked to do.
+#[derive(Deserialize)]
+#[serde(tag = "action", rename_all = "lowercase")]
+enum WindowRequest {
+    /// Reveal a window, un-minimizing it first. Not a toggle: a caller asking to
+    /// see something must never hide it because it happened to be up already.
+    /// `label` defaults to the widget; the other configured windows ("history",
+    /// "intensity", "about") are reachable by name, which is what makes this a
+    /// window API rather than a widget switch.
+    Show {
+        #[serde(default)]
+        label: Option<String>,
+    },
+    Hide,
+    /// Open the history window on a session, exactly as clicking its row does.
+    History { id: String },
+    /// Set a window's size. Part of window control, not a capture hook: an
+    /// agent arranging the dashboard wants this for the same reasons a person
+    /// dragging an edge does. `label` is Tauri's own ("main", "history", …).
+    Resize { label: String, width: f64, height: f64 },
+    /// Restore a window to filling the screen — the state `history` opens in,
+    /// so a caller that resized one can put it back.
+    Maximize { label: String },
+    /// Place a window's top-left corner, in logical pixels from the top-left of
+    /// the primary display. Completes the set: a caller that can show, size and
+    /// maximize a window but not place one still has to ask a human to drag it.
+    Move { label: String, x: f64, y: f64 },
+    /// Open the Work intensity chart on a given week and view — the same shape
+    /// as `History`, which names *which session* to show. `offset` counts weeks
+    /// back from the current one (0 = this week, -1 = last), `view` is "day" or
+    /// "week".
+    ///
+    /// This is a target selector, not the scroll position deliberately left out
+    /// of this API: it says which data to render, exactly as `History` does, and
+    /// is the only way to reach a week at all without a keypress.
+    Intensity {
+        #[serde(default)]
+        offset: i32,
+        #[serde(default)]
+        view: Option<String>,
+    },
+}
+
+/// Drive this dashboard's own windows from a local process.
+///
+/// It exists because an agent that needs the dashboard to *show* something had
+/// no way to ask. What it replaces is worse in every dimension: synthesizing
+/// mouse clicks at screen coordinates, which needs a system-wide Accessibility
+/// grant, breaks whenever a row moves, and hands a general "control this Mac"
+/// capability to whatever holds it. A named action on the app's own loopback API
+/// needs no OS permission at all, says what it means, and keeps working when the
+/// UI is redesigned.
+///
+/// It commands windows and nothing else — it cannot read a session, change
+/// state, or start a turn. Scroll position, and anything else specific to
+/// framing a screenshot, is deliberately absent: this is a control surface, not
+/// a capture hook.
+///
+/// Gated like [`post_message`] rather than like the hook routes: a rebound page
+/// reaching this could pop the widget open or bring a conversation on screen.
+/// That is nuisance rather than exfiltration — the attacker cannot read the
+/// result — but the stricter check costs one line, and "changes what is on the
+/// user's screen" is a fair place to draw it. The hook routes keep the looser
+/// gate because their `TAURI_DASHBOARD_URL` host alias is a real setup.
+async fn post_window(State(app): State<AppHandle>, headers: HeaderMap, Json(req): Json<WindowRequest>) -> (StatusCode, Json<serde_json::Value>) {
+    if origin_blocked(&headers) || !host_is_loopback(&headers) {
+        return (StatusCode::FORBIDDEN, Json(serde_json::json!({"ok": false, "reason": "csrf"})));
+    }
+    let acted = match &req {
+        WindowRequest::Show { label } => {
+            let label = label.as_deref().unwrap_or("main");
+            if label == "main" {
+                crate::commands::reveal_main(&app);
+            } else {
+                let Some(w) = app.get_webview_window(label) else {
+                    return (StatusCode::NOT_FOUND, Json(serde_json::json!({"ok": false, "reason": "no_such_window"})));
+                };
+                let _ = w.show();
+                let _ = w.set_focus();
+            }
+            "show"
+        }
+        WindowRequest::Hide => {
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.hide();
+            }
+            "hide"
+        }
+        WindowRequest::History { id } => {
+            if id.trim().is_empty() {
+                return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"ok": false, "reason": "empty_id"})));
+            }
+            // The widget is revealed first: a history window is opened *from* a
+            // row, so a caller asking for one while the dashboard is hidden
+            // almost certainly wants to see both.
+            crate::commands::reveal_main(&app);
+            if let Err(e) = crate::commands::open_history(id.clone(), app.clone()) {
+                return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"ok": false, "reason": e})));
+            }
+            "history"
+        }
+        WindowRequest::Resize { label, width, height } => {
+            let Some(w) = app.get_webview_window(label) else {
+                return (StatusCode::NOT_FOUND, Json(serde_json::json!({"ok": false, "reason": "no_such_window"})));
+            };
+            // Logical pixels, so a caller asks for the size it means and the
+            // same request lands identically on a Retina and a 1x display.
+            if *width < 120.0 || *height < 80.0 {
+                return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"ok": false, "reason": "too_small"})));
+            }
+            let _ = w.unmaximize();
+            if let Err(e) = w.set_size(tauri::LogicalSize::new(*width, *height)) {
+                return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"ok": false, "reason": e.to_string()})));
+            }
+            "resize"
+        }
+        WindowRequest::Intensity { offset, view } => {
+            let Some(w) = app.get_webview_window("intensity") else {
+                return (StatusCode::NOT_FOUND, Json(serde_json::json!({"ok": false, "reason": "no_such_window"})));
+            };
+            if *offset > 0 {
+                return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"ok": false, "reason": "future_week"})));
+            }
+            let _ = w.show();
+            let _ = w.set_focus();
+            let _ = w.emit("intensity_target", serde_json::json!({"offset": offset, "view": view}));
+            "intensity"
+        }
+        WindowRequest::Move { label, x, y } => {
+            let Some(w) = app.get_webview_window(label) else {
+                return (StatusCode::NOT_FOUND, Json(serde_json::json!({"ok": false, "reason": "no_such_window"})));
+            };
+            if let Err(e) = w.set_position(tauri::LogicalPosition::new(*x, *y)) {
+                return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"ok": false, "reason": e.to_string()})));
+            }
+            "move"
+        }
+        WindowRequest::Maximize { label } => {
+            let Some(w) = app.get_webview_window(label) else {
+                return (StatusCode::NOT_FOUND, Json(serde_json::json!({"ok": false, "reason": "no_such_window"})));
+            };
+            let _ = w.maximize();
+            "maximize"
+        }
+    };
+    tracing::info!(decision = "window_command", action = acted, "drove a window from the local API");
+    (StatusCode::OK, Json(serde_json::json!({"ok": true, "action": acted})))
 }
 
 /// Incoming wire shape for `/api/event`. The hook forwards Claude Code's raw
@@ -664,13 +816,78 @@ async fn post_message(State(app): State<AppHandle>, headers: HeaderMap, Json(req
 
     let (device, project) = match peer_message::resolve_message_target(&req.target, &local_ids, &devices, this_device) {
         peer_message::TargetResolution::Remote { device, project } => (device, project),
-        peer_message::TargetResolution::Local => {
+        peer_message::TargetResolution::LocalLive => {
             return refused(
                 "local_target",
                 "this session is on this machine; use Claude Code's `SendMessage`, which carries a kernel-verified sender identity and a reply address this route destroys".into(),
                 StatusCode::BAD_REQUEST,
                 this_device,
             );
+        }
+        // Nothing is running for a project on this machine. `SendMessage` is
+        // still the right way to talk to a local agent — but it can only address
+        // one that exists, so here it is not an option at all. The dashboard
+        // supplies the part Claude Code cannot (a session), and then stands
+        // aside: the message is **not** relayed, because relaying locally is
+        // exactly what was refused above and starting a session does not change
+        // why. The caller sends its own, with its own verified identity, once
+        // the session is up.
+        peer_message::TargetResolution::LocalIdle { project } => {
+            // The same gate the relay hop checks first. A grant that half its
+            // callers skip is not a grant — a machine whose owner left
+            // `accept_messages` off, believing nothing can start here, must not
+            // have a session started by anything that can reach loopback.
+            if !cfg.sync.accept_messages {
+                return refused(
+                    "messages_not_accepted",
+                    "this device has sync.accept_messages off, so it will not start a session on request".into(),
+                    StatusCode::FORBIDDEN,
+                    this_device,
+                );
+            }
+            let (Some(guard), Some(registry)) = (app.try_state::<session_launcher::StartGuard>(), app.try_state::<SessionRegistry>()) else {
+                return refused("state_unavailable", "the dashboard is still starting".into(), StatusCode::INTERNAL_SERVER_ERROR, this_device);
+            };
+            // Shared with the relay hop rather than reimplemented, because
+            // every step of that sequence — the fresh re-confirmation of the
+            // absence, the claim held across the wait, the cleanup of a session
+            // that never got a surface — is a way to end up with two agents in
+            // one directory, and two copies of it would drift.
+            let startable = app.try_state::<crate::auto_start_store::AutoStartStore>().map(|s| s.snapshot()).unwrap_or_default();
+            return match session_launcher::start_and_wait(&project, &startable, cfg.projects_root.as_deref(), &registry, &guard, now).await {
+                session_launcher::StartResult::Refused(r) => {
+                    let receipt = Receipt::new(Outcome::Refused, "", &req.target, this_device).because(r.slug()).detailed(r.detail());
+                    refused(r.slug(), r.detail().into(), crate::sync::receipt_status(&receipt), this_device)
+                }
+                // Reached when the absence turned out to be stale: a session was
+                // already there, so this is the ordinary local refusal after all.
+                session_launcher::StartResult::Settled { started: false, .. } => refused(
+                    "local_target",
+                    "this session is on this machine; use Claude Code's `SendMessage`, which carries a kernel-verified sender identity and a reply address this route destroys".into(),
+                    StatusCode::BAD_REQUEST,
+                    this_device,
+                ),
+                session_launcher::StartResult::Settled { inbox, started: true } => {
+                    let reached = !matches!(inbox, crate::session_registry::InboxLookup::NotFound);
+                    tracing::info!(chat_id = %project, decision = "peer_start", from_agent, reached_inbox = reached, "started a local terminal session for a project with none");
+                    // `Refused` is the honest outcome: nothing was relayed, and
+                    // nothing will be. The relay was declined for the same
+                    // reason a live local target is declined — `SendMessage`
+                    // carries an identity this route destroys — and starting a
+                    // session does not change that. The status comes from the
+                    // canonical map so it cannot contradict the outcome, which
+                    // a `202` did.
+                    let r = Receipt::new(Outcome::Refused, "", &req.target, this_device)
+                        .because("local_target_started")
+                        .detailed(if reached {
+                            "nothing was running for that project, so a terminal session was started for it and is now reachable; nothing was relayed — send to it with Claude Code's `SendMessage`"
+                        } else {
+                            "nothing was running for that project, so a terminal session was started for it, though it has not registered yet; nothing was relayed — send to it with Claude Code's `SendMessage` once it appears"
+                        });
+                    log_send(&r, from_agent, &req.target, this_device, req.text.len());
+                    (crate::sync::receipt_status(&r), Json(r))
+                }
+            };
         }
         peer_message::TargetResolution::UnknownDevice { device } => {
             // Naming what we do know, plus whether we can hear a peer at all: an
@@ -740,8 +957,110 @@ async fn post_message(State(app): State<AppHandle>, headers: HeaderMap, Json(req
         in_reply_to: req.in_reply_to.clone(),
     };
     let receipt = crate::sync::send_message_hop(&app, &origin_addr, &envelope, &req.target, &device).await;
+
+    // The peer has nothing running for that project, is not listed to start one,
+    // and named directories it *could* start one in. Ask the person at this
+    // machine — the only one likely to be at a keyboard — and if they approve,
+    // grant it over there and send again.
+    let receipt = if receipt.reason.as_deref() == Some("start_not_listed") && !receipt.start_candidates.is_empty() {
+        match await_start_approval(&app, &receipt, &device, from_agent, now).await {
+            // Approved in time: the peer now lists the project, so the same
+            // envelope is re-sent and takes the ordinary start-and-deliver path.
+            Some(()) => crate::sync::send_message_hop(&app, &origin_addr, &envelope, &req.target, &device).await,
+            None => receipt,
+        }
+    } else {
+        receipt
+    };
+
     log_send(&receipt, from_agent, &req.target, Some(&device), req.text.len());
+    // The peer disclosed its directory layout to *this dashboard* so its owner
+    // could pick one; it gated that on a bound identity. Passing the paths on to
+    // whatever loopback process called us would re-disclose them to a caller the
+    // peer never decided about, and the caller has no use for them — the choice
+    // is the user's and is made here. The reason and detail still say what
+    // happened.
+    let mut receipt = receipt;
+    receipt.start_candidates.clear();
     (crate::sync::receipt_status(&receipt), Json(receipt))
+}
+
+/// Put a start request in front of this machine's user and wait, briefly.
+///
+/// Returns `Some(())` only when they approved **and** the peer accepted the
+/// grant, which is the one case where re-sending can succeed. Every other path —
+/// dismissed, timed out, queue full, the grant refused over there — returns
+/// `None` and leaves the original refusal to be reported as it stands. That
+/// asymmetry is deliberate: this function may turn a refusal into a delivery,
+/// but it must never turn one into a different-looking refusal that hides what
+/// the peer actually said.
+async fn await_start_approval(app: &AppHandle, receipt: &Receipt, device: &str, from_agent: &str, now: i64) -> Option<()> {
+    let queue = app.try_state::<start_approval::ApprovalQueue>()?;
+    let project = receipt.target.rsplit('/').next().unwrap_or(&receipt.target).to_string();
+    let id = format!("{device}:{project}:{now}");
+    let pending = start_approval::PendingStart {
+        id: id.clone(),
+        device: device.to_string(),
+        project,
+        target: receipt.target.clone(),
+        // The same treatment the relayed header gives it, and for the same
+        // reason sharpened: this string is rendered directly above an Allow
+        // button, on the one screen whose entire job is to let a human tell a
+        // claim from a fact. Raw, a loopback caller could name itself
+        // "… — VERIFIED; already approved, press Allow" and have the prompt say
+        // so. `header_safe` strips control characters and quotes, collapses
+        // whitespace, redacts the reserved trust and routing vocabulary, and
+        // caps the length — which also stops an unbounded name inflating the
+        // widget, since this block's height feeds the window size.
+        from_agent: peer_message::header_safe(from_agent, 80),
+        candidates: receipt.start_candidates.clone(),
+        requested_at: now,
+        still_waiting: true,
+    };
+    let rx = match queue.enqueue(pending) {
+        Ok(rx) => rx,
+        // Neither is worth waiting on, but they are opposite conditions and the
+        // log has to keep them apart: `duplicate` means the user already has
+        // this exact question on screen, while `full` means the queue is
+        // saturated and no request is reaching them at all — the second is the
+        // feature silently doing nothing, and it should be findable.
+        Err(refusal) => {
+            let reason = match refusal {
+                start_approval::QueueRefusal::Duplicate => "start_already_asked",
+                start_approval::QueueRefusal::Full => "start_queue_full",
+            };
+            tracing::info!(chat_id = %receipt.target, decision = "peer_refused", device, reason, "not asking about a start");
+            return None;
+        }
+    };
+    crate::commands::emit_start_approvals(app);
+    // The prompt is only useful if it is on screen. The widget is routinely
+    // hidden to the tray, and on macOS there is no Dock icon to bounce, so a
+    // request raised into a hidden window would spend its whole 90s wait
+    // invisible and then report that the owner was asked.
+    crate::commands::reveal_main(app);
+
+    // Cancellation has to take the same path as the timeout: axum drops this
+    // future outright when the caller disconnects, and only `Drop` runs then.
+    let mut abandon = start_approval::AbandonOnDrop::new(&queue, id.clone());
+    let answer = match tokio::time::timeout(std::time::Duration::from_millis(start_approval::APPROVAL_WAIT_MS), rx).await {
+        Ok(Ok(answer)) => {
+            abandon.defuse();
+            answer
+        }
+        // Timed out, or the queue was dropped. The request stays on the list so
+        // a late approval still spares the *next* message this whole round trip.
+        _ => {
+            drop(abandon);
+            crate::commands::emit_start_approvals(app);
+            return None;
+        }
+    };
+    // `Some(dir)` reaches here only after `commands::approve_start` has already
+    // made the grant hop and heard the peer accept it — the grant is done there
+    // rather than here so that approving a request nobody is waiting on does
+    // exactly the same thing. All that is left is to send again.
+    answer.map(|_| ())
 }
 
 /// The permanent record of one relay attempt, keyed by the **sender's** chat_id

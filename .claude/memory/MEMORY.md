@@ -57,4 +57,4 @@
 - [Homebrew tap distribution](homebrew_tap_distribution.md) — macOS also ships via AnotherSava/homebrew-tap; cask strips quarantine on purpose, zap path UNTESTED and can disable sleep, never `brew audit --new`
 - [agterm status co-existence](agterm_status_coexistence.md) — dashboard owns status in agterm (glyph can't express WAIT/ERROR); agterm-side mechanics in learnings/agterm.md
 - [CLAUDE.md is one 75k-char line](claude_md_single_line_merge.md) — cross-machine edits always conflict; never resolve markers, stash + ff + re-apply edits onto the pulled text
-- [Verify a relayed message's target](verify_peer_message_delivery.md) — `peer_write` logs a pid, not an agent; map it via `~/.claude/sessions/<pid>.json` to see which session got the bytes
+- [Verify a relayed message's target](verify_peer_message_delivery.md) — diagnose relays on the RECEIVER: `peer_write` logs a pid to map via `~/.claude/sessions/<pid>.json`, `peer_refused` carries the true reason the sender's receipt may have mislabelled

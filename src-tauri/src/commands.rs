@@ -979,3 +979,122 @@ pub async fn test_telegram_notification(app: AppHandle) -> Result<(), String> {
 
     Ok(())
 }
+
+/// Push the current start-approval requests to the widget.
+///
+/// Its own event rather than a field on the session snapshot: a pending request
+/// is not a session — it has no status, no history and no row of its own — and
+/// folding it into `sessions_updated` would make every state transition carry
+/// it, and every approval re-render the whole list.
+pub fn emit_start_approvals(app: &AppHandle) {
+    let pending = app
+        .try_state::<crate::start_approval::ApprovalQueue>()
+        .map(|q| q.list())
+        .unwrap_or_default();
+    let _ = app.emit("start_approvals_updated", pending);
+}
+
+/// The requests awaiting an answer, for the widget's mount snapshot.
+#[tauri::command]
+pub fn get_start_approvals(app: AppHandle) -> Vec<crate::start_approval::PendingStart> {
+    app.try_state::<crate::start_approval::ApprovalQueue>().map(|q| q.list()).unwrap_or_default()
+}
+
+/// Approve starting `request_id`'s project at `dir` on the peer that asked.
+///
+/// The grant hop happens **here**, not in the waiting HTTP handler, so that
+/// approving a request whose caller has already given up does exactly the same
+/// thing as approving one still on the line: the peer records the permission
+/// either way, and the only difference is whether there is still someone to
+/// deliver the original message. That is the whole point of letting a request
+/// outlive its caller.
+///
+/// The click is not the authority — the peer's acceptance is. It re-checks the
+/// directory against its own disk and its own Claude Code trust state, and a
+/// refusal there leaves the request on the list rather than pretending it
+/// worked.
+#[tauri::command]
+pub async fn approve_start(request_id: String, dir: String, app: AppHandle) -> Result<(), String> {
+    let queue = app.try_state::<crate::start_approval::ApprovalQueue>().ok_or("the dashboard is still starting")?;
+    let pending = queue.get(&request_id).ok_or("that request is no longer waiting")?;
+
+    // The user may only approve a directory the peer itself offered. A free-text
+    // path would be this machine asserting something about the other one's disk,
+    // which is the mistake the candidate list exists to avoid.
+    if !pending.candidates.iter().any(|c| c.dir == dir) {
+        return Err("that directory was not one of the ones offered".into());
+    }
+
+    let device_name = app.try_state::<ConfigState>().map(|c| c.snapshot().sync.device_name).unwrap_or_default();
+    let origin_addr = app
+        .try_state::<AppState>()
+        .and_then(|s| s.remote.lock().unwrap().get(&pending.device).map(|d| d.origin_addr.clone()))
+        .unwrap_or_default();
+    if origin_addr.is_empty() {
+        return Err(format!("no address for \"{}\" — it has not pushed to this device", pending.device));
+    }
+
+    let envelope = crate::sync::GrantEnvelope { origin_device: device_name, project: pending.project.clone(), dir: dir.clone() };
+    let receipt = crate::sync::send_grant_hop(&app, &origin_addr, &envelope).await;
+    if !receipt.granted {
+        tracing::warn!(chat_id = %format!("{}/{}", pending.device, pending.project), decision = "peer_refused", device = %pending.device, reason = ?receipt.reason, "peer refused a grant its user approved here");
+        return Err(receipt.detail.unwrap_or_else(|| receipt.reason.unwrap_or_else(|| "the other machine refused it".into())));
+    }
+    // Namespaced the way remote row ids already are: this line is written on
+    // the sending machine about a project on another one, and a bare id would
+    // collide with a local row of the same name — three projects are checked out
+    // on both of these machines.
+    tracing::info!(chat_id = %format!("{}/{}", pending.device, pending.project), decision = "peer_grant", device = %pending.device, dir = %dir, "approved starting a project on a peer");
+
+    queue.resolve(&request_id, Some(dir));
+    emit_start_approvals(&app);
+    Ok(())
+}
+
+/// Decline a start request. The peer is told nothing — it already answered the
+/// message, and there is no standing state over there to undo.
+#[tauri::command]
+pub fn dismiss_start(request_id: String, app: AppHandle) {
+    if let Some(queue) = app.try_state::<crate::start_approval::ApprovalQueue>() {
+        if let Some(p) = queue.resolve(&request_id, None) {
+            tracing::info!(chat_id = %format!("{}/{}", p.device, p.project), decision = "peer_refused", device = %p.device, reason = "start_dismissed", "declined a start request");
+        }
+    }
+    emit_start_approvals(&app);
+}
+
+/// Bring the main window to the front because something needs an answer.
+///
+/// Separate from `toggle_main`, which is the user's own show/hide and must stay
+/// a toggle: a request arriving while the window is already up must not hide it.
+/// Reuses `reveal` so the un-minimize handling stays in one place.
+pub fn reveal_main(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        // Best-effort: a window that refuses to come forward is not a reason to
+        // fail the request, and the prompt is still in the widget when the user
+        // next opens it.
+        let _ = reveal(&window);
+    }
+}
+
+/// The stored dialog for `id`, for a history window with no live row to read.
+///
+/// Rows are deliberately not restored at startup — the dashboard cannot tell a
+/// session that was closed from one sitting idle, so listing them would assert a
+/// liveness it never established. Reading a conversation back asserts nothing of
+/// the kind: the caller already has an id and is asking what was said, not what
+/// is running. Without this the two questions shared one answer, and every
+/// project's history became unreadable after a restart until that session
+/// happened to act again — the data being complete on disk the whole time.
+///
+/// The live snapshot still wins when it has the row (see `HistoryApp`): a live
+/// session's dialog is ahead of what has been persisted, because the watcher
+/// upserts the assistant's reply into the row before it is written out. This is
+/// the fallback, not the source.
+#[tauri::command]
+pub fn get_persisted_dialog(id: String, app: AppHandle) -> Vec<crate::state::DialogEntry> {
+    app.try_state::<PromptHistoryStore>()
+        .and_then(|store| store.get(&id))
+        .map(|s| s.dialog)
+        .unwrap_or_default()
+}

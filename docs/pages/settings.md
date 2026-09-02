@@ -226,6 +226,22 @@ The `sync` block shows sessions from your other computers — see [Features → 
 
 A typical two-device setup — desktop: `"listen": true, "peers": ["http://laptop:9078"], "token": "pick-a-long-random-string"`; laptop: the same with `"peers": ["http://desktop:9078"]`.
 
+### Startable projects
+
+Separate from `config.json`, in its own `auto_start.json` in the same folder — the tray's **Startable projects** item opens it. It lives apart because the widget writes to it when you approve a request, and `config.json` is overwritten every time the app is installed.
+
+It lists the projects a message from another machine may **start a session for**, written as `{"transcripts": "/Users/you/Projects/transcripts"}`. Empty (the default) means a message never starts anything. Each machine has its own — the folders are different — and the widget re-reads the file whenever it needs it, so removing a line takes a project off the list straight away, with no restart.
+
+**You don't have to write it by hand.** When an agent on your other machine messages a project that isn't running and isn't listed, the widget on *this* machine — the one you're sitting at — shows the request: who asked, what they wanted to reach, and the folders the other machine found that match the name. Pick one and press **Allow**, and the project is added over there for good; the message that prompted it is then delivered. Press **Not now** and nothing happens.
+
+The asking agent waits about a minute and a half. If you're away, it gives up and tells its own user plainly that nothing was delivered — nothing is queued, and no message text is ever stored on either machine. The request stays in your widget, though, so approving it later still saves the *next* message the same round trip. The agent can send again if what it had is still worth sending.
+
+**Allowing a project is a standing invitation.** From then on, any agent on any of your devices that has the shared `token` can, at any hour and with nobody sitting at that computer, open a terminal there and start Claude Code in that folder — with your permission settings, your hooks and your files. You're not approving one message; you're approving that a session may come into existence without you. The widget confirms which *computer* asked (via `peer_identity`, which it requires both for a start and for recording your approval), but nothing anywhere can confirm which *agent* did. The window it opens is deliberately a real one: it's how you see what the session is doing, and how you close it.
+
+A session started this way is a normal one — an agterm tab in the project folder running `claude` the way your shell does, so it picks up `--continue` and everything else you'd get by hand. It stays after the conversation ends: quitting Claude leaves you at a prompt in that directory, and the tab is still there when you come back. macOS only for now; on Windows a start is turned away with a note saying so.
+
+Two things are refused rather than attempted, both because they'd otherwise leave a session stuck where nobody can see it: a folder Claude Code hasn't been trusted in (it would stop at the trust question and wait forever), and a start while the display is asleep — the terminal can't give the tab a screen, so nothing would run. The first is caught before anything is launched; the second only becomes visible once the session fails to appear, and the empty tab is closed rather than left behind.
+
 ### Server port
 
 - `server_port` — port the embedded HTTP server listens on for hook events. Most users never touch this. Two caveats if you do: it needs an app restart to take effect (like the `sync` listener settings, while everything else hot-reloads), and the Claude hook must point at the same port — it defaults to `9077`, so set `TAURI_DASHBOARD_URL=http://127.0.0.1:<port>` in the hook's environment to match.

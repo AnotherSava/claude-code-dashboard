@@ -184,6 +184,16 @@ pub struct Receipt {
     /// [`observed_text`] for `outcome`, carried on the wire so a caller that
     /// only ever prints the receipt cannot accidentally print "delivered".
     pub observed: String,
+    /// On a `start_not_listed` refusal only: directories on the **receiving**
+    /// machine whose derived id is the target project, for its owner to choose
+    /// between when approving.
+    ///
+    /// They have to travel, because only that machine can produce them — the
+    /// sender has no view of the peer's filesystem and a path composed here
+    /// would be a guess presented as a fact. Defaulted and skipped when empty so
+    /// a peer that predates the field parses, and contributes none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub start_candidates: Vec<crate::session_launcher::StartCandidate>,
 }
 
 impl Receipt {
@@ -196,7 +206,14 @@ impl Receipt {
             target: target.to_string(),
             device: device.map(str::to_string),
             observed: observed_text(outcome).to_string(),
+            start_candidates: Vec::new(),
         }
+    }
+
+    /// Attach the directories the receiving machine could start this project in.
+    pub fn with_candidates(mut self, candidates: Vec<crate::session_launcher::StartCandidate>) -> Self {
+        self.start_candidates = candidates;
+        self
     }
 
     pub fn because(mut self, reason: &str) -> Self {
@@ -215,8 +232,18 @@ impl Receipt {
 pub enum TargetResolution {
     /// A session on `device`, addressed there by `project`.
     Remote { device: String, project: String },
-    /// On this machine — refused, with the correct tool named.
-    Local,
+    /// A session running on this machine — refused, with the correct tool
+    /// named.
+    LocalLive,
+    /// This machine, but nothing is running for `project`.
+    ///
+    /// Separate from [`Self::LocalLive`] because the reason a local target is
+    /// refused does not apply here. That refusal says `SendMessage` is the
+    /// better tool, and it is — but `SendMessage` can only address a session
+    /// that exists, so for a project with none it is not a tool at all. This is
+    /// the gap that decision leaves rather than a reopening of it: what is
+    /// offered here is a *start*, never a brokered delivery.
+    LocalIdle { project: String },
     /// Shaped like `{device}/{project}` but naming a device we hold no address
     /// for. The refusal lists what we do know rather than guessing.
     UnknownDevice { device: String },
@@ -245,7 +272,7 @@ pub fn resolve_message_target(target: &str, local_ids: &[String], remote_devices
         return TargetResolution::NotAnAddress;
     }
     if local_ids.iter().any(|id| id == target) {
-        return TargetResolution::Local;
+        return TargetResolution::LocalLive;
     }
     // Longest device name first, so a device that is a prefix of another cannot
     // claim the other's rows.
@@ -260,11 +287,21 @@ pub fn resolve_message_target(target: &str, local_ids: &[String], remote_devices
         }
     }
     // A caller will type `this-box/project` even though the roster never emits
-    // that shape for a local row, so recognize it and give the local refusal
-    // rather than the "unknown device" one.
+    // that shape for a local row, so recognize it and give a local answer rather
+    // than the "unknown device" one. Reaching here means the project is not in
+    // `local_ids`, so nothing is running for it — which is a start, not a
+    // brokered delivery, and a different answer from the live case above.
     if let Some(me) = self_device.filter(|d| !d.is_empty()) {
-        if target.strip_prefix(&format!("{me}/")).is_some_and(|p| !p.is_empty()) {
-            return TargetResolution::Local;
+        if let Some(project) = target.strip_prefix(&format!("{me}/")).filter(|p| !p.is_empty() && p.trim() == *p) {
+            // The bare-name check above compared the *whole* target, so a live
+            // session addressed the long way round has not been seen yet.
+            // Without this it would read as idle and be offered a start beside
+            // the session it is already running.
+            return if local_ids.iter().any(|id| id == project) {
+                TargetResolution::LocalLive
+            } else {
+                TargetResolution::LocalIdle { project: project.to_string() }
+            };
         }
     }
     match target.split_once('/') {
@@ -356,7 +393,7 @@ fn sanitize_id_part(raw: &str) -> String {
 /// the quote character and every control character (newline first) are removed
 /// rather than escaped, whitespace runs are collapsed, and the result is capped
 /// — a header cannot be forged out of parts that cannot contain its punctuation.
-fn header_safe(raw: &str, cap: usize) -> String {
+pub(crate) fn header_safe(raw: &str, cap: usize) -> String {
     let cleaned: String = raw
         .chars()
         .map(|c| if c.is_control() || c == '"' { ' ' } else { c })
@@ -850,16 +887,35 @@ mod tests {
     #[test]
     fn a_target_on_this_machine_is_refused() {
         let r = resolve_message_target("transcripts", &ids(&["transcripts"]), &ids(&["chrome"]), Some("air"));
-        assert_eq!(r, TargetResolution::Local);
+        assert_eq!(r, TargetResolution::LocalLive);
     }
 
     /// A caller will type the roster's `device` beside the project even though
-    /// the roster never namespaces a local row. Recognized, so the refusal is
+    /// the roster never namespaces a local row. Recognized, so the answer is
     /// the useful one rather than "unknown device".
     #[test]
     fn this_devices_own_name_also_resolves_local() {
         let r = resolve_message_target("air/transcripts", &ids(&[]), &ids(&["chrome"]), Some("air"));
-        assert_eq!(r, TargetResolution::Local);
+        assert_eq!(r, TargetResolution::LocalIdle { project: "transcripts".into() }, "nothing running for it, so a start is on the table");
+    }
+
+    /// The long-form address must reach the same verdict as the bare one. The
+    /// bare-name check compares the whole target, so `air/transcripts` slips
+    /// past it — and reading a live session as idle would offer to start a
+    /// second one in the directory it is already running in, which is exactly
+    /// what makes a project permanently `Ambiguous`.
+    #[test]
+    fn the_long_form_address_still_sees_a_live_session() {
+        let r = resolve_message_target("air/transcripts", &ids(&["transcripts"]), &ids(&["chrome"]), Some("air"));
+        assert_eq!(r, TargetResolution::LocalLive);
+    }
+
+    /// A remote device still wins over this device's own name, so a project
+    /// that exists on both machines is not quietly redirected home.
+    #[test]
+    fn a_remote_device_prefix_is_not_mistaken_for_a_local_start() {
+        let r = resolve_message_target("chrome/transcripts", &ids(&[]), &ids(&["chrome"]), Some("air"));
+        assert_eq!(r, TargetResolution::Remote { device: "chrome".into(), project: "transcripts".into() });
     }
 
     #[test]

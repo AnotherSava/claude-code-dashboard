@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount, tick } from 'svelte'
   import SessionList from './lib/components/SessionList.svelte'
+  import StartApprovals from './lib/components/StartApprovals.svelte'
   import SetupPanel from './lib/components/SetupPanel.svelte'
   import HistoryApp from './HistoryApp.svelte'
   import AboutApp from './AboutApp.svelte'
@@ -12,6 +13,7 @@
     getConfig,
     getSessions,
     getSetupState,
+    getStartApprovals,
     getUsageLimits,
     getWindowLabel,
     getWindowLabelSync,
@@ -20,6 +22,8 @@
     onRefitWindow,
     onSessionsUpdated,
     onShowSetupInstructions,
+    onStartApprovalsUpdated,
+    type PendingStart,
     onUsageLimitsUpdated,
     refreshUsageLimits,
     setCompactWidth,
@@ -37,6 +41,7 @@
   // widgetEl is permanently absent and would otherwise read as a readiness gap.
   const isMainWindow = getWindowLabelSync() === 'main'
   let sessions = $state<AgentSession[]>([])
+  let startApprovals = $state<PendingStart[]>([])
   let config = $state<Config | null>(null)
   let usage = $state<UsageLimits | null>(null)
   let setup = $state<SetupState | null>(null)
@@ -195,6 +200,19 @@
   // so a window resize doesn't change its height and can't feed back a loop.
   let contentObserver: ResizeObserver | null = null
   let observedEl: Element | null = null
+  // A second, independent observer target. `observeContent` unobserves whatever
+  // it watched before — it tracks a single moving element (list / panel / empty)
+  // — so reusing it for the approvals block would make the two evict each other.
+  let observedApprovals: Element | null = null
+  let approvalsObserver: ResizeObserver | null = null
+  function observeApprovals(el: Element | null) {
+    if (el === observedApprovals) return
+    if (!approvalsObserver) approvalsObserver = new ResizeObserver(() => scheduleMeasure())
+    if (observedApprovals) approvalsObserver.unobserve(observedApprovals)
+    observedApprovals = el
+    if (el) approvalsObserver.observe(el)
+  }
+
   function observeContent(el: Element | null) {
     if (el === observedEl) return
     if (!contentObserver) contentObserver = new ResizeObserver(() => scheduleMeasure())
@@ -230,6 +248,12 @@
     const content = widgetEl?.querySelector('.list-inner') as HTMLElement | null
     const panel = widgetEl?.querySelector('.panel') as HTMLElement | null
     const emptyEl = widgetEl?.querySelector('.empty') as HTMLElement | null
+    // A third sibling inside .widget, outside the header/content pair the sum
+    // below is built from. Without this term the window is sized short by
+    // exactly this block's height, the list loses that space to it, and the
+    // resulting scrollbar self-corrects nowhere: `desired` never exceeds the
+    // viewport, so neither the overflow path nor the collapse heal fires.
+    const approvalsEl = widgetEl?.querySelector('.approvals') as HTMLElement | null
     const contentEl = content ?? panel ?? emptyEl
     if (!widgetEl || !config || !headerEl || !contentEl) {
       // Not ready — retry until the tree commits (see scheduleReadyRetry). Log
@@ -274,7 +298,13 @@
     // Subpixel-accurate getBoundingClientRect(), then ceil the total: rounding
     // down would leave us asking for a hair less than the content needs and the
     // OS would resize to exactly that, surfacing a scrollbar.
-    const desired = Math.ceil(headerEl.getBoundingClientRect().height + listH)
+    // Observed as well as summed: this block changes its own height from state
+    // inside the component — a revealed trust warning, a grant error, a button
+    // label — and the `$effect` below can only see the array identity, so
+    // nothing else would re-measure.
+    observeApprovals(approvalsEl)
+    const approvalsH = approvalsEl?.getBoundingClientRect().height ?? 0
+    const desired = Math.ceil(headerEl.getBoundingClientRect().height + approvalsH + listH)
     // Always fire when content actually exceeds the viewport — that's the
     // overflow case we're guarding against. Drift sources (DPI shift, OS
     // clamp on a prior request, external resize) leave `lastSentHeight`
@@ -360,6 +390,7 @@
   // window resize.
   $effect(() => {
     sessions
+    startApprovals
     usage
     config?.auto_resize
     config?.compact_mode
@@ -436,6 +467,7 @@
   })
 
   onMount(() => {
+    let unlistenApprovals: (() => void) | undefined
     let unlistenSessions: (() => void) | undefined
     let unlistenConfig: (() => void) | undefined
     let unlistenUsage: (() => void) | undefined
@@ -459,6 +491,7 @@
         }
         config = await getConfig()
         sessions = await getSessions()
+        startApprovals = await getStartApprovals()
         usage = await getUsageLimits()
         setup = await getSetupState()
         frontendLog('trace', 'mount snapshot', {
@@ -466,6 +499,9 @@
           seven_day_present: usage?.seven_day != null,
           status: usage?.status,
         }).catch(() => {})
+        unlistenApprovals = await onStartApprovalsUpdated((p) => {
+          startApprovals = p
+        })
         unlistenSessions = await onSessionsUpdated((s) => {
           frontendLog('trace', 'event sessions_updated', { sessions: s.length }).catch(() => {})
           sessions = s
@@ -582,6 +618,7 @@
       document.removeEventListener('visibilitychange', onVisibility)
       window.removeEventListener('resize', onWindowResize)
       dprMedia?.removeEventListener('change', onDprChange)
+      unlistenApprovals?.()
       unlistenSessions?.()
       unlistenConfig?.()
       unlistenUsage?.()
@@ -592,6 +629,7 @@
       if (widthTimer !== null) clearTimeout(widthTimer)
       cancelReadyRetry()
       contentObserver?.disconnect()
+      approvalsObserver?.disconnect()
     }
   })
 
@@ -640,6 +678,7 @@
     </div>
     <button class="hide-btn" onclick={onHide} aria-label="Hide to tray" title="Hide to tray">×</button>
   </header>
+  <StartApprovals pending={startApprovals} />
   {#if config}
     {#if showSetup && setup}
       <SetupPanel

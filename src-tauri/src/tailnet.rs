@@ -116,6 +116,30 @@ pub fn attest(claimed_device: &str, peer: Option<&TailnetPeer>, bindings: &BTree
     }
 }
 
+/// Whether an explicit `peer_identity` entry binds `claimed_device` to the node
+/// this connection actually came from.
+///
+/// Strictly stronger than [`attest`] answering [`Attestation::Attested`], and
+/// the gap is the whole point for a route that **authorises** rather than
+/// attributes. `attest` also answers `Attested` on the happy coincidence that an
+/// *unbound* claimed name already equals the node's own name — but the sender
+/// picks that name, so it chooses both sides of the comparison and any node
+/// holding the fleet token self-attests by simply telling the truth about
+/// itself. That is a fair corroboration for deciding whose rows a push becomes,
+/// which is all `attest` was written for. It is not a gate.
+///
+/// So starting a process, recording a standing permission, and disclosing this
+/// machine's directory layout all require a binding the *receiver* wrote down —
+/// which is what makes the check non-circular, exactly as `attest`'s own doc
+/// says about the map living locally.
+pub fn bound(claimed_device: &str, peer: Option<&TailnetPeer>, bindings: &BTreeMap<String, String>) -> bool {
+    let Some(peer) = peer else { return false };
+    bindings
+        .iter()
+        .find(|(device, _)| device.eq_ignore_ascii_case(claimed_device))
+        .is_some_and(|(_, node)| node.eq_ignore_ascii_case(&peer.node))
+}
+
 /// Cached `tailscale whois` lookups, managed by Tauri so the cache outlives one
 /// request.
 #[derive(Default)]
@@ -150,6 +174,12 @@ impl TailnetResolver {
     pub fn attest_peer(&self, ip: IpAddr, claimed_device: &str, bindings: &BTreeMap<String, String>) -> (Attestation, Option<TailnetPeer>) {
         let peer = self.whois(ip);
         (attest(claimed_device, peer.as_ref(), bindings), peer)
+    }
+
+    /// [`bound`] against this connection's real node. The gate for anything that
+    /// authorises rather than attributes.
+    pub fn peer_is_bound(&self, ip: IpAddr, claimed_device: &str, bindings: &BTreeMap<String, String>) -> bool {
+        bound(claimed_device, self.whois(ip).as_ref(), bindings)
     }
 }
 
@@ -255,6 +285,26 @@ mod tests {
 
     fn peer(node: &str) -> TailnetPeer {
         TailnetPeer { node: node.to_string(), user: Some("you@example.com".into()) }
+    }
+
+    /// The gap between attributing and authorising, pinned.
+    ///
+    /// `attest` accepts an unbound name that happens to equal the node's own —
+    /// which the sender picks, so it chooses both sides of the comparison and
+    /// any node holding the fleet token self-attests by truthfully naming
+    /// itself. That is fine for deciding whose rows a push becomes. It is not a
+    /// gate, and starting a process on a peer's word is a gate.
+    #[test]
+    fn an_unbound_name_attests_but_is_never_bound() {
+        let none = BTreeMap::new();
+        assert_eq!(attest("evil", Some(&peer("evil")), &none), Attestation::Attested, "the coincidence branch, unchanged");
+        assert!(!bound("evil", Some(&peer("evil")), &none), "but nothing the receiver wrote down says so");
+
+        let bindings: BTreeMap<String, String> = [("CHROME".to_string(), "chrome".to_string())].into_iter().collect();
+        assert!(bound("CHROME", Some(&peer("chrome")), &bindings), "an explicit binding, matched case-insensitively like attest");
+        assert!(!bound("CHROME", Some(&peer("air")), &bindings), "bound to a different node");
+        assert!(!bound("air", Some(&peer("air")), &bindings), "a device with no entry is never bound, even truthfully named");
+        assert!(!bound("CHROME", None, &bindings), "no answer from tailscaled is not a pass");
     }
 
     /// The real fleet's shape: `device_name` is `CHROME` (from `COMPUTERNAME`)

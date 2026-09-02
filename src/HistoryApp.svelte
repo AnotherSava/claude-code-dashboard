@@ -2,7 +2,7 @@
   import { onMount } from 'svelte'
   import { invoke } from '@tauri-apps/api/core'
   import { listen, type UnlistenFn } from '@tauri-apps/api/event'
-  import { closeWindow, getConfig, getSessions, onConfigUpdated, onHistoryLoading, onSessionsUpdated, setHistoryFontSize } from './lib/api'
+  import { closeWindow, getConfig, getPersistedDialog, getSessions, onConfigUpdated, onHistoryLoading, onSessionsUpdated, setHistoryFontSize, type DialogEntry } from './lib/api'
   import type { AgentSession, HistoryFontSize } from './lib/types'
 
   const SIZE_ORDER: HistoryFontSize[] = ['smallest', 'small', 'regular', 'large', 'largest']
@@ -140,6 +140,9 @@
 
   let sessionId = $state<string | null>(null)
   let session = $state<AgentSession | null>(null)
+  // The stored dialog, used only when no live row exists for this id. Cleared
+  // the moment one does, so a live session is never rendered from a stale copy.
+  let persisted = $state<DialogEntry[]>([])
   let fontSize = $state<HistoryFontSize>('regular')
   let error = $state<string | null>(null)
   // Session id whose remote-dialog catch-up fetch is in flight (see
@@ -160,7 +163,15 @@
     try {
       const sessions = await getSessions()
       session = sessions.find((s) => s.id === id) ?? null
-      if (!session) error = `session "${id}" not found`
+      if (!session) {
+        // No live row. That is not the same as no history: rows are rebuilt from
+        // the hook stream, so every conversation is unreadable after a restart
+        // until its session next acts — while the dialog sits complete on disk.
+        persisted = await getPersistedDialog(id)
+        error = persisted.length ? null : `session "${id}" not found`
+      } else {
+        persisted = []
+      }
     } catch (e) {
       error = String(e)
     }
@@ -182,7 +193,22 @@
         if (!sessionId) return
         const found = s.find((x) => x.id === sessionId) ?? null
         session = found
-        if (!found) { session = null; error = 'session removed' }
+        // A row disappearing (the session ended, or the app restarted) must not
+        // take the conversation with it — fall back to what was persisted, and
+        // only call it gone when there is nothing stored either.
+        if (!found) {
+          // Resolve first, decide after. Setting the error up front and clearing
+          // it when the fetch lands would flash "session removed" over a
+          // conversation that was never gone.
+          if (persisted.length === 0) {
+            getPersistedDialog(sessionId).then((d) => {
+              persisted = d
+              if (d.length === 0) error = 'session removed'
+            })
+          }
+        } else {
+          persisted = []
+        }
       })
 
       unlistenConfig = await onConfigUpdated((c) => { fontSize = c.history_font_size })
@@ -208,9 +234,9 @@
     return `${pad(d.getHours())}:${pad(d.getMinutes())}`
   }
 
-  function deduplicatedDialog(): import('./lib/types').DialogEntry[] {
-    if (!session) return []
-    const d = session.dialog
+  function deduplicatedDialog(): DialogEntry[] {
+    if (!session && persisted.length === 0) return []
+    const d = session ? session.dialog : persisted
     return d.filter((entry, i) => {
       if (entry.role !== 'user') return true
       const next = d[i + 1]
@@ -256,7 +282,7 @@
 
 {#if error}
   <div class="msg">{error}</div>
-{:else if session}
+{:else if session || persisted.length > 0}
   {#if catchingUp && dialog.length > 0}
     <div class="loading-banner">Loading full history...</div>
   {/if}

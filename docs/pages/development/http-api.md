@@ -259,9 +259,9 @@ The reply is a receipt. Its `outcome` is one of five words, and none of them is 
 
 `unknown` answers `200`, not `5xx`, on purpose: a `5xx` reads as "it failed, retry", and retrying a message that may already have been written is how one message becomes two.
 
-`reason` values: `local_target`, `not_an_address`, `unknown_device`, `device_unheard`, `no_device_name`, `empty_text`, `too_large`, `csrf`, `no_such_session`, `ambiguous_target`, `registry_unreadable`, `no_inbox`, `inbox_dead`, `peer_unreachable`, `response_lost`. A refusal the *peer* made keeps its own status across the relay — `no_such_session` stays a `404`, `ambiguous_target` a `409` — so a caller is not told its request was malformed when the problem was on the other machine.
+`reason` values: `local_target`, `local_target_started`, `not_an_address`, `unknown_device`, `device_unheard`, `no_device_name`, `empty_text`, `too_large`, `csrf`, `no_such_session`, `ambiguous_target`, `registry_unreadable`, `no_inbox`, `inbox_dead`, `peer_unreachable`, `response_lost`, plus the `start_*` family described under [Starting a session](#starting-a-session-that-is-not-running). A refusal the *peer* made keeps its own status across the relay — `no_such_session` stays a `404`, `ambiguous_target` a `409` — so a caller is not told its request was malformed when the problem was on the other machine.
 
-Two refusals are the sender's own and are made with certainty: a local target, and a device it holds no address for (the refusal lists the devices it does know, and whether it is listening for peers at all). Everything else — above all *does that project exist over there* — is the receiving dashboard's answer, relayed verbatim, because this side's roster is at best one push cycle old.
+Two refusals about the *remote* side are the sender's own and are made with certainty: a live local target, and a device it holds no address for (the refusal lists the devices it does know, and whether it is listening for peers at all). Everything else — above all *does that project exist over there* — is the receiving dashboard's answer, relayed verbatim, because this side's roster is at best one push cycle old.
 
 ### The extra gate on this route
 
@@ -272,6 +272,44 @@ The [`Origin` check](#endpoint) shared by the hook routes is CSRF only; a page w
 Each send is stamped with a `message_id` minted here, and the *receiving* dashboard — the only party that knows whether bytes reached a socket — remembers the ids it has written for 10 minutes. A hop that times out after the peer already wrote the frame can therefore be retried without delivering twice. The entry expires, so a deliberate resend of the same words an hour later still gets through.
 
 Claude Code's own identical-repeat drop is not relied on: it compares only against the immediately previous message from one sender, so an interleaved message defeats it; its window is tunable from the server side; it drops a legitimate resend as readily as a retry; and it is invisible to a relay.
+
+### Starting a session that is not running
+
+A message can only ever reach an agent that already exists, so a target with no live session used to end the story at `no_such_session`. It no longer has to. Which of three things happens depends on where the project is and whether its owner has allowed it.
+
+**A local project with nothing running** answers `local_target_started`: the dashboard opens a terminal session for it and then stands aside. Nothing is relayed — the outcome is still `refused`, and the status is the same `400` a live `local_target` gets, because what the caller asked for is what did not happen. The detail says what did. This is not a softening of the local-target rule: `SendMessage` carries a kernel-verified sender and a working reply address that a relay destroys, and that is as true after the start as before. What it *cannot* do is address a session that does not exist, which is the gap being filled — the dashboard supplies existence, Claude Code keeps delivery.
+
+**A remote project the peer has allowed** is started by the peer and the message is delivered into it, answering an ordinary `written`. Nothing about the receipt changes.
+
+**A remote project the peer has *not* allowed** answers `refused` / `start_not_listed` — and, when that machine found directories matching the name, carries them as `start_candidates`:
+
+```json
+{
+  "outcome": "refused",
+  "reason": "start_not_listed",
+  "start_candidates": [
+    { "dir": "/Users/you/Projects/transcripts", "trusted": true }
+  ]
+}
+```
+
+The candidates come from the peer's own disk and are gated on a bound identity, because they disclose a little of its directory layout. The sending dashboard uses them to raise an approval prompt on *its* screen — the machine that would run the session is by definition the one nobody is at — and holds this HTTP call open for up to 90 s while the user decides. On approval it records the grant on the peer over `POST /api/sync/grant` and re-sends, so a caller sees a normal `written` and never learns an approval happened. If nobody answers in time, the original refusal is returned unchanged, nothing is stored on either machine, and the request stays approvable so a later yes spares the *next* message the same trip. **`start_candidates` is stripped before the receipt reaches the loopback caller** — the peer disclosed those paths to the dashboard, not to whatever process called it, and the choice is the user's, made here.
+
+The `start_*` refusals, all of them certain and none of them retryable by the caller:
+
+| `reason` | status | what it means |
+|---|---|---|
+| `start_not_listed` | `404` | nothing is running and the owner has not allowed this project |
+| `start_unattested` | `403` | the sending device has no `sync.peer_identity` binding on the peer, so its name is only claimed |
+| `start_path_mismatch` | `404` | the allowed directory does not derive the project id it is filed under |
+| `start_no_directory` | `404` | the allowed directory is gone |
+| `start_untrusted_directory` | `503` | Claude Code has never been trusted there, so a session would stop at a prompt nobody can answer |
+| `start_already_running` | `409` | a start for this project is already in flight |
+| `start_no_launcher` | `503` | no terminal this dashboard can drive (Windows today) |
+| `start_not_realized` | `503` | the terminal made a session but never gave it a screen — a sleeping display; the empty session is closed rather than left behind |
+| `start_not_ready` | `502` | a session was launched and had not registered in time; nothing was written, and whether it comes up is not observable from here. The outcome is `unreachable` rather than `refused` — we tried and found nothing listening yet — so it maps to `502` here even though the peer deliberately answered `200`, keeping the sender from reading it as a lost hop |
+
+**Attested is not enough to start something.** Reading a peer's rows tolerates the case where an unbound device name happens to equal its Tailscale node name — the sender picks that name, so it chooses both sides of the comparison, which is fair corroboration for attribution and useless as a gate. Causing a process to exist, recording a standing permission, and disclosing directories all require an explicit `sync.peer_identity` entry the *receiver* wrote down.
 
 ## Sync API
 
@@ -327,3 +365,15 @@ Returns `200` and a receipt for anything it observed about the socket (`written`
 **No credential crosses the wire.** The alternative shape — reaching into the other machine to read a session's key file and injecting it into that machine's IPC channel — is indistinguishable from exfiltration whatever the intent, and was refused when tried. This design exists so the only process that ever reads a messaging key is the dashboard already running as that user on that machine.
 
 **Windows is verified in one direction.** A Mac → Windows relay on 2026-08-30 closed all three questions that had been open: the Windows build does write the session registry, it does publish `messagingSocketPath`, and its named pipe accepts the same auth-line-first, `\n`-terminated frame — the receiving agent surfaced the message, and the receiving dashboard recorded the write as authenticated. Windows → Mac was exercised on 2026-08-31, a reply from that session arriving correlated on `in_reply_to`, so both directions have now been observed. What did not change is the silent close: a connection whose first line is not valid auth is dropped without a word, indistinguishable from a dead session. That is a property of the inbox rather than of Windows, so `written` means the bytes left us and nothing more on *either* platform, and one observed end-to-end delivery does not turn it into a delivery receipt. The socket path is always taken verbatim from the session's own record rather than composed from a pattern, which is what lets the Windows leg follow a path Claude Code chose for itself.
+
+### `POST /api/sync/grant`
+
+One machine telling another that its user approved starting a project. The only route in the system that writes a **standing permission** on another computer — everything else acts once and is done.
+
+```json
+{ "origin_device": "air", "project": "transcripts", "dir": "/Users/you/Projects/transcripts" }
+```
+
+Answers `{"granted": true}`, or `granted: false` with a `reason` and `detail`. The click is not the authority: the peer re-runs every check it would run at start time — the path derives the id it is filed under, the directory exists, Claude Code trusts it — against its own disk, and requires the bound identity above. A peer cannot grant anything the receiving dashboard would not have granted about its own filesystem. The single thing taken on faith is that a human clicked over there, which no design can verify across a machine boundary, and which is why this route accepts nothing weaker than a binding.
+
+Grants live in `auto_start.json` in the app data directory, not in `config.json` — an install overwrites `config.json`, and a permission that vanished at the next deploy would have the user re-approving a project they had already allowed. The file is re-read on every use, so deleting a line withdraws the grant immediately.

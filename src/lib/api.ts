@@ -1,7 +1,7 @@
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow'
-import type { AgentSession, Config, IntensityUnit, SetupState, TokenWeekChart, UsageLimits, WeekChart } from './types'
+import type { AgentSession, Config, DialogEntry, IntensityUnit, SetupState, TokenWeekChart, UsageLimits, WeekChart } from './types'
 
 export function getSessions(): Promise<AgentSession[]> {
   return invoke<AgentSession[]>('get_sessions')
@@ -184,4 +184,51 @@ export function onHistoryLoading(
   handler: (payload: { id: string; loading: boolean }) => void,
 ): Promise<UnlistenFn> {
   return listen<{ id: string; loading: boolean }>('history_loading', (evt) => handler(evt.payload))
+}
+
+// A peer has nothing running for a project a local agent messaged, and offered
+// directories it could start one in. The answer is a standing permission on
+// that machine, so the prompt is raised here — where a human plausibly is.
+export interface StartCandidate {
+  dir: string
+  trusted: boolean
+}
+
+export interface PendingStart {
+  id: string
+  device: string
+  project: string
+  target: string
+  from_agent: string
+  candidates: StartCandidate[]
+  requested_at: number
+  /** False once the requesting agent stopped waiting: approving still records
+   *  the permission for next time, but can no longer deliver that message. */
+  still_waiting: boolean
+}
+
+export function getStartApprovals(): Promise<PendingStart[]> {
+  return invoke<PendingStart[]>('get_start_approvals')
+}
+
+export function approveStart(requestId: string, dir: string): Promise<void> {
+  return invoke('approve_start', { requestId, dir })
+}
+
+export function dismissStart(requestId: string): Promise<void> {
+  return invoke('dismiss_start', { requestId })
+}
+
+export function onStartApprovalsUpdated(
+  handler: (pending: PendingStart[]) => void,
+): Promise<UnlistenFn> {
+  return listen<PendingStart[]>('start_approvals_updated', (evt) => handler(evt.payload))
+}
+
+// The stored dialog for a session with no live row. Rows are not restored at
+// startup (the dashboard cannot tell a closed session from an idle one), so
+// without this a conversation is unreadable after a restart until that session
+// next acts — while sitting complete on disk the whole time.
+export function getPersistedDialog(id: string): Promise<DialogEntry[]> {
+  return invoke<DialogEntry[]>('get_persisted_dialog', { id })
 }

@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte'
-  import type { UnlistenFn } from '@tauri-apps/api/event'
+  import { listen, type UnlistenFn } from '@tauri-apps/api/event'
   import {
     closeWindow,
     getConfig,
@@ -23,6 +23,7 @@
   // 'day' = one week shown as 7 day-rows; 'week' = one row per week (overview).
   let view = $state<'day' | 'week'>('day')
   let weekOffset = $state(0)
+  let unlistenTarget: UnlistenFn | undefined
   let chart = $state<WeekChart | null>(null)
   let weeks = $state<WeekChart[] | null>(null)
   // 'percent' = share of the 5h quota (breaks across a plan change); 'tokens' =
@@ -697,6 +698,15 @@
         // fall through on the default
       }
       load(0)
+
+      // A caller can open the chart on a particular week and view — the same
+      // deep link `history_target` gives the history window. Without it the
+      // only way to reach any week but this one is a keypress.
+      unlistenTarget = await listen<{ offset: number; view?: string | null }>('intensity_target', (evt) => {
+        const v = evt.payload?.view
+        if (v === 'day' || v === 'week') view = v
+        load(Math.min(0, evt.payload?.offset ?? 0))
+      })
     })()
     const ro = new ResizeObserver(() => draw())
     if (canvasEl) ro.observe(canvasEl)
@@ -709,6 +719,7 @@
       })
     })()
     return () => {
+      unlistenTarget?.()
       ro.disconnect()
       unlistenUsage?.()
     }

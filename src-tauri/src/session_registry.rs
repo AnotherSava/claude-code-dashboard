@@ -286,6 +286,19 @@ impl SessionRegistry {
         }
     }
 
+    /// Drop the cache, so the next read re-scans.
+    ///
+    /// Needed by exactly one caller: the poll that waits for a session
+    /// `session_launcher` has just started. That poll is only reached *because*
+    /// a lookup moments earlier answered `NotFound`, and that lookup is what
+    /// filled the cache — so without this the poll would re-read its own stale
+    /// snapshot for a full `CACHE_TTL_MS` and conclude the launch failed while
+    /// the session was already registered. The TTL exists to keep the two
+    /// hot read paths cheap; a launch happens rarely enough to pay full price.
+    pub fn invalidate(&self) {
+        *self.cached.lock().unwrap() = None;
+    }
+
     /// The single place the directory and the process table are read, so both
     /// accessors share one snapshot rather than racing two. `None` propagates an
     /// unreadable registry; an unreadable one is not cached, so a directory that
