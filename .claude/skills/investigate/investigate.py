@@ -72,6 +72,14 @@ def status_from(fields):
         return "Done"
     if d == "revert_cancelled":
         return fields.get("status")
+    # A row put back after a restart bypasses `apply_set` entirely (it goes
+    # through `AppState::restore_row`), so this line is the *only* thing that
+    # establishes its status — without it a restored row is attributed to
+    # whatever pre-restart line happens to still be in the trail.
+    if d == "restore_row":
+        return fields.get("status")
+    if d == "settle_waiting":
+        return "Done"
     if d == "session_clear":
         return "(cleared)"
     return None

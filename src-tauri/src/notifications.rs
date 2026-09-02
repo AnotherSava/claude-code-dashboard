@@ -259,6 +259,26 @@ pub fn rule_notifies(rule: &StateNotify) -> bool {
     rule.afk_window_ms.unwrap_or(0) > 0 || rule.reaction_window_ms.unwrap_or(0) > 0
 }
 
+/// Whether a row's current state is one this process ever saw begin.
+///
+/// A row restored by `session_restore` carries the status its terminal tab was
+/// holding and the instant that status began — both from before this process
+/// started, which is the point: the age is what makes the widget's clock and
+/// `/api/agents` honest. But it also means every restored `Blocked` and `Error`
+/// row arrives already past its reaction backstop, so without this the first tick
+/// after a restart would ping for each of them — announcing states that the
+/// dashboard which *wrote* those glyphs already had its own chance to announce,
+/// and whose earlier messages this process can no longer revoke (`outstanding` is
+/// in-memory). A deploy would ping the whole board.
+///
+/// No flag distinguishes a restored row, and none is needed: `apply_set` stamps
+/// `state_entered_at = now` on every status change, so a state beginning before
+/// this process started could only have been restored. The suppression is
+/// therefore exact, and it lifts the moment the agent does anything at all.
+pub fn state_observed_here(state_entered_at: i64, process_started_at: i64) -> bool {
+    state_entered_at >= process_started_at
+}
+
 pub fn fire_reason(rule: &StateNotify, time_in_state_ms: u64, idle_ms: Option<u64>, reading_ms: u64) -> Option<&'static str> {
     let afk_due = matches!((rule.afk_window_ms, idle_ms), (Some(afk), Some(idle)) if afk > 0 && idle >= afk.saturating_add(reading_ms) && idle >= time_in_state_ms);
     if afk_due {
@@ -489,6 +509,7 @@ pub async fn reconcile(
     idle_ms: Option<u64>,
     reading_speed_cps: u64,
     high_alert: bool,
+    process_started_at: i64,
 ) {
     let rules = notifier.state_rules();
 
@@ -515,6 +536,11 @@ pub async fn reconcile(
         }
         let key = status_key(s.status);
         let Some(rule) = rules.get(key) else { continue };
+        // A state this process never saw begin was restored from a tab title, and
+        // the dashboard that wrote that title already had its turn to announce it.
+        if !state_observed_here(s.state_entered_at, process_started_at) {
+            continue;
+        }
         let time_in_state = (now_ms - s.state_entered_at).max(0) as u64;
         // High alert short-circuits the windows entirely: any state that's
         // configured to notify at all (at least one positive window) fires the
@@ -614,6 +640,10 @@ impl NotificationManager {
             let mut reset_tracker = ResetTracker::default();
             let mut last_usage_updated: i64 = 0;
             let mut pending_limit_resets: Vec<LimitReset> = Vec::new();
+            // When this process started, so a state it never saw begin — one
+            // `session_restore` read back off a tab title — is not re-announced.
+            // See `state_observed_here`.
+            let started_at = now_ms();
             let mut ticker = tokio::time::interval(Duration::from_secs(1));
             // First tick fires immediately; skip it so startup doesn't see
             // stale state before AppState is populated.
@@ -685,6 +715,7 @@ impl NotificationManager {
                         crate::idle::idle_ms(),
                         tg_cfg.and_then(|c| c.reading_speed_cps).unwrap_or(0),
                         cfg.high_alert,
+                        started_at,
                     )
                     .await;
 
@@ -1000,7 +1031,7 @@ mod tests {
         let m = Mock::with(&[("blocked", 60_000)]);
         let mut out = HashMap::new();
         let sessions = vec![session("s1", Status::Blocked, 0)];
-        reconcile(m.as_ref(), &sessions, &mut out, &mut HashMap::new(), 60_000, None, 0, false).await;
+        reconcile(m.as_ref(), &sessions, &mut out, &mut HashMap::new(), 60_000, None, 0, false, 0).await;
         assert_eq!(out.len(), 1);
         assert_eq!(out["s1"].for_status, Status::Blocked);
         assert_eq!(out["s1"].handle, "h1");
@@ -1012,7 +1043,7 @@ mod tests {
         let m = Mock::with(&[("blocked", 60_000)]);
         let mut out = HashMap::new();
         let sessions = vec![session("s1", Status::Blocked, 0)];
-        reconcile(m.as_ref(), &sessions, &mut out, &mut HashMap::new(), 59_999, None, 0, false).await;
+        reconcile(m.as_ref(), &sessions, &mut out, &mut HashMap::new(), 59_999, None, 0, false, 0).await;
         assert!(out.is_empty());
         assert!(m.events().is_empty());
     }
@@ -1026,7 +1057,7 @@ mod tests {
             Outstanding { handle: "h1".into(), for_status: Status::Blocked, },
         );
         let sessions = vec![session("s1", Status::Blocked, 0)];
-        reconcile(m.as_ref(), &sessions, &mut out, &mut HashMap::new(), 120_000, None, 0, false).await;
+        reconcile(m.as_ref(), &sessions, &mut out, &mut HashMap::new(), 120_000, None, 0, false, 0).await;
         assert_eq!(out.len(), 1);
         assert!(m.events().is_empty(), "no events when nothing changes");
     }
@@ -1040,7 +1071,7 @@ mod tests {
             Outstanding { handle: "h9".into(), for_status: Status::Blocked, },
         );
         let sessions = vec![session("s1", Status::Working, 100_000)];
-        reconcile(m.as_ref(), &sessions, &mut out, &mut HashMap::new(), 120_000, None, 0, false).await;
+        reconcile(m.as_ref(), &sessions, &mut out, &mut HashMap::new(), 120_000, None, 0, false, 0).await;
         assert!(out.is_empty());
         assert_eq!(m.events(), vec![Event::Dismiss { handle: "h9".into() }]);
     }
@@ -1056,7 +1087,7 @@ mod tests {
             Outstanding { handle: "h7".into(), for_status: Status::Blocked, },
         );
         let sessions: Vec<AgentSession> = vec![];
-        reconcile(m.as_ref(), &sessions, &mut out, &mut HashMap::new(), 120_000, None, 0, false).await;
+        reconcile(m.as_ref(), &sessions, &mut out, &mut HashMap::new(), 120_000, None, 0, false, 0).await;
         assert!(out.is_empty());
         assert_eq!(m.events(), vec![Event::Dismiss { handle: "h7".into() }]);
     }
@@ -1067,7 +1098,7 @@ mod tests {
         let m = Mock::with(&[("blocked", 60_000)]);
         let mut out = HashMap::new();
         let sessions: Vec<AgentSession> = vec![];
-        reconcile(m.as_ref(), &sessions, &mut out, &mut HashMap::new(), 30_000, None, 0, false).await;
+        reconcile(m.as_ref(), &sessions, &mut out, &mut HashMap::new(), 30_000, None, 0, false, 0).await;
         assert!(out.is_empty());
         assert!(m.events().is_empty());
     }
@@ -1077,7 +1108,7 @@ mod tests {
         let m = Mock::with(&[("blocked", 0)]);
         let mut out = HashMap::new();
         let sessions = vec![session("s1", Status::Blocked, 0)];
-        reconcile(m.as_ref(), &sessions, &mut out, &mut HashMap::new(), 1_000_000, None, 0, false).await;
+        reconcile(m.as_ref(), &sessions, &mut out, &mut HashMap::new(), 1_000_000, None, 0, false, 0).await;
         assert!(out.is_empty());
         assert!(m.events().is_empty());
     }
@@ -1087,7 +1118,7 @@ mod tests {
         let m = Mock::with(&[("error", 60_000)]);
         let mut out = HashMap::new();
         let sessions = vec![session("s1", Status::Blocked, 0)];
-        reconcile(m.as_ref(), &sessions, &mut out, &mut HashMap::new(), 1_000_000, None, 0, false).await;
+        reconcile(m.as_ref(), &sessions, &mut out, &mut HashMap::new(), 1_000_000, None, 0, false, 0).await;
         assert!(out.is_empty());
         assert!(m.events().is_empty());
     }
@@ -1100,7 +1131,7 @@ mod tests {
         let mut out = HashMap::new();
         let mut backoff = HashMap::new();
         let sessions = vec![session("s1", Status::Blocked, 0)];
-        reconcile(m.as_ref(), &sessions, &mut out, &mut backoff, 60_000, None, 0, false).await;
+        reconcile(m.as_ref(), &sessions, &mut out, &mut backoff, 60_000, None, 0, false, 0).await;
         assert!(out.is_empty(), "failed send must not populate outstanding");
         assert!(backoff.is_empty(), "not-delivered failure sets no hold → next tick retries promptly");
     }
@@ -1115,17 +1146,17 @@ mod tests {
         let mut backoff = HashMap::new();
         let sessions = vec![session("s1", Status::Done, 0)];
         // Window elapsed → attempt; the send times out (maybe delivered).
-        reconcile(m.as_ref(), &sessions, &mut out, &mut backoff, 60_000, None, 0, false).await;
+        reconcile(m.as_ref(), &sessions, &mut out, &mut backoff, 60_000, None, 0, false, 0).await;
         assert!(out.is_empty());
         assert!(m.events().is_empty(), "a failed send emits no Send event");
         assert!(matches!(backoff.get("s1"), Some(h) if h.for_status == Status::Done), "maybe-delivered failure sets a retry hold");
         // Channel recovers, but we're still inside the hold → no retry.
         *m.send_err.lock().unwrap() = None;
-        reconcile(m.as_ref(), &sessions, &mut out, &mut backoff, 60_000 + 1_000, None, 0, false).await;
+        reconcile(m.as_ref(), &sessions, &mut out, &mut backoff, 60_000 + 1_000, None, 0, false, 0).await;
         assert!(m.events().is_empty(), "no retry while the hold is active");
         assert!(out.is_empty());
         // Past the hold → retries and succeeds, clearing the hold.
-        reconcile(m.as_ref(), &sessions, &mut out, &mut backoff, 60_000 + UNCERTAIN_RETRY_BACKOFF_MS + 1, None, 0, false).await;
+        reconcile(m.as_ref(), &sessions, &mut out, &mut backoff, 60_000 + UNCERTAIN_RETRY_BACKOFF_MS + 1, None, 0, false, 0).await;
         assert_eq!(out.len(), 1, "retries once the backoff window elapses");
         assert!(!backoff.contains_key("s1"), "a successful send clears the hold");
     }
@@ -1139,12 +1170,12 @@ mod tests {
         let mut out = HashMap::new();
         let mut backoff = HashMap::new();
         let done = vec![session("s1", Status::Done, 0)];
-        reconcile(m.as_ref(), &done, &mut out, &mut backoff, 60_000, None, 0, false).await;
+        reconcile(m.as_ref(), &done, &mut out, &mut backoff, 60_000, None, 0, false, 0).await;
         assert!(matches!(backoff.get("s1"), Some(h) if h.for_status == Status::Done));
         // Same session is now Blocked; channel recovered.
         *m.send_err.lock().unwrap() = None;
         let blocked = vec![session("s1", Status::Blocked, 0)];
-        reconcile(m.as_ref(), &blocked, &mut out, &mut backoff, 60_000, None, 0, false).await;
+        reconcile(m.as_ref(), &blocked, &mut out, &mut backoff, 60_000, None, 0, false, 0).await;
         assert_eq!(out.len(), 1, "the new Blocked state pings promptly");
         assert_eq!(out["s1"].for_status, Status::Blocked);
     }
@@ -1280,10 +1311,10 @@ mod tests {
         let sessions = vec![session_with_message("s1", Status::Done, 0, &text)];
         let mut out = HashMap::new();
         // 90s in, idle 90s: today this fires (idle > 60s); now suppressed mid-read.
-        reconcile(m.as_ref(), &sessions, &mut out, &mut HashMap::new(), 90_000, Some(90_000), 15, false).await;
+        reconcile(m.as_ref(), &sessions, &mut out, &mut HashMap::new(), 90_000, Some(90_000), 15, false, 0).await;
         assert!(out.is_empty(), "present reader of a long message isn't pinged mid-read");
         // 170s in, idle 170s: past the 60s + 100s budget → fires.
-        reconcile(m.as_ref(), &sessions, &mut out, &mut HashMap::new(), 170_000, Some(170_000), 15, false).await;
+        reconcile(m.as_ref(), &sessions, &mut out, &mut HashMap::new(), 170_000, Some(170_000), 15, false, 0).await;
         assert_eq!(out.len(), 1, "fires once the reading budget elapses");
     }
 
@@ -1297,8 +1328,38 @@ mod tests {
         s.label = "api error".into();
         let sessions = vec![s];
         let mut out = HashMap::new();
-        reconcile(m.as_ref(), &sessions, &mut out, &mut HashMap::new(), 61_000, Some(0), 15, false).await;
+        reconcile(m.as_ref(), &sessions, &mut out, &mut HashMap::new(), 61_000, Some(0), 15, false, 0).await;
         assert_eq!(out.len(), 1, "error backstop fires off its short label, not the stale long turn");
+    }
+
+    #[test]
+    fn a_state_that_began_before_this_process_did_was_restored_not_observed() {
+        // No flag marks a restored row and none is needed: `apply_set` stamps
+        // `state_entered_at = now` on every status change, so only a restore can
+        // produce a state older than the process.
+        assert!(!state_observed_here(9_999, 10_000));
+        assert!(state_observed_here(10_000, 10_000), "created at the instant we started");
+        assert!(state_observed_here(20_000, 10_000));
+    }
+
+    #[tokio::test]
+    async fn a_restored_row_is_not_re_announced_but_its_next_real_state_is() {
+        // A `Blocked` row restored off a tab title arrives hours past its
+        // reaction backstop, so without the guard the first tick after every
+        // deploy would ping the whole board — re-announcing states the dashboard
+        // that wrote those glyphs already had its own chance to announce, and
+        // whose earlier messages this process can no longer revoke.
+        let m = Mock::with_rules(&[("blocked", StateNotify { afk_window_ms: Some(60_000), reaction_window_ms: Some(120_000) })]);
+        let restored = vec![session("s1", Status::Blocked, 1_000)];
+        let mut out = HashMap::new();
+        reconcile(m.as_ref(), &restored, &mut out, &mut HashMap::new(), 5_000_000, Some(0), 0, false, 900_000).await;
+        assert!(out.is_empty(), "a state this process never saw begin is not announced");
+
+        // The suppression is scoped to that state, not to the row: the moment the
+        // agent does anything, `state_entered_at` moves and the guard lifts.
+        let acted = vec![session("s1", Status::Blocked, 1_000_000)];
+        reconcile(m.as_ref(), &acted, &mut out, &mut HashMap::new(), 5_000_000, Some(0), 0, false, 900_000).await;
+        assert_eq!(out.len(), 1, "a state entered while we were running still fires");
     }
 
     #[tokio::test]
@@ -1307,7 +1368,7 @@ mod tests {
         let mut out = HashMap::new();
         // Done for 10s, user idle 70s (away since before it finished).
         let sessions = vec![session("s1", Status::Done, 0)];
-        reconcile(m.as_ref(), &sessions, &mut out, &mut HashMap::new(), 10_000, Some(70_000), 0, false).await;
+        reconcile(m.as_ref(), &sessions, &mut out, &mut HashMap::new(), 10_000, Some(70_000), 0, false, 0).await;
         assert_eq!(out.len(), 1, "AFK path fires done");
         assert_eq!(out["s1"].for_status, Status::Done);
     }
@@ -1318,7 +1379,7 @@ mod tests {
         let mut out = HashMap::new();
         // Done for 10s but user touched the machine 2s ago → saw it.
         let sessions = vec![session("s1", Status::Done, 0)];
-        reconcile(m.as_ref(), &sessions, &mut out, &mut HashMap::new(), 10_000, Some(2_000), 0, false).await;
+        reconcile(m.as_ref(), &sessions, &mut out, &mut HashMap::new(), 10_000, Some(2_000), 0, false, 0).await;
         assert!(out.is_empty(), "present user => no done ping");
         assert!(m.events().is_empty());
     }
@@ -1331,7 +1392,7 @@ mod tests {
         let m = Mock::with_rules(&[("done", AFK_ONLY)]);
         let mut out = HashMap::new();
         let sessions = vec![session_with_message("s1", Status::Done, 0, &"x".repeat(5_000))];
-        reconcile(m.as_ref(), &sessions, &mut out, &mut HashMap::new(), 0, Some(0), 15, true).await;
+        reconcile(m.as_ref(), &sessions, &mut out, &mut HashMap::new(), 0, Some(0), 15, true, 0).await;
         assert_eq!(out.len(), 1, "high alert pings immediately");
         assert_eq!(out["s1"].for_status, Status::Done);
     }
@@ -1343,7 +1404,7 @@ mod tests {
         let m = Mock::with_rules(&[("done", StateNotify { afk_window_ms: Some(0), reaction_window_ms: Some(0) })]);
         let mut out = HashMap::new();
         let sessions = vec![session("s1", Status::Done, 0)];
-        reconcile(m.as_ref(), &sessions, &mut out, &mut HashMap::new(), 0, Some(0), 0, true).await;
+        reconcile(m.as_ref(), &sessions, &mut out, &mut HashMap::new(), 0, Some(0), 0, true, 0).await;
         assert!(out.is_empty(), "disabled state stays silent under high alert");
         assert!(m.events().is_empty());
     }

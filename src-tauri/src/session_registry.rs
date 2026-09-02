@@ -13,12 +13,16 @@
 //! times. A daemon is shared, so no walk of any shape recovers the tab.
 //!
 //! The second exists because the dashboard learns a session exists only when
-//! that session fires a hook and restores nothing at startup, so every restart
-//! empties the roster and it refills on session *activity*, not on a timer — a
-//! session idle since before the restart stays invisible for as long as it
-//! stays idle, which is exactly the session a caller is most likely asking
-//! after. Measured across one redeploy: 9 live sessions, 1 row; six minutes
-//! later, 2. The registry knows all 9 the whole time.
+//! that session fires a hook, so every restart empties its own tracking and it
+//! refills on session *activity*, not on a timer — a session idle since before
+//! the restart stays invisible for as long as it stays idle, which is exactly
+//! the session a caller is most likely asking after. Measured across one
+//! redeploy: 9 live sessions, 1 row; six minutes later, 2. The registry knows
+//! all 9 the whole time. `session_restore` now uses this same reading to put
+//! those rows *back* within a tick where a terminal tab can also vouch for them,
+//! which narrows the window but does not remove the reason this exists: the
+//! roster must answer for a machine with no terminal adapter, for a session with
+//! no tab, and in the moments before the reconcile has run.
 //!
 //! The registry sidesteps the process tree entirely. Claude Code writes one
 //! file per live session carrying `{pid, sessionId, cwd, kind, name, status,
@@ -195,6 +199,57 @@ pub struct LiveSession {
     /// The session ids behind this row, so the caller can prefer an id already
     /// anchored in `ChatIdRegistry` over `chat_id`'s fresh cwd derivation.
     pub session_ids: Vec<String>,
+    /// The pid of the record speaking for this row.
+    ///
+    /// Only meaningful when `sessions == 1`, and that is a caller's obligation
+    /// rather than this field's: with two records collapsed the speaker is
+    /// merely the one with the freshest stamp, so treating its pid as *the* row's
+    /// owner would let the sibling's death — or its survival — be read as the
+    /// row's. `session_launcher` and `terminal_title` refuse ambiguity outright;
+    /// a reader of this field must do the same. Never crosses the wire: the
+    /// `RegistrySync` a peer receives is built field by field and does not
+    /// include it.
+    pub pid: u32,
+}
+
+impl LiveSession {
+    /// The dashboard row this session belongs to: the anchored id where
+    /// `ChatIdRegistry` has pinned one of its session ids, else the cwd
+    /// derivation.
+    ///
+    /// A `chat_id` is only a *first-seen anchor*, so a session that has `cd`-ed
+    /// into a subdirectory derives some **other** row's id. Two callers need the
+    /// same answer for opposite reasons and must not each keep a copy:
+    /// `http_server::agent_roster` dedupes registry rows against hook rows with
+    /// it — getting it wrong reports one live session twice, once in each array —
+    /// and `session_restore` *creates* rows with it, where getting it wrong makes
+    /// a duplicate the session's next hook event then declines to use, leaving an
+    /// orphan with no owning pid and no owner.
+    ///
+    /// `anchored` is deliberately a read-only lookup that inserts nothing, so
+    /// both callers stay read paths.
+    pub fn row_id(&self, anchored: &dyn Fn(&str) -> Option<String>) -> String {
+        self.session_ids.iter().find_map(|sid| anchored(sid)).unwrap_or_else(|| self.chat_id.clone())
+    }
+
+    /// Whether this dashboard has ever processed an event for one of the sessions
+    /// behind this row.
+    ///
+    /// What it is for: tying a terminal tab's glyph to the session it is supposed
+    /// to describe. Nothing rewrites a tab title while the dashboard is down —
+    /// Claude Code's own titling is off — so a tab can carry a status belonging to
+    /// a *previous* conversation. Quit the dashboard on a `✋`, answer it over the
+    /// weekend, finish the work, exit, start a fresh session in that same tab, and
+    /// the glyph still reads `✋` on Monday while nothing about it is true. A
+    /// session this dashboard has never seen is exactly that case, and the only
+    /// one, because a session it *has* seen is one it titled that tab for.
+    ///
+    /// Costs nothing in the ordinary case: measured against the live registry, ten
+    /// of eleven session ids were anchored, and the eleventh shares its row with
+    /// one that was.
+    pub fn known_to(&self, anchored: &dyn Fn(&str) -> Option<String>) -> bool {
+        self.session_ids.iter().any(|sid| anchored(sid).is_some())
+    }
 }
 
 /// What the registry can say about where to write a message for one row.
@@ -403,6 +458,7 @@ fn live_rows(records: &[Record], projects_root: Option<&str>, now: i64) -> Vec<L
                 activity_age_ms: speaker.status_updated_at.map(|t| (now - t).max(0)),
                 sessions: recs.len(),
                 session_ids: recs.iter().filter_map(|r| r.session_id.clone()).collect(),
+                pid: speaker.pid,
             })
         })
         .collect()

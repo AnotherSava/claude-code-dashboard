@@ -1,13 +1,24 @@
-//! Terminal adapters: how each terminal tells the dashboard that the user looked
-//! at a session.
+//! Terminal adapters: what the dashboard asks a terminal, and how each one
+//! answers.
 //!
-//! One adapter per terminal, because the answer is terminal-specific and always
-//! will be — agterm on macOS today, a different one on Windows later. The seam is
-//! deliberately narrow: an adapter's whole job is to turn whatever its terminal
-//! exposes into a stream of [`Observation`]s. Everything after that — resolving an
-//! observation to a dashboard row, the [`crate::state::Attention`] verdict, the
-//! decision log, the emit — is generic and lives in `crate::attention`, which
-//! names no terminal at all.
+//! One adapter per terminal, because the answers are terminal-specific and always
+//! will be — agterm on macOS today, a different one on Windows later. An adapter's
+//! whole job is to turn whatever its terminal exposes into this module's
+//! vocabulary; everything downstream is generic and names no terminal at all.
+//!
+//! Two questions, two callers:
+//!
+//! - **Did the user look at this session?** [`TerminalAdapter::poll`] and
+//!   [`TerminalAdapter::watch`] answer it as a stream of [`Observation`]s.
+//!   `crate::attention` consumes them — resolving each to a row, deciding the
+//!   [`crate::state::Attention`] verdict, logging and emitting.
+//! - **What are you showing right now?** [`TerminalAdapter::sessions`] answers it
+//!   as a plain list. `crate::session_restore` consumes it to give a live session
+//!   its row back after a restart, reading the status out of the tab title this
+//!   dashboard last wrote there.
+//!
+//! They are different axes — one is about a human, the other about a screen — and
+//! they share the seam because they share all of its vocabulary.
 //!
 //! Two things make that seam hold rather than leak:
 //!
@@ -76,11 +87,37 @@ pub struct Observation {
     pub kind: ObservationKind,
 }
 
-/// A terminal this dashboard can ask about the user's attention.
+/// A terminal this dashboard can ask about.
+///
+/// Two questions, both answered in the vocabulary above. *What did the user do*
+/// ([`poll`](TerminalAdapter::poll) / [`watch`](TerminalAdapter::watch)) and
+/// *what are you showing* ([`sessions`](TerminalAdapter::sessions)). They are
+/// different axes — one is about a human, the other about the screen — but they
+/// share the seam because they share its whole vocabulary: a session named by
+/// `cwd` and `title`, which is all either caller needs and all any terminal can
+/// be relied on to have.
 pub trait TerminalAdapter: Send {
     /// Stable slug for the decision log, so `widget.jsonl` says which terminal
     /// answered.
     fn name(&self) -> &'static str;
+
+    /// Every session this terminal is showing right now, or `None` when it could
+    /// not be asked.
+    ///
+    /// The `Option` is the point of the return type, and it draws the same line
+    /// `session_registry::live_sessions` draws: `Some(vec![])` means "I have no
+    /// sessions", `None` means "I could not look" — the terminal is not running,
+    /// the control channel refused, the answer did not parse. Flattening them
+    /// would turn a terminal that has not started yet into a machine with no
+    /// tabs, and a caller reading that as fact would conclude there is nothing
+    /// to restore. A check that never ran must not read as one that passed.
+    ///
+    /// **Listing, not observing.** This reports the terminal's own current
+    /// contents; it makes no claim about a human and produces no
+    /// [`Observation`]. In particular a `title` here is whatever the tab holds
+    /// *now*, which — where this dashboard writes titles — is the last status it
+    /// published for that session before it was last restarted.
+    fn sessions(&self) -> Option<Vec<TerminalSession>>;
 
     /// Everything observed since the previous call. An empty vec is the normal,
     /// common answer and is not an error.

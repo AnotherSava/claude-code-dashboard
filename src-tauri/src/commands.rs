@@ -1137,13 +1137,18 @@ pub fn reveal_main(app: &AppHandle) {
 
 /// The stored dialog for `id`, for a history window with no live row to read.
 ///
-/// Rows are deliberately not restored at startup — the dashboard cannot tell a
-/// session that was closed from one sitting idle, so listing them would assert a
-/// liveness it never established. Reading a conversation back asserts nothing of
-/// the kind: the caller already has an id and is asking what was said, not what
-/// is running. Without this the two questions shared one answer, and every
-/// project's history became unreadable after a restart until that session
-/// happened to act again — the data being complete on disk the whole time.
+/// This is the *conversation*, asked for by id — a different question from what
+/// is running, and one that asserts no liveness at all. Without it the two shared
+/// one answer, and every project's history became unreadable after a restart
+/// until that session happened to act again, the data being complete on disk the
+/// whole time.
+///
+/// It stayed the only thing a restart could recover for as long as the dashboard
+/// could not tell a closed session from an idle one. `session_restore` can now,
+/// so rows do come back — but only for the sessions two independent sources
+/// vouch for, and only carrying a status one of them was holding for us. This
+/// fallback is unchanged by that and still needed: the history window can be
+/// opened on a chat_id with no row at all.
 ///
 /// The live snapshot still wins when it has the row (see `HistoryApp`): a live
 /// session's dialog is ahead of what has been persisted, because the watcher

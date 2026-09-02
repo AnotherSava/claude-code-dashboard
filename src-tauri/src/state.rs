@@ -146,8 +146,12 @@ pub struct AgentSession {
     /// leaves this `false` — a background subagent always resolves with a
     /// completion turn, so time-settling it would falsely mark a live subagent
     /// Done. Set by `apply_set` from the `Stop` classification. Internal
-    /// bookkeeping, never serialized (a restored row is never in WAIT since
-    /// `status` isn't persisted).
+    /// bookkeeping, never serialized — so it cannot survive a restart, and a WAIT
+    /// restored without it would be one the backstop can never settle. That is
+    /// one of the reasons `session_restore::restored_status` refuses to bring a
+    /// row back in `Waiting` at all unless the registry independently reports a
+    /// turn running, and where it does the work is genuinely in flight and its
+    /// completion turn leaves the state.
     #[serde(skip)]
     pub waiting_backstop_armed: bool,
     /// User-assigned display name, resolved from `CustomNamesStore` at emit
@@ -511,66 +515,113 @@ impl AppState {
                 new_original_prompt = ?event_prompt,
                 "apply_set"
             );
-
-            let r = restored.unwrap_or_default();
-            // A restored dialog ending in a separator means the conversation was
-            // cleared or compacted — the boundary marker is the last thing on the
-            // row, so no task is in flight. Don't resurrect the pre-boundary
-            // task's prompt/timer onto the fresh row (that's what made a `/clear`
-            // recreate the row as Idle still showing the previous task). Keep the
-            // dialog for history continuity but start the row's active-task state
-            // clean. An incoming `event_prompt` (a Working prompt arriving with
-            // this same event) still takes precedence and starts a real task.
-            let cleared = r.dialog.last().is_some_and(|e| e.role == DialogRole::Separator);
-            let restored_prompt = if cleared { None } else { r.original_prompt };
-            let restored_task_started_at = if cleared { 0 } else { r.task_started_at };
-            let original_prompt = event_prompt.or(restored_prompt);
-            let task_started_at = if original_prompt.is_some() && restored_task_started_at == 0 {
-                now_ms
-            } else {
-                restored_task_started_at
-            };
-            let mut dialog = r.dialog;
-
-            let has_new_entry = if let Some(pending) = dialog_entry {
-                let task_start = pending.role == DialogRole::User;
-                dialog.push(DialogEntry {
-                    role: pending.role,
-                    text: pending.text,
-                    timestamp: now_ms,
-                    status: input.status,
-                    task_start,
-                });
-                true
-            } else {
-                false
-            };
-
-            let dialog_restored = !dialog.is_empty();
-            sessions.push(AgentSession {
-                id: input.id,
-                status: input.status,
-                status_before_working: Status::Idle,
-                label,
-                original_prompt,
-                task_started_at,
-                dialog,
-                source: input.source.unwrap_or_else(|| "claude-code".to_string()),
-                model: input.model,
-                input_tokens: input.input_tokens,
-                updated: now_ms,
-                state_entered_at: now_ms,
-                working_accumulated_ms: 0,
-                waiting_backstop_armed: input.waiting_backstop_armed,
-                display_name: None,
-                origin: None,
-                instruction_drift: false,
-                canary: Canary::Off,
-                attended_at: None,
-            });
-            has_new_entry || dialog_restored
+            let (session, seeded) = new_session(input, label, event_prompt, dialog_entry, now_ms, now_ms, restored);
+            sessions.push(session);
+            seeded
         }
     }
+
+    /// Create a row for a session this process has *not* heard from, or do
+    /// nothing if one already exists.
+    ///
+    /// Separate from [`apply_set`](Self::apply_set) for one reason, and it is a
+    /// correctness one rather than tidiness: `apply_set`'s existing-row branch
+    /// overwrites `status` and resets `state_entered_at` unconditionally, so a
+    /// restore racing a live hook event — the axum server is already accepting
+    /// them by the time this runs — would stamp a session that is genuinely
+    /// `Working` back to whatever its tab said before the restart. The check and
+    /// the insert therefore happen under one lock, and the answer to "it is
+    /// already there" is to leave it entirely alone.
+    ///
+    /// `state_entered_at` is passed in rather than taken from `now_ms` because
+    /// the two are different facts here: the row is being *written* now, but its
+    /// status began when the agent last acted, which is what every age-based
+    /// reader — the widget's elapsed clock, `/api/agents`' `status_age_ms`, the
+    /// notifier's time-in-state — needs to be told. `updated` stays `now_ms`,
+    /// since that is a fact about this process's bookkeeping.
+    ///
+    /// Returns whether a row was created.
+    pub fn restore_row(&self, input: SetInput, state_entered_at: i64, now_ms: i64, restored: Option<PersistedSession>) -> bool {
+        let mut sessions = self.sessions.lock().unwrap();
+        if sessions.iter().any(|s| s.id == input.id) {
+            return false;
+        }
+        let (label, event_prompt) = crate::label_policy::select(None, &input, false);
+        let (session, _) = new_session(input, label, event_prompt, None, state_entered_at, now_ms, restored);
+        sessions.push(session);
+        true
+    }
+}
+
+/// Build a brand-new row, shared by [`AppState::apply_set`]'s new-session branch
+/// and [`AppState::restore_row`].
+///
+/// One constructor rather than two, because the fields that must be right on a
+/// fresh row — the separator-terminated dialog rule, `status_before_working`,
+/// the `Canary::Off` / `origin: None` / `attended_at: None` triple — are exactly
+/// the ones a second copy would forget. Returns the row and whether it carries
+/// any content (a pushed entry or a restored dialog), which is what `apply_set`
+/// reports as "the dialog changed".
+#[allow(clippy::too_many_arguments)]
+fn new_session(
+    input: SetInput,
+    label: String,
+    event_prompt: Option<String>,
+    dialog_entry: Option<PendingDialogEntry>,
+    state_entered_at: i64,
+    now_ms: i64,
+    restored: Option<PersistedSession>,
+) -> (AgentSession, bool) {
+    let r = restored.unwrap_or_default();
+    // A restored dialog ending in a separator means the conversation was
+    // cleared or compacted — the boundary marker is the last thing on the
+    // row, so no task is in flight. Don't resurrect the pre-boundary
+    // task's prompt/timer onto the fresh row (that's what made a `/clear`
+    // recreate the row as Idle still showing the previous task). Keep the
+    // dialog for history continuity but start the row's active-task state
+    // clean. An incoming `event_prompt` (a Working prompt arriving with
+    // this same event) still takes precedence and starts a real task.
+    let cleared = r.dialog.last().is_some_and(|e| e.role == DialogRole::Separator);
+    let restored_prompt = if cleared { None } else { r.original_prompt };
+    let restored_task_started_at = if cleared { 0 } else { r.task_started_at };
+    let original_prompt = event_prompt.or(restored_prompt);
+    let task_started_at = if original_prompt.is_some() && restored_task_started_at == 0 { now_ms } else { restored_task_started_at };
+    let mut dialog = r.dialog;
+
+    let has_new_entry = if let Some(pending) = dialog_entry {
+        let task_start = pending.role == DialogRole::User;
+        dialog.push(DialogEntry { role: pending.role, text: pending.text, timestamp: now_ms, status: input.status, task_start });
+        true
+    } else {
+        false
+    };
+
+    let dialog_restored = !dialog.is_empty();
+    let session = AgentSession {
+        id: input.id,
+        status: input.status,
+        status_before_working: Status::Idle,
+        label,
+        original_prompt,
+        task_started_at,
+        dialog,
+        source: input.source.unwrap_or_else(|| "claude-code".to_string()),
+        model: input.model,
+        input_tokens: input.input_tokens,
+        updated: now_ms,
+        state_entered_at,
+        working_accumulated_ms: 0,
+        waiting_backstop_armed: input.waiting_backstop_armed,
+        display_name: None,
+        origin: None,
+        instruction_drift: false,
+        canary: Canary::Off,
+        attended_at: None,
+    };
+    (session, has_new_entry || dialog_restored)
+}
+
+impl AppState {
 
     /// Remove a session and return it, after appending a session boundary to its
     /// dialog (so a restored copy ends with a separator, exactly like `/clear`).
@@ -906,6 +957,73 @@ mod tests {
     }
 
     const NO_CONTINUATIONS: &[String] = &[];
+
+    #[test]
+    fn restore_row_backdates_the_state_clock_while_stamping_updated_now() {
+        // The two are different facts and sit adjacent in the signature, so this
+        // is what catches them being swapped: age is read by the widget's elapsed
+        // clock, `/api/agents`' `status_age_ms` and the notifier's time-in-state,
+        // and `notifications::state_observed_here` reads it to decide a restored
+        // state is not re-announced. A `state_entered_at` of `now` defeats all
+        // four at once.
+        let state = AppState::new();
+        assert!(state.restore_row(set_no_label("dash", Status::Blocked), 1_000, 900_000, None));
+        let s = get(&state, "dash");
+        assert_eq!(s.state_entered_at, 1_000, "the status began long before we started");
+        assert_eq!(s.updated, 900_000, "but the row was written just now");
+        assert_eq!(s.status, Status::Blocked);
+    }
+
+    #[test]
+    fn restore_row_leaves_an_existing_row_completely_alone() {
+        // The race this method exists for: the axum server is already accepting
+        // hook events when the reconcile runs, and `apply_set`'s existing-row
+        // branch would overwrite `status` and reset `state_entered_at` — stamping
+        // a genuinely Working session back to whatever its tab said.
+        let state = AppState::new();
+        state.apply_set(set("dash", Status::Working, "live prompt"), 500_000, NO_CONTINUATIONS, None);
+        assert!(!state.restore_row(set_no_label("dash", Status::Blocked), 1_000, 900_000, None), "no row was created");
+        let s = get(&state, "dash");
+        assert_eq!(s.status, Status::Working, "the live status survives");
+        assert_eq!(s.label, "live prompt");
+        assert_eq!(s.state_entered_at, 500_000, "and its clock is untouched");
+    }
+
+    #[test]
+    fn restore_row_seeds_the_persisted_conversation() {
+        let state = AppState::new();
+        let persisted = PersistedSession {
+            dialog: vec![DialogEntry { role: DialogRole::User, text: "do the thing".into(), timestamp: 10, status: Status::Working, task_start: true }],
+            original_prompt: Some("do the thing".into()),
+            task_started_at: 10,
+        };
+        assert!(state.restore_row(set_no_label("dash", Status::Done), 1_000, 900_000, Some(persisted)));
+        let s = get(&state, "dash");
+        assert_eq!(s.dialog.len(), 1);
+        assert_eq!(s.original_prompt.as_deref(), Some("do the thing"));
+        assert_eq!(s.task_started_at, 10);
+        assert_eq!(s.label, "", "no label was ever observed, and inventing one is not this path's business");
+    }
+
+    #[test]
+    fn restore_row_honors_the_separator_rule_exactly_as_the_hook_path_does() {
+        // Shared through `new_session`, so a cleared conversation restores its
+        // history without resurrecting the pre-boundary task.
+        let state = AppState::new();
+        let persisted = PersistedSession {
+            dialog: vec![
+                DialogEntry { role: DialogRole::User, text: "old task".into(), timestamp: 10, status: Status::Working, task_start: true },
+                DialogEntry { role: DialogRole::Separator, text: String::new(), timestamp: 20, status: Status::Idle, task_start: false },
+            ],
+            original_prompt: Some("old task".into()),
+            task_started_at: 10,
+        };
+        assert!(state.restore_row(set_no_label("dash", Status::Idle), 1_000, 900_000, Some(persisted)));
+        let s = get(&state, "dash");
+        assert_eq!(s.dialog.len(), 2, "history kept");
+        assert_eq!(s.original_prompt, None, "but no task is in flight");
+        assert_eq!(s.task_started_at, 0);
+    }
 
     // -------- attention (finished-and-unread) tests --------
 

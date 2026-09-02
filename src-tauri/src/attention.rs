@@ -116,16 +116,8 @@ pub fn should_poll(sessions: &[AgentSession]) -> bool {
 /// can be off, and a session can predate the dashboard writing to it — and
 /// answers `None` rather than guessing when neither resolves.
 pub fn resolve_row(session: &TerminalSession, sessions: &[AgentSession], projects_root: Option<&str>) -> Option<String> {
-    if let Some(title) = session.title.as_deref() {
-        // "<glyph> <name>" with an optional " [N%]" / " ⚠" suffix. Match on the
-        // name rather than reconstructing the whole title, which would have to
-        // track every suffix `build_title` learns later.
-        let body = title.split_whitespace().skip(1).collect::<Vec<_>>().join(" ");
-        let named = sessions.iter().filter(|s| s.origin.is_none()).find(|s| {
-            let label = s.display_label();
-            body == label || body.starts_with(&format!("{label} "))
-        });
-        if let Some(s) = named {
+    if let Some(reading) = session.title.as_deref().and_then(crate::terminal_title::parse_title) {
+        if let Some(s) = sessions.iter().filter(|s| s.origin.is_none()).find(|s| reading.names(s.display_label())) {
             return Some(s.id.clone());
         }
     }

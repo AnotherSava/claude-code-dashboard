@@ -101,6 +101,58 @@ fn status_glyph(status: Status) -> &'static str {
     }
 }
 
+/// One reading of a tab title *this* dashboard wrote.
+pub struct TitleReading<'a> {
+    /// The status its glyph names.
+    pub status: Status,
+    /// Everything after the glyph, suffixes included — deliberately not the bare
+    /// name. `build_title` appends " [N%]" and " ⚠" today and will grow more, so
+    /// a parser that stripped them would have to learn each one; [`names`] does
+    /// prefix matching instead.
+    ///
+    /// [`names`]: TitleReading::names
+    rest: &'a str,
+}
+
+impl TitleReading<'_> {
+    /// Whether this title is the one written for a row labelled `label`.
+    pub fn names(&self, label: &str) -> bool {
+        self.rest == label || self.rest.starts_with(&format!("{label} "))
+    }
+}
+
+/// Read back a title this dashboard wrote, or `None` for anything else — a
+/// shell's own `~/proj — zsh`, a tab we have never titled, a blank one.
+///
+/// It lives beside [`status_glyph`] and [`build_title`] rather than in either
+/// reader, because the two halves of one map must not be able to drift: the
+/// round-trip test below is what keeps the glyphs distinct when a seventh status
+/// is added. Two readers depend on it — `attention::resolve_row`, which wants
+/// only the name, and `session_restore`, which wants the status a tab has been
+/// holding for us across a restart.
+///
+/// An unrecognized leading token yields `None` rather than a guess: a title we
+/// did not write says nothing about a row, and inventing a status from one would
+/// be the single worst thing this parser could do.
+pub fn parse_title(title: &str) -> Option<TitleReading<'_>> {
+    let (head, rest) = title.trim().split_once(' ')?;
+    Some(TitleReading { status: status_from_glyph(head)?, rest: rest.trim() })
+}
+
+/// The inverse of [`status_glyph`]. Total over the glyphs that function emits
+/// and `None` everywhere else.
+fn status_from_glyph(glyph: &str) -> Option<Status> {
+    Some(match glyph {
+        "⚪" => Status::Idle,
+        "🔵" => Status::Working,
+        "⏳" => Status::Waiting,
+        "✋" => Status::Blocked,
+        "🟢" => Status::Done,
+        "🔴" => Status::Error,
+        _ => return None,
+    })
+}
+
 /// The tab title for a session: "<glyph> <name>", with " [N%]" appended when
 /// the session's context usage is at least `context_threshold` percent of its
 /// model's window (the same figure as the token counter), and a trailing " ⚠"
@@ -157,27 +209,32 @@ pub fn sync(app: &AppHandle, sessions: &[AgentSession]) {
         }
     };
 
+    // Blanking a tab is driven by `last` — every chat_id this process has
+    // titled — and deliberately not by `pids`, which a hook event populates
+    // (`titles.register`) while the *write target* comes from the session
+    // registry. So a row the registry placed and no hook ever reported is absent
+    // from `pids` and present in `last`, and sweeping `pids` left our own last
+    // glyph sitting on a tab whose row had gone — which is exactly the stale
+    // title `session_restore` reads back on the next start.
+    let blank = |chat_id: &str, last: &mut HashMap<String, (String, i64)>| {
+        last.remove(chat_id);
+        push_title(&resolve(chat_id, pids.get(chat_id).map_or(&[][..], Vec::as_slice)), "");
+    };
+
     if !enabled {
         // Toggled off: blank every title we have written, keep the pid map so
         // re-enabling resumes without waiting for the next hook event.
-        for (chat_id, candidates) in pids.iter() {
-            if last.remove(chat_id).is_some() {
-                push_title(&resolve(chat_id, candidates), "");
-            }
+        for chat_id in last.keys().cloned().collect::<Vec<_>>() {
+            blank(&chat_id, &mut last);
         }
         return;
     }
 
     let live: HashSet<&str> = sessions.iter().map(|s| s.id.as_str()).collect();
-    pids.retain(|chat_id, candidates| {
-        if live.contains(chat_id.as_str()) {
-            return true;
-        }
-        if last.remove(chat_id).is_some() {
-            push_title(&resolve(chat_id, candidates), "");
-        }
-        false
-    });
+    for chat_id in last.keys().filter(|id| !live.contains(id.as_str())).cloned().collect::<Vec<_>>() {
+        blank(&chat_id, &mut last);
+    }
+    pids.retain(|chat_id, _| live.contains(chat_id.as_str()));
 
     let context_threshold = cfg.as_ref().and_then(|c| c.terminal_title_context_percent).unwrap_or(0.0);
     let empty_tokens = HashMap::new();
@@ -295,6 +352,69 @@ mod tests {
         assert_eq!(status_glyph(Status::Done), "🟢");
         assert_eq!(status_glyph(Status::Error), "🔴");
         assert_eq!(status_glyph(Status::Idle), "⚪");
+    }
+
+    /// The two halves of the map must not drift. `session_restore` reads a status
+    /// back out of a tab title, so a seventh status sharing a glyph would make one
+    /// of them silently unrecoverable — this is what catches that at the moment it
+    /// is added rather than after a restart shows the wrong pill.
+    /// Every `Status`, listed through an exhaustive `match` so adding a seventh
+    /// variant fails to *compile* here rather than silently skipping every row in
+    /// that state after the next restart. A hard-coded array would have passed.
+    const ALL_STATUSES: [Status; 6] = [Status::Idle, Status::Working, Status::Waiting, Status::Blocked, Status::Done, Status::Error];
+
+    #[test]
+    fn the_status_list_these_tests_use_is_every_status() {
+        for status in ALL_STATUSES {
+            // No wildcard arm: a new variant breaks the build right here.
+            match status {
+                Status::Idle | Status::Working | Status::Waiting | Status::Blocked | Status::Done | Status::Error => {}
+            }
+        }
+        assert_eq!(ALL_STATUSES.iter().map(|s| status_glyph(*s)).collect::<std::collections::HashSet<_>>().len(), ALL_STATUSES.len(), "every glyph is distinct, so `parse_title` can invert the map");
+    }
+
+    #[test]
+    fn every_glyph_round_trips_back_to_its_own_status() {
+        for status in ALL_STATUSES {
+            let title = format!("{} dash", status_glyph(status));
+            let reading = parse_title(&title).expect("parses");
+            assert_eq!(reading.status, status, "{status:?}");
+            assert!(reading.names("dash"));
+        }
+    }
+
+    #[test]
+    fn a_title_this_dashboard_did_not_write_yields_nothing() {
+        // Inventing a status from a stranger's title is the worst thing this
+        // parser could do: `session_restore` would create a row asserting it.
+        for title in ["", "   ", "dash", "~/Projects/dash — zsh", "• dash", "🟡 dash"] {
+            assert!(parse_title(title).is_none(), "{title:?}");
+        }
+    }
+
+    #[test]
+    fn a_reading_names_its_row_through_every_suffix_build_title_appends() {
+        // Matching the whole string would have to learn each suffix separately.
+        for title in ["✋ dash", "✋ dash [62%]", "✋ dash ⚠", "✋ dash [62%] ⚠"] {
+            let reading = parse_title(title).expect("parses");
+            assert_eq!(reading.status, Status::Blocked);
+            assert!(reading.names("dash"), "{title}");
+            assert!(!reading.names("das"), "a prefix of the name is not the name: {title}");
+            assert!(!reading.names("dashboard"), "{title}");
+        }
+    }
+
+    #[test]
+    fn a_built_title_round_trips_through_the_parser() {
+        // The end-to-end property `session_restore` depends on, exercised against
+        // `build_title` itself rather than a hand-written string.
+        let mut s = session("what-is-next", None, None);
+        s.status = Status::Done;
+        let title = build_title(&s, 0.0, &HashMap::new());
+        let reading = parse_title(&title).expect("parses");
+        assert_eq!(reading.status, Status::Done);
+        assert!(reading.names("what-is-next"));
     }
 
     fn candidates(t: &TerminalTitles, id: &str) -> Vec<u32> {

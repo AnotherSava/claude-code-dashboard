@@ -628,7 +628,7 @@ fn agent_roster(
     match registry {
         Some(regs) => registry_only.extend(
             regs.iter()
-                .map(|s| (s, s.session_ids.iter().find_map(|sid| anchored(sid)).unwrap_or_else(|| s.chat_id.clone())))
+                .map(|s| (s, s.row_id(anchored)))
                 .filter(|(_, id)| !hook_rows.contains(&(this_device, id.as_str())))
                 .map(|(s, id)| RegistryRow {
                     project: id.clone(),
@@ -1516,7 +1516,7 @@ mod tests {
     }
 
     fn live(chat_id: &str, activity: Activity, sessions: usize) -> LiveSession {
-        LiveSession { chat_id: chat_id.to_string(), name: Some(chat_id.to_string()), activity, activity_age_ms: Some(600), sessions, session_ids: Vec::new() }
+        LiveSession { chat_id: chat_id.to_string(), name: Some(chat_id.to_string()), activity, activity_age_ms: Some(600), sessions, session_ids: Vec::new(), pid: 4_242 }
     }
 
     fn reg_sync(chat_id: &str, activity: Activity, activity_age_ms: Option<i64>, sessions: usize) -> crate::sync::RegistrySync {

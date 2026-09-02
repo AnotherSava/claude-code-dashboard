@@ -145,6 +145,18 @@ pub struct Config {
     /// the user types in a different session entirely. Off makes every row render
     /// as it did before the feature existed.
     pub attention_tracking: bool,
+    /// Give a live session its row back after the dashboard restarts, instead of
+    /// leaving it invisible until it next acts — which a session parked on a
+    /// question cannot do, because it is waiting for the user.
+    ///
+    /// Read by `session_restore`, which asks Claude Code's session registry which
+    /// agents are alive here and the terminal what each of their tabs says, and
+    /// creates only the rows that both answer for. Off leaves the dashboard empty
+    /// on a cold start, as it was before the feature existed. Requires a terminal
+    /// adapter (`terminals::for_platform`), so it does nothing on Windows yet, and
+    /// requires `terminal_titles` — the tab title is the only place a row's status
+    /// outlives this process.
+    pub restore_sessions: bool,
     /// Grace window (ms) after which a `Waiting` row that hasn't changed status
     /// is settled to `Done`. `Waiting` ("looks done but isn't") is entered at
     /// `Stop` from the hook's `background_tasks` and normally left when the
@@ -585,6 +597,7 @@ impl Default for Config {
             detect_cancelled_turns: true,
             reap_exited_sessions: true,
             attention_tracking: true,
+            restore_sessions: true,
             waiting_settle_ms: Some(600_000),
             sync: SyncConfig::default(),
             tray_badge: TrayBadge::None,
@@ -826,6 +839,14 @@ mod tests {
         assert!(!cfg.history_window_maximized);
         let on: Config = serde_json::from_str(r#"{ "history_window_maximized": true }"#).unwrap();
         assert!(on.history_window_maximized);
+    }
+
+    #[test]
+    fn restore_sessions_defaults_on_when_field_missing() {
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert!(cfg.restore_sessions, "a config written before the field existed still restores");
+        let off: Config = serde_json::from_str(r#"{ "restore_sessions": false }"#).unwrap();
+        assert!(!off.restore_sessions);
     }
 
     #[test]

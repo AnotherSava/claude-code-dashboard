@@ -25,6 +25,7 @@ mod remote_tokens;
 mod remote_usage;
 mod session_launcher;
 mod session_registry;
+mod session_restore;
 mod setup;
 mod start_approval;
 mod state;
@@ -292,6 +293,7 @@ pub fn run() {
             lid_awake::clear_on_start();
             lid_awake::spawn(app.handle().clone());
             attention::spawn(app.handle().clone());
+            session_restore::spawn(app.handle().clone());
 
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {

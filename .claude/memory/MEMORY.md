@@ -1,7 +1,6 @@
 - [Check remote before fixing](feedback_check_remote_before_fixing.md) — deployed app often lags origin/main; git fetch + check log before reimplementing a fix that may already be merged
 - [Prefer generous notification timing](user_prefers_generous_timing.md) — default to the longer end on any notification/auto-dismiss/grace-period delay; reading_speed_cps default is 10 (≈100 wpm)
 - [Hook env var setup](hook_env_var_setup.md) — Claude Code hooks in ~/.claude/settings.json need $CLAUDE_AI_AGENT_DASHBOARD set to the repo root; silent failure when unset
-- [Frontend question detector is lenient](feedback_frontend_question_detector_lenient.md) — src/lib/dialog.ts intentionally diverges from Rust is_a_question; don't unify
 - [Benign openers for offer questions](benign_openers_offer_questions.md) — config benign_openers (prefix) keeps "Anything …?" sign-offs DONE; distinct from benign_closers (suffix), don't merge
 - [macOS ad-hoc signing strategy](macos_signing_strategy.md) — DMG uses signingIdentity="-" + documented user workaround; don't push for $99/yr Apple notarization unprompted
 - [Test SetupPanel via port override](dashboard_test_port_override.md) — `config/local.json {"server_port": 9078}` keeps prompt_history empty; revert to 9077 after or the dashboard goes deaf
@@ -40,7 +39,7 @@
 - [idle_probe retired](idle_probe_screen_criteria_tui_sensitive.md) — screen-scrape removed 2026-07-01; instant Esc-cancels DO write the interrupt marker (verified), so the marker path is authoritative
 - [Diagnose state via widget.jsonl](debug_state_transitions_via_widget_jsonl.md) — run /investigate <agent> to reconstruct state + decision chain; or grep the "decision"-tagged lines; don't theorize
 - [Tray badge deferred work](tray_badge_deferred.md) — macOS contrast on number modes + live DPI re-render not done; config.tray_badge set in config/local.json
-- [Startup session restore infeasible](startup_session_restore_infeasible.md) — can't tell closed from idle-open sessions; Claude doesn't hold transcript open; don't re-attempt
+- [Startup session restore](startup_session_restore.md) — rejected 2026-06-21, built 2026-09-02 (`session_restore.rs`); registry vouches for liveness, the tab title for status; bar for any third source
 - [Preview tray rendering via PNG test](debug_preview_tray_rendering.md) — throwaway #[ignore] test + png dev-dep renders tray_badge fns to scratchpad PNGs; view, then remove
 - [Verify macOS window geometry via AX](verify_macos_window_geometry_via_ax.md) — project-specific gotchas only now (setupOverride, auto_resize default); general AX-testing technique moved to the global macos-ax-window-testing learning
 - [Verify cfg-gated platform branches](verify_cfg_gated_platform_branches.md) — macOS cargo test skips the #[cfg(not(macos))] stub; can't cross-compile (aws-lc-sys needs windows.h) — invert gates in a scratch module copy

@@ -110,6 +110,36 @@ impl TerminalAdapter for AgtermAdapter {
         });
     }
 
+    /// Every tab agterm currently holds, across every workspace of every open
+    /// window.
+    ///
+    /// Per-window, for the same reason [`poll`](Self::poll) is: a bare `tree`
+    /// projects only the **frontmost** window, and asking again returns that same
+    /// window, so a session in a background one would not merely be late — it
+    /// would be permanently invisible, and the caller's "is anything missing?"
+    /// gate would stay true forever, paying a subprocess on every tick to
+    /// rediscover the same nothing. `poll` learned this already; the stake here is
+    /// higher, since a missed session has no row at all rather than a stale read
+    /// marker.
+    ///
+    /// A window it cannot read is skipped rather than failing the whole answer: a
+    /// window closing between the list and the read is ordinary, and the sessions
+    /// in the windows that *did* answer are still worth returning. `None` is
+    /// reserved for having been unable to ask agterm at all, which is the only
+    /// case the caller must not read as "there are no tabs".
+    fn sessions(&self) -> Option<Vec<TerminalSession>> {
+        let list = crate::agterm::agtermctl(&["window", "list", "--json"])?;
+        let mut out = Vec::new();
+        for window in crate::agterm::open_window_ids(&list) {
+            let Some(tree) = crate::agterm::agtermctl(&["tree", "--json", "--window", &window]) else {
+                tracing::debug!(terminal = "agterm", window = %window, "no tree for this window; its sessions are not restorable this pass");
+                continue;
+            };
+            out.extend(crate::agterm::session_nodes(&tree).map(session_from_node));
+        }
+        Some(out)
+    }
+
     fn poll(&mut self, now_ms: i64) -> Vec<Observation> {
         let mut out = Vec::new();
         for window in self.windows_to_poll(now_ms) {

@@ -2044,6 +2044,7 @@ mod tests {
             activity_age_ms: Some(1_500),
             sessions: 2,
             session_ids: vec!["abc".into()],
+            pid: 4_242,
         }];
         let push = build_push("desktop", 9078, &[], 0, 0, Some(&regs));
         let rows = push.registry_sessions.expect("registry rows ride the push");

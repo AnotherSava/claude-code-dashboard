@@ -42,6 +42,16 @@ Each session's status is mirrored onto the terminal tab it runs in, next to the 
 
 Once a session's context usage climbs past a threshold (50% by default), the tab title also shows it — `🔵 printlab [67%]` — so a tab that's filling toward a `/compact` stands out among the rest. The number falls off again when a new task or `/clear` frees the context. See [Settings](settings#color-terminal-tabs) to change the threshold or turn the number off.
 
+## Your sessions come back after a restart
+
+Close the widget, update it, or reboot, and the sessions you had running are still there when it comes back — with the status each one was on, how long it has been sitting there, and its conversation. Without this the widget starts empty and a session only reappears when it next does something, which the ones that most need you never will: an agent parked on a question is waiting for *you*, so it will sit unheard for as long as you leave it.
+
+It runs once, at start-up — retrying for a minute in case your terminal is still coming up, then stopping for good. It works because the status was never only in the widget. Every session's tab is already labelled with its state, so on start-up the widget cross-checks what your terminal is showing against the sessions actually running on the machine, and brings back only the ones both agree on — a tab whose agent has since quit does not come back, and neither does one the widget was never labelling. The read/unread distinction survives too, so a result you had already been through returns as IDLE rather than asking for you a second time.
+
+Two things stay quiet on purpose. A session that was mid-task when the widget went down only comes back as working if it really is still working — otherwise it comes back idle rather than claiming a task that may have finished while the widget was away. And nothing that comes back this way sends you a notification: it is a state from before, and you were already told about it at the time.
+
+On macOS with agterm. On Windows the widget still starts empty for now, until its terminals are supported. On by default; see [Settings](settings#behavior).
+
 ## Focus on the task
 
 While Claude is blocked on you (BLOCK), the row shows the question or approval request, so you know what it needs. Once you answer and Claude resumes (WORK), the row goes back to showing your **original request** rather than the *yes* you typed — so a quick approval or a *continue* never replaces your task on screen. The work timer pauses during BLOCK — replaced by a timer counting how long Claude has been blocked on you — and resumes once the agent continues working on the task. A new top-level prompt after DONE / IDLE starts a fresh task.

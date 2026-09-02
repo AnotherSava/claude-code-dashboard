@@ -225,10 +225,10 @@ export function onStartApprovalsUpdated(
   return listen<PendingStart[]>('start_approvals_updated', (evt) => handler(evt.payload))
 }
 
-// The stored dialog for a session with no live row. Rows are not restored at
-// startup (the dashboard cannot tell a closed session from an idle one), so
-// without this a conversation is unreadable after a restart until that session
-// next acts — while sitting complete on disk the whole time.
+// The stored dialog for a session with no live row. A row can be absent for a
+// conversation that is complete on disk — a session the restore could not vouch
+// for, one on a platform with no terminal adapter, or simply one that has ended —
+// and without this the history window would have nothing to show for any of them.
 export function getPersistedDialog(id: string): Promise<DialogEntry[]> {
   return invoke<DialogEntry[]>('get_persisted_dialog', { id })
 }
