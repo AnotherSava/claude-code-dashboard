@@ -3,7 +3,7 @@ use crate::custom_names::CustomNamesStore;
 use crate::log_watcher::WatcherRegistry;
 use crate::prompt_history::PromptHistoryStore;
 use crate::setup;
-use crate::state::{AgentSession, AppState, Canary};
+use crate::state::{AgentSession, AppState, Attention, Canary, Status};
 use crate::telegram::TelegramNotifier;
 use crate::usage_limits::{UsageLimits, UsageLimitsState};
 use serde::Serialize;
@@ -51,9 +51,49 @@ pub(crate) fn resolved_snapshot(app: &AppHandle) -> Vec<AgentSession> {
     sessions
 }
 
+/// The snapshot everything the *user* looks at is built from: [`resolved_snapshot`]
+/// plus [`apply_read_as_idle`].
+///
+/// The split is the point. `resolved_snapshot` answers "what is each agent doing",
+/// which is what `/api/agents` and the sync push report; this answers "what should
+/// this person see", which additionally depends on whether they have already read
+/// it. Only the frontend and the terminal titles want the second question.
+pub(crate) fn display_snapshot(app: &AppHandle) -> Vec<AgentSession> {
+    let mut sessions = resolved_snapshot(app);
+    if app.try_state::<ConfigState>().is_some_and(|c| c.config.lock().unwrap().attention_tracking) {
+        apply_read_as_idle(&mut sessions);
+    }
+    sessions
+}
+
+/// Show a finished local row the user has already read as `Idle`.
+///
+/// `Done` in this dashboard means "finished, **and you haven't looked**" — once
+/// you have, the row is just a live session sitting there, which is what `Idle`
+/// already means. Folding read/unread into the status vocabulary rather than
+/// adding a badge beside it is why there is no second signal on the row: the
+/// widget's pill and `terminal_title`'s ⚪-vs-🟢 both fall out of the status.
+///
+/// Derived at display time rather than written into `AppState`, which buys three
+/// things. A machine reading `/api/agents` or a sync push still learns what the
+/// *agent* did, not whether a human at this keyboard has looked at their screen.
+/// `state_entered_at` is untouched, so the row keeps counting from when the agent
+/// finished instead of restarting from when it was read. And the late-flush case
+/// needs no machinery: `Stop` settles a row `Done` before Claude Code writes the
+/// final reply, so a read landing in that gap is undone for free the moment the
+/// text arrives and moves `content_at` past the stamp — the row simply reads
+/// `Done` again at the next emit.
+pub(crate) fn apply_read_as_idle(sessions: &mut [AgentSession]) {
+    for s in sessions.iter_mut().filter(|s| s.origin.is_none() && s.status == Status::Done) {
+        if s.attention() == Attention::Seen {
+            s.status = Status::Idle;
+        }
+    }
+}
+
 #[tauri::command]
 pub fn get_sessions(app: AppHandle) -> Vec<AgentSession> {
-    resolved_snapshot(&app)
+    display_snapshot(&app)
 }
 
 #[tauri::command]
@@ -730,6 +770,11 @@ pub fn open_history(id: String, app: AppHandle) -> Result<(), String> {
     if let Some(target) = app.try_state::<HistoryTarget>() {
         *target.0.lock().unwrap() = Some(id.clone());
     }
+    // Opening a row's history *is* the act of looking at it — the app's only
+    // per-session user action. Stamped at both ends (see `hide_history` /
+    // `close_window`) so a read spanning a mid-read transcript flush still ends
+    // attended rather than being re-raised by its own arriving text.
+    let _ = crate::attention::observe(&app, &id, now_ms(), crate::attention::AttentionSource::HistoryOpened);
     // Remote sessions accumulate dialog from push deltas, which a dashboard
     // restart discards — catch up from the origin device now so the window
     // fills in once the fetch lands (it re-emits and the window re-renders).
@@ -791,6 +836,7 @@ pub fn close_window(window: WebviewWindow) -> Result<(), String> {
     window.hide().map_err(|e| e.to_string())?;
     if window.label() == "history" {
         let _ = window.emit("history_hidden", ());
+        mark_history_target_read(window.app_handle());
     }
     Ok(())
 }
@@ -802,7 +848,19 @@ pub fn hide_history(app: AppHandle) -> Result<(), String> {
         window.hide().map_err(|e| e.to_string())?;
         let _ = window.emit("history_hidden", ());
     }
+    mark_history_target_read(&app);
     Ok(())
+}
+
+/// Close half of the read dwell: stamp attention on whichever row the history
+/// window was showing. `HistoryTarget` is a single slot written only by
+/// `open_history` and never cleared, which is exactly right here — read at the
+/// moment a close happens, it is by construction the row that was open.
+fn mark_history_target_read(app: &AppHandle) {
+    let Some(id) = app.try_state::<HistoryTarget>().and_then(|t| t.0.lock().unwrap().clone()) else {
+        return;
+    };
+    let _ = crate::attention::observe(app, &id, now_ms(), crate::attention::AttentionSource::HistoryClosed);
 }
 
 #[tauri::command]
@@ -890,7 +948,7 @@ pub fn now_ms() -> i64 {
 }
 
 pub fn emit_sessions_updated(app: &AppHandle) {
-    let sessions = resolved_snapshot(app);
+    let sessions = display_snapshot(app);
     // Every state transition flows through this emit, so it doubles as the
     // single trigger for terminal tab-title reconciliation — the tab tracks
     // exactly what the row shows (watcher promotions, renames, removals)
@@ -927,7 +985,7 @@ pub fn emit_sessions_updated(app: &AppHandle) {
 /// Also skips terminal-title reconciliation: remote rows never own a local
 /// terminal, and the local subset is untouched by definition.
 pub fn emit_sessions_updated_remote(app: &AppHandle) {
-    let _ = app.emit("sessions_updated", resolved_snapshot(app));
+    let _ = app.emit("sessions_updated", display_snapshot(app));
 }
 
 pub fn emit_config_updated(app: &AppHandle) {
@@ -1097,4 +1155,81 @@ pub fn get_persisted_dialog(id: String, app: AppHandle) -> Vec<crate::state::Dia
         .and_then(|store| store.get(&id))
         .map(|s| s.dialog)
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::{DialogEntry, DialogRole};
+
+    fn row(id: &str, status: Status, state_entered_at: i64, attended_at: Option<i64>) -> AgentSession {
+        let state = AppState::new();
+        state.apply_set(
+            crate::state::SetInput {
+                id: id.into(),
+                status,
+                label: None,
+                source: None,
+                model: None,
+                input_tokens: None,
+                dialog_entry: None,
+                waiting_backstop_armed: false,
+            },
+            state_entered_at,
+            &[],
+            None,
+        );
+        let mut s = state.snapshot().pop().expect("row");
+        s.attended_at = attended_at;
+        s
+    }
+
+    #[test]
+    fn a_finished_row_reads_done_until_it_is_read_then_idle() {
+        // The whole model in one test: DONE means "finished, and you haven't
+        // looked". There is no second badge because there is nothing left to say.
+        let mut rows = vec![row("a", Status::Done, 1_000, None)];
+        apply_read_as_idle(&mut rows);
+        assert_eq!(rows[0].status, Status::Done, "unread");
+
+        let mut rows = vec![row("a", Status::Done, 1_000, Some(2_000))];
+        apply_read_as_idle(&mut rows);
+        assert_eq!(rows[0].status, Status::Idle, "read");
+    }
+
+    #[test]
+    fn reading_a_row_does_not_restart_its_timer() {
+        // `state_entered_at` is untouched, so the row keeps counting from when the
+        // agent finished rather than from when it was read — the only one of
+        // IDLE's several origins whose elapsed number is worth reading.
+        let mut rows = vec![row("a", Status::Done, 1_000, Some(9_000))];
+        apply_read_as_idle(&mut rows);
+        assert_eq!(rows[0].state_entered_at, 1_000);
+    }
+
+    #[test]
+    fn a_late_assistant_flush_undoes_the_read_with_no_extra_machinery() {
+        // `Stop` settles the row Done *before* Claude Code writes the final reply.
+        // A read landing in that gap must not swallow the answer — and doesn't,
+        // because the flip is derived from `content_at` at every emit rather than
+        // written into `AppState`.
+        let mut r = row("a", Status::Done, 1_000, Some(2_000));
+        r.dialog.push(DialogEntry { role: DialogRole::Assistant, text: "the answer".into(), timestamp: 3_000, status: Status::Done, task_start: false });
+        let mut rows = vec![r];
+        apply_read_as_idle(&mut rows);
+        assert_eq!(rows[0].status, Status::Done, "the reply arrived after the read");
+    }
+
+    #[test]
+    fn only_finished_local_rows_are_flipped() {
+        // A remote row's attention is not this device's to judge, and no other
+        // status means "finished" — flipping one would be inventing a transition.
+        let mut remote = row("a", Status::Done, 1_000, Some(2_000));
+        remote.origin = Some("chrome".into());
+        let mut rows = vec![remote, row("b", Status::Blocked, 1_000, Some(2_000)), row("c", Status::Working, 1_000, Some(2_000))];
+        apply_read_as_idle(&mut rows);
+        assert_eq!(rows[0].status, Status::Done, "remote");
+        assert_eq!(rows[1].status, Status::Blocked);
+        assert_eq!(rows[2].status, Status::Working);
+    }
 }

@@ -133,6 +133,18 @@ pub struct Config {
     /// which removes the row only once the owning pid is positively confirmed
     /// gone. Off keeps the stranded row until the next `/clear` or app restart.
     pub reap_exited_sessions: bool,
+    /// Track which finished sessions the user has actually looked at, so a row
+    /// that finished and hasn't been read stands apart from one already read.
+    /// Read by `commands::resolved_snapshot` (which stamps the verdict) and by
+    /// `attention`, which observes the two things that count as looking: opening
+    /// a row's history window, and — on macOS with agterm — producing input in
+    /// the terminal while that session is the selected one.
+    ///
+    /// This is the axis `notifications`' `afk_window_ms` cannot reach: that
+    /// measures input anywhere on the desktop, so it reads "at the desk" while
+    /// the user types in a different session entirely. Off makes every row render
+    /// as it did before the feature existed.
+    pub attention_tracking: bool,
     /// Grace window (ms) after which a `Waiting` row that hasn't changed status
     /// is settled to `Done`. `Waiting` ("looks done but isn't") is entered at
     /// `Stop` from the hook's `background_tasks` and normally left when the
@@ -572,6 +584,7 @@ impl Default for Config {
             intensity_axis_max_tokens: Some(crate::token_history::DEFAULT_AXIS_MAX_TOKENS),
             detect_cancelled_turns: true,
             reap_exited_sessions: true,
+            attention_tracking: true,
             waiting_settle_ms: Some(600_000),
             sync: SyncConfig::default(),
             tray_badge: TrayBadge::None,

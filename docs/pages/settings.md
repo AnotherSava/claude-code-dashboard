@@ -52,6 +52,7 @@ Every field is optional — omit one and the built-in default applies. A complet
   "terminal_title_context_percent": 50,
   "detect_cancelled_turns": true,
   "reap_exited_sessions": true,
+  "attention_tracking": true,
   "waiting_settle_ms": 600000,
   "instruction_canary_enabled": false,
   "save_window_position": true,
@@ -133,6 +134,7 @@ Set autostart through the tray's **On system start** submenu — it writes both 
 
 - `detect_cancelled_turns` — settle a working row back out of the working state when its turn was cancelled with Esc, returning it to wherever it was before that turn — a question it was waiting on, otherwise idle — so a cancelled reply doesn't get mistaken for a new task. Cancelling emits no event; the dashboard recognizes it from the conversation transcript, and on Windows also by noticing the terminal returned to its idle prompt (which catches an instant cancel that left nothing in the transcript). On by default. Turn it off to leave a cancelled row showing as working until the next prompt.
 - `reap_exited_sessions` — remove a session's row once you've quit it (typed `exit`, pressed Ctrl-D, or closed the terminal). Quitting that way doesn't reliably tell the dashboard the session ended, so the row would otherwise linger — often stuck showing "working" if you quit mid-turn. The dashboard removes it once it confirms the session's process is gone. On by default. Turn it off to keep rows until you clear them or restart the app.
+- `attention_tracking` — drop a finished session to IDLE once you've read it, so DONE means "finished, and you haven't looked". Opening a row's history counts as reading, and on macOS with agterm so does leaving that session's terminal tab — no typing needed. The terminal tab follows too, 🟢 becoming ⚪. Windows has no terminal adapter yet, so a result read in the terminal there leaves the row on DONE until its next turn. On by default. Turn it off to leave every finished row showing DONE.
 - `waiting_settle_ms` — how long a row can sit in WAIT (background work still running) before the dashboard settles it to DONE on its own. WAIT normally clears when the background work finishes, but if you *stop* it yourself — say you kill a background dev server — nothing tells the dashboard, so the row would otherwise stay WAIT until your next prompt. This backstop clears it after the set time (10 minutes by default). `null` or `0` turns it off.
 
 ### Instruction adherence

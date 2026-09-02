@@ -86,6 +86,16 @@ pub fn spawn(app: AppHandle, path: PathBuf) {
                     }
                 }
             }
+            // Same for attention tracking: with it off, every row must render as
+            // it did before the feature existed, so drop the observations rather
+            // than leaving read rows looking read until their next turn.
+            if !new_cfg.attention_tracking {
+                if let Some(app_state) = app.try_state::<crate::state::AppState>() {
+                    if app_state.clear_all_attention() {
+                        crate::commands::emit_sessions_updated(&app);
+                    }
+                }
+            }
             // Turning the lid-closed veto off must drop a live hold at once —
             // it's a system-wide sleep kill switch, so leaving it set until the
             // next agent goes idle would keep thermal and low-battery sleep

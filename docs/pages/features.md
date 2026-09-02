@@ -20,8 +20,8 @@ The row's status badge tracks the agent in real time:
 - **WORK** — Claude is working on your task. Timer accumulates total time spent working on the same prompt across approval cycles.
 - **WAIT** — the main turn finished but background work Claude started (a subagent, or a background command like a dev server) is still running, so the row stays active (light-blue) rather than dropping to DONE while work continues. If you stop that work yourself instead of letting it finish, the row settles to DONE on its own after a while rather than staying stuck.
 - **BLOCK** — Claude is blocked on you. The row shows the agent's current question or permission request.
-- **IDLE** — the session is alive but not actively working. A task you cancel with Esc usually settles here too: cancelling sends no event of its own, but the dashboard notices the turn ended and settles the row back on its own — to idle, or back to a question it was waiting on (on by default, see [Settings](settings#behavior)).
-- **DONE** — Claude finished the task and isn't waiting on you. Timer shows time since it finished.
+- **IDLE** — the session is alive but not actively working, and nothing on it is waiting for you: a session you've just opened, one you've cleared, or one whose result you've already read. A task you cancel with Esc usually settles here too: cancelling sends no event of its own, but the dashboard notices the turn ended and settles the row back on its own — to idle, or back to a question it was waiting on (on by default, see [Settings](settings#behavior)).
+- **DONE** — Claude finished the task and you haven't read it yet. Timer shows time since it finished. Once you've looked, the row drops to IDLE — see [Finished, and not yet read](#finished-and-not-yet-read).
 - **ERROR** — the hook reported an error; the row shows the error text.
 
 Each badge is color-coded, and BLOCK and ERROR pulse to draw your eye when a session needs attention.
@@ -36,7 +36,7 @@ Turn on the tray's **Compact view** toggle for a denser widget: each row drops i
 
 ## Color terminal tabs
 
-Each session's status is mirrored onto the terminal tab it runs in, next to the session name — 🔵 working, ⏳ background work still running, ✋ blocked on you, 🟢 done, 🔴 error, ⚪ idle. Two of them deliberately aren't circles: an orange and a red circle read too alike at tab size, and no light-blue circle exists to mirror the widget's WAIT pill. A glance at your terminal tabs shows which session needs attention, even without the widget on screen. The title updates the moment the status changes and clears when the session ends. On by default; the tray's **Color terminal tabs** toggle turns it off.
+Each session's status is mirrored onto the terminal tab it runs in, next to the session name — 🔵 working, ⏳ background work still running, ✋ blocked on you, 🟢 done, 🔴 error, ⚪ idle. Because a finished session drops to idle once you've read it, 🟢 marks the ones still waiting on you and ⚪ the ones you've been through — see [Finished, and not yet read](#finished-and-not-yet-read). Two of them deliberately aren't circles: an orange and a red circle read too alike at tab size, and no light-blue circle exists to mirror the widget's WAIT pill. A glance at your terminal tabs shows which session needs attention, even without the widget on screen. The title updates the moment the status changes and clears when the session ends. On by default; the tray's **Color terminal tabs** toggle turns it off.
 
 ![Terminal sessions listed with a status glyph each — blue working, green done, grey idle, a raised hand for one blocked on the user — two carrying their context percentage](../screenshots/terminal-tabs.png)
 
@@ -53,6 +53,14 @@ For the full state machine and the rules that pick between the current text and 
 The dashboard doesn't just relay raw events — it reads the conversation to keep each row's status and the text it shows accurate. It tells a genuine question apart from a rhetorical sign-off, so a closing *"What's next?"* doesn't flip a finished session into WAIT. It recognizes permission and plan-approval prompts as blocked states. It treats short replies like *"continue"* as resuming the current task rather than starting a new one. And it cleans up Claude's formatting so the text reads cleanly.
 
 Several of these rules are tunable — see [Settings](settings) — and the full ruleset is documented under [Classification](development/classification).
+
+## Finished, and not yet read
+
+DONE means more than "finished" — it means **finished, and you haven't looked yet**. Once you read a session's result, its row drops to IDLE, because there is nothing left there that wants you. So the rows still showing DONE are exactly the ones with something waiting, and a glance at the widget is a to-do list rather than a history.
+
+Reading is all it takes, and you don't have to type anything: opening the row's history counts, and on macOS with agterm so does *leaving* that session's terminal tab — switching away is the moment you're done with what was on screen, so that's when it counts. Because the terminal tab already shows 🟢 for done and ⚪ for idle, the distinction shows up there too without any extra marker. Start the agent on something new and it goes back to DONE when it finishes, since there's a fresh answer waiting.
+
+This is deliberately not the same question as "are you at your desk". You can be typing away all afternoon in one session while another has sat finished and unopened since lunch — that one still wants you, and only a per-session answer can say so. On by default; see [Settings](settings#behavior).
 
 ## Instruction adherence
 

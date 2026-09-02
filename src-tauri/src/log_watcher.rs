@@ -1037,6 +1037,7 @@ mod tests {
             origin: None,
             instruction_drift: false,
             canary: crate::state::Canary::Off,
+            attended_at: None,
         }
     }
 

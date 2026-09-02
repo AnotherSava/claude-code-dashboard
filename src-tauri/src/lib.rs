@@ -1,4 +1,6 @@
 mod adapters;
+mod agterm;
+mod attention;
 mod auto_resize;
 mod auto_start_store;
 mod chat_id_registry;
@@ -29,6 +31,7 @@ mod state;
 mod sync;
 mod tailnet;
 mod telegram;
+mod terminals;
 mod terminal_title;
 mod token_history;
 mod token_scan;
@@ -288,6 +291,7 @@ pub fn run() {
             // reboot, so a stranded flag would otherwise persist indefinitely.
             lid_awake::clear_on_start();
             lid_awake::spawn(app.handle().clone());
+            attention::spawn(app.handle().clone());
 
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
@@ -675,6 +679,7 @@ fn seed_dev_sessions(app: &tauri::AppHandle) {
                 origin: Some("macbook".into()),
                 instruction_drift: false,
                 canary: crate::state::Canary::Off,
+                attended_at: None,
             }],
             last_seen: now,
             origin_addr: "http://127.0.0.1:9078".into(),

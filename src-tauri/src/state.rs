@@ -21,6 +21,32 @@ pub enum Status {
     Error,
 }
 
+/// Whether a finished row is still waiting to be looked at — the "I haven't read
+/// this one yet" axis, orthogonal to [`Status`].
+///
+/// **Internal, and deliberately never serialized.** It is a verdict computed on
+/// demand by [`AgentSession::attention`], read by `commands::apply_read_as_idle`
+/// (which turns it into the row's displayed status) and by
+/// `attention::should_poll`. The frontend is never told it separately: `Done`
+/// already means "finished, and you haven't looked", so a field carrying the same
+/// fact beside the status would be a duplicate state signal.
+///
+/// This exists because nothing else in the process can answer it. `idle.rs`
+/// reports input across the whole desktop, not per session, so a `Done` row the
+/// user read ten seconds ago and one he has never opened are byte-identical
+/// today — same `status`, same `state_entered_at`, same dialog.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Attention {
+    /// This row isn't asking to be read, so "looked at" carries no meaning.
+    /// Every non-`Done` row, and every remote row — this device doesn't observe
+    /// attention for another machine's sessions.
+    Moot,
+    /// Finished, and not looked at since it finished.
+    Pending,
+    /// Finished, and looked at since it finished.
+    Seen,
+}
+
 /// Instruction-adherence canary status for a session — colors the agent name in
 /// the dashboard (stamped for local rows by `commands::resolved_snapshot`; read by
 /// `SessionItem.svelte`). Ordered by certainty: `Alive` is only claimed once the
@@ -154,6 +180,23 @@ pub struct AgentSession {
     /// canary for them.
     #[serde(default)]
     pub canary: Canary,
+    /// Wall-clock ms of the last moment the user was *observed* attending to this
+    /// session — opening its history window, or (macOS) producing input in the
+    /// agterm window while this session was the selected one. The only field on
+    /// this row written by a user action rather than by the agent.
+    ///
+    /// Compared against [`AgentSession::content_at`] by [`AgentSession::attention`],
+    /// which `commands::apply_read_as_idle` turns into the row's *displayed*
+    /// status. The frontend is never told the verdict separately — `Done` already
+    /// means "finished, and you haven't looked", so a second field saying the same
+    /// thing would be a duplicate state signal.
+    ///
+    /// Internal bookkeeping — never serialized to the frontend, to sync, or to
+    /// disk (mirrors `status_before_working`). Keeping it off the wire is
+    /// deliberate: it is *this* machine's observation of *this* keyboard, while a
+    /// remote row's timestamps are the sender's clock.
+    #[serde(skip)]
+    pub attended_at: Option<i64>,
 }
 
 impl AgentSession {
@@ -163,6 +206,47 @@ impl AgentSession {
     /// so this reads the chat_id anywhere that overlay hasn't been applied.
     pub fn display_label(&self) -> &str {
         self.display_name.as_deref().unwrap_or(&self.id)
+    }
+
+    /// The moment this row last produced something the user may not have seen:
+    /// the later of the current state's start and the newest assistant text on
+    /// the row.
+    ///
+    /// Both terms move forward on their own, which is what makes `attended_at`
+    /// self-falsifying — there is no attention-clearing code anywhere in the hook
+    /// path, the watcher, the reaper or the sync ingest, and none is needed.
+    ///
+    /// The second term is not redundant with the first. `Stop` settles a row
+    /// `Done` *before* Claude Code flushes the final reply to JSONL, and the
+    /// watcher's `apply_text_entries` bumps only `updated`, never
+    /// `state_entered_at` — so a read that happened in that gap would otherwise
+    /// count as having seen text that hadn't arrived yet.
+    fn content_at(&self) -> i64 {
+        let newest_assistant = self
+            .dialog
+            .iter()
+            .rev()
+            .find(|e| e.role == DialogRole::Assistant)
+            .map(|e| e.timestamp)
+            .unwrap_or(0);
+        self.state_entered_at.max(newest_assistant)
+    }
+
+    /// Whether this row is finished-and-unread, finished-and-read, or not asking
+    /// ([`Attention`]).
+    ///
+    /// Scoped to `Done` in this first cut: it matches what was asked for ("an
+    /// agent that have finished the work"), and it keeps this decoration disjoint
+    /// from `SessionItem.svelte`'s pulse, which fires on `blocked || error`, so no
+    /// row can say "wants attention" and "already seen" at once.
+    pub fn attention(&self) -> Attention {
+        if self.status != Status::Done {
+            return Attention::Moot;
+        }
+        match self.attended_at {
+            Some(at) if at >= self.content_at() => Attention::Seen,
+            _ => Attention::Pending,
+        }
     }
 }
 
@@ -482,6 +566,7 @@ impl AppState {
                 origin: None,
                 instruction_drift: false,
                 canary: Canary::Off,
+                attended_at: None,
             });
             has_new_entry || dialog_restored
         }
@@ -579,6 +664,45 @@ impl AppState {
         s.instruction_drift = drift;
         s.updated = now_ms;
         true
+    }
+
+    /// Record that the user was observed attending to `id` at `at_ms`. Orthogonal
+    /// to `status`: it never changes the state.
+    ///
+    /// Deliberately does **not** bump `updated`. Unlike [`Self::set_drift`], this
+    /// is a local observation of the user rather than a fact about the agent, and
+    /// `updated` is the compare-and-swap guard that `take_session` (the liveness
+    /// reaper) and `settle_stale_waiting` abort on — and whose *stability* the
+    /// reaper's dead-streak counter requires. Stamping it here would restart that
+    /// count every time the user looked at a row.
+    ///
+    /// Monotonic, so a slow poll answering with an older observation can't walk
+    /// the stamp backwards. Returns whether the row's [`AgentSession::attention`]
+    /// *verdict* changed — not whether the timestamp moved — so a re-stamp on an
+    /// already-`Seen` (or `Moot`) row emits nothing, and the presence sensor
+    /// doesn't fire an event, a terminal-title reconcile and a sync poke on every
+    /// tick while the user sits typing.
+    pub fn mark_attended(&self, id: &str, at_ms: i64) -> bool {
+        let mut sessions = self.sessions.lock().unwrap();
+        let Some(s) = sessions.iter_mut().find(|s| s.id == id) else {
+            return false;
+        };
+        let before = s.attention();
+        s.attended_at = Some(s.attended_at.map_or(at_ms, |prev| prev.max(at_ms)));
+        s.attention() != before
+    }
+
+    /// Forget every attention observation — the teardown for
+    /// `config.attention_tracking` going false, so every row renders exactly as
+    /// it did before the feature existed. Mirrors [`Self::clear_all_drift`].
+    pub fn clear_all_attention(&self) -> bool {
+        let mut sessions = self.sessions.lock().unwrap();
+        let mut changed = false;
+        for s in sessions.iter_mut().filter(|s| s.attended_at.is_some()) {
+            s.attended_at = None;
+            changed = true;
+        }
+        changed
     }
 
     /// Current confirmed instruction-drift flag for a row (false when the row is
@@ -782,6 +906,124 @@ mod tests {
     }
 
     const NO_CONTINUATIONS: &[String] = &[];
+
+    // -------- attention (finished-and-unread) tests --------
+
+    #[test]
+    fn done_row_is_pending_until_marked_then_seen() {
+        let state = AppState::new();
+        state.apply_set(set("a", Status::Working, "fix foo.py"), 0, NO_CONTINUATIONS, None);
+        state.apply_set(set_no_label("a", Status::Done), 10_000, NO_CONTINUATIONS, None);
+        assert_eq!(get(&state, "a").attention(), Attention::Pending);
+
+        assert!(state.mark_attended("a", 12_000), "verdict changed");
+        assert_eq!(get(&state, "a").attention(), Attention::Seen);
+    }
+
+    #[test]
+    fn a_new_finish_re_raises_attention_with_no_reset_call() {
+        // The whole point of anchoring on content rather than storing a bool:
+        // nothing anywhere clears `attended_at`, yet a fresh turn must come back
+        // unread. `state_entered_at` moving forward is what does it.
+        let state = AppState::new();
+        state.apply_set(set("a", Status::Working, "task one"), 0, NO_CONTINUATIONS, None);
+        state.apply_set(set_no_label("a", Status::Done), 10_000, NO_CONTINUATIONS, None);
+        state.mark_attended("a", 11_000);
+        assert_eq!(get(&state, "a").attention(), Attention::Seen);
+
+        state.apply_set(set("a", Status::Working, "task two"), 20_000, NO_CONTINUATIONS, None);
+        state.apply_set(set_no_label("a", Status::Done), 30_000, NO_CONTINUATIONS, None);
+        assert_eq!(get(&state, "a").attention(), Attention::Pending, "second finish is unread again");
+        assert!(get(&state, "a").attended_at.is_some(), "the old stamp is still there — it's simply stale");
+    }
+
+    #[test]
+    fn assistant_text_flushed_after_stop_re_raises_attention() {
+        // `Stop` settles the row Done *before* Claude Code flushes the final
+        // reply, and `apply_text_entries` bumps only `updated`. Without the
+        // dialog term in `content_at`, a read landing in that gap would count as
+        // having seen text that hadn't arrived.
+        let state = AppState::new();
+        state.apply_set(set("a", Status::Working, "task"), 0, NO_CONTINUATIONS, None);
+        state.apply_set(set_no_label("a", Status::Done), 10_000, NO_CONTINUATIONS, None);
+        state.mark_attended("a", 10_500);
+        assert_eq!(get(&state, "a").attention(), Attention::Seen);
+
+        state.apply_text_entries("a", &[(DialogRole::Assistant, "here is the answer".into())], 11_000);
+        assert_eq!(get(&state, "a").attention(), Attention::Pending, "the reply arrived after the read");
+    }
+
+    #[test]
+    fn non_done_rows_are_moot_regardless_of_stamp() {
+        let state = AppState::new();
+        for status in [Status::Working, Status::Waiting, Status::Blocked, Status::Error, Status::Idle] {
+            state.apply_set(set_no_label("a", status), 0, NO_CONTINUATIONS, None);
+            state.mark_attended("a", 5_000);
+            assert_eq!(get(&state, "a").attention(), Attention::Moot, "{status:?} never asks to be read");
+        }
+    }
+
+    #[test]
+    fn mark_attended_reports_only_real_verdict_changes() {
+        // What keeps the presence sensor off the emit path: a re-stamp on an
+        // already-read row must not fire an event every tick while the user types.
+        let state = AppState::new();
+        state.apply_set(set_no_label("a", Status::Done), 0, NO_CONTINUATIONS, None);
+        assert!(state.mark_attended("a", 1_000), "Pending -> Seen is a change");
+        assert!(!state.mark_attended("a", 2_000), "Seen -> Seen is not");
+
+        state.apply_set(set_no_label("b", Status::Working), 0, NO_CONTINUATIONS, None);
+        assert!(!state.mark_attended("b", 1_000), "a Moot row never changes verdict");
+        assert!(!state.mark_attended("nope", 1_000), "an unknown id is not a change");
+    }
+
+    #[test]
+    fn mark_attended_is_monotonic() {
+        // A slow poll can answer with an observation older than one already held;
+        // it must not walk the stamp backwards and un-read a row.
+        let state = AppState::new();
+        state.apply_set(set_no_label("a", Status::Done), 0, NO_CONTINUATIONS, None);
+        state.mark_attended("a", 5_000);
+        state.mark_attended("a", 1_000);
+        assert_eq!(get(&state, "a").attended_at, Some(5_000));
+    }
+
+    #[test]
+    fn mark_attended_does_not_bump_updated() {
+        // `updated` is the compare-and-swap guard the liveness reaper and
+        // `settle_stale_waiting` abort on, and the reaper's dead-streak counter
+        // needs it to stay still. Looking at a row must not disturb either.
+        let state = AppState::new();
+        state.apply_set(set_no_label("a", Status::Done), 7_000, NO_CONTINUATIONS, None);
+        state.mark_attended("a", 9_000);
+        assert_eq!(get(&state, "a").updated, 7_000);
+    }
+
+    #[test]
+    fn clear_all_attention_restores_pre_feature_rendering() {
+        let state = AppState::new();
+        state.apply_set(set_no_label("a", Status::Done), 0, NO_CONTINUATIONS, None);
+        state.mark_attended("a", 1_000);
+        assert!(state.clear_all_attention());
+        assert_eq!(get(&state, "a").attention(), Attention::Pending);
+        assert!(!state.clear_all_attention(), "idempotent once nothing is stamped");
+    }
+
+    #[test]
+    fn attention_never_reaches_the_wire_in_any_form() {
+        // Neither the raw observation nor a verdict field: `status` carries the
+        // whole thing (`commands::apply_read_as_idle`), and a second field saying
+        // the same would be a duplicate state signal. What *does* go out is
+        // `status: "done"` — a peer asking what this machine's agents are doing
+        // must not be told whether a human here has looked at their screen.
+        let state = AppState::new();
+        state.apply_set(set_no_label("a", Status::Done), 0, NO_CONTINUATIONS, None);
+        state.mark_attended("a", 1_000);
+        let json = serde_json::to_value(get(&state, "a")).expect("serialize");
+        assert!(json.get("attended_at").is_none(), "the observation stays on this machine");
+        assert!(json.get("attention").is_none(), "and so does the verdict");
+        assert_eq!(json.get("status").and_then(|v| v.as_str()), Some("done"), "the wire reports what the agent did");
+    }
 
     #[test]
     fn revert_cancelled_turn_banks_elapsed_and_falls_back_to_idle() {
@@ -1446,6 +1688,7 @@ mod tests {
             origin: None,
             instruction_drift: false,
             canary: Canary::Off,
+            attended_at: None,
         });
     }
 
@@ -1711,6 +1954,7 @@ mod tests {
             origin: Some(origin.to_string()),
             instruction_drift: false,
             canary: Canary::Off,
+            attended_at: None,
         }
     }
 

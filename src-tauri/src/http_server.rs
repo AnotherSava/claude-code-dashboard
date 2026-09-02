@@ -1374,6 +1374,7 @@ mod tests {
             origin: origin.map(str::to_string),
             instruction_drift: false,
             canary: crate::state::Canary::Off,
+            attended_at: None,
         }
     }
 
