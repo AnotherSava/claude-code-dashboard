@@ -1,0 +1,86 @@
+{
+  "screenshots": [
+    {
+      "id": "hero",
+      "files": ["screenshot.png"],
+      "shows": "Main widget, three rows with the 5h and 7d usage bars in the header — the hero image on both the README and the docs index",
+      "policy": "confirm",
+      "capture": {
+        "steps": [
+          "Deploy the current build so the shot matches the working tree, not the installed release",
+          "Have three real sessions live: one BLOCK (genuinely blocked on a permission prompt), one WORK, one DONE",
+          "Both usage bars populated — the shot is also the only place the header is shown",
+          "Reveal the widget (tray icon left-click), capture the window rect, not the screen"
+        ]
+      },
+      "verifiedAt": "87e006a"
+    },
+    {
+      "id": "compact-mode",
+      "files": ["compact.png"],
+      "shows": "Main widget in compact mode: six rows, no label lines, showing DONE/WORK/IDLE badges and device pills on the synced rows",
+      "policy": "confirm",
+      "capture": {
+        "steps": [
+          "Deploy the current build",
+          "Turn on compact mode so the label lines are suppressed",
+          "Have both local and synced rows live, so at least one device pill is in frame",
+          "Capture the window rect"
+        ]
+      },
+      "verifiedAt": "87e006a"
+    },
+    {
+      "id": "terminal-tabs",
+      "files": ["terminal-tabs.png"],
+      "shows": "agterm's sidebar with per-session status glyphs written by the dashboard, two of them carrying a context-usage suffix",
+      "policy": "confirm",
+      "capture": {
+        "steps": [
+          "macOS with agterm — this frame does not exist on Windows",
+          "Several sessions across projects showing a spread of glyphs, and at least one past the context-percent threshold so a [N%] suffix is visible",
+          "Capture agterm's sidebar; the surrounding chrome is third-party and is not evidence for staleness"
+        ]
+      },
+      "verifiedAt": "87e006a"
+    },
+    {
+      "id": "history-window",
+      "files": ["history.png"],
+      "shows": "History window for one session: timestamped prompts and replies with collapsed middles",
+      "policy": "confirm",
+      "capture": {
+        "steps": [
+          "Deploy the current build",
+          "Open history for a session with enough turns that at least one reply is folded behind a <...> button",
+          "Capture the history window rect"
+        ]
+      },
+      "verifiedAt": "87e006a"
+    },
+    {
+      "id": "work-intensity",
+      "files": ["work-intensity.png"],
+      "shows": "Work intensity window, Days view in Percent unit, one week of 10-minute bars with the full-5h-pace reference line",
+      "policy": "confirm",
+      "capture": {
+        "steps": [
+          "Deploy the current build",
+          "Open Work intensity from the tray, Days view, Percent unit",
+          "Pick a week with enough activity that the pace reference and the over-2x red bars both appear",
+          "Size the window at or above 1280px wide — the header controls collide below that",
+          "Capture the window rect"
+        ]
+      },
+      "verifiedAt": "87e006a"
+    }
+  ],
+  "declinedGaps": [
+    {
+      "id": "G1",
+      "where": "docs/pages/features.md — Notifications",
+      "would_show": "A real Telegram ping, so the section shows what the message looks like and what it carries",
+      "declined": "2026-09-02"
+    }
+  ]
+}
