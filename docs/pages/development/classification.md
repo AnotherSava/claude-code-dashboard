@@ -40,7 +40,7 @@ The adapter recognizes six event names. Anything else returns `Ignore` and the w
 |---                 |---                                                                                  |---                                                             |
 | `SessionStart`     | `idle` (no fields) — otherwise treated like `Notification`                          | Used to seed an empty row before any user activity.            |
 | `UserPromptSubmit` | `working`                                                                           | Label is the cleaned prompt; blank prompt → label `None`.      |
-| `Notification`     | `blocked` (default) — `done` if `notification_type == "idle_prompt"` with no question | See the notification-type table below.                      |
+| `Notification`     | `blocked` (default); `idle_prompt` is ignored outright                               | See the notification-type table below.                      |
 | `PreToolUse`       | `blocked` for `AskUserQuestion` / `ExitPlanMode` only; other tools ignored         | Label: `"has a question"` for `AskUserQuestion`, `"plan approval"` for `ExitPlanMode`. The matcher in `~/.claude/settings.json` should restrict the hook to these two tools (see [Installation → Wire the Claude Code hook](../install#2-wire-the-claude-code-hook)) — Claude Code buffers the `tool_use` block until the user answers, so the JSONL transcript can't carry the signal in flight. |
 | `Stop`             | `blocked` if the final assistant message ends on a question, else `waiting` if background work is still in flight, else `done` (see [detection rules](#question-detection)) | Settled here and not revisited: the payload carries the final text as `last_assistant_message` and any in-flight work as `background_tasks`, so `classify_stop` has everything it needs at `Stop` time. The question check ignores configured benign closers and openers. |
 | `SessionEnd`       | emits `Clear` (removes the row, unless a live sibling owns it)                       | Bypasses status classification entirely.                       |
@@ -57,11 +57,13 @@ The adapter recognizes six event names. Anything else returns `Ignore` and the w
 |---                   |---                                                           |---                                                   |
 | `permission_prompt`  | `blocked`                                                   | `"needs approval: <tool>"` — `<tool>` is the text after `"use "` in the message; falls back to `"tool"` if the marker is absent. |
 | `plan_approval`      | `blocked`                                                   | `"plan approval"` (fixed)                            |
-| `idle_prompt`        | `blocked` if transcript ends with `?` (non-benign), else `done` | `"has a question"` when flipped, else `None`     |
+| `idle_prompt`        | none — the event is ignored                                  | none                                                 |
 | anything else        | `blocked`                                                   | cleaned `payload.message`, truncated to 60 chars     |
 | empty type, empty message | `idle`                                                  | `None`                                               |
 
 The 60-char truncation counts **characters, not bytes**, so multi-byte glyphs (emoji, CJK) are never split mid-codepoint.
+
+`idle_prompt` produces no classification at all: `Stop` has already settled the row from its own payload, so re-deriving a verdict here would be redundant, and the event is a flaky fixed timer besides. See [question detection](#question-detection).
 
 ## Prompt and label cleaning
 
@@ -138,7 +140,7 @@ Every status-affecting decision is written to `widget.jsonl` (the same tracing s
 
 | `decision`                            | Emitted from              | Meaning                                                                                                                                                                      |
 |---                                    |---                        |---                                                                                                                                                                          |
-| `classify`                            | `http_server` (`event -> set`) | A hook event set the row's status. For `Stop` / idle prompts the `reason` reads `<kind> on a question [<rule>]: "<snippet>"` or `<kind>; final message is not a question: "<snippet>"`, where `<kind>` is `turn ended` or `idle prompt`. |
+| `classify`                            | `http_server` (`event -> set`) | A hook event set the row's status. For `Stop` the `reason` reads `turn ended on a question [<rule>]: "<snippet>"` or `turn ended; final message is not a question: "<snippet>"`. |
 | `resume_working`                      | `log_watcher`             | The transcript watcher saw new activity (a tool call or user turn) after a pause and promoted the row back to `working` — the path that clears a stale `blocked` once the user answers an `AskUserQuestion`. |
 | `settle_waiting`                      | `waiting_settle`          | A row sat in `waiting` (light-blue WAIT) unchanged past `waiting_settle_ms` and was settled to `done` — the backstop for a background shell task the user killed, which ends silently and so fires no follow-up `Stop`. Carries `waited_ms` / `window_ms`. |
 | `revert_cancelled`                    | `log_watcher`             | An Esc-cancelled turn (no lifecycle hook) reverted to its pre-prompt status — the `status` field records where it landed.                                              |

@@ -135,10 +135,16 @@ pub struct Config {
     pub reap_exited_sessions: bool,
     /// Track which finished sessions the user has actually looked at, so a row
     /// that finished and hasn't been read stands apart from one already read.
-    /// Read by `commands::resolved_snapshot` (which stamps the verdict) and by
-    /// `attention`, which observes the two things that count as looking: opening
-    /// a row's history window, and — on macOS with agterm — producing input in
-    /// the terminal while that session is the selected one.
+    /// Read by `commands::resolved_snapshot` (which stamps the verdict), by
+    /// `commands::display_snapshot` (which turns it into the row's status), by
+    /// `notifications::reconcile` (which takes it as a verdict rather than a
+    /// status — see there for why) and by `attention` itself, which observes what
+    /// counts as looking: opening a row's history window, *leaving* that session's
+    /// terminal tab — the primary signal, since leaving is the moment you are done
+    /// with what was on screen — and producing input while it is the selected tab.
+    /// The terminal half is agterm on macOS and Windows Terminal on Windows
+    /// (`terminals::for_platform`); elsewhere the history window is the only
+    /// source.
     ///
     /// This is the axis `notifications`' `afk_window_ms` cannot reach: that
     /// measures input anywhere on the desktop, so it reads "at the desk" while
@@ -153,7 +159,7 @@ pub struct Config {
     /// agents are alive here and the terminal what each of their tabs says, and
     /// creates only the rows that both answer for. Off leaves the dashboard empty
     /// on a cold start, as it was before the feature existed. Requires a terminal
-    /// adapter (`terminals::for_platform`), so it does nothing on Windows yet, and
+    /// adapter (`terminals::for_platform`), so it does nothing on Linux, and
     /// requires `terminal_titles` — the tab title is the only place a row's status
     /// outlives this process.
     pub restore_sessions: bool,

@@ -272,11 +272,11 @@ enum Pass {
 
 /// Restore what can be restored, retrying only while something has yet to answer.
 ///
-/// A no-op where no terminal adapter exists — Windows today, which means a row
-/// there stays absent until its session next acts. That is the honest gap rather
-/// than a guess: the registry alone would say a session is alive without being
-/// able to say anything about what it is doing, and `Idle` for a blocked agent is
-/// a wrong claim, not a missing one.
+/// A no-op where no terminal adapter exists — Linux, which means a row there
+/// stays absent until its session next acts. That is the honest gap rather than a
+/// guess: the registry alone would say a session is alive without being able to
+/// say anything about what it is doing, and `Idle` for a blocked agent is a wrong
+/// claim, not a missing one.
 ///
 /// Its own adapter instance rather than sharing `attention`'s: listing tabs holds
 /// no state, the two run on different threads, and sharing a
