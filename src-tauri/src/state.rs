@@ -280,7 +280,7 @@ impl AgentSession {
     /// watcher's `apply_text_entries` bumps only `updated`, never
     /// `state_entered_at` — so a read that happened in that gap would otherwise
     /// count as having seen text that hadn't arrived yet.
-    fn content_at(&self) -> i64 {
+    pub(crate) fn content_at(&self) -> i64 {
         let newest_assistant = self
             .dialog
             .iter()

@@ -6,7 +6,7 @@ use tauri::{AppHandle, Manager};
 
 use crate::config::{ConfigState, StateNotify};
 use crate::custom_names::CustomNamesStore;
-use crate::state::{AgentSession, AppState, DialogRole, Status};
+use crate::state::{AgentSession, AppState, Attention, DialogRole, Status};
 use crate::telegram::{SyncOutcome, TelegramNotifier};
 use crate::usage_limits::UsageLimitsState;
 
@@ -72,8 +72,13 @@ pub fn status_key(s: Status) -> &'static str {
     match s {
         Status::Idle => "idle",
         Status::Working => "working",
-        // `Waiting` (background agents) is passive — no config key, so it never
-        // fires (like `working`/`idle`).
+        // `Waiting` (background agents) is passive, so it carries no rule in the
+        // shipped defaults and stays silent there — as `working` and `idle` do.
+        // Silent by default is not the same as unreachable: `states` is a free
+        // map and `settings.md` documents all six keys, so a user who configures
+        // one of these gets it. `reconcile`'s read verdict depends on that being
+        // true of `idle` — it is why a read row is judged rather than restated as
+        // `Idle`, which would hand a configured `idle` rule a row to fire on.
         Status::Waiting => "waiting",
         Status::Blocked => "blocked",
         Status::Done => "done",
@@ -550,8 +555,29 @@ pub async fn reconcile(
     reading_speed_cps: u64,
     high_alert: bool,
     process_started_at: i64,
+    attention_tracking: bool,
 ) {
     let rules = notifier.state_rules();
+
+    // A finished row the user has demonstrably read has nothing left to announce,
+    // so it neither fires nor keeps a ping.
+    //
+    // Judged here rather than by rewriting the row's `status` to `Idle`, which is
+    // what `commands::apply_read_as_idle` does for the widget and the tab titles.
+    // That flip is right for a *display*, where `Idle` is just a quieter pill, and
+    // wrong here: `idle` is a user-settable rule key (`status_key`, and
+    // `settings.md` documents it), so a configured `states.idle` would fire
+    // *because* the row was read, turning the suppression into its opposite.
+    // Nothing about the row is restated; only this decision is taken.
+    //
+    // "Read" is stricter here than on the display, and deliberately. It also
+    // requires the final text to have arrived (`content_at` past
+    // `state_entered_at`): `Stop` settles a row `Done` before Claude Code flushes
+    // the reply, so a read landing in that gap is undone the moment the text does.
+    // The widget can afford that, correcting itself on the next emit — but a
+    // dismissal here has already deleted a message from the user's phone, and the
+    // re-raise would send a second one, so a read of nothing must not act.
+    let read = |s: &AgentSession| attention_tracking && s.attention() == Attention::Seen && s.content_at() > s.state_entered_at;
 
     let stale: Vec<String> = outstanding
         .iter()
@@ -559,7 +585,7 @@ pub async fn reconcile(
             sessions
                 .iter()
                 .find(|s| &s.id == *id)
-                .map_or(true, |s| s.status != o.for_status)
+                .map_or(true, |s| s.status != o.for_status || read(s))
         })
         .map(|(k, _)| k.clone())
         .collect();
@@ -572,6 +598,9 @@ pub async fn reconcile(
 
     for s in sessions {
         if outstanding.contains_key(&s.id) {
+            continue;
+        }
+        if read(s) {
             continue;
         }
         let key = status_key(s.status);
@@ -709,6 +738,8 @@ impl NotificationManager {
                 if let Some(names) = app.try_state::<CustomNamesStore>() {
                     names.apply(&mut sessions);
                 }
+                // The read/unread verdict rides along as a flag rather than by
+                // rewriting each row's `status`; see `reconcile`.
 
                 let tg_cfg = cfg
                     .notifications
@@ -717,18 +748,20 @@ impl NotificationManager {
 
                 let outcome = telegram.sync_config(tg_cfg);
                 if matches!(outcome, SyncOutcome::CredsChanged | SyncOutcome::Disabled) {
-                    if !outstanding.is_empty() || !context_outstanding.is_empty() || !drift_outstanding.is_empty() {
+                    if !outstanding.is_empty() || !context_outstanding.is_empty() || !drift_outstanding.is_empty() || !stale_outstanding.is_empty() {
                         tracing::warn!(
                             channel = "telegram",
                             reason = ?outcome,
                             count = outstanding.len(),
                             context_count = context_outstanding.len(),
                             drift_count = drift_outstanding.len(),
+                            stale_count = stale_outstanding.len(),
                             "credentials changed or disabled; dropping outstanding maps without deleting"
                         );
                         outstanding.clear();
                         context_outstanding.clear();
                         drift_outstanding.clear();
+                        stale_outstanding.clear();
                     }
                     // Retry holds are handle-free (nothing to delete), but they
                     // predate the new credentials, so drop them too — a ping held
@@ -736,6 +769,7 @@ impl NotificationManager {
                     retry_backoff.clear();
                     context_backoff.clear();
                     drift_backoff.clear();
+                    stale_backoff.clear();
                     reset_backoff.clear();
                     // Re-seed the reset detector so a window that reset while
                     // creds were absent doesn't fire a stale / frozen-peak ping
@@ -760,6 +794,7 @@ impl NotificationManager {
                         tg_cfg.and_then(|c| c.reading_speed_cps).unwrap_or(0),
                         cfg.high_alert,
                         started_at,
+                        cfg.attention_tracking,
                     )
                     .await;
 
@@ -1113,7 +1148,7 @@ mod tests {
         let m = Mock::with(&[("blocked", 60_000)]);
         let mut out = HashMap::new();
         let sessions = vec![session("s1", Status::Blocked, 0)];
-        reconcile(m.as_ref(), &sessions, &mut out, &mut HashMap::new(), 60_000, None, 0, false, 0).await;
+        reconcile(m.as_ref(), &sessions, &mut out, &mut HashMap::new(), 60_000, None, 0, false, 0, true).await;
         assert_eq!(out.len(), 1);
         assert_eq!(out["s1"].for_status, Status::Blocked);
         assert_eq!(out["s1"].handle, "h1");
@@ -1125,7 +1160,7 @@ mod tests {
         let m = Mock::with(&[("blocked", 60_000)]);
         let mut out = HashMap::new();
         let sessions = vec![session("s1", Status::Blocked, 0)];
-        reconcile(m.as_ref(), &sessions, &mut out, &mut HashMap::new(), 59_999, None, 0, false, 0).await;
+        reconcile(m.as_ref(), &sessions, &mut out, &mut HashMap::new(), 59_999, None, 0, false, 0, true).await;
         assert!(out.is_empty());
         assert!(m.events().is_empty());
     }
@@ -1139,7 +1174,7 @@ mod tests {
             Outstanding { handle: "h1".into(), for_status: Status::Blocked, },
         );
         let sessions = vec![session("s1", Status::Blocked, 0)];
-        reconcile(m.as_ref(), &sessions, &mut out, &mut HashMap::new(), 120_000, None, 0, false, 0).await;
+        reconcile(m.as_ref(), &sessions, &mut out, &mut HashMap::new(), 120_000, None, 0, false, 0, true).await;
         assert_eq!(out.len(), 1);
         assert!(m.events().is_empty(), "no events when nothing changes");
     }
@@ -1153,7 +1188,7 @@ mod tests {
             Outstanding { handle: "h9".into(), for_status: Status::Blocked, },
         );
         let sessions = vec![session("s1", Status::Working, 100_000)];
-        reconcile(m.as_ref(), &sessions, &mut out, &mut HashMap::new(), 120_000, None, 0, false, 0).await;
+        reconcile(m.as_ref(), &sessions, &mut out, &mut HashMap::new(), 120_000, None, 0, false, 0, true).await;
         assert!(out.is_empty());
         assert_eq!(m.events(), vec![Event::Dismiss { handle: "h9".into() }]);
     }
@@ -1169,7 +1204,7 @@ mod tests {
             Outstanding { handle: "h7".into(), for_status: Status::Blocked, },
         );
         let sessions: Vec<AgentSession> = vec![];
-        reconcile(m.as_ref(), &sessions, &mut out, &mut HashMap::new(), 120_000, None, 0, false, 0).await;
+        reconcile(m.as_ref(), &sessions, &mut out, &mut HashMap::new(), 120_000, None, 0, false, 0, true).await;
         assert!(out.is_empty());
         assert_eq!(m.events(), vec![Event::Dismiss { handle: "h7".into() }]);
     }
@@ -1180,7 +1215,7 @@ mod tests {
         let m = Mock::with(&[("blocked", 60_000)]);
         let mut out = HashMap::new();
         let sessions: Vec<AgentSession> = vec![];
-        reconcile(m.as_ref(), &sessions, &mut out, &mut HashMap::new(), 30_000, None, 0, false, 0).await;
+        reconcile(m.as_ref(), &sessions, &mut out, &mut HashMap::new(), 30_000, None, 0, false, 0, true).await;
         assert!(out.is_empty());
         assert!(m.events().is_empty());
     }
@@ -1190,7 +1225,7 @@ mod tests {
         let m = Mock::with(&[("blocked", 0)]);
         let mut out = HashMap::new();
         let sessions = vec![session("s1", Status::Blocked, 0)];
-        reconcile(m.as_ref(), &sessions, &mut out, &mut HashMap::new(), 1_000_000, None, 0, false, 0).await;
+        reconcile(m.as_ref(), &sessions, &mut out, &mut HashMap::new(), 1_000_000, None, 0, false, 0, true).await;
         assert!(out.is_empty());
         assert!(m.events().is_empty());
     }
@@ -1200,7 +1235,7 @@ mod tests {
         let m = Mock::with(&[("error", 60_000)]);
         let mut out = HashMap::new();
         let sessions = vec![session("s1", Status::Blocked, 0)];
-        reconcile(m.as_ref(), &sessions, &mut out, &mut HashMap::new(), 1_000_000, None, 0, false, 0).await;
+        reconcile(m.as_ref(), &sessions, &mut out, &mut HashMap::new(), 1_000_000, None, 0, false, 0, true).await;
         assert!(out.is_empty());
         assert!(m.events().is_empty());
     }
@@ -1213,7 +1248,7 @@ mod tests {
         let mut out = HashMap::new();
         let mut backoff = HashMap::new();
         let sessions = vec![session("s1", Status::Blocked, 0)];
-        reconcile(m.as_ref(), &sessions, &mut out, &mut backoff, 60_000, None, 0, false, 0).await;
+        reconcile(m.as_ref(), &sessions, &mut out, &mut backoff, 60_000, None, 0, false, 0, true).await;
         assert!(out.is_empty(), "failed send must not populate outstanding");
         assert!(backoff.is_empty(), "not-delivered failure sets no hold → next tick retries promptly");
     }
@@ -1228,17 +1263,17 @@ mod tests {
         let mut backoff = HashMap::new();
         let sessions = vec![session("s1", Status::Done, 0)];
         // Window elapsed → attempt; the send times out (maybe delivered).
-        reconcile(m.as_ref(), &sessions, &mut out, &mut backoff, 60_000, None, 0, false, 0).await;
+        reconcile(m.as_ref(), &sessions, &mut out, &mut backoff, 60_000, None, 0, false, 0, true).await;
         assert!(out.is_empty());
         assert!(m.events().is_empty(), "a failed send emits no Send event");
         assert!(matches!(backoff.get("s1"), Some(h) if h.for_status == Status::Done), "maybe-delivered failure sets a retry hold");
         // Channel recovers, but we're still inside the hold → no retry.
         *m.send_err.lock().unwrap() = None;
-        reconcile(m.as_ref(), &sessions, &mut out, &mut backoff, 60_000 + 1_000, None, 0, false, 0).await;
+        reconcile(m.as_ref(), &sessions, &mut out, &mut backoff, 60_000 + 1_000, None, 0, false, 0, true).await;
         assert!(m.events().is_empty(), "no retry while the hold is active");
         assert!(out.is_empty());
         // Past the hold → retries and succeeds, clearing the hold.
-        reconcile(m.as_ref(), &sessions, &mut out, &mut backoff, 60_000 + UNCERTAIN_RETRY_BACKOFF_MS + 1, None, 0, false, 0).await;
+        reconcile(m.as_ref(), &sessions, &mut out, &mut backoff, 60_000 + UNCERTAIN_RETRY_BACKOFF_MS + 1, None, 0, false, 0, true).await;
         assert_eq!(out.len(), 1, "retries once the backoff window elapses");
         assert!(!backoff.contains_key("s1"), "a successful send clears the hold");
     }
@@ -1252,12 +1287,12 @@ mod tests {
         let mut out = HashMap::new();
         let mut backoff = HashMap::new();
         let done = vec![session("s1", Status::Done, 0)];
-        reconcile(m.as_ref(), &done, &mut out, &mut backoff, 60_000, None, 0, false, 0).await;
+        reconcile(m.as_ref(), &done, &mut out, &mut backoff, 60_000, None, 0, false, 0, true).await;
         assert!(matches!(backoff.get("s1"), Some(h) if h.for_status == Status::Done));
         // Same session is now Blocked; channel recovered.
         *m.send_err.lock().unwrap() = None;
         let blocked = vec![session("s1", Status::Blocked, 0)];
-        reconcile(m.as_ref(), &blocked, &mut out, &mut backoff, 60_000, None, 0, false, 0).await;
+        reconcile(m.as_ref(), &blocked, &mut out, &mut backoff, 60_000, None, 0, false, 0, true).await;
         assert_eq!(out.len(), 1, "the new Blocked state pings promptly");
         assert_eq!(out["s1"].for_status, Status::Blocked);
     }
@@ -1393,10 +1428,10 @@ mod tests {
         let sessions = vec![session_with_message("s1", Status::Done, 0, &text)];
         let mut out = HashMap::new();
         // 90s in, idle 90s: today this fires (idle > 60s); now suppressed mid-read.
-        reconcile(m.as_ref(), &sessions, &mut out, &mut HashMap::new(), 90_000, Some(90_000), 15, false, 0).await;
+        reconcile(m.as_ref(), &sessions, &mut out, &mut HashMap::new(), 90_000, Some(90_000), 15, false, 0, true).await;
         assert!(out.is_empty(), "present reader of a long message isn't pinged mid-read");
         // 170s in, idle 170s: past the 60s + 100s budget → fires.
-        reconcile(m.as_ref(), &sessions, &mut out, &mut HashMap::new(), 170_000, Some(170_000), 15, false, 0).await;
+        reconcile(m.as_ref(), &sessions, &mut out, &mut HashMap::new(), 170_000, Some(170_000), 15, false, 0, true).await;
         assert_eq!(out.len(), 1, "fires once the reading budget elapses");
     }
 
@@ -1410,7 +1445,7 @@ mod tests {
         s.label = "api error".into();
         let sessions = vec![s];
         let mut out = HashMap::new();
-        reconcile(m.as_ref(), &sessions, &mut out, &mut HashMap::new(), 61_000, Some(0), 15, false, 0).await;
+        reconcile(m.as_ref(), &sessions, &mut out, &mut HashMap::new(), 61_000, Some(0), 15, false, 0, true).await;
         assert_eq!(out.len(), 1, "error backstop fires off its short label, not the stale long turn");
     }
 
@@ -1434,13 +1469,13 @@ mod tests {
         let m = Mock::with_rules(&[("blocked", StateNotify { afk_window_ms: Some(60_000), reaction_window_ms: Some(120_000) })]);
         let restored = vec![session("s1", Status::Blocked, 1_000)];
         let mut out = HashMap::new();
-        reconcile(m.as_ref(), &restored, &mut out, &mut HashMap::new(), 5_000_000, Some(0), 0, false, 900_000).await;
+        reconcile(m.as_ref(), &restored, &mut out, &mut HashMap::new(), 5_000_000, Some(0), 0, false, 900_000, true).await;
         assert!(out.is_empty(), "a state this process never saw begin is not announced");
 
         // The suppression is scoped to that state, not to the row: the moment the
         // agent does anything, `state_entered_at` moves and the guard lifts.
         let acted = vec![session("s1", Status::Blocked, 1_000_000)];
-        reconcile(m.as_ref(), &acted, &mut out, &mut HashMap::new(), 5_000_000, Some(0), 0, false, 900_000).await;
+        reconcile(m.as_ref(), &acted, &mut out, &mut HashMap::new(), 5_000_000, Some(0), 0, false, 900_000, true).await;
         assert_eq!(out.len(), 1, "a state entered while we were running still fires");
     }
 
@@ -1450,9 +1485,94 @@ mod tests {
         let mut out = HashMap::new();
         // Done for 10s, user idle 70s (away since before it finished).
         let sessions = vec![session("s1", Status::Done, 0)];
-        reconcile(m.as_ref(), &sessions, &mut out, &mut HashMap::new(), 10_000, Some(70_000), 0, false, 0).await;
+        reconcile(m.as_ref(), &sessions, &mut out, &mut HashMap::new(), 10_000, Some(70_000), 0, false, 0, true).await;
         assert_eq!(out.len(), 1, "AFK path fires done");
         assert_eq!(out["s1"].for_status, Status::Done);
+    }
+
+    /// A `Done` row whose final reply flushed at `flushed_at` and which the user
+    /// read at `read_at`. Both timestamps matter: `attention` compares the read
+    /// against the newest assistant entry, not against the status change.
+    fn read_done(id: &str, flushed_at: i64, read_at: i64) -> AgentSession {
+        let mut s = session(id, Status::Done, 0);
+        s.dialog.push(DialogEntry { role: DialogRole::Assistant, text: String::new(), timestamp: flushed_at, status: Status::Done, task_start: false });
+        s.attended_at = Some(read_at);
+        s
+    }
+
+    #[tokio::test]
+    async fn reading_a_finished_row_revokes_the_ping_already_sent_for_it() {
+        // The reachable half under the shipped defaults. `done` is AFK-only, and
+        // the AFK path already declines a *read* row on its own (see the test
+        // below), so what the read verdict adds here is revocation: a ping that
+        // fired while the user was away is deleted once they come back and read
+        // the session, rather than sitting on the phone until the agent moves on.
+        let m = Mock::with_rules(&[("done", AFK_ONLY)]);
+        let mut out = HashMap::new();
+
+        // Away since before it finished: the ping fires.
+        let unread = {
+            let mut s = read_done("s1", 2_000, 0);
+            s.attended_at = None;
+            vec![s]
+        };
+        reconcile(m.as_ref(), &unread, &mut out, &mut HashMap::new(), 61_000, Some(161_000), 0, false, 0, true).await;
+        assert_eq!(out.len(), 1, "an unread finished row still pings when the user was away");
+
+        // They come back and read it. The message goes.
+        let read = vec![read_done("s1", 2_000, 210_000)];
+        reconcile(m.as_ref(), &read, &mut out, &mut HashMap::new(), 211_000, Some(1_000), 0, false, 0, true).await;
+        assert!(out.is_empty(), "the outstanding done ping is dismissed once read");
+        assert!(m.events().iter().any(|e| matches!(e, Event::Dismiss { handle } if handle == "h1")), "dismiss reached the notifier");
+    }
+
+    #[tokio::test]
+    async fn the_afk_window_already_declines_a_read_row_without_the_verdict() {
+        // Why the paragraph above says "revocation" and not "suppression". AFK
+        // needs `idle >= time_in_state`, and a read stamp trails real input at or
+        // after the row entered `Done`, so idle can never overtake time-in-state
+        // for a row that was read. Pinned so the claim in `reconcile`'s comment
+        // stays true if either term is ever loosened.
+        let m = Mock::with_rules(&[("done", AFK_ONLY)]);
+        let mut out = HashMap::new();
+        // Done at 0, read at 60s, now 180s → idle 120s: past the 60s window, but
+        // short of the 180s the row has been sitting there.
+        let sessions = vec![read_done("s1", 2_000, 60_000)];
+        reconcile(m.as_ref(), &sessions, &mut out, &mut HashMap::new(), 180_000, Some(120_000), 0, false, 0, false).await;
+        assert!(out.is_empty(), "AFK declines it even with the read verdict switched off");
+    }
+
+    #[tokio::test]
+    async fn a_read_row_is_not_restated_as_idle_so_an_idle_rule_cannot_fire_for_it() {
+        // The reason this is a verdict rather than `apply_read_as_idle`'s status
+        // rewrite. `idle` is a documented, user-settable rule key, so flipping a
+        // read row's status here would let a configured `states.idle` fire
+        // *because* the user read it — the opposite of what the feature promises.
+        let m = Mock::with_rules(&[
+            ("done", AFK_ONLY),
+            ("idle", StateNotify { afk_window_ms: None, reaction_window_ms: Some(300_000) }),
+        ]);
+        let mut out = HashMap::new();
+        let sessions = vec![read_done("s1", 2_000, 30_000)];
+        reconcile(m.as_ref(), &sessions, &mut out, &mut HashMap::new(), 400_000, Some(1_000), 0, false, 0, true).await;
+        assert!(out.is_empty(), "reading a session must not produce a ping");
+        assert!(m.events().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_read_landing_before_the_reply_flushed_neither_suppresses_nor_revokes() {
+        // `Stop` settles the row `Done` before Claude Code writes the final reply,
+        // so a read in that gap saw nothing. The widget lets such a read stand and
+        // corrects itself when the text arrives; here it must not, because the
+        // correction would delete a delivered message and then send a second one.
+        let m = Mock::with_rules(&[("done", AFK_ONLY)]);
+        let mut out = HashMap::new();
+        // Read at 1.5s, nothing flushed yet: `content_at` is still the status change.
+        let mut s = session("s1", Status::Done, 0);
+        s.attended_at = Some(1_500);
+        assert_eq!(s.attention(), Attention::Seen, "the display would call this read");
+        reconcile(m.as_ref(), &[s], &mut out, &mut HashMap::new(), 61_000, Some(161_000), 0, false, 0, true).await;
+        assert_eq!(out.len(), 1, "a read of text that had not arrived does not suppress the ping");
     }
 
     #[tokio::test]
@@ -1461,7 +1581,7 @@ mod tests {
         let mut out = HashMap::new();
         // Done for 10s but user touched the machine 2s ago → saw it.
         let sessions = vec![session("s1", Status::Done, 0)];
-        reconcile(m.as_ref(), &sessions, &mut out, &mut HashMap::new(), 10_000, Some(2_000), 0, false, 0).await;
+        reconcile(m.as_ref(), &sessions, &mut out, &mut HashMap::new(), 10_000, Some(2_000), 0, false, 0, true).await;
         assert!(out.is_empty(), "present user => no done ping");
         assert!(m.events().is_empty());
     }
@@ -1474,7 +1594,7 @@ mod tests {
         let m = Mock::with_rules(&[("done", AFK_ONLY)]);
         let mut out = HashMap::new();
         let sessions = vec![session_with_message("s1", Status::Done, 0, &"x".repeat(5_000))];
-        reconcile(m.as_ref(), &sessions, &mut out, &mut HashMap::new(), 0, Some(0), 15, true, 0).await;
+        reconcile(m.as_ref(), &sessions, &mut out, &mut HashMap::new(), 0, Some(0), 15, true, 0, true).await;
         assert_eq!(out.len(), 1, "high alert pings immediately");
         assert_eq!(out["s1"].for_status, Status::Done);
     }
@@ -1486,7 +1606,7 @@ mod tests {
         let m = Mock::with_rules(&[("done", StateNotify { afk_window_ms: Some(0), reaction_window_ms: Some(0) })]);
         let mut out = HashMap::new();
         let sessions = vec![session("s1", Status::Done, 0)];
-        reconcile(m.as_ref(), &sessions, &mut out, &mut HashMap::new(), 0, Some(0), 0, true, 0).await;
+        reconcile(m.as_ref(), &sessions, &mut out, &mut HashMap::new(), 0, Some(0), 0, true, 0, true).await;
         assert!(out.is_empty(), "disabled state stays silent under high alert");
         assert!(m.events().is_empty());
     }
