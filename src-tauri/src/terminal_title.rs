@@ -238,6 +238,33 @@ pub fn pin_verdict(caption: &str, written: &str, written_at: i64, now: i64, live
 /// are true instances of "this tab no longer follows the row"; only the remedy
 /// differs.
 ///
+/// **An exact match wins; failing that the longest shared label wins; a draw is
+/// refused.** [`same_row`] is documented as erring toward "the same row", which
+/// is safe where a miss only costs an observation but not here, where the match
+/// *selects which row gets accused*: with a `projects_root` set, the caption
+/// `🟢 bga assistant` is `same_row` with both the `bga assistant` row's title and
+/// the `bga` row's, so taking the first match off a `HashMap` flagged an
+/// arbitrary one of them, and a different one between events since iteration
+/// order is unstable.
+///
+/// The exact-match rung is not a nicety, and ranking alone is not enough. Unlike
+/// `attention::resolve_row`, which scores each candidate by *its own* label and
+/// so separates `bga` from `bga assistant` outright, the candidates here are
+/// titles and every label is drawn from the *caption*: against the short caption
+/// `🟢 bga` both the `bga` title and the `bga assistant` title yield the same
+/// label `bga`, a permanent draw. Refusing it would leave a row whose stale flag
+/// is already set with no path to `Pin::Following`, so the `≠` badge and its
+/// Telegram alert could never be cleared — the exact case the comment below
+/// calls worse than a late warning. A caption byte-equal to what we wrote names
+/// that row and no other, which is the same test `pin_verdict` opens with.
+///
+/// What stays refused is a draw with no exact match, and two candidates that are
+/// byte-equal to the caption (two rows with literally identical titles). Both
+/// cost only a missed report, the recoverable direction. **The residual limit,
+/// stated rather than hidden:** a row whose label is a token-prefix of a
+/// sibling's cannot be *reported* while both are titled, since a stale caption
+/// for it draws against the sibling with nothing to break the tie.
+///
 /// Known limit. A caption is judged against the row whose title it resembles,
 /// because Windows Terminal offers no way to learn which window hosts which
 /// session — so a *second* window sitting on a lookalike caption is judged
@@ -247,7 +274,26 @@ pub fn pin_verdict(caption: &str, written: &str, written_at: i64, now: i64, live
 /// the user has to act on.
 pub fn observe_caption(app: &AppHandle, caption: &str, now: i64) {
     let Some(titles) = app.try_state::<TerminalTitles>() else { return };
-    let Some((chat_id, written, written_at)) = titles.last.lock().unwrap().iter().find(|(_, (t, _))| same_row(caption, t)).map(|(id, (t, at))| (id.clone(), t.clone(), *at)) else { return };
+    let Some((chat_id, written, written_at)) = ({
+        let last = titles.last.lock().unwrap();
+        // Rank on (is it byte-equal, then how much of the caption it names), so an
+        // exact match outranks every prefix sibling and a draw is a draw only
+        // among equals on both.
+        let mut best: Option<(&String, &(String, i64), (bool, usize))> = None;
+        let mut drawn = 1;
+        for (id, entry) in last.iter() {
+            let Some(len) = shared_label(caption, &entry.0).map(str::len) else { continue };
+            let score = (entry.0 == caption, len);
+            match best {
+                Some((_, _, b)) if b > score => {}
+                Some((_, _, b)) if b == score => drawn += 1,
+                _ => (best, drawn) = (Some((id, entry, score)), 1),
+            }
+        }
+        best.filter(|_| drawn == 1).map(|(id, (t, at), _)| (id.clone(), t.clone(), *at))
+    }) else {
+        return;
+    };
     let live = live_session_count(app, &chat_id);
     // The verdict and the bookkeeping happen under the lock; the flag and the
     // emit happen after it, so nothing downstream can re-enter this map.
@@ -324,11 +370,41 @@ fn pin_step(recorded: Option<(&str, &str, bool)>, caption: &str, written: &str) 
 /// How many live sessions the registry maps to `chat_id`, or `None` when it could
 /// not be read. Shares the registry's 5 s cache with `sync`, which runs on every
 /// emit, so this adds no directory read of its own in the steady state.
+///
+/// Counted under the **anchored** row id, because the key here is the row a title
+/// was written for while `LiveSession::chat_id` is a fresh cwd derivation, and a
+/// session that has `cd`-ed into a subdirectory disagrees with itself between the
+/// two. Matching on the raw derivation summed to zero for such a row, which reads
+/// as "not exactly one session" and made `pin_verdict` abstain for the life of
+/// that row.
+///
+/// Counted **per session id**, not per row, which `LiveSession::row_id` alone
+/// cannot do: a row is a group of records sharing one cwd, and `row_id` answers
+/// for the group by taking the first of its ids that is anchored anywhere. Where
+/// a group's members anchor to *different* rows — one session `cd`-ed in from
+/// elsewhere, sitting beside that directory's own — attributing the whole group
+/// to that one answer credits a row with sessions that are not its own and leaves
+/// the other at zero, and which way round depends on directory-read order. Both
+/// readings then miss `Some(1)` and the detector goes quiet for both rows.
 fn live_session_count(app: &AppHandle, chat_id: &str) -> Option<usize> {
     let registry = app.try_state::<crate::session_registry::SessionRegistry>()?;
     let root = app.try_state::<ConfigState>().and_then(|c| c.config.lock().unwrap().projects_root.clone());
+    let anchors = app.try_state::<crate::chat_id_registry::ChatIdRegistry>();
+    let anchored = |sid: &str| anchors.as_ref().and_then(|r| r.anchored(sid));
     let live = registry.live_sessions(root.as_deref(), crate::commands::now_ms())?;
-    Some(live.iter().filter(|s| s.chat_id == chat_id).map(|s| s.sessions).sum())
+    Some(
+        live.iter()
+            .map(|s| {
+                // An id with no anchor belongs to the row its cwd derives, which is
+                // this group's own `chat_id` — the same fallback `row_id` makes.
+                s.session_ids.iter().filter(|sid| anchored(sid).as_deref().unwrap_or(&s.chat_id) == chat_id).count()
+                    // A group whose records carry no session id at all still counts
+                    // as its derived row: `session_ids` is best-effort, `sessions`
+                    // is the record count.
+                    + if s.session_ids.is_empty() && s.chat_id == chat_id { s.sessions } else { 0 }
+            })
+            .sum(),
+    )
 }
 
 fn status_glyph(status: Status) -> &'static str {
@@ -397,11 +473,26 @@ impl TitleReading<'_> {
 ///
 /// [`names`]: TitleReading::names
 pub fn same_row(a: &str, b: &str) -> bool {
-    let (Some(a), Some(b)) = (parse_title(a), parse_title(b)) else { return false };
+    shared_label(a, b).is_some()
+}
+
+/// The longest label both titles name, or `None` when they name no common row.
+///
+/// [`same_row`] is this asked as a yes/no. It is separate because one caller
+/// needs to *rank* candidates rather than filter them: [`observe_caption`] holds
+/// one caption and every title this dashboard has written, and "does this match"
+/// cannot choose between two that do.
+///
+/// The returned label is always a token-boundary prefix of `a`'s rest, so across
+/// candidates sharing one `a` the results are prefixes of the same string and
+/// totally ordered by length — which is what makes "longest wins, refuse only an
+/// exact draw" well-defined, the same argument `attention::resolve_row` rests on.
+pub fn shared_label<'a>(a: &'a str, b: &str) -> Option<&'a str> {
+    let (Some(a), Some(b)) = (parse_title(a), parse_title(b)) else { return None };
     // Every token-boundary prefix of one title's rest, longest first, asked of
     // the other. `a.names(label)` holds by construction for each candidate, so
     // the test that matters is `b`'s.
-    std::iter::once(a.rest).chain(a.rest.rmatch_indices(' ').map(|(i, _)| &a.rest[..i])).any(|label| !label.is_empty() && b.names(label))
+    std::iter::once(a.rest).chain(a.rest.rmatch_indices(' ').map(|(i, _)| &a.rest[..i])).find(|label| !label.is_empty() && b.names(label))
 }
 
 /// Read back a title this dashboard wrote, or `None` for anything else — a
@@ -702,6 +793,41 @@ mod tests {
         // A name that is a prefix of another is the trap `names` already guards.
         assert!(!same_row("🟢 dash", "🟢 dashboard"));
         assert!(!same_row("🟢 dashboard [10%]", "🟢 dash [10%]"));
+    }
+
+    #[test]
+    fn a_caption_names_its_own_row_more_specifically_than_a_prefix_sibling() {
+        // What `observe_caption` ranks on. With a `projects_root` set, the label
+        // for `bga/assistant` is `bga assistant`, which is `same_row` with a
+        // sibling row labelled `bga` — so a yes/no answer cannot pick between
+        // them, and the first match off a HashMap picked an arbitrary one. The
+        // shared label is a token-boundary prefix of the caption in both cases,
+        // so the longer one is the row the caption actually names.
+        let caption = "🟢 bga assistant";
+        assert_eq!(shared_label(caption, "🟢 bga assistant [12%]"), Some("bga assistant"));
+        assert_eq!(shared_label(caption, "🔵 bga"), Some("bga"));
+        assert!(shared_label(caption, "🔵 bga").unwrap().len() < shared_label(caption, "🟢 bga assistant [12%]").unwrap().len());
+        // And an unrelated row still ranks nowhere at all.
+        assert_eq!(shared_label(caption, "🟢 what-is-next"), None);
+    }
+
+    #[test]
+    fn a_short_caption_draws_against_its_own_prefix_siblings_so_only_equality_separates_them() {
+        // Why `observe_caption` ranks on (byte-equal, shared length) and not on
+        // length alone. The labels here are drawn from the *caption*, so the short
+        // caption `🟢 bga` yields `bga` against both its own row's title and the
+        // longer sibling's: a permanent draw that length can never break.
+        let caption = "🟢 bga";
+        assert_eq!(shared_label(caption, "🟢 bga"), Some("bga"));
+        assert_eq!(shared_label(caption, "🔵 bga assistant [12%]"), Some("bga"));
+
+        // Refusing that draw would be the one forbidden outcome: a row already
+        // flagged stale could never reach `Pin::Following`, so its ≠ badge and its
+        // Telegram alert would outlive the process with nothing able to clear
+        // them. Byte-equality is what separates them, and it is the same test
+        // `pin_verdict` opens with.
+        assert_eq!(pin_verdict(caption, "🟢 bga", 0, GRACE_MS * 2, Some(1)), Pin::Following);
+        assert_ne!(caption, "🔵 bga assistant [12%]");
     }
 
     #[test]
