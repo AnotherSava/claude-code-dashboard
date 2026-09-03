@@ -282,7 +282,7 @@ enum Pass {
 /// no state, the two run on different threads, and sharing a
 /// `&mut dyn TerminalAdapter` between them would buy a lock for nothing.
 pub fn spawn(app: AppHandle) {
-    let Some(adapter) = crate::terminals::for_platform() else {
+    let Some(adapter) = crate::terminals::for_platform(&app) else {
         tracing::info!("no terminal adapter on this platform; sessions are not restored after a restart");
         return;
     };

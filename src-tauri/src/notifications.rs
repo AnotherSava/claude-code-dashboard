@@ -1009,6 +1009,7 @@ mod tests {
             instruction_drift: false,
             canary: crate::state::Canary::Off,
             attended_at: None,
+            name_shared_by: None,
         }
     }
 

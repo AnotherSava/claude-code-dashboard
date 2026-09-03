@@ -77,10 +77,82 @@ impl TerminalTitles {
 }
 
 /// A process can be attached to at most one console, so every
-/// free→attach→…→free dance in `push_title` must hold this lock for its whole
+/// free→attach→…→free dance in [`with_console`] must hold this lock for its whole
 /// duration or two threads would corrupt each other's console attachment.
 #[cfg(windows)]
 static ATTACH_LOCK: Mutex<()> = Mutex::new(());
+
+// Declared by hand to avoid a `windows`/`windows-sys` dep, same as
+// `auto_resize::nchittest` — these kernel32 signatures are ancient.
+// `GetConsoleTitleW` returns the length in characters, 0 on failure: judge
+// success by that length, never by `GetLastError`, which reads a stale value
+// after a call that succeeded (203 `ERROR_ENVVAR_NOT_FOUND`, observed).
+#[cfg(windows)]
+#[link(name = "kernel32")]
+extern "system" {
+    fn FreeConsole() -> i32;
+    fn AttachConsole(pid: u32) -> i32;
+    fn SetConsoleTitleW(title: *const u16) -> i32;
+    fn GetConsoleTitleW(buf: *mut u16, size: u32) -> u32;
+    fn GetConsoleWindow() -> isize;
+}
+
+#[cfg(windows)]
+const ATTACH_PARENT_PROCESS: u32 = u32::MAX;
+
+/// Run `f` attached to the console of the first candidate that will have us, and
+/// leave this process's own console attachment as it was found.
+///
+/// Shared by the writer ([`push_title`]) and the reader ([`read_title`]) because
+/// the dance is the same and the restore step is the part a second copy would
+/// drop: `FreeConsole` detaches the whole **process**, not the calling thread, so
+/// forgetting to reattach costs a `cargo tauri dev` run its console output — a
+/// failure that would show up nowhere near the copy that caused it.
+///
+/// Iteration stops at the first console successfully attached, not at the first
+/// `Some`: attaching is what identifies the right console, and what `f` then makes
+/// of it is `f`'s business.
+#[cfg(windows)]
+fn with_console<T>(candidates: impl IntoIterator<Item = u32>, f: impl Fn(u32) -> Option<T>) -> Option<T> {
+    let _guard = ATTACH_LOCK.lock().unwrap();
+    unsafe {
+        let had_console = GetConsoleWindow() != 0;
+        let mut out = None;
+        for pid in candidates {
+            FreeConsole();
+            if AttachConsole(pid) != 0 {
+                out = f(pid);
+                break;
+            }
+        }
+        FreeConsole();
+        if had_console {
+            // Dev runs (`cargo tauri dev`) start attached to the launching
+            // terminal — reattach best-effort so console output keeps a home.
+            AttachConsole(ATTACH_PARENT_PROCESS);
+        }
+        out
+    }
+}
+
+/// The title currently on `pid`'s console, or `None` when it has none, refuses
+/// the attach, or holds an empty title.
+///
+/// The read half of [`push_title`], and the Windows answer to "what is this
+/// session showing" — deliberately per *session* rather than per window. On
+/// Windows the title lives on the **console object**, one per tab, which is what
+/// this dashboard writes and what every Windows terminal merely renders; so this
+/// returns that session's own title whatever is on screen, where a terminal's
+/// window title can only ever report its active tab. Verified against seven live
+/// sessions sharing one window: seven distinct titles, order-independent.
+#[cfg(windows)]
+pub fn read_title(pid: u32) -> Option<String> {
+    with_console([pid], |_| {
+        let mut buf = [0u16; 512];
+        let len = unsafe { GetConsoleTitleW(buf.as_mut_ptr(), buf.len() as u32) } as usize;
+        (len > 0).then(|| String::from_utf16_lossy(&buf[..len]))
+    })
+}
 
 fn status_glyph(status: Status) -> &'static str {
     // Mirrors the status pill colors in SessionItem.svelte.
@@ -119,6 +191,40 @@ impl TitleReading<'_> {
     pub fn names(&self, label: &str) -> bool {
         self.rest == label || self.rest.starts_with(&format!("{label} "))
     }
+}
+
+/// Whether two tab titles this dashboard wrote name the same row.
+///
+/// The question a terminal that has no session handle of its own has to ask.
+/// agterm keys its selection on agterm's `sessionID`, so it compares two ids and
+/// is immune to anything the title does; Windows Terminal publishes only the
+/// active tab's *title*, so the Windows adapter's only key is this — and a title
+/// changes for two quite different reasons. The user switched tabs, or **we**
+/// rewrote the tab we are already on: a glyph moving `🟢 x` → `🔵 x`, the
+/// context suffix ticking `[76%]` → `[77%]`, a drift badge appearing. Calling one
+/// of ours a switch marks the row read on our own write, which hides finished
+/// work — the one direction this must never fail in.
+///
+/// It answers by looking for a label both titles would answer [`names`] for,
+/// which is why it needs no list of suffixes and cannot rot as `build_title`
+/// grows one. `rest`'s doc comment refuses a parser that strips known suffixes,
+/// and this is not one: the only structure assumed is the one `names` already
+/// assumes, that a title is a label followed by space-separated extras.
+///
+/// **It errs toward "the same row".** Two rows whose labels share a first word
+/// (`my proj`, `my other`) compare equal, so switching between them reports
+/// nothing. That is a missed observation, which leaves the row *showing* — the
+/// recoverable direction — where the opposite error hides it. A title we did not
+/// write names no row at all, so it is never the same row as anything, including
+/// another title we did not write.
+///
+/// [`names`]: TitleReading::names
+pub fn same_row(a: &str, b: &str) -> bool {
+    let (Some(a), Some(b)) = (parse_title(a), parse_title(b)) else { return false };
+    // Every token-boundary prefix of one title's rest, longest first, asked of
+    // the other. `a.names(label)` holds by construction for each candidate, so
+    // the test that matters is `b`'s.
+    std::iter::once(a.rest).chain(a.rest.rmatch_indices(' ').map(|(i, _)| &a.rest[..i])).any(|label| !label.is_empty() && b.names(label))
 }
 
 /// Read back a title this dashboard wrote, or `None` for anything else — a
@@ -262,48 +368,22 @@ pub fn sync(app: &AppHandle, sessions: &[AgentSession]) {
 /// untouched so the next sync retries.
 #[cfg(windows)]
 fn push_title(candidates: &[u32], title: &str) -> bool {
-    // Declared by hand to avoid a `windows`/`windows-sys` dep, same as
-    // `auto_resize::nchittest` — these kernel32 signatures are ancient.
-    #[link(name = "kernel32")]
-    extern "system" {
-        fn FreeConsole() -> i32;
-        fn AttachConsole(pid: u32) -> i32;
-        fn SetConsoleTitleW(title: *const u16) -> i32;
-        fn GetConsoleWindow() -> isize;
-    }
-    const ATTACH_PARENT_PROCESS: u32 = u32::MAX;
-
-    let _guard = ATTACH_LOCK.lock().unwrap();
     let wide: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
-    unsafe {
-        let had_console = GetConsoleWindow() != 0;
-        let mut ok = false;
-        // Far-to-near: the hook reports candidates ordered nearest-first
-        // (its own console processes, then parent, grandparent, …). The near
-        // end is transient per-hook processes holding a fresh *invisible*
-        // console (hooks are spawned CREATE_NO_WINDOW) — a title written
-        // there is lost. The far end is GUI ancestors (Windows Terminal,
-        // explorer) where attach simply fails. So walking from the far end,
-        // the first successful attach is the user's shell or Claude Code
-        // itself — the real terminal console. (GetConsoleWindow can't
-        // discriminate instead: conPTY consoles report no window on current
-        // Windows 11, same as invisible ones.)
-        for &pid in candidates.iter().rev() {
-            FreeConsole();
-            if AttachConsole(pid) != 0 {
-                ok = SetConsoleTitleW(wide.as_ptr()) != 0;
-                tracing::debug!(pid, ok, title, "terminal title written");
-                break;
-            }
-        }
-        FreeConsole();
-        if had_console {
-            // Dev runs (`cargo tauri dev`) start attached to the launching
-            // terminal — reattach best-effort so console output keeps a home.
-            AttachConsole(ATTACH_PARENT_PROCESS);
-        }
-        ok
-    }
+    // Far-to-near: the hook reports candidates ordered nearest-first (its own
+    // console processes, then parent, grandparent, …). The near end is transient
+    // per-hook processes holding a fresh *invisible* console (hooks are spawned
+    // CREATE_NO_WINDOW) — a title written there is lost. The far end is GUI
+    // ancestors (Windows Terminal, explorer) where attach simply fails. So
+    // walking from the far end, the first successful attach is the user's shell
+    // or Claude Code itself — the real terminal console. (GetConsoleWindow can't
+    // discriminate instead: conPTY consoles report no window on current Windows
+    // 11, same as invisible ones.)
+    with_console(candidates.iter().rev().copied(), |pid| {
+        let ok = unsafe { SetConsoleTitleW(wide.as_ptr()) } != 0;
+        tracing::debug!(pid, ok, title, "terminal title written");
+        Some(ok)
+    })
+    .unwrap_or(false)
 }
 
 /// macOS/Linux: resolve the candidate's controlling tty via `ps -o tty=` and
@@ -406,6 +486,59 @@ mod tests {
     }
 
     #[test]
+    fn every_suffix_build_title_can_append_still_names_the_same_row() {
+        // The property the Windows adapter's whole departure signal rests on, and
+        // the reason `same_row` looks for a shared label rather than stripping
+        // known suffixes: this must keep holding when `build_title` grows a
+        // seventh one, without anything here being updated.
+        let mut s = session("what-is-next", Some("m"), Some(140_000));
+        s.status = Status::Done;
+        let plain = build_title(&s, 0.0, &tokens_map());
+        let with_context = build_title(&s, 50.0, &tokens_map());
+        s.instruction_drift = true;
+        let with_both = build_title(&s, 50.0, &tokens_map());
+        s.status = Status::Working;
+        let other_glyph = build_title(&s, 50.0, &tokens_map());
+        for (a, b) in [(&plain, &with_context), (&plain, &with_both), (&with_context, &with_both), (&with_both, &other_glyph)] {
+            assert!(same_row(a, b), "{a} / {b}");
+            assert!(same_row(b, a), "and the other way round: {b} / {a}");
+        }
+    }
+
+    #[test]
+    fn our_own_rewrite_of_one_tab_is_never_a_switch() {
+        // Both measured live: a glyph moving when the user prompts the session
+        // already on screen, and the context suffix ticking while it works.
+        assert!(same_row("🟢 bga-assistant", "🔵 bga-assistant"));
+        assert!(same_row("🟢 what-is-next [76%]", "🟢 what-is-next [77%]"));
+    }
+
+    #[test]
+    fn two_different_rows_are_not_the_same_row() {
+        assert!(!same_row("🟢 transcripts", "🟢 what-is-next"));
+        // A name that is a prefix of another is the trap `names` already guards.
+        assert!(!same_row("🟢 dash", "🟢 dashboard"));
+        assert!(!same_row("🟢 dashboard [10%]", "🟢 dash [10%]"));
+    }
+
+    #[test]
+    fn a_title_we_did_not_write_is_never_the_same_row_as_anything() {
+        // Which is what makes leaving a tracked tab for a plain shell a
+        // departure, and what stops two foreign titles being confused for one row.
+        assert!(!same_row("🟢 transcripts", "powershell"));
+        assert!(!same_row("powershell", "🟢 transcripts"));
+        assert!(!same_row("powershell", "pwsh"));
+        assert!(!same_row("", ""));
+    }
+
+    #[test]
+    fn labels_sharing_a_first_word_are_treated_as_one_row() {
+        // The documented direction of error. It costs a missed observation, which
+        // leaves the row *showing*; the opposite error would hide finished work.
+        assert!(same_row("🟢 my proj", "🟢 my other"));
+    }
+
+    #[test]
     fn a_built_title_round_trips_through_the_parser() {
         // The end-to-end property `session_restore` depends on, exercised against
         // `build_title` itself rather than a hand-written string.
@@ -442,6 +575,7 @@ mod tests {
             instruction_drift: false,
             canary: crate::state::Canary::Off,
             attended_at: None,
+            name_shared_by: None,
         }
     }
 

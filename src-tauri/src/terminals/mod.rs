@@ -2,9 +2,12 @@
 //! answers.
 //!
 //! One adapter per terminal, because the answers are terminal-specific and always
-//! will be — agterm on macOS today, a different one on Windows later. An adapter's
-//! whole job is to turn whatever its terminal exposes into this module's
-//! vocabulary; everything downstream is generic and names no terminal at all.
+//! will be — agterm on macOS, Windows Terminal plus the Windows console on
+//! Windows. An adapter's whole job is to turn whatever its terminal exposes into
+//! this module's vocabulary; everything downstream is generic and names no
+//! terminal at all. The two answer the same two questions from entirely different
+//! places: agterm from a control socket and a state file, Windows from a window
+//! title and a console object.
 //!
 //! Two questions, two callers:
 //!
@@ -37,6 +40,35 @@
 
 #[cfg(target_os = "macos")]
 pub mod agterm;
+#[cfg(target_os = "windows")]
+pub mod windows;
+
+/// The instant to credit a departure to, or `None` when nobody left.
+///
+/// Shared by every adapter because both of its rules are, and a second copy of
+/// either would be a second thing to get wrong.
+///
+/// A departure is a *change* of selection: a different session is on screen now,
+/// so the user left the previous one somewhere in between. That is what marks a
+/// row read — leaving is the moment you are done with what was on screen, and
+/// reading itself produces no keystroke to observe.
+///
+/// The stamp is the **previous** reading rather than now, because the change is
+/// known only to within an interval and crediting it to `now` would mark a row
+/// that finished *during* that interval as read by a departure that came before
+/// it. A first observation is deliberately not a departure — at startup every
+/// window's selection is new to us, and there is no earlier session to have left.
+///
+/// The selection key is the adapter's own and the adapters do not agree on what
+/// it is, which is why `same_selection` is a parameter rather than `==`. agterm
+/// keys on agterm's session id, a stable handle that says nothing about titles;
+/// Windows Terminal publishes no handle at all, so its adapter keys on the tab
+/// title and has to ask `terminal_title::same_row` whether two of them mean one
+/// row. Both keys are strings and neither is a dashboard row id.
+pub fn departure_stamp(previous: Option<&str>, current: &str, same_selection: impl Fn(&str, &str) -> bool, last_reading_at: Option<i64>, now_ms: i64) -> Option<i64> {
+    let switched = previous.is_some_and(|p| !same_selection(p, current));
+    switched.then(|| last_reading_at.unwrap_or(now_ms))
+}
 
 /// A terminal session as its *terminal* names it — the two handles every terminal
 /// has, and the only ones `attention::resolve_row` needs to find a row.
@@ -53,10 +85,10 @@ pub struct TerminalSession {
 /// What the user was observed doing.
 ///
 /// `dead_code` is allowed because this is the seam's vocabulary, not one
-/// terminal's: on a platform whose adapter is not written yet — Windows today —
-/// nothing constructs these, and that is the expected state rather than a defect.
-/// Deleting them to silence it would delete the interface the next adapter
-/// implements.
+/// terminal's: on a platform whose adapter is not written — Linux, where
+/// [`for_platform`] answers `None` — nothing constructs these, and that is the
+/// expected state rather than a defect. Deleting them to silence it would delete
+/// the interface the next adapter implements.
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ObservationKind {
@@ -143,17 +175,23 @@ pub trait TerminalAdapter: Send {
 
 /// The adapter for this platform, or `None` where no terminal is wired up.
 ///
-/// Windows has no adapter yet: its terminal is a different program with a
-/// different way of exposing the selected tab, and guessing at one would be worse
-/// than the honest gap — a row read there simply stays `Done` until its next turn,
-/// which is the safe direction.
-pub fn for_platform() -> Option<Box<dyn TerminalAdapter>> {
+/// `app` is taken because an adapter may need state this process already holds:
+/// the Windows one reads `SessionRegistry`, whose whole design is that one cache
+/// serves every reader, so constructing a second would double the directory reads
+/// and the process-table snapshots it exists to share.
+pub fn for_platform(app: &tauri::AppHandle) -> Option<Box<dyn TerminalAdapter>> {
     #[cfg(target_os = "macos")]
     {
+        let _ = app;
         Some(Box::new(agterm::AgtermAdapter::default()))
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
     {
+        Some(Box::new(windows::WindowsAdapter::new(app.clone())))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let _ = app;
         None
     }
 }

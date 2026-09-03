@@ -153,7 +153,10 @@ impl TerminalAdapter for AgtermAdapter {
             };
             let previous = self.last_selected.insert(window.clone(), reading.session_id.clone());
             let reading = with_departed(reading, &tree, previous.as_deref());
-            let outcome = match departure_stamp(previous.as_deref(), &reading.session_id, self.last_poll_at, now_ms) {
+            // agterm hands out a stable session id, so identity is plain
+            // equality here — unlike the Windows adapter, which has only titles
+            // to compare. See `terminals::departure_stamp`.
+            let outcome = match super::departure_stamp(previous.as_deref(), &reading.session_id, |a: &str, b: &str| a == b, self.last_poll_at, now_ms) {
                 Some(at_ms) => {
                     // The row the user *left*, which is the one they were reading —
                     // not the one they arrived at.
@@ -374,23 +377,6 @@ pub fn with_departed(mut reading: Reading, tree: &serde_json::Value, previous_id
     reading
 }
 
-/// The instant to credit a departure to, or `None` when nobody left.
-///
-/// A departure is a *change* of selection: a different session is on screen now,
-/// so the user left the previous one somewhere in between. That is what marks a
-/// row read — leaving is the moment you are done with what was on screen, and
-/// reading itself produces no keystroke to observe.
-///
-/// The stamp is the **previous** poll rather than now, because the change is known
-/// only to within a poll interval and crediting it to `now` would mark a row that
-/// finished *during* that interval as read by a departure that came before it. A
-/// first observation is deliberately not a departure — at startup every window's
-/// selection is new to us, and there is no earlier session to have left.
-pub fn departure_stamp(previous: Option<&str>, now_selected: &str, last_poll_at: Option<i64>, now_ms: i64) -> Option<i64> {
-    let switched = previous.is_some_and(|p| p != now_selected);
-    switched.then(|| last_poll_at.unwrap_or(now_ms))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -496,22 +482,37 @@ mod tests {
         assert_eq!(r.departed.title.as_deref(), Some("🔵 two"));
     }
 
+    /// The shared rules, exercised through the key *this* adapter uses — agterm's
+    /// own session id under plain equality. `terminals::departure_stamp` owns
+    /// them; this pins that the call site passes them what it means to.
+    fn stamp(previous: Option<&str>, current: &str, last: Option<i64>, now: i64) -> Option<i64> {
+        super::super::departure_stamp(previous, current, |a: &str, b: &str| a == b, last, now)
+    }
+
     #[test]
     fn leaving_a_tab_is_credited_to_the_previous_poll() {
         // Known only to within an interval, so crediting `now` would mark a row
         // that finished *during* it as read by a departure that predated it.
-        assert_eq!(departure_stamp(Some("S1"), "S2", Some(1_000), 6_000), Some(1_000));
+        assert_eq!(stamp(Some("S1"), "S2", Some(1_000), 6_000), Some(1_000));
     }
 
     #[test]
     fn staying_on_one_tab_is_not_a_departure() {
-        assert_eq!(departure_stamp(Some("S2"), "S2", Some(1_000), 6_000), None);
+        assert_eq!(stamp(Some("S2"), "S2", Some(1_000), 6_000), None);
     }
 
     #[test]
     fn the_first_sight_of_a_window_is_not_a_departure() {
         // At startup every selection is new to us and there is no earlier session
         // to have left; calling it one would mark whatever is on screen as read.
-        assert_eq!(departure_stamp(None, "S2", Some(1_000), 6_000), None);
+        assert_eq!(stamp(None, "S2", Some(1_000), 6_000), None);
+    }
+
+    #[test]
+    fn two_agterm_tabs_of_one_project_are_two_selections() {
+        // Why the key is agterm's session id and not a row id: several sessions
+        // can share one dashboard row, and switching between them is a real
+        // departure from the first.
+        assert_eq!(stamp(Some("S1"), "S2", Some(1_000), 6_000), Some(1_000));
     }
 }

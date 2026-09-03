@@ -50,7 +50,7 @@ It runs once, at start-up — retrying for a minute in case your terminal is sti
 
 Two things stay quiet on purpose. A session that was mid-task when the widget went down only comes back as working if it really is still working — otherwise it comes back idle rather than claiming a task that may have finished while the widget was away. And nothing that comes back this way sends you a notification: it is a state from before, and you were already told about it at the time.
 
-On macOS with agterm. On Windows the widget still starts empty for now, until its terminals are supported. On by default; see [Settings](settings#behavior).
+On macOS with agterm, and on Windows. On by default; see [Settings](settings#behavior).
 
 ## Focus on the task
 
@@ -68,9 +68,11 @@ Several of these rules are tunable — see [Settings](settings) — and the full
 
 DONE means more than "finished" — it means **finished, and you haven't looked yet**. Once you read a session's result, its row drops to IDLE, because there is nothing left there that wants you. So the rows still showing DONE are exactly the ones with something waiting, and a glance at the widget is a to-do list rather than a history.
 
-Reading is all it takes, and you don't have to type anything: opening the row's history counts, and on macOS with agterm so does *leaving* that session's terminal tab — switching away is the moment you're done with what was on screen, so that's when it counts. Because the terminal tab already shows 🟢 for done and ⚪ for idle, the distinction shows up there too without any extra marker. Start the agent on something new and it goes back to DONE when it finishes, since there's a fresh answer waiting.
+Reading is all it takes, and you don't have to type anything: opening the row's history counts, and so does *leaving* that session's terminal tab — switching away is the moment you're done with what was on screen, so that's when it counts. That last part needs a terminal the widget can follow: agterm on macOS, Windows Terminal on Windows. Because the terminal tab already shows 🟢 for done and ⚪ for idle, the distinction shows up there too without any extra marker. Start the agent on something new and it goes back to DONE when it finishes, since there's a fresh answer waiting.
 
 This is deliberately not the same question as "are you at your desk". You can be typing away all afternoon in one session while another has sat finished and unopened since lunch — that one still wants you, and only a per-session answer can say so. On by default; see [Settings](settings#behavior).
+
+Occasionally two agents end up answering to the same name — two projects in folders named alike, or two sessions started in one folder. Their terminal tabs then read the same, so the widget marks the row with a small **×2** after the name. It is worth knowing about: a row in that state may be mixing two conversations, and the dashboard can no longer tell which of them you looked at. Giving one of them a different name, by double-clicking it, separates them again.
 
 ## Instruction adherence
 

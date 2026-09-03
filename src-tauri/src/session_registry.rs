@@ -321,6 +321,26 @@ impl SessionRegistry {
         Self::refresh(&mut cached, now).map(|recs| live_rows(recs, projects_root, now))
     }
 
+    /// Every live interactive session as a `(pid, cwd)` pair — one entry per
+    /// *record*, not per row.
+    ///
+    /// The one reading that does not collapse a shared cwd, and deliberately so.
+    /// Its caller is the Windows terminal adapter's `sessions()`, where a pid is
+    /// how a console is addressed and the cwd is what `session_restore::plan`
+    /// matches a row against; collapsing here would hand that caller one console
+    /// to read where two exist, and it would restore a fork migration's row from
+    /// whichever of the two happened to be titled. Two entries instead let
+    /// `title_status` do what it already does on macOS with two tabs — restore
+    /// when they agree, refuse when they disagree.
+    ///
+    /// `None` versus `Some(vec![])` carries the same weight as in
+    /// [`live_sessions`](Self::live_sessions): could not look, versus nothing
+    /// running.
+    pub fn live_records(&self, now: i64) -> Option<Vec<(u32, String)>> {
+        let mut cached = self.cached.lock().unwrap();
+        Self::refresh(&mut cached, now).map(|recs| recs.iter().map(|r| (r.pid, r.cwd.clone())).collect())
+    }
+
     /// Where a cross-machine message for `chat_id` must be written, or why it
     /// cannot be. Shares the same 5 s cache as the other two readings, so a
     /// message delivery costs no extra directory read and no extra

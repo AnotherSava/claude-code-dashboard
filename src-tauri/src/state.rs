@@ -201,6 +201,32 @@ pub struct AgentSession {
     /// remote row's timestamps are the sender's clock.
     #[serde(skip)]
     pub attended_at: Option<i64>,
+    /// How many things on this machine answer to this row's *name*. `1` is the
+    /// ordinary case; anything above it means several terminal tabs carry the same
+    /// caption, which is what the row's warning marker reports.
+    ///
+    /// Each local row sharing this row's display label counts at least once, and a
+    /// row that several live sessions derive counts once per session. That covers
+    /// both ways of arriving here with one number: a directory basename collision
+    /// or a `--fork-session --resume` migration puts two sessions under one row,
+    /// while two rows renamed alike put one under each. Reporting them separately
+    /// would be two fields for one question — and the floor of one per row is what
+    /// keeps this in step with `attention::resolve_row`, which refuses two
+    /// identically labelled rows whether or not the registry sees a session behind
+    /// either.
+    ///
+    /// `None` means not established, and is the honest answer in three cases: a
+    /// remote row (this device does not run that machine's sessions), an
+    /// unreadable session registry, and a build where `SessionRegistry` is not
+    /// managed. It is deliberately not folded into `Some(1)`, which would assert
+    /// a uniqueness nothing checked.
+    ///
+    /// Stamped at emit time by `commands::resolved_snapshot`, like
+    /// [`AgentSession::canary`], so `AppState` never holds it and it is always
+    /// `None` in the sync push (which reads raw `AppState`) — a peer's count would
+    /// be about that machine's tabs anyway.
+    #[serde(default)]
+    pub name_shared_by: Option<usize>,
 }
 
 impl AgentSession {
@@ -617,6 +643,7 @@ fn new_session(
         instruction_drift: false,
         canary: Canary::Off,
         attended_at: None,
+        name_shared_by: None,
     };
     (session, has_new_entry || dialog_restored)
 }
@@ -1807,6 +1834,7 @@ mod tests {
             instruction_drift: false,
             canary: Canary::Off,
             attended_at: None,
+            name_shared_by: None,
         });
     }
 
@@ -2073,6 +2101,7 @@ mod tests {
             instruction_drift: false,
             canary: Canary::Off,
             attended_at: None,
+            name_shared_by: None,
         }
     }
 

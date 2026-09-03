@@ -101,6 +101,49 @@ pub fn should_poll(sessions: &[AgentSession]) -> bool {
     sessions.iter().any(|s| s.origin.is_none() && s.attention() == Attention::Pending)
 }
 
+/// This machine's rows, with their display names resolved.
+///
+/// The resolution is not a nicety here, it is the difference between the sensor
+/// working and doing nothing at all for a renamed row. [`resolve_row`] matches a
+/// tab title against `AgentSession::display_label`, and the title it is matching
+/// was *written* from a snapshot whose names were already resolved
+/// (`terminal_title::sync` runs inside `commands::emit_sessions_updated`) — so a
+/// row the user renamed carries `bga-assistant` on its tab and `assistant` in the
+/// raw `AppState`, and the two never meet. Caught in production the day the
+/// Windows adapter first ran: a real departure logged `no_target`, which is
+/// exactly what a sensor looks like when it is quietly broken.
+///
+/// It goes through `CustomNamesStore::apply` — the same single resolution point
+/// the emit path and the notification path use — rather than
+/// `commands::resolved_snapshot`, which would also merge in the remote rows
+/// [`resolve_row`] then has to filter back out.
+fn local_rows(app: &AppHandle) -> Vec<AgentSession> {
+    let Some(state) = app.try_state::<AppState>() else { return Vec::new() };
+    let mut sessions = state.snapshot();
+    if let Some(names) = app.try_state::<crate::custom_names::CustomNamesStore>() {
+        names.apply(&mut sessions);
+    }
+    sessions
+}
+
+/// Which local row a terminal observation names, or why none.
+///
+/// Three answers rather than an `Option`, because a caller explaining itself in
+/// `widget.jsonl` needs to tell "that tab belongs to nobody here" apart from "two
+/// rows answer to that name and I will not guess" — the second is a sensor that
+/// is structurally dead for those rows, and logging it as the first would hide
+/// that behind the ordinary case.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Resolved {
+    Row(String),
+    /// This many local rows carry the *same* label, so the title names all of
+    /// them equally. Only ever reached by rows labelled identically — see
+    /// [`resolve_row`].
+    Ambiguous(usize),
+    /// Nothing here names a row.
+    Unknown,
+}
+
 /// Which local row a terminal session is, given how its terminal names it.
 ///
 /// The title is preferred over the working directory, and that ordering is the
@@ -114,16 +157,52 @@ pub fn should_poll(sessions: &[AgentSession]) -> bool {
 ///
 /// Falls back to the cwd join when no title is recognizable — `terminal_titles`
 /// can be off, and a session can predate the dashboard writing to it — and
-/// answers `None` rather than guessing when neither resolves.
-pub fn resolve_row(session: &TerminalSession, sessions: &[AgentSession], projects_root: Option<&str>) -> Option<String> {
+/// answers [`Resolved::Unknown`] rather than guessing when neither resolves.
+///
+/// **The longest matching label wins, and only an exact draw is refused.**
+/// `TitleReading::names` is a token-boundary prefix match, so with a
+/// `projects_root` set — which turns `bga/assistant` into the label
+/// `bga assistant` — the title `🟢 bga assistant` is named by *both* a row
+/// labelled `bga` and its subproject row. Taking the first match, as this did,
+/// marks whichever row `AppState` happens to hold first as read: the wrong row,
+/// hiding unread work, and dependent on insertion order so it can flip between
+/// emits. Refusing every such collision would be no better — it would kill the
+/// subproject row's sensor permanently, since its label never stops being
+/// prefixed. Every match here is a prefix of the *same* string, and prefixes are
+/// totally ordered by length, so the longest is unique unless two rows carry a
+/// literally identical label — which is the only genuinely unanswerable case and
+/// the only one refused.
+///
+/// A refusal is a hard stop rather than a fall-through to the cwd, because
+/// dropping to the working directory is exactly the hazard the title-first
+/// ordering above exists to close.
+pub fn resolve_row(session: &TerminalSession, sessions: &[AgentSession], projects_root: Option<&str>) -> Resolved {
     if let Some(reading) = session.title.as_deref().and_then(crate::terminal_title::parse_title) {
-        if let Some(s) = sessions.iter().filter(|s| s.origin.is_none()).find(|s| reading.names(s.display_label())) {
-            return Some(s.id.clone());
+        let mut best: Option<&AgentSession> = None;
+        let mut drawn = 1;
+        for s in sessions.iter().filter(|s| s.origin.is_none()) {
+            let label = s.display_label();
+            if !reading.names(label) {
+                continue;
+            }
+            match best {
+                Some(b) if b.display_label().len() > label.len() => {}
+                Some(b) if b.display_label().len() == label.len() => drawn += 1,
+                _ => (best, drawn) = (Some(s), 1),
+            }
+        }
+        if let Some(s) = best {
+            return if drawn > 1 { Resolved::Ambiguous(drawn) } else { Resolved::Row(s.id.clone()) };
         }
     }
-    let cwd = session.cwd.as_deref()?;
+    let Some(cwd) = session.cwd.as_deref() else { return Resolved::Unknown };
     let derived = crate::adapters::claude::derive_chat_id(Some(cwd), projects_root);
-    sessions.iter().find(|s| s.origin.is_none() && s.id == derived).map(|s| s.id.clone())
+    // A row id is unique by construction, so this join matches at most one row
+    // and needs no tie-break of its own.
+    match sessions.iter().find(|s| s.origin.is_none() && s.id == derived) {
+        Some(s) => Resolved::Row(s.id.clone()),
+        None => Resolved::Unknown,
+    }
 }
 
 /// Start the sensor: a tick that asks this platform's terminal adapter what the
@@ -136,7 +215,7 @@ pub fn resolve_row(session: &TerminalSession, sessions: &[AgentSession], project
 /// hook handler and inside the watcher thread and has no business waiting on a
 /// terminal.
 pub fn spawn(app: AppHandle) {
-    let Some(mut adapter) = crate::terminals::for_platform() else { return };
+    let Some(mut adapter) = crate::terminals::for_platform(&app) else { return };
     let terminal = adapter.name();
 
     // The push half. A terminal that can be watched reports a departure the
@@ -148,9 +227,8 @@ pub fn spawn(app: AppHandle) {
     let watched = app.clone();
     std::thread::spawn(move || {
         while let Ok(observation) = rx.recv() {
-            let Some(state) = watched.try_state::<AppState>() else { continue };
             let projects_root = watched.try_state::<crate::config::ConfigState>().and_then(|c| c.config.lock().unwrap().projects_root.clone());
-            apply(&watched, &state.snapshot(), terminal, &observation, projects_root.as_deref());
+            apply(&watched, &local_rows(&watched), terminal, &observation, projects_root.as_deref());
         }
     });
 
@@ -169,8 +247,7 @@ fn tick(app: &AppHandle, adapter: &mut dyn crate::terminals::TerminalAdapter) {
     if !app.try_state::<crate::config::ConfigState>().is_some_and(|c| c.config.lock().unwrap().attention_tracking) {
         return;
     }
-    let Some(state) = app.try_state::<AppState>() else { return };
-    let sessions = state.snapshot();
+    let sessions = local_rows(app);
     if !should_poll(&sessions) {
         return;
     }
@@ -186,16 +263,31 @@ fn tick(app: &AppHandle, adapter: &mut dyn crate::terminals::TerminalAdapter) {
 /// Split out from [`tick`] and taking the sessions it judges against, so the
 /// resolution half is testable without a terminal or an `AppHandle`.
 fn apply(app: &AppHandle, sessions: &[AgentSession], terminal: &'static str, observation: &Observation, projects_root: Option<&str>) {
-    let Some(id) = resolve_row(&observation.session, sessions, projects_root) else {
-        tracing::debug!(
-            decision = "attention_poll",
-            terminal,
-            outcome = "no_target",
-            kind = ?observation.kind,
-            title = ?observation.session.title,
-            "the terminal named a session matching no row"
-        );
-        return;
+    let id = match resolve_row(&observation.session, sessions, projects_root) {
+        Resolved::Row(id) => id,
+        Resolved::Ambiguous(rows) => {
+            tracing::debug!(
+                decision = "attention_poll",
+                terminal,
+                outcome = "ambiguous_title",
+                rows,
+                kind = ?observation.kind,
+                title = ?observation.session.title,
+                "several rows carry this exact name, so the tab names all of them equally"
+            );
+            return;
+        }
+        Resolved::Unknown => {
+            tracing::debug!(
+                decision = "attention_poll",
+                terminal,
+                outcome = "no_target",
+                kind = ?observation.kind,
+                title = ?observation.session.title,
+                "the terminal named a session matching no row"
+            );
+            return;
+        }
     };
     observe(app, &id, observation.at_ms, observation.kind.into());
 }
@@ -256,6 +348,16 @@ mod tests {
         TerminalSession { title: title.map(str::to_string), cwd: cwd.map(str::to_string) }
     }
 
+    /// The id [`resolve_row`] settled on, for the cases that only care that one
+    /// row was named. The tests that care *why* nothing was named assert on
+    /// [`Resolved`] directly.
+    fn row_of(session: &TerminalSession, sessions: &[AgentSession], projects_root: Option<&str>) -> Option<String> {
+        match resolve_row(session, sessions, projects_root) {
+            Resolved::Row(id) => Some(id),
+            _ => None,
+        }
+    }
+
     #[test]
     fn the_title_names_the_row_and_outranks_the_working_directory() {
         // The hazard this ordering exists for: a session that `cd`-ed into a
@@ -263,7 +365,7 @@ mod tests {
         // that row would mark unread work as read.
         let sessions = vec![row("dash", Status::Done, 0, None), row("sub", Status::Done, 0, None)];
         let s = named(Some("🟢 dash"), Some("/p/dash/sub"));
-        assert_eq!(resolve_row(&s, &sessions, None).as_deref(), Some("dash"), "the title wins over the misleading cwd");
+        assert_eq!(row_of(&s, &sessions, None).as_deref(), Some("dash"), "the title wins over the misleading cwd");
     }
 
     #[test]
@@ -272,15 +374,56 @@ mod tests {
         // have to learn every suffix it grows later.
         let sessions = vec![row("dash", Status::Done, 0, None)];
         for title in ["🟢 dash", "🟢 dash [62%]", "🟢 dash ⚠", "🟢 dash [62%] ⚠"] {
-            assert_eq!(resolve_row(&named(Some(title), None), &sessions, None).as_deref(), Some("dash"), "{title}");
+            assert_eq!(row_of(&named(Some(title), None), &sessions, None).as_deref(), Some("dash"), "{title}");
         }
     }
 
     #[test]
     fn a_name_that_is_a_prefix_of_another_is_not_confused_for_it() {
         let sessions = vec![row("dash", Status::Done, 0, None), row("dashboard", Status::Done, 0, None)];
-        assert_eq!(resolve_row(&named(Some("🟢 dashboard"), None), &sessions, None).as_deref(), Some("dashboard"));
-        assert_eq!(resolve_row(&named(Some("🟢 dash"), None), &sessions, None).as_deref(), Some("dash"));
+        assert_eq!(row_of(&named(Some("🟢 dashboard"), None), &sessions, None).as_deref(), Some("dashboard"));
+        assert_eq!(row_of(&named(Some("🟢 dash"), None), &sessions, None).as_deref(), Some("dash"));
+    }
+
+    #[test]
+    fn a_name_a_whole_word_longer_goes_to_the_longer_row() {
+        // The collision `names`' token-boundary rule really does admit, and the
+        // one a `projects_root` produces: `bga/assistant` becomes the label
+        // `bga assistant`, which the sibling row `bga` also names. Taking the
+        // first match marked whichever row `AppState` held first — the wrong row,
+        // hiding unread work, and dependent on insertion order.
+        let deep = || row("bga assistant", Status::Done, 0, None);
+        let shallow = || row("bga", Status::Done, 0, None);
+        for sessions in [vec![shallow(), deep()], vec![deep(), shallow()]] {
+            assert_eq!(row_of(&named(Some("🟢 bga assistant"), None), &sessions, None).as_deref(), Some("bga assistant"));
+            assert_eq!(row_of(&named(Some("🟢 bga assistant [62%]"), None), &sessions, None).as_deref(), Some("bga assistant"), "and through a suffix");
+            // The shallow row is still perfectly resolvable from its own tab.
+            assert_eq!(row_of(&named(Some("🟢 bga"), None), &sessions, None).as_deref(), Some("bga"));
+        }
+    }
+
+    #[test]
+    fn two_rows_named_exactly_alike_are_refused_rather_than_guessed_between() {
+        // The residue longest-match cannot settle, because the labels are the
+        // same string: `custom_names::set` enforces no uniqueness. Refusing marks
+        // neither, which leaves both rows *showing* — the recoverable direction.
+        let mut a = row("one", Status::Done, 0, None);
+        let mut b = row("two", Status::Done, 0, None);
+        a.display_name = Some("web".into());
+        b.display_name = Some("web".into());
+        assert_eq!(resolve_row(&named(Some("🟢 web"), None), &[a, b], None), Resolved::Ambiguous(2));
+    }
+
+    #[test]
+    fn a_refused_title_does_not_fall_through_to_the_working_directory() {
+        // Dropping to the cwd here would re-open the exact hazard the
+        // title-first ordering exists to close, and would resolve the tie by
+        // picking the row the ambiguous title was never able to name.
+        let mut a = row("one", Status::Done, 0, None);
+        let mut b = row("two", Status::Done, 0, None);
+        a.display_name = Some("web".into());
+        b.display_name = Some("web".into());
+        assert_eq!(resolve_row(&named(Some("🟢 web"), Some("/p/one")), &[a, b], None), Resolved::Ambiguous(2));
     }
 
     #[test]
@@ -288,13 +431,27 @@ mod tests {
         // `terminal_titles` can be off, and a session can predate the dashboard
         // ever writing to that tab.
         let sessions = vec![row("dash", Status::Done, 0, None)];
-        assert_eq!(resolve_row(&named(None, Some("/p/dash")), &sessions, None).as_deref(), Some("dash"));
+        assert_eq!(row_of(&named(None, Some("/p/dash")), &sessions, None).as_deref(), Some("dash"));
+    }
+
+    #[test]
+    fn a_renamed_row_is_named_by_the_name_on_its_tab() {
+        // A tab carries the *display* name, because that is what `build_title`
+        // wrote there; the raw `AppState` row carries only its chat_id. This is
+        // the invariant `local_rows` exists to hold up — the second half is the
+        // production failure it was written for, where a real departure from
+        // `🟢 bga-assistant` logged `no_target` against a row called `assistant`.
+        let mut renamed = row("assistant", Status::Done, 0, None);
+        renamed.display_name = Some("bga-assistant".into());
+        assert_eq!(row_of(&named(Some("🟢 bga-assistant"), None), &[renamed], None).as_deref(), Some("assistant"));
+        let unresolved = row("assistant", Status::Done, 0, None);
+        assert_eq!(row_of(&named(Some("🟢 bga-assistant"), None), &[unresolved], None), None, "an unresolved snapshot cannot recognize its own tab");
     }
 
     #[test]
     fn an_unmatchable_session_resolves_to_nothing() {
         let sessions = vec![row("dash", Status::Done, 0, None)];
-        assert_eq!(resolve_row(&named(Some("🟢 stranger"), Some("/p/elsewhere")), &sessions, None), None, "no row is better than the wrong row");
+        assert_eq!(row_of(&named(Some("🟢 stranger"), Some("/p/elsewhere")), &sessions, None), None, "no row is better than the wrong row");
     }
 
     #[test]
@@ -303,7 +460,7 @@ mod tests {
         // are not ours to mark read.
         let mut remote = row("dash", Status::Done, 0, None);
         remote.origin = Some("chrome".into());
-        assert_eq!(resolve_row(&named(Some("🟢 dash"), Some("/p/dash")), &[remote], None), None);
+        assert_eq!(row_of(&named(Some("🟢 dash"), Some("/p/dash")), &[remote], None), None);
     }
 
     #[test]
