@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use crate::config::{Config, ConfigState};
 use crate::custom_names::CustomNamesStore;
 use crate::log_watcher::WatcherRegistry;
@@ -48,7 +50,73 @@ pub(crate) fn resolved_snapshot(app: &AppHandle) -> Vec<AgentSession> {
             };
         }
     }
+    stamp_name_sharing(app, &mut sessions);
     sessions
+}
+
+/// Count how many live sessions answer to each local row's *name*, for
+/// [`AgentSession::name_shared_by`].
+///
+/// Must run after the custom names are applied, since the name in question is
+/// `display_label` — what `terminal_title::build_title` puts on the tab, and
+/// therefore the string two tabs can end up sharing.
+///
+/// Two sources, one number, because both produce the same thing: identically
+/// captioned tabs. Several sessions can derive **one** row — a
+/// `--fork-session --resume` migration, or, with `projects_root` unset, two
+/// projects whose directory basenames match — and `terminal_title::sync` titles
+/// whichever of them fired the last hook, so both tabs end up carrying that one
+/// row's caption. Separately, two **rows** can be renamed alike, which
+/// `custom_names::set` does not prevent. Summing the per-row counts across a
+/// shared label covers both without asking which happened.
+///
+/// This is what `attention::resolve_row` is up against, and it is worth more than
+/// the attention gap: everything keyed on a row id is guessing which conversation
+/// it means — the transcript watcher restarts on whichever session spoke last,
+/// the dialogs interleave, `tab_pid` and `inbox_for` refuse, and the liveness
+/// reaper can drop a row a live session still holds.
+fn stamp_name_sharing(app: &AppHandle, sessions: &mut [AgentSession]) {
+    let Some(registry) = app.try_state::<crate::session_registry::SessionRegistry>() else { return };
+    // The config guard is taken and released before the registry call:
+    // `SessionRegistry::refresh` does a directory read plus a full process
+    // enumeration on a cache miss, and holding `ConfigState` across that would
+    // put `config_watcher` behind blocking I/O.
+    let root = app.try_state::<ConfigState>().and_then(|c| c.config.lock().unwrap().projects_root.clone());
+    let anchors = app.try_state::<crate::chat_id_registry::ChatIdRegistry>();
+    let anchored = |sid: &str| anchors.as_ref().and_then(|r| r.anchored(sid));
+    // Unreadable stays unreadable: leaving every row `None` says "not
+    // established", where writing 1 everywhere would assert a uniqueness nothing
+    // checked.
+    let Some(live) = registry.live_sessions(root.as_deref(), now_ms()) else { return };
+    // Keyed by the *anchored* row id, the same resolution `agent_roster` and
+    // `session_restore` perform: a `cd`-ed session derives another row's id, and
+    // counting under the raw derivation files it against a row it is not in.
+    let mut per_row: HashMap<String, usize> = HashMap::new();
+    for s in &live {
+        *per_row.entry(s.row_id(&anchored)).or_default() += s.sessions;
+    }
+    let per_name = name_counts(sessions, &per_row);
+    for s in sessions.iter_mut().filter(|s| s.origin.is_none()) {
+        let shared = per_name.get(s.display_label()).copied();
+        s.name_shared_by = shared;
+    }
+}
+
+/// How many things answer to each local row's display label, given how many live
+/// sessions the registry maps to each row.
+///
+/// Pure, because the floor is the subtle part: **a row counts at least once even
+/// where the registry knows no session for it**. That is what keeps the number in
+/// step with `attention::resolve_row`, which refuses two rows sharing a label
+/// whether or not either has a live session behind it. Summing bare session counts
+/// would leave the marker silent on exactly the rows the sensor had already given
+/// up on — a warning that lies by staying quiet, which is worse than no warning.
+fn name_counts(sessions: &[AgentSession], per_row: &HashMap<String, usize>) -> HashMap<String, usize> {
+    let mut per_name: HashMap<String, usize> = HashMap::new();
+    for s in sessions.iter().filter(|s| s.origin.is_none()) {
+        *per_name.entry(s.display_label().to_string()).or_default() += per_row.get(&s.id).copied().unwrap_or(0).max(1);
+    }
+    per_name
 }
 
 /// The snapshot everything the *user* looks at is built from: [`resolved_snapshot`]
@@ -1166,6 +1234,68 @@ pub fn get_persisted_dialog(id: String, app: AppHandle) -> Vec<crate::state::Dia
 mod tests {
     use super::*;
     use crate::state::{DialogEntry, DialogRole};
+
+    /// `name_counts` keyed by the row id, which is what the caller then reads
+    /// through each row's label — the shape the assertions care about.
+    fn shared(rows: &[AgentSession], per_row: &[(&str, usize)]) -> Vec<usize> {
+        let per_row: HashMap<String, usize> = per_row.iter().map(|(id, n)| ((*id).to_string(), *n)).collect();
+        let counts = name_counts(rows, &per_row);
+        rows.iter().map(|s| counts.get(s.display_label()).copied().unwrap_or(0)).collect()
+    }
+
+    fn named_row(id: &str, display_name: Option<&str>) -> AgentSession {
+        let mut s = row(id, Status::Done, 0, None);
+        s.display_name = display_name.map(str::to_string);
+        s
+    }
+
+    #[test]
+    fn a_row_of_its_own_answers_to_its_name_once() {
+        assert_eq!(shared(&[named_row("dash", None)], &[("dash", 1)]), vec![1]);
+    }
+
+    #[test]
+    fn two_sessions_under_one_row_are_two_tabs_with_one_caption() {
+        // A `--fork-session --resume` migration, or two projects whose directory
+        // basenames match with `projects_root` unset.
+        assert_eq!(shared(&[named_row("web", None)], &[("web", 2)]), vec![2]);
+    }
+
+    #[test]
+    fn two_rows_renamed_alike_both_report_the_collision() {
+        // The harm lands on whichever row is resolved second, so neither may be
+        // left looking clean.
+        let rows = [named_row("one", Some("web")), named_row("two", Some("web"))];
+        assert_eq!(shared(&rows, &[("one", 1), ("two", 1)]), vec![2, 2]);
+    }
+
+    #[test]
+    fn a_row_the_registry_knows_nothing_about_still_counts_itself() {
+        // The floor, and the reason for it: `attention::resolve_row` refuses these
+        // two rows whether or not a live session sits behind either, so a count
+        // that summed bare session numbers would read `1` — silent — on exactly
+        // the rows whose sensor had already given up.
+        let rows = [named_row("one", Some("web")), named_row("two", Some("web"))];
+        assert_eq!(shared(&rows, &[("one", 1)]), vec![2, 2], "the second row has no registry session");
+        assert_eq!(shared(&rows, &[]), vec![2, 2], "and neither does the first");
+    }
+
+    #[test]
+    fn distinct_names_never_report_sharing() {
+        let rows = [named_row("dash", None), named_row("printlab", None), named_row("assistant", Some("bga-assistant"))];
+        assert_eq!(shared(&rows, &[("dash", 1), ("printlab", 1), ("assistant", 1)]), vec![1, 1, 1]);
+    }
+
+    #[test]
+    fn a_remote_row_neither_counts_nor_is_counted() {
+        // Attention and tab captions are about this machine; a peer's row shares
+        // nothing with a local one even when the names match.
+        let mut remote = named_row("web", None);
+        remote.origin = Some("chrome".into());
+        remote.id = "chrome/web".into();
+        let rows = [named_row("web", None), remote];
+        assert_eq!(shared(&rows, &[("web", 1)])[0], 1);
+    }
 
     fn row(id: &str, status: Status, state_entered_at: i64, attended_at: Option<i64>) -> AgentSession {
         let state = AppState::new();

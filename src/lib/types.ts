@@ -42,6 +42,12 @@ export interface AgentSession {
   // set up but not yet confirmed — the marker hasn't been observed, so aliveness is
   // unknown (amber), 'off' = not set up (default). Absent for rows from older backends.
   canary?: 'off' | 'pending' | 'alive' | 'dead'
+  // How many live sessions on this machine answer to this row's name. 1 is the
+  // ordinary case; above 1 means several terminal tabs carry the same caption, so
+  // the dashboard cannot tell them apart and this row may be merging more than one
+  // conversation. null/absent means not established — a remote row, an unreadable
+  // session registry, or an older backend — and must not be read as "unique".
+  name_shared_by?: number | null
 }
 
 export interface UsageColors {

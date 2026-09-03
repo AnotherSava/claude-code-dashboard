@@ -146,6 +146,11 @@
   const shouldPulse = $derived(session.status === 'blocked' || session.status === 'error')
   // Agent-name color by canary status: green (confirmed adhering), amber (set up
   // but not yet confirmed), red (drifted), default near-white (not set up).
+  // How many live sessions answer to this row's name. A null from the backend is
+  // "not established", never "unique", so it must not render as a warning — but it
+  // must not render as an all-clear either, which is why nothing else on the row
+  // claims the name is unambiguous.
+  const sharedBy = $derived(session.name_shared_by ?? 1)
   const canaryClass = $derived(
     !session.canary || session.canary === 'off' ? '' : `canary-${session.canary}`,
   )
@@ -249,17 +254,22 @@
 <div class="row">
   <div class="content">
     <div class="top">
-      {#if editing}
-        <input
-          class="id-edit"
-          use:focusSelect
-          bind:value={draft}
-          onkeydown={onNameKeydown}
-          onblur={cancelEdit}
-        />
-      {:else}
-        <span class="id {canaryClass}" title="{displayName} — double-click to rename" ondblclick={startEdit} role="textbox" tabindex="-1">{displayName}</span>
-      {/if}
+      <div class="name">
+        {#if editing}
+          <input
+            class="id-edit"
+            use:focusSelect
+            bind:value={draft}
+            onkeydown={onNameKeydown}
+            onblur={cancelEdit}
+          />
+        {:else}
+          <span class="id {canaryClass}" title="{displayName} — double-click to rename" ondblclick={startEdit} role="textbox" tabindex="-1">{displayName}</span>
+        {/if}
+        {#if sharedBy > 1}
+          <span class="shared" title="{sharedBy} sessions answer to this name, so their terminal tabs read alike and this row may be merging more than one of them">×{sharedBy}</span>
+        {/if}
+      </div>
       {#if session.origin}
         <span class="device" title="Session on {session.origin}">{session.origin}</span>
       {/if}
@@ -309,6 +319,17 @@
     gap: 8px;
     min-width: 0;
   }
+  /* The name and its sharing marker travel together and take the row's free
+     space as one unit, so the marker stays against the name it is about instead
+     of drifting across the gap to the state pill, where `×2` would read as
+     belonging to the status. */
+  .name {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    flex: 1;
+    min-width: 0;
+  }
   .id {
     font-size: 13px;
     font-weight: 600;
@@ -316,7 +337,7 @@
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
-    flex: 1;
+    flex: 0 1 auto;
     min-width: 0;
   }
   /* Canary status on the agent name: green = confirmed adhering, amber = set up
@@ -356,6 +377,19 @@
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
+  }
+  /* Deliberately not a pill. It sits in the drift warning's colour family so it
+     reads as the same kind of thing, but bare rather than filled, because a
+     second pill of identical geometry differing only in hue would be a duplicate
+     signal rather than a distinct one. It rides against the name because the name
+     is what is not unique, and it carries the count so its meaning does not live
+     entirely in a tooltip. */
+  .shared {
+    font-size: 11px;
+    font-weight: 600;
+    color: #fca5a5;
+    flex-shrink: 0;
+    cursor: default;
   }
   .drift {
     font-size: 11px;
