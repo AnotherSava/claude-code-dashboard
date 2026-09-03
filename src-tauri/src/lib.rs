@@ -683,6 +683,7 @@ fn seed_dev_sessions(app: &tauri::AppHandle) {
                 canary: crate::state::Canary::Off,
                 attended_at: None,
                 name_shared_by: None,
+                terminal_stale_at: None,
             }],
             last_seen: now,
             origin_addr: "http://127.0.0.1:9078".into(),

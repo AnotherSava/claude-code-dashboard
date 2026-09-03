@@ -32,7 +32,7 @@ use tauri::{AppHandle, Manager};
 
 use crate::config::ConfigState;
 use crate::notifications::context_percent;
-use crate::state::{AgentSession, Status};
+use crate::state::{AgentSession, AppState, Status};
 
 /// How long a pushed title is trusted to still be on the console. Spawned
 /// console processes (bash.exe, pwsh.exe — every command the agent runs)
@@ -50,6 +50,10 @@ const REASSERT_MS: i64 = 5_000;
 pub struct TerminalTitles {
     pids: Mutex<HashMap<String, Vec<u32>>>,
     last: Mutex<HashMap<String, (String, i64)>>,
+    /// Rows whose tab has been caught not following, keyed by chat_id: the
+    /// caption it was stuck on, the title we had written when we first noticed,
+    /// and whether it has been reported. See [`observe_caption`].
+    pinned: Mutex<HashMap<String, (String, String, bool)>>,
 }
 
 impl TerminalTitles {
@@ -152,6 +156,179 @@ pub fn read_title(pid: u32) -> Option<String> {
         let len = unsafe { GetConsoleTitleW(buf.as_mut_ptr(), buf.len() as u32) } as usize;
         (len > 0).then(|| String::from_utf16_lossy(&buf[..len]))
     })
+}
+
+/// How long a write is given to reach the tab before a mismatch means anything.
+///
+/// Measured on this machine, a console title change reaches the tab in 5.8 to
+/// 33.7 ms, and that figure *includes* the probe's own round-trip, so the real
+/// propagation is smaller still. Two seconds is ~60x the worst observation, which
+/// is the margin a detector that must never cry wolf wants.
+const GRACE_MS: i64 = 2_000;
+
+/// Whether a terminal tab is still showing what this dashboard wrote for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Pin {
+    /// The tab shows exactly what we wrote.
+    Following,
+    /// The tab names this row but shows something else, and long enough has
+    /// passed that propagation delay cannot explain it.
+    Suspect,
+    /// Nothing to judge here.
+    Unknown,
+}
+
+/// Judge one tab caption against the title this dashboard wrote for that row.
+///
+/// Windows Terminal lets a tab carry a **custom name** (right-click -> Rename
+/// tab, or a double-click on the tab title). `Tab::_GetActiveTitle` returns that
+/// name unconditionally when it is set, so from then on the tab ignores every
+/// console title we write: `SetConsoleTitleW` still succeeds, `GetConsoleTitleW`
+/// still reads back the new value, and the tab goes on showing the glyph it was
+/// frozen at. Nothing clears it but the user's own "Reset tab title" — no number
+/// of writes, no tab switch, no reattach — so a row can read `Working` in the
+/// widget while its tab reads finished, indefinitely. Observed in production on
+/// 2026-09-02.
+///
+/// Pure, and deliberately conservative: every gate that cannot rule the mismatch
+/// *in* answers [`Pin::Unknown`], because the cost of a false alarm is a `warn`
+/// accusing a terminal of a fault the user then goes looking for.
+///
+/// - A caption we did not write names no row, so it judges nothing. That covers a
+///   shell's own title, a tab we have never titled, and a blank one.
+/// - A caption naming a *different* row is simply another tab in front.
+/// - `live_sessions` is how many live sessions the registry maps to this row.
+///   Anything but exactly one abstains: with two sessions under one row (see
+///   `AgentSession::name_shared_by`) only one console is written, so a sibling
+///   tab showing an older title is **expected** rather than pinned. `None` — the
+///   registry could not be read — abstains for the same reason it does
+///   everywhere else, rather than suspecting on a count nothing established.
+pub fn pin_verdict(caption: &str, written: &str, written_at: i64, now: i64, live_sessions: Option<usize>) -> Pin {
+    if caption == written {
+        return Pin::Following;
+    }
+    if parse_title(caption).is_none() || !same_row(caption, written) {
+        return Pin::Unknown;
+    }
+    if now - written_at < GRACE_MS || live_sessions != Some(1) {
+        return Pin::Unknown;
+    }
+    Pin::Suspect
+}
+
+/// Compare a terminal caption against what this dashboard last wrote, and report
+/// a tab that has stopped following its row.
+///
+/// Called from the Windows adapter's watch thread, which already receives every
+/// caption change for free — the `EVENT_OBJECT_NAMECHANGE` hook it installs
+/// carries the window caption, and that caption *is* the active tab's rendered
+/// name. So this costs two string comparisons on a stream measured at 6 events in
+/// 22 s, needs no UI Automation and no timer, and must never be called from
+/// `sync`, which runs inside the axum hook handler.
+///
+/// **One sample never accuses.** A single mismatch is indistinguishable from a
+/// write that is still in flight or a caption read a moment early, so a suspicion
+/// is only reported once a *later* write has also failed to move the tab: the
+/// caption has not budged while the title we wrote has changed under it. A tab
+/// that catches up clears the record, which is what makes the user's own "Reset
+/// tab title" self-heal with nothing to acknowledge.
+///
+/// What it cannot separate, and the message says so: a pinned tab, and a leftover
+/// tab whose session has exited still showing the last glyph we wrote there. Both
+/// are true instances of "this tab no longer follows the row"; only the remedy
+/// differs.
+///
+/// Known limit. A caption is judged against the row whose title it resembles,
+/// because Windows Terminal offers no way to learn which window hosts which
+/// session — so a *second* window sitting on a lookalike caption is judged
+/// against that row too. The two-sample rule absorbs the ordinary case, since a
+/// caption that ever moves stops being a suspect; a permanently static lookalike
+/// would be reported, which is why this writes a log line rather than anything
+/// the user has to act on.
+pub fn observe_caption(app: &AppHandle, caption: &str, now: i64) {
+    let Some(titles) = app.try_state::<TerminalTitles>() else { return };
+    let Some((chat_id, written, written_at)) = titles.last.lock().unwrap().iter().find(|(_, (t, _))| same_row(caption, t)).map(|(id, (t, at))| (id.clone(), t.clone(), *at)) else { return };
+    let live = live_session_count(app, &chat_id);
+    // The verdict and the bookkeeping happen under the lock; the flag and the
+    // emit happen after it, so nothing downstream can re-enter this map.
+    let flag = {
+        let mut pinned = titles.pinned.lock().unwrap();
+        match pin_verdict(caption, &written, written_at, now, live) {
+            Pin::Following => match pinned.remove(&chat_id) {
+                Some((_, _, true)) => {
+                    tracing::info!(decision = "title_unpinned", chat_id = %chat_id, caption, "the tab is following this row again");
+                    Some(false)
+                }
+                _ => Some(false),
+            },
+            Pin::Suspect => match pin_step(pinned.get(&chat_id).map(|(c, w, r)| (c.as_str(), w.as_str(), *r)), caption, &written) {
+                Step::Record => {
+                    pinned.insert(chat_id.clone(), (caption.to_string(), written.clone(), false));
+                    None
+                }
+                Step::Report => {
+                    pinned.insert(chat_id.clone(), (caption.to_string(), written.clone(), true));
+                    tracing::warn!(
+                        decision = "title_pinned",
+                        chat_id = %chat_id,
+                        caption,
+                        written = %written,
+                        "this tab has stopped following the row, so its status is stale on screen. Most often a Windows Terminal custom tab name (right-click the tab -> Reset tab title); otherwise a leftover tab whose session has exited"
+                    );
+                    Some(true)
+                }
+                Step::Hold => None,
+            },
+            Pin::Unknown => None,
+        }
+    };
+    // `set_terminal_stale` answers whether anything moved, so the emit is on the
+    // edge only. Clearing is unconditional on `Following` rather than gated on
+    // having reported: the flag can outlive this process's memory of why it was
+    // set — a restart drops `pinned` while the row's flag is restored from
+    // nothing — and a warning nobody can clear is worse than a late one.
+    if let Some(stale) = flag {
+        if app.try_state::<AppState>().is_some_and(|s| s.set_terminal_stale(&chat_id, stale, now)) {
+            crate::commands::emit_sessions_updated(app);
+        }
+    }
+}
+
+/// What a fresh [`Pin::Suspect`] does to the record kept for that row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Step {
+    /// First sighting. Remember it and say nothing.
+    Record,
+    /// A later write also failed to move this caption. Report it, once.
+    Report,
+    /// Nothing new: the same write suspected again, or already reported.
+    Hold,
+}
+
+/// Decide whether a suspicion has earned a report yet.
+///
+/// The rule the whole detector rests on: a report needs the caption to have sat
+/// unchanged *while the title we wrote moved underneath it*. One sample cannot
+/// distinguish a stuck tab from a write still in flight, and re-suspecting on the
+/// same written title adds no evidence — only a second, different write that also
+/// failed to land does.
+fn pin_step(recorded: Option<(&str, &str, bool)>, caption: &str, written: &str) -> Step {
+    match recorded {
+        None => Step::Record,
+        Some((_, _, true)) => Step::Hold,
+        Some((seen, when, false)) if seen == caption && when != written => Step::Report,
+        Some(_) => Step::Hold,
+    }
+}
+
+/// How many live sessions the registry maps to `chat_id`, or `None` when it could
+/// not be read. Shares the registry's 5 s cache with `sync`, which runs on every
+/// emit, so this adds no directory read of its own in the steady state.
+fn live_session_count(app: &AppHandle, chat_id: &str) -> Option<usize> {
+    let registry = app.try_state::<crate::session_registry::SessionRegistry>()?;
+    let root = app.try_state::<ConfigState>().and_then(|c| c.config.lock().unwrap().projects_root.clone());
+    let live = registry.live_sessions(root.as_deref(), crate::commands::now_ms())?;
+    Some(live.iter().filter(|s| s.chat_id == chat_id).map(|s| s.sessions).sum())
 }
 
 fn status_glyph(status: Status) -> &'static str {
@@ -332,6 +509,12 @@ pub fn sync(app: &AppHandle, sessions: &[AgentSession]) {
         // re-enabling resumes without waiting for the next hook event.
         for chat_id in last.keys().cloned().collect::<Vec<_>>() {
             blank(&chat_id, &mut last);
+        }
+        // With nothing being written there is nothing a tab can disagree with,
+        // so a standing stale-tab warning would outlive its evidence.
+        titles.pinned.lock().unwrap().clear();
+        if let Some(state) = app.try_state::<AppState>() {
+            state.clear_all_terminal_stale(now);
         }
         return;
     }
@@ -538,6 +721,88 @@ mod tests {
         assert!(same_row("🟢 my proj", "🟢 my other"));
     }
 
+    /// `written_at` 0, judged at `now`, so the grace is the whole clock.
+    fn pin(caption: &str, written: &str, now: i64, live: Option<usize>) -> Pin {
+        pin_verdict(caption, written, 0, now, live)
+    }
+
+    #[test]
+    fn a_tab_showing_what_we_wrote_is_following() {
+        // Equality settles it, whatever the clock or the registry say — those
+        // gates exist to explain a *mismatch*.
+        assert_eq!(pin("🔵 dash", "🔵 dash", 99_999, Some(1)), Pin::Following);
+        assert_eq!(pin("🔵 dash", "🔵 dash", 0, None), Pin::Following);
+    }
+
+    #[test]
+    fn a_mismatch_inside_the_grace_is_not_judged() {
+        // A write still in flight, or a caption read a moment early. Measured
+        // propagation is under 34ms; this is the window that makes that safe.
+        assert_eq!(pin("🟢 dash", "🔵 dash", GRACE_MS - 1, Some(1)), Pin::Unknown);
+    }
+
+    #[test]
+    fn a_frozen_glyph_on_a_settled_write_is_suspect() {
+        // The production symptom: the row went Working, the console took `🔵`,
+        // and the tab stayed on the `🟢` it was frozen at.
+        assert_eq!(pin("🟢 achievement-overlay", "🔵 achievement-overlay", GRACE_MS, Some(1)), Pin::Suspect);
+        // …and a suffix moving under a stuck caption is the same fault.
+        assert_eq!(pin("🔵 dash [62%]", "🔵 dash [77%]", GRACE_MS, Some(1)), Pin::Suspect);
+    }
+
+    #[test]
+    fn a_row_several_sessions_answer_to_never_suspects() {
+        // Only one console is written for such a row, so a sibling tab holding an
+        // older title is expected rather than stuck. An unreadable registry
+        // abstains for the same reason: nothing established the count.
+        assert_eq!(pin("🟢 web", "🔵 web", GRACE_MS, Some(2)), Pin::Unknown);
+        assert_eq!(pin("🟢 web", "🔵 web", GRACE_MS, None), Pin::Unknown);
+        assert_eq!(pin("🟢 web", "🔵 web", GRACE_MS, Some(0)), Pin::Unknown, "and a row the registry knows no session for");
+    }
+
+    #[test]
+    fn a_caption_we_did_not_write_judges_nothing() {
+        // A shell's own title, a tab we have never titled, a blank one. None of
+        // them names a row, so none of them is evidence about one.
+        for caption in ["PowerShell", "~/proj — zsh", "", "   "] {
+            assert_eq!(pin(caption, "🔵 dash", GRACE_MS, Some(1)), Pin::Unknown, "{caption:?}");
+        }
+    }
+
+    #[test]
+    fn another_row_in_front_judges_nothing() {
+        // The caption is whichever tab is selected, which is usually not this row.
+        assert_eq!(pin("🔵 transcripts", "🔵 dash", GRACE_MS, Some(1)), Pin::Unknown);
+    }
+
+    #[test]
+    fn one_suspicion_never_reports() {
+        // A single mismatch is indistinguishable from a write still settling.
+        assert_eq!(pin_step(None, "🟢 dash", "🔵 dash"), Step::Record);
+    }
+
+    #[test]
+    fn re_suspecting_on_the_same_write_adds_no_evidence() {
+        assert_eq!(pin_step(Some(("🟢 dash", "🔵 dash", false)), "🟢 dash", "🔵 dash"), Step::Hold);
+    }
+
+    #[test]
+    fn a_second_write_that_also_fails_to_land_reports() {
+        // The caption sat still while the title we wrote moved underneath it.
+        assert_eq!(pin_step(Some(("🟢 dash", "🔵 dash", false)), "🟢 dash", "⏳ dash"), Step::Report);
+    }
+
+    #[test]
+    fn a_caption_that_moved_is_not_the_one_we_suspected() {
+        // It went somewhere — so it is not stuck, whatever it now shows.
+        assert_eq!(pin_step(Some(("🟢 dash", "🔵 dash", false)), "⏳ dash", "🔵 dash"), Step::Hold);
+    }
+
+    #[test]
+    fn a_reported_tab_is_not_reported_again() {
+        assert_eq!(pin_step(Some(("🟢 dash", "🔵 dash", true)), "🟢 dash", "⏳ dash"), Step::Hold);
+    }
+
     #[test]
     fn a_built_title_round_trips_through_the_parser() {
         // The end-to-end property `session_restore` depends on, exercised against
@@ -576,6 +841,7 @@ mod tests {
             canary: crate::state::Canary::Off,
             attended_at: None,
             name_shared_by: None,
+            terminal_stale_at: None,
         }
     }
 

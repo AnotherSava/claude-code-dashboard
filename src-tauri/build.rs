@@ -6,6 +6,7 @@ fn main() {
     // src/setup.rs; tell cargo to recompile when it changes.
     println!("cargo:rerun-if-changed=../integrations/claude_hook.py");
     register_release_date();
+    register_release_channel();
     register_frontend_fingerprint(Path::new("../dist"));
     tauri_build::build()
 }
@@ -19,6 +20,25 @@ fn main() {
 fn register_release_date() {
     let date = chrono::Local::now().format("%Y-%m-%d").to_string();
     println!("cargo:rustc-env=APP_RELEASE_DATE={date}");
+}
+
+/// Record whether this binary is the one people download, so a default can
+/// differ between a build you made and a build you shipped.
+///
+/// `CCDASH_RELEASE_BUILD` is set by the release workflow's Tauri build step and
+/// by nothing else, so every local `deploy` — on any machine, from any clone —
+/// comes out as a non-release build with no per-machine setup. Deliberately not
+/// inferred from `CI` or `debug_assertions`: local deploys build `--release` too,
+/// and `build.yml` runs in CI while shipping no installer, so neither answers the
+/// actual question, which is whether this binary is going to strangers.
+///
+/// Read at compile time through `env!`; `rerun-if-env-changed` makes cargo
+/// rebuild when the flag appears or disappears rather than reusing a cached
+/// object with the wrong default baked in.
+fn register_release_channel() {
+    println!("cargo:rerun-if-env-changed=CCDASH_RELEASE_BUILD");
+    let shipped = std::env::var("CCDASH_RELEASE_BUILD").is_ok_and(|v| !v.is_empty() && v != "0");
+    println!("cargo:rustc-env=CCDASH_RELEASE_BUILD={}", u8::from(shipped));
 }
 
 /// `tauri-build` registers only `tauri.conf.json` and `capabilities/` as

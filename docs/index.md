@@ -14,7 +14,7 @@ A desktop app for Windows and macOS — a compact always-on-top widget that list
 
 ## Features
 
-- **Notifications** — Telegram pings you when an agent finishes or is waiting while you're away from your machine — staying quiet when you were there to see it — when a session's context fills past a threshold, or when a heavily-used usage limit resets.
+- **Notifications** — Telegram pings you when an agent finishes or is waiting while you're away from your machine — staying quiet when you were there to see it — when a session's context fills past a threshold, when a heavily-used usage limit resets, or when a terminal tab stops showing its session's status.
 - **Color terminal tabs** — each session's status appears as a colored circle in its terminal tab — with its context usage once it climbs high — so you see who needs you even without the widget on screen.
 - **Finished, and not yet read** — DONE means an agent finished *and you haven't looked yet*; read it and the row drops to IDLE, so what's still marked DONE is exactly what's still waiting for you.
 - **Sessions survive a restart** — update or reboot the widget and your agents are still listed, each at the status it was on, so a session parked on a question isn't invisible until you happen to go looking.

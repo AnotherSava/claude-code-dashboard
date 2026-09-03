@@ -150,6 +150,46 @@ pub fn build_drift_message(session: &AgentSession) -> String {
     )
 }
 
+/// Reconcile stale-terminal-tab alerts, mirroring [`drift_reconcile`] exactly: an
+/// alert is *sent* once a session's `terminal_stale_at` stamp is old enough, and
+/// *dismissed* once it clears — the tab started following again, the session
+/// vanished, or the option was turned off (`enabled == false` dismisses
+/// everything outstanding). Returns `(to_dismiss, to_send)`.
+///
+/// It is a separate reconciler rather than a second reason folded into
+/// `drift_reconcile` because the two flags are independent: a row can be drifting
+/// and stale at once, and one alert clearing must not delete the other's message.
+/// `delay_ms` is how long the tab must have been stale before the message goes
+/// out, `null` or `0` disabling the alert outright — the same "the value is also
+/// the switch" shape as `context_alert_percent` and `limit_reset_percent`. The
+/// delay is the point, not a rate limit: the row's badge appears the moment the
+/// tab is caught, so the wait is a chance to notice it on screen and reset the tab
+/// before a phone buzzes about it. It is `reaction_window_ms`'s idea applied to a
+/// condition rather than a status.
+pub fn stale_reconcile<'a>(delay_ms: Option<u64>, sessions: &'a [AgentSession], outstanding: &HashMap<String, String>, now: i64) -> (Vec<String>, Vec<&'a AgentSession>) {
+    let is_flagged = |s: &AgentSession| match (delay_ms.filter(|d| *d > 0), s.terminal_stale_at) {
+        (Some(delay), Some(at)) => now - at >= delay as i64,
+        _ => false,
+    };
+    let flagged_ids: HashSet<&str> = sessions.iter().filter(|s| is_flagged(s)).map(|s| s.id.as_str()).collect();
+    let to_dismiss: Vec<String> = outstanding.keys().filter(|id| !flagged_ids.contains(id.as_str())).cloned().collect();
+    let to_send: Vec<&AgentSession> = sessions.iter().filter(|s| is_flagged(s) && !outstanding.contains_key(&s.id)).collect();
+    (to_dismiss, to_send)
+}
+
+/// The stale-tab alert's text.
+///
+/// It reports the observation and not a cause, because the dashboard cannot tell
+/// a tab given a custom name from a leftover tab whose session has exited — and
+/// names the fix for the common one, since there is nothing this app can do about
+/// it from here.
+pub fn build_stale_tab_message(session: &AgentSession) -> String {
+    format!(
+        "⚠ [{}] its terminal tab is showing a stale status. If the tab was renamed, right-click it and choose \"Reset tab title\"; otherwise it is a leftover tab whose session has ended.",
+        session.display_label()
+    )
+}
+
 /// Reconcile context-usage alerts against the currently-over set, mirroring the
 /// per-state notification lifecycle: an alert is *sent* when a session first
 /// crosses `threshold_percent` of its context window, and *dismissed* (the
@@ -621,6 +661,10 @@ impl NotificationManager {
             // Live instruction-drift alerts: session id -> Telegram message handle,
             // deleted once the agent resumes emitting its adherence marker.
             let mut drift_outstanding: HashMap<String, String> = HashMap::new();
+            // Live stale-terminal-tab alerts: session id -> Telegram message
+            // handle, deleted once the tab starts following the row again.
+            let mut stale_outstanding: HashMap<String, String> = HashMap::new();
+            let mut stale_backoff: HashMap<String, i64> = HashMap::new();
             // Maybe-delivered (read-timeout) backoff for the raw-send alerts, so a
             // sustained outage can't re-send a possibly-delivered alert every tick
             // (mirrors `retry_backoff` for the per-state pings). Per-session for the
@@ -790,6 +834,42 @@ impl NotificationManager {
                     // driven by the orthogonal `instruction_drift` flag instead of a
                     // token threshold. Gated on the feature toggle, so disabling it
                     // dismisses everything outstanding.
+                    // The tab stopped showing this row's status. Reported, never
+                    // repaired: a Windows Terminal custom tab name outranks the
+                    // console title permanently and only the user can clear it.
+                    let (stale_dismiss, stale_send) = stale_reconcile(tg_cfg.and_then(|c| c.stale_tab_alert_ms), &sessions, &stale_outstanding, now);
+                    for id in &stale_dismiss {
+                        tracing::debug!(
+                            channel = "telegram",
+                            id = %id,
+                            decision = "stale_tab_dismiss",
+                            reason = if sessions.iter().any(|s| &s.id == id) { "the tab is following this row again (or the option was turned off)" } else { "session cleared or ended" },
+                            "stale-tab alert dismissed"
+                        );
+                    }
+                    dismiss_and_forget(telegram.as_ref() as &dyn Notifier, &mut stale_outstanding, stale_dismiss, |h| h.as_str()).await;
+                    for s in stale_send {
+                        if stale_backoff.get(&s.id).is_some_and(|until| now < *until) {
+                            continue;
+                        }
+                        match telegram.send_raw_tracked(&build_stale_tab_message(s)).await {
+                            Ok(handle) => {
+                                tracing::debug!(channel = "telegram", id = %s.id, decision = "stale_tab_alert", reason = "the terminal tab stopped following this row", "stale-tab alert sent");
+                                stale_outstanding.insert(s.id.clone(), handle);
+                                stale_backoff.remove(&s.id);
+                            }
+                            Err(SendError { maybe_delivered: true, source }) => {
+                                stale_backoff.insert(s.id.clone(), now + UNCERTAIN_RETRY_BACKOFF_MS);
+                                tracing::warn!(channel = "telegram", id = %s.id, decision = "stale_tab_alert", backoff_ms = UNCERTAIN_RETRY_BACKOFF_MS, error = %source, "stale-tab alert may have been delivered; backing off retry");
+                            }
+                            Err(SendError { maybe_delivered: false, source }) => {
+                                stale_backoff.remove(&s.id);
+                                tracing::warn!(channel = "telegram", id = %s.id, decision = "stale_tab_alert", error = %source, "stale-tab alert failed; will retry");
+                            }
+                        }
+                    }
+                    stale_backoff.retain(|id, until| now < *until && sessions.iter().any(|s| &s.id == id && s.terminal_stale_at.is_some()));
+
                     let (drift_dismiss, drift_send) = drift_reconcile(cfg.instruction_canary_enabled, &sessions, &drift_outstanding);
                     for id in &drift_dismiss {
                         tracing::debug!(
@@ -1010,6 +1090,7 @@ mod tests {
             canary: crate::state::Canary::Off,
             attended_at: None,
             name_shared_by: None,
+            terminal_stale_at: None,
         }
     }
 
@@ -1669,6 +1750,90 @@ mod tests {
         let (dismiss, send) = drift_reconcile(false, &flagged, &out);
         assert_eq!(dismiss, vec!["s".to_string()]);
         assert!(send.is_empty());
+    }
+
+    const STALE_DELAY: u64 = 600_000;
+
+    fn stale_row(id: &str, since: i64) -> AgentSession {
+        let mut s = session(id, Status::Working, 0);
+        s.terminal_stale_at = Some(since);
+        s
+    }
+
+    #[test]
+    fn a_stale_tab_is_not_alerted_until_the_delay_has_run() {
+        // The badge is on the row the moment the tab is caught; this window is the
+        // chance to see it there and reset the tab before a phone buzzes.
+        let out = HashMap::new();
+        let rows = vec![stale_row("s", 0)];
+        let (_, send) = stale_reconcile(Some(STALE_DELAY), &rows, &out, STALE_DELAY as i64 - 1);
+        assert!(send.is_empty(), "still inside the window");
+        let (_, send) = stale_reconcile(Some(STALE_DELAY), &rows, &out, STALE_DELAY as i64);
+        assert_eq!(sent_ids(&send), vec!["s".to_string()]);
+    }
+
+    #[test]
+    fn stale_tab_alert_fires_once_then_dismisses_when_the_tab_recovers() {
+        let mut out = HashMap::new();
+        let flagged = vec![stale_row("s", 0)];
+        let now = STALE_DELAY as i64;
+        let (dismiss, send) = stale_reconcile(Some(STALE_DELAY), &flagged, &out, now);
+        assert_eq!(sent_ids(&send), vec!["s".to_string()]);
+        assert!(dismiss.is_empty());
+        apply(&mut out, dismiss, send);
+        // Still stale next tick → no second buzz for one condition.
+        let (dismiss, send) = stale_reconcile(Some(STALE_DELAY), &flagged, &out, now + 1_000);
+        assert!(send.is_empty() && dismiss.is_empty());
+        // The user resets the tab title → the stamp clears → the message is deleted.
+        let recovered = vec![session("s", Status::Working, 0)];
+        let (dismiss, send) = stale_reconcile(Some(STALE_DELAY), &recovered, &out, now + 2_000);
+        assert_eq!(dismiss, vec!["s".to_string()]);
+        assert!(send.is_empty());
+    }
+
+    #[test]
+    fn a_null_or_zero_delay_turns_the_alert_off_and_dismisses_outstanding() {
+        // The value is the switch, like `context_alert_percent`. Turning it off
+        // must take a standing message with it rather than strand it in the chat.
+        let out: HashMap<String, String> = [("s".to_string(), "h-s".to_string())].into_iter().collect();
+        let flagged = vec![stale_row("s", 0)];
+        for off in [None, Some(0)] {
+            let (dismiss, send) = stale_reconcile(off, &flagged, &out, 10_000_000);
+            assert_eq!(dismiss, vec!["s".to_string()], "{off:?}");
+            assert!(send.is_empty(), "{off:?}");
+        }
+    }
+
+    #[test]
+    fn a_session_that_ends_while_flagged_has_its_alert_dismissed() {
+        let out: HashMap<String, String> = [("gone".to_string(), "h".to_string())].into_iter().collect();
+        let (dismiss, send) = stale_reconcile(Some(STALE_DELAY), &[], &out, 10_000_000);
+        assert_eq!(dismiss, vec!["gone".to_string()]);
+        assert!(send.is_empty());
+    }
+
+    #[test]
+    fn drift_and_stale_alerts_do_not_cancel_each_other() {
+        // Both flags can be set on one row, and each reconciler owns its own
+        // message: clearing one must not delete the other's.
+        let mut s = stale_row("s", 0);
+        s.instruction_drift = true;
+        let rows = vec![s];
+        let empty = HashMap::new();
+        let now = STALE_DELAY as i64;
+        assert_eq!(sent_ids(&drift_reconcile(true, &rows, &empty).1), vec!["s".to_string()]);
+        assert_eq!(sent_ids(&stale_reconcile(Some(STALE_DELAY), &rows, &empty, now).1), vec!["s".to_string()]);
+        // Only the stale one is outstanding; the drift reconciler must not dismiss it.
+        let stale_out: HashMap<String, String> = [("s".to_string(), "h".to_string())].into_iter().collect();
+        assert!(drift_reconcile(true, &rows, &stale_out).0.is_empty(), "drift dismisses only its own");
+    }
+
+    #[test]
+    fn stale_tab_message_format() {
+        assert_eq!(
+            build_stale_tab_message(&session("proj", Status::Working, 0)),
+            "⚠ [proj] its terminal tab is showing a stale status. If the tab was renamed, right-click it and choose \"Reset tab title\"; otherwise it is a leftover tab whose session has ended."
+        );
     }
 
     #[test]

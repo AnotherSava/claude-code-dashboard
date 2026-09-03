@@ -9,6 +9,8 @@ metadata:
 
 **The Win32 mechanics are global, not project knowledge, and deliberately live outside this repo.** `~/.claude/learnings/windows-terminal-title.md` holds the console title read-back (per session, not per screen) and what Windows Terminal exposes about which tab is on screen; `~/.claude/learnings/windows-winevent-hooks.md` holds the `SetWinEventHook` technique with the measured pid-scoping numbers. Read those before touching the adapter, and do not copy their content back here.
 
+One consequence found in production on 2026-09-03 and now handled by `terminal_title::observe_caption`: a Windows Terminal tab the user renames stops following the title for good, so a row can read `Working` while its tab reads `🟢`. `~/.claude/learnings/windows-terminal-title.md` has the mechanism, the measurements and every dead route to resetting it from outside; the detector's own design is in CLAUDE.md.
+
 What is specific to this setup:
 
 - **This machine's WT `settings.json` pins no titles.** No `suppressApplicationTitle`, no `tabTitle`, no per-profile `title`. Any of them would stop the window caption following the session and would silently kill departure detection, so it is the first thing to check if the adapter goes quiet.

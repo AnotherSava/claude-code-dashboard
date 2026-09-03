@@ -1039,6 +1039,7 @@ mod tests {
             canary: crate::state::Canary::Off,
             attended_at: None,
             name_shared_by: None,
+            terminal_stale_at: None,
         }
     }
 

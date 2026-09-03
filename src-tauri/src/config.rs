@@ -481,6 +481,35 @@ pub struct TelegramConfig {
     /// Account-wide, so with the dashboard running on several devices each one
     /// pings independently; set this to `null` on the extras to avoid dupes.
     pub limit_reset_percent: Option<f32>,
+    /// Alert when a session's terminal tab stops showing its status.
+    ///
+    /// The dashboard writes each row's status onto its terminal tab, and a
+    /// Windows Terminal tab given a custom name ignores that write from then on —
+    /// so a tab can sit on `🟢` while the agent is working, with nothing on screen
+    /// admitting it. Nothing outside the terminal can undo that, so this reports
+    /// rather than repairs. Follows the same lifecycle as the context-usage alert:
+    /// sent once when the tab is confirmed stuck, and the message deleted once it
+    /// follows again, the session vanishes, or this is turned off.
+    ///
+    /// How long the tab must have been stale before the message goes out. `null`
+    /// or `0` disables the alert, so the value is also the switch — the same shape
+    /// as `context_alert_percent` and `limit_reset_percent`, and no separate
+    /// boolean to keep in step with it.
+    ///
+    /// The delay earns its place rather than being a rate limit: the row's `≠`
+    /// badge appears the moment the tab is caught, so this is the window in which
+    /// you can notice it on screen and reset the tab yourself before a phone
+    /// buzzes about it — `reaction_window_ms`'s idea applied to a condition
+    /// instead of a status. It runs from when the tab was *first* caught, and a
+    /// repeat confirmation does not restart it.
+    ///
+    /// The default depends on how the binary was built ([`built_for_release`]):
+    /// ten minutes in a build you deployed yourself, and **off** in the released
+    /// installers. The alert reports a fault in another application that this one
+    /// cannot repair, which is worth knowing about when you already understand the
+    /// feature and is an unexplained buzz when you have just installed the thing.
+    /// Setting the field explicitly wins either way.
+    pub stale_tab_alert_ms: Option<u64>,
     /// Reading pace, in characters per second, used to defer a notification by
     /// how long the final assistant message takes to read. The reconciler adds
     /// `chars / reading_speed_cps` (capped, see `notifications::READING_CAP_MS`)
@@ -489,6 +518,21 @@ pub struct TelegramConfig {
     /// base delay. `null` or `0` disables the scaling (fixed windows, the
     /// pre-feature behavior). Read by `notifications::reconcile`.
     pub reading_speed_cps: Option<u64>,
+}
+
+/// The stale-tab alert's delay wherever it is on by default.
+const STALE_TAB_ALERT_MS: u64 = 600_000;
+
+/// Whether this binary came out of the release workflow — the build people
+/// download — rather than one built and deployed by hand.
+///
+/// The flag is baked in by `build.rs` from an environment variable that workflow
+/// sets and nothing else does, so this needs no runtime probe and cannot be wrong
+/// about the machine it happens to be running on. Its only job is to let a default
+/// be useful to someone who built the thing without being a surprise to someone
+/// who just installed it; every setting stays explicitly settable either way.
+fn built_for_release() -> bool {
+    env!("CCDASH_RELEASE_BUILD") == "1"
 }
 
 impl Default for TelegramConfig {
@@ -509,6 +553,7 @@ impl Default for TelegramConfig {
             .collect(),
             context_alert_percent: Some(80.0),
             limit_reset_percent: Some(90.0),
+            stale_tab_alert_ms: (!built_for_release()).then_some(STALE_TAB_ALERT_MS),
             reading_speed_cps: Some(10),
         }
     }
@@ -839,6 +884,27 @@ mod tests {
         assert!(!cfg.history_window_maximized);
         let on: Config = serde_json::from_str(r#"{ "history_window_maximized": true }"#).unwrap();
         assert!(on.history_window_maximized);
+    }
+
+    #[test]
+    fn the_stale_tab_alert_default_follows_the_build_channel() {
+        // On in a build you deployed yourself, off in the one people download.
+        // The alert reports a fault in another application that this one cannot
+        // repair: worth knowing when you already understand the feature, an
+        // unexplained buzz when you have just installed the thing. Pins the
+        // polarity, so flipping it has to be deliberate.
+        let expected = if built_for_release() { None } else { Some(STALE_TAB_ALERT_MS) };
+        assert_eq!(TelegramConfig::default().stale_tab_alert_ms, expected);
+    }
+
+    #[test]
+    fn an_explicit_stale_tab_delay_wins_in_either_build() {
+        // Whatever the build decided, a config file that states a value is the
+        // answer — including stating `null` to turn the alert off.
+        let set: TelegramConfig = serde_json::from_str(r#"{ "stale_tab_alert_ms": 1234 }"#).unwrap();
+        assert_eq!(set.stale_tab_alert_ms, Some(1234));
+        let off: TelegramConfig = serde_json::from_str(r#"{ "stale_tab_alert_ms": null }"#).unwrap();
+        assert_eq!(off.stale_tab_alert_ms, None);
     }
 
     #[test]

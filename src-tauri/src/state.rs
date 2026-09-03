@@ -177,6 +177,35 @@ pub struct AgentSession {
     /// titles stay local-only by construction.
     #[serde(default)]
     pub instruction_drift: bool,
+    /// When the session's terminal tab was found to have stopped showing this
+    /// row's status, or `None` while it is keeping up — see
+    /// `terminal_title::observe_caption`, which sets it.
+    ///
+    /// The instant *is* the flag, rather than a bool beside one: the badge only
+    /// needs to know it is set, but the Telegram alert waits out
+    /// `stale_tab_alert_ms` from here so you can notice the `≠` and fix the tab
+    /// before your phone buzzes. A separate boolean would carry nothing the
+    /// `Option` doesn't. Repeated confirmations leave the stamp alone, so the
+    /// clock measures the fault rather than the last time it was noticed.
+    ///
+    /// Orthogonal to `status` in the same way `instruction_drift` is: the row is
+    /// right and something outside it is wrong, so it colours nothing and gates
+    /// nothing. Windows-only, because it is detected from the terminal caption the
+    /// Windows adapter's hook delivers.
+    ///
+    /// It lives here rather than being stamped at emit time like `canary` and
+    /// `name_shared_by` for one concrete reason: `notifications::reconcile` reads
+    /// the raw `AppState` snapshot, so a fact written only into
+    /// `commands::resolved_snapshot` is invisible to the notifier and could never
+    /// raise an alert.
+    ///
+    /// Two causes produce it and nothing outside the terminal can tell them apart
+    /// — a Windows Terminal tab given a custom name (which outranks the console
+    /// title for good), and a leftover tab whose session has exited. Both are
+    /// truthfully "a tab is showing a stale status for this session", which is
+    /// what the badge and the alert say.
+    #[serde(default)]
+    pub terminal_stale_at: Option<i64>,
     /// Instruction-adherence canary status ([`Canary`]) — colors the agent name in
     /// the dashboard. Stamped at emit time by `commands::resolved_snapshot` for
     /// local rows from the live nonce store (`Off` in `AppState`, like
@@ -641,6 +670,7 @@ fn new_session(
         display_name: None,
         origin: None,
         instruction_drift: false,
+        terminal_stale_at: None,
         canary: Canary::Off,
         attended_at: None,
         name_shared_by: None,
@@ -731,6 +761,39 @@ impl AppState {
     /// `emit_sessions_updated` fans the change out to every surface) and returns
     /// whether the value actually changed. No-op when the row is gone or already at
     /// `drift`.
+    /// Flag or clear "this row's terminal tab is showing a stale status".
+    /// Returns whether anything changed, so the caller only emits and logs on an
+    /// edge. Mirrors [`AppState::set_drift`], including leaving `status`
+    /// untouched.
+    pub fn set_terminal_stale(&self, id: &str, stale: bool, now_ms: i64) -> bool {
+        let mut sessions = self.sessions.lock().unwrap();
+        let Some(s) = sessions.iter_mut().find(|s| s.id == id) else {
+            return false;
+        };
+        // Compare presence, not value: a repeat confirmation must not restart the
+        // clock the alert's delay is measured against.
+        if s.terminal_stale_at.is_some() == stale {
+            return false;
+        }
+        s.terminal_stale_at = stale.then_some(now_ms);
+        s.updated = now_ms;
+        true
+    }
+
+    /// Clear every stale-tab flag, for when title writing is turned off: with
+    /// nothing being written, nothing can be found to disagree with, so a
+    /// standing warning would outlive the evidence for it.
+    pub fn clear_all_terminal_stale(&self, now_ms: i64) -> bool {
+        let mut sessions = self.sessions.lock().unwrap();
+        let mut changed = false;
+        for s in sessions.iter_mut().filter(|s| s.terminal_stale_at.is_some()) {
+            s.terminal_stale_at = None;
+            s.updated = now_ms;
+            changed = true;
+        }
+        changed
+    }
+
     pub fn set_drift(&self, id: &str, drift: bool, now_ms: i64) -> bool {
         let mut sessions = self.sessions.lock().unwrap();
         let Some(s) = sessions.iter_mut().find(|s| s.id == id) else {
@@ -1832,6 +1895,7 @@ mod tests {
             display_name: None,
             origin: None,
             instruction_drift: false,
+            terminal_stale_at: None,
             canary: Canary::Off,
             attended_at: None,
             name_shared_by: None,
@@ -2099,6 +2163,7 @@ mod tests {
             display_name: None,
             origin: Some(origin.to_string()),
             instruction_drift: false,
+            terminal_stale_at: None,
             canary: Canary::Off,
             attended_at: None,
             name_shared_by: None,

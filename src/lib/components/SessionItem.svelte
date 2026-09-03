@@ -277,6 +277,9 @@
       {#if session.instruction_drift}
         <span class="drift" title="Instruction drift — the last reply dropped its adherence marker; treat its output with caution">⚠</span>
       {/if}
+      {#if session.terminal_stale_at}
+        <span class="stale" title="This session's terminal tab is showing a stale status. If you renamed the tab, right-click it and choose Reset tab title; otherwise it is a leftover tab whose session has ended">≠</span>
+      {/if}
       {#if !config.compact_mode}
         <span class="time">{time}</span>
       {/if}
@@ -388,6 +391,17 @@
     font-size: 11px;
     font-weight: 600;
     color: #fca5a5;
+    flex-shrink: 0;
+    cursor: default;
+  }
+  /* The terminal disagreeing with the row, which is a different subject from
+     everything else here — so it is neither the drift badge's filled red pill nor
+     the name's own colour, but a bare amber mark in the badge cluster. `≠` says
+     "these two do not match", which is the whole claim. */
+  .stale {
+    font-size: 12px;
+    font-weight: 700;
+    color: #e0a458;
     flex-shrink: 0;
     cursor: default;
   }

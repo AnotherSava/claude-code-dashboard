@@ -48,6 +48,13 @@ export interface AgentSession {
   // conversation. null/absent means not established — a remote row, an unreadable
   // session registry, or an older backend — and must not be read as "unique".
   name_shared_by?: number | null
+  // When this session's terminal tab was found to have stopped showing its
+  // status, null while it is keeping up — a tab given a custom name in Windows
+  // Terminal ignores the title we write from then on, and a leftover tab of an
+  // ended session keeps the last one. Orthogonal to `status`: the row is right and
+  // the tab is not. The instant is here rather than a bool because the Telegram
+  // alert waits it out; the badge only cares that it is set. Windows only.
+  terminal_stale_at?: number | null
 }
 
 export interface UsageColors {

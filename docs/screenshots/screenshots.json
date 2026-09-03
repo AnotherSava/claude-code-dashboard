@@ -13,7 +13,7 @@
           "Reveal the widget (tray icon left-click), capture the window rect, not the screen"
         ]
       },
-      "verifiedAt": "eaebc2f"
+      "verifiedAt": "2a0c824"
     },
     {
       "id": "compact-mode",
@@ -28,7 +28,7 @@
           "Capture the window rect"
         ]
       },
-      "verifiedAt": "eaebc2f"
+      "verifiedAt": "2a0c824"
     },
     {
       "id": "terminal-tabs",

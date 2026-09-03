@@ -274,6 +274,12 @@ fn human_switch(event_hwnd: isize, foreground: isize, idle_ms: Option<u64>) -> b
 fn consume(app: &AppHandle, foreground: &Foreground, rx: &std::sync::mpsc::Receiver<RawEvent>, sink: &Sender<Observation>) {
     let mut last: HashMap<isize, String> = HashMap::new();
     while let Ok(ev) = rx.recv() {
+        // Free of charge, and only here: this caption *is* the active tab's
+        // rendered name, so comparing it against what we wrote catches a tab that
+        // has stopped following its row. Both event kinds carry one, and a
+        // foreground change is worth judging too — it is how a tab that was
+        // already stuck comes into view.
+        crate::terminal_title::observe_caption(app, &ev.title, ev.at_ms);
         if ev.event == EVENT_SYSTEM_FOREGROUND {
             *foreground.lock().unwrap() = Some((ev.hwnd, ev.at_ms));
             continue;

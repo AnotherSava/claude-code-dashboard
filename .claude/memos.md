@@ -21,3 +21,5 @@ Off-task ideas captured during sessions, to revisit later. Managed by `/memo`; o
 - [ ] 2026-09-02 04:58 — add note and links on creating firecrawl api key
 - [ ] 2026-09-02 05:06 — use logarithmic scale for intensity graph
 - [ ] 2026-09-02 17:12 — use limit reset day and time for weekly and daily usage calculations
+- [ ] 2026-09-03 00:18 — A pinned Windows Terminal tab is invisible to attention: its caption never changes, so no EVENT_OBJECT_NAMECHANGE fires and departures to/from that tab go unobserved. Related: the pin detector needs two sightings with one of our writes changing in between, so reporting takes minutes and only while the tab is on screen.
+- [ ] 2026-09-03 00:51 — click on the status pill highlights it as a reminder to get back to it later

@@ -49,6 +49,13 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Marks this as the build people download, which `build.rs` turns into
+          # a compile-time flag. It is set here rather than inferred from `CI`
+          # because the question is "is this binary going to strangers", and this
+          # workflow is the only thing that ships one — `build.yml` produces no
+          # installer. Alert defaults that are useful when you built the binary
+          # yourself are unwelcome on a fresh install; see `config::TelegramConfig`.
+          CCDASH_RELEASE_BUILD: "1"
         with:
           tagName: ${{ github.ref_type == 'tag' && github.ref_name || format('v-{0}', github.sha) }}
           # Title = just the version tag (e.g. "v1.6.3"). The product name is
