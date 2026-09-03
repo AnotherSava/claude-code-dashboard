@@ -121,8 +121,8 @@ Rust tests live inline in `#[cfg(test)]` modules next to the code they cover:
 
 - `state::tests` — sticky-label machine, working-time accumulator, error transitions.
 - `label_policy::tests` — the `(label, original_prompt)` decision extracted from `apply_set`.
-- `log_watcher::tests` — the transcript parser (`infer_state`, `split_complete`), the upgrade-only merge policy, and the `flushed_turn_verdict` question corrections (`done → blocked` and `blocked → done`).
+- `log_watcher::tests` — the transcript parser (`infer_state`, `split_complete`), the promote-to-`working`-only merge policy, and the `[Request interrupted by user]` cancel marker.
 - `sync::tests` — the receive-side `ingest` (namespacing, dialog seeding, contiguity guard) and the oldest-first chunked `build_push_chunk`.
-- `adapters::claude::tests` — `classify`, `derive_chat_id`, `clean_prompt`, `last_assistant_text`, `is_a_question` / `question_reason` / `evidence_snippet`, and the outer `dispatch`.
+- `adapters::claude::tests` — `classify` / `classify_stop`, `derive_chat_id`, `clean_prompt`, `is_a_question` / `question_reason` / `evidence_snippet`, and the outer `dispatch`.
 
 CI runs Rust tests on every push and PR (`build.yml`) and again before bundling on every tag push (`release.yml`), so a broken state machine can't ship a release.

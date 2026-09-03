@@ -42,7 +42,7 @@ The adapter recognizes six event names. Anything else returns `Ignore` and the w
 | `UserPromptSubmit` | `working`                                                                           | Label is the cleaned prompt; blank prompt → label `None`.      |
 | `Notification`     | `blocked` (default) — `done` if `notification_type == "idle_prompt"` with no question | See the notification-type table below.                      |
 | `PreToolUse`       | `blocked` for `AskUserQuestion` / `ExitPlanMode` only; other tools ignored         | Label: `"has a question"` for `AskUserQuestion`, `"plan approval"` for `ExitPlanMode`. The matcher in `~/.claude/settings.json` should restrict the hook to these two tools (see [Installation → Wire the Claude Code hook](../install#2-wire-the-claude-code-hook)) — Claude Code buffers the `tool_use` block until the user answers, so the JSONL transcript can't carry the signal in flight. |
-| `Stop`             | `done` — flips to `blocked` if last assistant turn contains a question (see [detection rules](#transcript-question-detection)) | Question check ignores configured benign closers. `Stop` fires *before* the final assistant turn flushes to JSONL, so it classifies from the **prior** turn's text and can be wrong either way — missing a trailing question (→ wrong `done`) or, when a statement turn follows a question turn, reading the stale question (→ wrong `blocked`). The transcript watcher corrects both once the real text lands (see [data flow](data-flow)). |
+| `Stop`             | `blocked` if the final assistant message ends on a question, else `waiting` if background work is still in flight, else `done` (see [detection rules](#question-detection)) | Settled here and not revisited: the payload carries the final text as `last_assistant_message` and any in-flight work as `background_tasks`, so `classify_stop` has everything it needs at `Stop` time. The question check ignores configured benign closers and openers. |
 | `SessionEnd`       | emits `Clear` (removes the row, unless a live sibling owns it)                       | Bypasses status classification entirely.                       |
 
 `SessionStart` and `Notification` share a code path because Claude Code occasionally emits notifications under either name; the dispatcher merges them.
@@ -76,19 +76,13 @@ This cleaning applies to the **label** (the one-line preview shown in the dashbo
 
 Other Unicode passes through untouched — accents, emoji, CJK, math symbols. The U+2300/U+2500 ranges are stripped because Claude Code's terminal output frequently leaks box-drawing glyphs into prompt and notification text.
 
-## Transcript question detection
+## Question detection
 
-`Stop` and `Notification` (subtype `idle_prompt`) need to decide whether the agent is genuinely done or is actually waiting for an answer. The transcript watcher (`log_watcher.rs`) is a third caller: it reuses `is_a_question` to re-judge the verdict once the final assistant turn flushes to JSONL — the case `Stop` fires too early to read — and corrects the row **both ways** (`done → blocked` for a missed question, `blocked → done` for a stale-read one). The watcher's demote is gated on a provenance flag (`status_from_transcript_scan`) so it only overturns `blocked` rows that came from this scan, never a tool-gating `blocked` (see [data flow](data-flow)). The flow has two helpers:
+`Stop` decides whether the agent is genuinely done or is handing back to the user, and it decides it from the payload rather than from the transcript: `last_assistant_message` carries the final assistant text — "avoids the need to read and parse the transcript file" — so `classify_stop` runs the question check on it directly and the row is settled there.
 
-**`last_assistant_text(path)`** — walks the JSONL transcript at `payload.transcript_path`:
+There is no re-read and no later correction. An earlier design classified from the *prior* turn's text, because `Stop` fires before the final turn flushes to JSONL, and had the transcript watcher fix the verdict both ways once the real text landed. Adopting `last_assistant_message` removed the reason for all of it: `flushed_turn_verdict`, `promote_done_to_blocked`, `demote_scanned_blocked_to_done` and the `status_from_transcript_scan` provenance flag are gone, and `Notification` (subtype `idle_prompt`) is ignored outright rather than acting as a second opinion. What the watcher still does is promote a paused row back to `working` once the transcript shows the main turn resumed — it never demotes (see [data flow](data-flow)).
 
-1. Read the file line-by-line.
-2. For each line, parse as JSON. Skip malformed lines.
-3. Skip entries whose `message.role` isn't `"assistant"`.
-4. Extract assistant text from `message.content`:
-   - if it's a JSON string, take the trimmed value;
-   - if it's an array, walk each block and take the trimmed `text` from blocks where `type == "text"`.
-5. Track the last non-empty text seen (so trailing whitespace-only assistant turns don't reset the state) and return it.
+One helper does the detection:
 
 **`is_a_question(text, rules)`** — pure check on a string, four detection paths. The `rules` argument bundles two config-driven lists that always travel together: `benign_closers` (suffix-matched) and `benign_openers` (prefix-matched). Before any path runs, inline Markdown formatting characters (`*`, `_`, `` ` ``, `#`, `~`) are stripped so a final `**Push?**` reduces to `Push?` and is still recognized — only those marker characters are removed; newlines and every other character (crucially the terminal `?`) are preserved.
 
@@ -136,7 +130,7 @@ If nothing above matches, check whether the **first sentence** of the last parag
 
 This path was validated against the recorded dialog history (`prompt_history.json`): it fires on 12 of 60 real assistant turns with zero false positives. Like path 2 it scans only the **last** paragraph, and like it the question must be the paragraph's *first* sentence — a statement-first paragraph (`"The migration is ready. Looks good to you?"`) is left to path 1's trailing-`?` check.
 
-Failure modes are silent: a missing transcript file returns `None` from `last_assistant_text` (treated as "no question"), and malformed JSONL lines are individually skipped. The adapter never crashes a status update because of a transcript read error.
+Failure modes are silent: a `Stop` payload carrying no `last_assistant_message`, or an empty one, is treated as "no question" and settles the row on the background-work check alone. The adapter never crashes a status update over a missing or unreadable field.
 
 ## Decision log
 
@@ -146,8 +140,7 @@ Every status-affecting decision is written to `widget.jsonl` (the same tracing s
 |---                                    |---                        |---                                                                                                                                                                          |
 | `classify`                            | `http_server` (`event -> set`) | A hook event set the row's status. For `Stop` / idle prompts the `reason` reads `<kind> on a question [<rule>]: "<snippet>"` or `<kind>; final message is not a question: "<snippet>"`, where `<kind>` is `turn ended` or `idle prompt`. |
 | `resume_working`                      | `log_watcher`             | The transcript watcher saw new activity (a tool call or user turn) after a pause and promoted the row back to `working` — the path that clears a stale `blocked` once the user answers an `AskUserQuestion`. |
-| `enter_waiting`                        | `log_watcher`             | The main turn settled (`done`) but `pendingBackgroundAgentCount > 0`, so the row is held on the `waiting` state (light-blue WAIT) until the agents finish. |
-| `correct_to_blocked` / `correct_to_done` | `log_watcher`         | The watcher re-judged the final assistant turn once it flushed, fixing a verdict `Stop` made too early (see [transcript question detection](#transcript-question-detection)). |
+| `settle_waiting`                      | `waiting_settle`          | A row sat in `waiting` (light-blue WAIT) unchanged past `waiting_settle_ms` and was settled to `done` — the backstop for a background shell task the user killed, which ends silently and so fires no follow-up `Stop`. Carries `waited_ms` / `window_ms`. |
 | `revert_cancelled`                    | `log_watcher`             | An Esc-cancelled turn (no lifecycle hook) reverted to its pre-prompt status — the `status` field records where it landed.                                              |
 | `apply_set`                           | `state.rs`                | The state-machine transition: `prior_status` → `new_status`, plus `task_boundary` and `continuation_suppressed`.                                                            |
 | `session_clear` / `compact_boundary`  | `http_server`             | Session removed / context-compaction history separator inserted.                                                                                                            |
