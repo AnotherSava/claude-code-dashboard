@@ -13,7 +13,7 @@
           "Reveal the widget (tray icon left-click), capture the window rect, not the screen"
         ]
       },
-      "verifiedAt": "2a0c824"
+      "verifiedAt": "5c248d5"
     },
     {
       "id": "compact-mode",
@@ -28,7 +28,7 @@
           "Capture the window rect"
         ]
       },
-      "verifiedAt": "2a0c824"
+      "verifiedAt": "5c248d5"
     },
     {
       "id": "terminal-tabs",
@@ -42,7 +42,7 @@
           "Capture agterm's sidebar; the surrounding chrome is third-party and is not evidence for staleness"
         ]
       },
-      "verifiedAt": "59d4b2e"
+      "verifiedAt": "5c248d5"
     },
     {
       "id": "history-window",
@@ -56,7 +56,7 @@
           "Capture the history window rect"
         ]
       },
-      "verifiedAt": "87e006a"
+      "verifiedAt": "5c248d5"
     },
     {
       "id": "work-intensity",
@@ -72,7 +72,7 @@
           "Capture the window rect"
         ]
       },
-      "verifiedAt": "87e006a"
+      "verifiedAt": "5c248d5"
     }
   ],
   "declinedGaps": [
