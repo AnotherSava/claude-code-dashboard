@@ -269,17 +269,17 @@
         {#if sharedBy > 1}
           <span class="shared" title="{sharedBy} sessions answer to this name, so their terminal tabs read alike and this row may be merging more than one of them">×{sharedBy}</span>
         {/if}
+        {#if session.instruction_drift}
+          <span class="drift" title="Instruction drift — the last reply dropped its adherence marker; treat its output with caution">⚠</span>
+        {/if}
+        {#if session.terminal_stale_at}
+          <span class="stale" title="This session's terminal tab is showing a stale status. If you renamed the tab, right-click it and choose Reset tab title; otherwise it is a leftover tab whose session has ended">≠</span>
+        {/if}
       </div>
       {#if session.origin}
         <span class="device" title="Session on {session.origin}">{session.origin}</span>
       {/if}
       <span class="pill state-{session.status}" class:pulse={shouldPulse}>{stateLabel[session.status]}</span>
-      {#if session.instruction_drift}
-        <span class="drift" title="Instruction drift — the last reply dropped its adherence marker; treat its output with caution">⚠</span>
-      {/if}
-      {#if session.terminal_stale_at}
-        <span class="stale" title="This session's terminal tab is showing a stale status. If you renamed the tab, right-click it and choose Reset tab title; otherwise it is a leftover tab whose session has ended">≠</span>
-      {/if}
       {#if !config.compact_mode}
         <span class="time">{time}</span>
       {/if}
@@ -396,8 +396,26 @@
   }
   /* The terminal disagreeing with the row, which is a different subject from
      everything else here — so it is neither the drift badge's filled red pill nor
-     the name's own colour, but a bare amber mark in the badge cluster. `≠` says
-     "these two do not match", which is the whole claim. */
+     the name's own colour, but a bare amber mark. `≠` says "these two do not
+     match", which is the whole claim.
+
+     Every badge rides inside `.name`, and the pill is only ever the status. Sat
+     after the pill a badge reads as a qualifier on the state, which is the one
+     thing about these rows that is not in doubt: the row is right, and it is
+     something around it that is wrong — the tab is showing the wrong caption, the
+     agent's output dropped its marker, several sessions answer to one name. All
+     three are facts about the *session*, which the name identifies.
+
+     The `.device` chip is the deliberate exception, and it is not settled so much
+     as unexamined: which machine a session runs on is equally a fact about the
+     session, so by this rule it would ride with the name too. It stays between
+     the name and the pill for now. See the memo of 2026-09-09.
+
+     They are ordered by how far the subject sits from the agent itself: `×N` is
+     about the name string, `⚠` about what the agent produced, `≠` about the
+     terminal displaying it. They stay legible together because each has its own
+     shape — a bare count, a filled pill, a bare mark — rather than one geometry
+     in three colours. */
   .stale {
     font-size: 12px;
     font-weight: 700;
