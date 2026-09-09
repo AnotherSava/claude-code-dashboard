@@ -9,7 +9,7 @@ metadata:
 
 **The Win32 mechanics are global, not project knowledge, and deliberately live outside this repo.** `~/.claude/learnings/windows-terminal-title.md` holds the console title read-back (per session, not per screen) and what Windows Terminal exposes about which tab is on screen; `~/.claude/learnings/windows-winevent-hooks.md` holds the `SetWinEventHook` technique with the measured pid-scoping numbers. Read those before touching the adapter, and do not copy their content back here.
 
-One consequence found in production on 2026-09-03 and now handled by `terminal_title::observe_caption`: a Windows Terminal tab the user renames stops following the title for good, so a row can read `Working` while its tab reads `🟢`. `~/.claude/learnings/windows-terminal-title.md` has the mechanism, the measurements and every dead route to resetting it from outside; the detector's own design is in CLAUDE.md.
+One consequence found in production on 2026-09-03 and now handled by `terminals::stale_check`, which is the **sole writer** of `AgentSession::terminal_stale_at` (`observe_caption` still runs `pin_verdict` and logs `title_pinned`/`title_unpinned`, but writes no verdict — two writers with no coordination was a shipped defect, since a caption byte-equal to a string we wrote is exactly what an accidentally pinned tab shows): a Windows Terminal tab the user renames stops following the title for good, so a row can read `Working` while its tab reads `🟢`. `~/.claude/learnings/windows-terminal-title.md` has the mechanism, the measurements and every dead route to resetting it from outside; the detector's own design is in CLAUDE.md.
 
 What is specific to this setup:
 
