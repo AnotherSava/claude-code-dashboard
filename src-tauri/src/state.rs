@@ -178,8 +178,15 @@ pub struct AgentSession {
     #[serde(default)]
     pub instruction_drift: bool,
     /// When the session's terminal tab was found to have stopped showing this
-    /// row's status, or `None` while it is keeping up — see
-    /// `terminal_title::observe_caption`, which sets it.
+    /// row's status, or `None` while it is keeping up.
+    ///
+    /// Two things set it, and they see different faults.
+    /// `terminals::stale_check` compares what a surface displays against the real
+    /// console title of the session in it, which catches a tab renamed to
+    /// anything at all. `terminal_title::observe_caption` compares a caption
+    /// against what this dashboard wrote, so it can only ever catch a tab frozen
+    /// on one of our own strings — the weaker oracle, and the one that was here
+    /// first.
     ///
     /// The instant *is* the flag, rather than a bool beside one: the badge only
     /// needs to know it is set, but the Telegram alert waits out
@@ -190,8 +197,9 @@ pub struct AgentSession {
     ///
     /// Orthogonal to `status` in the same way `instruction_drift` is: the row is
     /// right and something outside it is wrong, so it colours nothing and gates
-    /// nothing. Windows-only, because it is detected from the terminal caption the
-    /// Windows adapter's hook delivers.
+    /// nothing. Windows-only today, because both oracles are: one is that
+    /// adapter's caption hook, and the other needs a terminal that implements
+    /// `TerminalAdapter::front_readings`.
     ///
     /// It lives here rather than being stamped at emit time like `canary` and
     /// `name_shared_by` for one concrete reason: `notifications::reconcile` reads
@@ -753,15 +761,19 @@ impl AppState {
         true
     }
 
-    /// Set (or clear) a session's instruction-drift flag — the canary overlay,
-    /// stamped from the `http_server` Stop check when the final assistant message
-    /// is (or is no longer) missing this session's adherence marker. Orthogonal to
-    /// `status`: it never changes the state, only this flag, so a drifting turn
-    /// still reads Done / Blocked / Waiting. Bumps `updated` (so the following
-    /// `emit_sessions_updated` fans the change out to every surface) and returns
-    /// whether the value actually changed. No-op when the row is gone or already at
-    /// `drift`.
     /// Flag or clear "this row's terminal tab is showing a stale status".
+    ///
+    /// A time-based expiry backstop was added here and removed again. It was meant
+    /// to bound a flag the detector failed to retract, but the revert that landed
+    /// beside it removed the only state in which that could happen — `Report` and
+    /// `Clear` are symmetric again — so its one reachable trigger was
+    /// `stale_step`'s deliberate `Hold`, the arm that refuses to retract on a
+    /// coincidental agreement. It therefore cleared exactly the flags that arm
+    /// exists to keep, preferentially in the accidental-rename case this feature
+    /// is for. If an unclearable state ever returns, bound it at the point that
+    /// knows it is unclearable, not on a timer that cannot tell a held verdict
+    /// from a missing one.
+    ///
     /// Returns whether anything changed, so the caller only emits and logs on an
     /// edge. Mirrors [`AppState::set_drift`], including leaving `status`
     /// untouched.
@@ -794,6 +806,14 @@ impl AppState {
         changed
     }
 
+    /// Set (or clear) a session's instruction-drift flag — the canary overlay,
+    /// stamped from the `http_server` Stop check when the final assistant message
+    /// is (or is no longer) missing this session's adherence marker. Orthogonal to
+    /// `status`: it never changes the state, only this flag, so a drifting turn
+    /// still reads Done / Blocked / Waiting. Bumps `updated` (so the following
+    /// `emit_sessions_updated` fans the change out to every surface) and returns
+    /// whether the value actually changed. No-op when the row is gone or already at
+    /// `drift`.
     pub fn set_drift(&self, id: &str, drift: bool, now_ms: i64) -> bool {
         let mut sessions = self.sessions.lock().unwrap();
         let Some(s) = sessions.iter_mut().find(|s| s.id == id) else {

@@ -184,15 +184,21 @@ pub fn stale_reconcile<'a>(delay_ms: Option<u64>, sessions: &'a [AgentSession], 
 
 /// The stale-tab alert's text.
 ///
-/// It reports the observation and not a cause, because the dashboard cannot tell
-/// a tab given a custom name from a leftover tab whose session has exited — and
-/// names the fix for the common one, since there is nothing this app can do about
-/// it from here.
-pub fn build_stale_tab_message(session: &AgentSession) -> String {
-    format!(
-        "⚠ [{}] its terminal tab is showing a stale status. If the tab was renamed, right-click it and choose \"Reset tab title\"; otherwise it is a leftover tab whose session has ended.",
-        session.display_label()
-    )
+/// The observation is this module's; the `remedy` is the terminal's, and comes
+/// from
+/// [`TerminalAdapter::stale_remedy`](crate::terminals::TerminalAdapter::stale_remedy).
+/// Naming a fix is as terminal-specific as the fault, so a remedy written here
+/// would go on quoting Windows Terminal's wording at whoever runs something else.
+///
+/// The split is also why this text no longer claims to report no cause: the
+/// dashboard still cannot tell a renamed tab from a leftover one, but the
+/// adapter may name both possibilities in its own vocabulary, and today's does.
+/// The remedy leads with what to do and gives the reason after, per
+/// `feedback_warning_leads_with_instruction`, and the seam requires it to read as
+/// a mid-sentence clause — see
+/// [`stale_remedy`](crate::terminals::TerminalAdapter::stale_remedy)'s contract.
+pub fn build_stale_tab_message(session: &AgentSession, remedy: &str) -> String {
+    format!("⚠ [{}] its terminal tab is showing a stale status: {}.", session.display_label(), remedy)
 }
 
 /// Reconcile context-usage alerts against the currently-over set, mirroring the
@@ -864,14 +870,10 @@ impl NotificationManager {
                         }
                     }
 
-                    // Instruction-drift alerts (the adherence canary) — same
-                    // send / track / dismiss lifecycle as the context-usage alert,
-                    // driven by the orthogonal `instruction_drift` flag instead of a
-                    // token threshold. Gated on the feature toggle, so disabling it
-                    // dismisses everything outstanding.
-                    // The tab stopped showing this row's status. Reported, never
-                    // repaired: a Windows Terminal custom tab name outranks the
-                    // console title permanently and only the user can clear it.
+                    // The tab stopped showing this row's status. Reported and
+                    // never repaired: nothing outside the terminal can undo a tab
+                    // rename, so the alert's whole job is to say what only the
+                    // user can do about it.
                     let (stale_dismiss, stale_send) = stale_reconcile(tg_cfg.and_then(|c| c.stale_tab_alert_ms), &sessions, &stale_outstanding, now);
                     for id in &stale_dismiss {
                         tracing::debug!(
@@ -887,7 +889,15 @@ impl NotificationManager {
                         if stale_backoff.get(&s.id).is_some_and(|until| now < *until) {
                             continue;
                         }
-                        match telegram.send_raw_tracked(&build_stale_tab_message(s)).await {
+                        // Resolved here rather than once per tick. This loop is
+                        // empty on all but a handful of ticks in a process's life,
+                        // and hoisting the lookup above it built an adapter every
+                        // second, forever, to fetch a string that depends only on
+                        // the platform. Every other caller builds one adapter and
+                        // keeps it; nothing in the trait promises a constructor
+                        // stays free.
+                        let remedy = crate::terminals::for_platform(&app).map_or(crate::terminals::FALLBACK_STALE_REMEDY, |a| a.stale_remedy());
+                        match telegram.send_raw_tracked(&build_stale_tab_message(s, remedy)).await {
                             Ok(handle) => {
                                 tracing::debug!(channel = "telegram", id = %s.id, decision = "stale_tab_alert", reason = "the terminal tab stopped following this row", "stale-tab alert sent");
                                 stale_outstanding.insert(s.id.clone(), handle);
@@ -905,6 +915,11 @@ impl NotificationManager {
                     }
                     stale_backoff.retain(|id, until| now < *until && sessions.iter().any(|s| &s.id == id && s.terminal_stale_at.is_some()));
 
+                    // Instruction-drift alerts (the adherence canary) — same
+                    // send / track / dismiss lifecycle as the context-usage alert,
+                    // driven by the orthogonal `instruction_drift` flag instead of a
+                    // token threshold. Gated on the feature toggle, so disabling it
+                    // dismisses everything outstanding.
                     let (drift_dismiss, drift_send) = drift_reconcile(cfg.instruction_canary_enabled, &sessions, &drift_outstanding);
                     for id in &drift_dismiss {
                         tracing::debug!(
@@ -1951,8 +1966,8 @@ mod tests {
     #[test]
     fn stale_tab_message_format() {
         assert_eq!(
-            build_stale_tab_message(&session("proj", Status::Working, 0)),
-            "⚠ [proj] its terminal tab is showing a stale status. If the tab was renamed, right-click it and choose \"Reset tab title\"; otherwise it is a leftover tab whose session has ended."
+            build_stale_tab_message(&session("proj", Status::Working, 0), crate::terminals::FALLBACK_STALE_REMEDY),
+            "⚠ [proj] its terminal tab is showing a stale status: check whether the tab was renamed, and reset its title."
         );
     }
 

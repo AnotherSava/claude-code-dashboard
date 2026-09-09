@@ -294,6 +294,15 @@ pub fn run() {
             lid_awake::spawn(app.handle().clone());
             attention::spawn(app.handle().clone());
             session_restore::spawn(app.handle().clone());
+            // Gated by neither the platform nor `terminal_titles`, and both are
+            // deliberate. `spawn` returns early where `for_platform` has no
+            // adapter, so a `#[cfg]` here would assert in a third place what the
+            // seam already decides — the coupling the adapter refactor removed.
+            // And the config flag hot-reloads from the tray while `sync` re-reads
+            // it every call, so gating on its start-time value left a user who
+            // enabled titles later with checks requested and nothing to receive
+            // them, silently.
+            terminals::stale_check::spawn(app.handle().clone());
 
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {

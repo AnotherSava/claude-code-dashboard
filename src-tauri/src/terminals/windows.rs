@@ -1,7 +1,9 @@
 //! The Windows adapter: what Windows Terminal shows, and what the console holds.
 //!
-//! Two questions with two different oracles, and the split is not tidiness — it
-//! is that on Windows they genuinely live in different places.
+//! Three questions with three different oracles, and the split is not tidiness —
+//! it is that on Windows they genuinely live in different places. A fourth read,
+//! the owner walk behind `attached_surface`, answers which window renders a
+//! console this process has just written to.
 //!
 //! - **Which session is on screen** is Windows Terminal's *window title*. WT
 //!   publishes the active tab's title as the window caption, and that string is
@@ -57,7 +59,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use tauri::{AppHandle, Manager};
 
-use super::{Observation, ObservationKind, TerminalAdapter, TerminalSession};
+use super::{FrontReading, Observation, ObservationKind, TerminalAdapter, TerminalSession};
 
 /// The slug the decision log carries. Deliberately the platform and not
 /// `"windows_terminal"`: attention really is Windows Terminal's, but
@@ -70,6 +72,33 @@ const NAME: &str = "windows";
 /// `Windows Terminal <hex>` — is the monarch, which is why visibility is checked
 /// as well.
 const TERMINAL_CLASS: &str = "CASCADIA_HOSTING_WINDOW_CLASS";
+
+/// What to tell a user whose tab has stopped following its session.
+///
+/// It names one cause, because since `stale_check` became the flag's only writer
+/// only one cause can raise it. That check needs the displayed name to differ
+/// from the pane's console title, and a leftover tab whose session merely exited
+/// shows the two as one string by construction — so telling the user it might be
+/// that would send them looking for something the detector cannot have seen.
+///
+/// Named rather than written inline so the contract test in the parent module
+/// can hold it to [`super::TerminalAdapter::stale_remedy`]'s splicing rules.
+/// That is a constant a reader benefits from either way, not a surface added
+/// for a test: an adapter needs an `AppHandle` to construct, so a test cannot
+/// reach the method.
+pub(super) const STALE_REMEDY: &str = "right-click the tab and choose \"Reset tab title\". A double-click on a tab opens the renamer, which pins it to whatever it was showing at the time, so this happens with nothing typed";
+
+/// The opaque surface key for one terminal window, per [`super::FrontReading`].
+///
+/// One function so no two sides can drift: `front_readings` mints these, the
+/// caption watch mints them for the window it saw, and `attached_surface` mints
+/// one when it attributes a session's console to the window rendering it.
+/// A caller comparing a key built one way against a key built another would
+/// silently match nothing — and since every reader treats an unmatched key as
+/// "do not know", it would fail by going quiet.
+fn surface_key(hwnd: isize) -> String {
+    format!("hwnd:{hwnd}")
+}
 
 /// How recent the last desktop input must be, at the instant a title change
 /// arrives, for the switch to be attributable to a person. Measured, a human tab
@@ -198,6 +227,110 @@ impl TerminalAdapter for WindowsAdapter {
         out
     }
 
+    /// Windows Terminal offers no way to undo a rename from outside, so the
+    /// remedy names the one action only the user can take.
+    fn stale_remedy(&self) -> &'static str {
+        STALE_REMEDY
+    }
+
+    /// The terminal window rendering the console this process is attached to.
+    ///
+    /// Three outcomes, and the difference between the last two matters. A handle
+    /// of zero is a `CREATE_NO_WINDOW` console — a hook process, never a tab. A
+    /// window whose root owner is *itself* is a console nothing owns: a bare
+    /// `conhost`, or a ConPTY whose host never claimed it, which is how a session
+    /// in another terminal presents. Only a root owner of Windows Terminal's own
+    /// class is a tab this adapter can reason about, so the test is
+    /// [`is_terminal_window`] and **never** "an owner exists" — any other
+    /// terminal that sets an owner would otherwise be taken for this one.
+    ///
+    /// The caller has already attached to `pid`'s console, so this reads that
+    /// console rather than looking the pid up: `GetConsoleWindow` answers for the
+    /// attachment, which is what makes the result per-session rather than
+    /// per-process and what confines the call to the inside of a write.
+    ///
+    /// Measured on Windows 11: a ConPTY console reports a real (invisible, 0x0)
+    /// window of class `PseudoConsoleWindow`, and the consoles reporting no window
+    /// at all are exactly the hook-side `CREATE_NO_WINDOW` ones. The owner link is
+    /// cross-process — the pseudo-console window belongs to `OpenConsole.exe`, not
+    /// to `WindowsTerminal.exe` — so it was measured end to end on 2026-09-04
+    /// against all six live sessions: every one resolved to the same visible
+    /// `CASCADIA_HOSTING_WINDOW_CLASS` window, and to the same handle
+    /// `front_readings` enumerates for it.
+    ///
+    /// Four kernel-side calls, no message send, no lock: cheap enough for the
+    /// caller's attach lock, per the trait's requirement.
+    fn attached_surface(&self, pid: u32) -> Option<String> {
+        // The attachment names the console; the pid is what the caller attached.
+        let _ = pid;
+        let console = unsafe { GetConsoleWindow() };
+        if console == 0 {
+            return None;
+        }
+        let owner = unsafe { GetAncestor(console, GA_ROOTOWNER) };
+        if owner == 0 || owner == console {
+            return None;
+        }
+        is_terminal_window(owner).then(|| surface_key(owner))
+    }
+
+    /// UI Automation is COM, so the reading thread must join an apartment
+    /// before [`front_readings`](TerminalAdapter::front_readings) can be
+    /// called on it.
+    fn prepare_reader(&self) {
+        super::wt_tabs::init_apartment();
+    }
+
+    /// One reading per visible Windows Terminal window: the name on the tab in
+    /// front, and the console titles of the panes realized behind it.
+    ///
+    /// The two sides come from two different places, which is the point. The
+    /// tab's name is what Windows Terminal *renders*, and a rename overwrites it.
+    /// The pane's UIA `HelpText` is `ControlCore::Title()`, the console title
+    /// itself, which a rename does not touch. Measured live 2026-09-03:
+    /// `shown=ttt` against `real=✋ what-is-next [78%]`.
+    ///
+    /// **Both come from the one UIA pass, and the window caption is deliberately
+    /// not used** even though this adapter already reads it for attention. Under
+    /// `showTerminalTitleInTitlebar: false` every caption is the literal string
+    /// `Windows Terminal` while each tab keeps its own name, so a caption-based
+    /// comparison would report every session on that machine as stale at once.
+    /// See `wt_tabs` for the second reason, which is that two APIs put the two
+    /// sides of the comparison at different instants.
+    ///
+    /// Only the tab in front of each window answers, and that is structural
+    /// rather than a shortfall: XAML's `TabView` realizes one `ContentPresenter`,
+    /// so the pane search returns the panes of the selected tab and of no other. It
+    /// is also the right limit — a stale glyph misleads precisely while its tab
+    /// is on screen.
+    fn front_readings(&self) -> Option<Vec<FrontReading>> {
+        // Always `Some`: enumerating this machine's terminal windows is a
+        // local call with no way to fail into "could not be asked". A window
+        // whose *contents* could not be read is a per-surface abstention
+        // below, which is the finer answer and the one the rule needs.
+        Some(
+            terminal_windows()
+                .into_iter()
+                .map(|(hwnd, _caption)| {
+                    // No caption fallback. It could never reach a verdict — a failed
+                    // pass leaves `sessions` at `None`, which abstains — but it would
+                    // hand the rule a *non-empty* `shown`, so a window whose read
+                    // failed and whose caption was readable would log its abstention
+                    // under whichever reason the rule tested first. "Could not look"
+                    // must never wear the name of "showed nothing".
+                    let read = super::wt_tabs::read_surface(hwnd);
+                    FrontReading {
+                        // Opaque per the seam's contract: the caller compares these
+                        // for equality and never reads the number back out.
+                        surface: surface_key(hwnd),
+                        shown: read.as_ref().map_or_else(String::new, |r| r.shown.clone()),
+                        sessions: read.map(|r| r.panes),
+                    }
+                })
+                .collect(),
+        )
+    }
+
     /// Report a departure the moment the active tab's title changes, rather than
     /// at the next tick.
     ///
@@ -279,7 +412,22 @@ fn consume(app: &AppHandle, foreground: &Foreground, rx: &std::sync::mpsc::Recei
         // has stopped following its row. Both event kinds carry one, and a
         // foreground change is worth judging too — it is how a tab that was
         // already stuck comes into view.
-        crate::terminal_title::observe_caption(app, &ev.title, ev.at_ms);
+        // The window the caption came from, so a lookalike caption in a second
+        // window cannot accuse a row this one does not render.
+        crate::terminal_title::observe_caption(app, &ev.title, ev.at_ms, Some(&surface_key(ev.hwnd)));
+        // A caption change is also the moment to ask whether the tab now in front
+        // is showing its own session's title. This is the trigger a write cannot
+        // supply: a pinned tab's caption never moves, so switching *to* it
+        // produces the only event that says "look at this one now".
+        //
+        // Gated on the same flag the departure path below reads: with titles off
+        // nothing is written, so every reading would resolve to no row — and this
+        // trigger, unlike the write one, fires on every caption event, so leaving
+        // it open meant a full cross-process read of every terminal window per
+        // tab switch for a disabled feature.
+        if titles_enabled(app) {
+            crate::terminals::stale_check::request();
+        }
         if ev.event == EVENT_SYSTEM_FOREGROUND {
             *foreground.lock().unwrap() = Some((ev.hwnd, ev.at_ms));
             continue;
@@ -409,6 +557,15 @@ fn terminal_pid() -> Option<u32> {
     (pid != 0).then_some(pid)
 }
 
+/// Whether `hwnd` is a terminal window a user can actually see.
+///
+/// The **visibility half is not decoration**: Windows Terminal's monarch is an
+/// invisible window of this same class, so a class check alone accepts a window
+/// no `front_readings` will ever enumerate. [`WindowsAdapter::attached_surface`]
+/// shares this rather than keeping a laxer copy — attributing a session's console
+/// to the monarch would produce a surface key nothing can match, and since an
+/// absent attribution is the permissive answer, that is the one direction it can
+/// silently kill both stale-tab oracles at once.
 fn is_terminal_window(hwnd: isize) -> bool {
     unsafe { IsWindowVisible(hwnd) != 0 && window_string(|buf, len| GetClassNameW(hwnd, buf, len)) == TERMINAL_CLASS }
 }
@@ -467,7 +624,21 @@ extern "system" {
     fn TranslateMessage(msg: *const Msg) -> i32;
     fn DispatchMessageW(msg: *const Msg) -> isize;
     fn SetTimer(hwnd: isize, id: usize, elapse: u32, cb: usize) -> usize;
+    fn GetAncestor(hwnd: isize, flags: u32) -> isize;
 }
+
+// The odd one out: `GetConsoleWindow` is kernel32's, not user32's, despite
+// answering with an HWND. `terminal_title` declares it too, for the attach
+// dance; a second declaration of the same import is free, and sharing one
+// would tie each module's `#[cfg]` tree to the other's.
+#[link(name = "kernel32")]
+extern "system" {
+    fn GetConsoleWindow() -> isize;
+}
+
+/// `GA_ROOTOWNER` — walk the owner chain to its root, which for a pseudo-console
+/// window is the terminal window hosting it.
+const GA_ROOTOWNER: u32 = 3;
 
 #[cfg(test)]
 mod tests {

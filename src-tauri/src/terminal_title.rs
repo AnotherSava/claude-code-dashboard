@@ -1,5 +1,5 @@
 //! Mirror each session's live status onto its terminal tab title as
-//! "<status glyph> <name>" (e.g. "🔵 ai-dashboard").
+//! `"<status glyph> <name>"` (e.g. "🔵 ai-dashboard").
 //!
 //! The dashboard is a GUI process with no handle into any terminal, so it
 //! reaches the session's terminal through the pid candidates the hook
@@ -33,6 +33,7 @@ use tauri::{AppHandle, Manager};
 use crate::config::ConfigState;
 use crate::notifications::context_percent;
 use crate::state::{AgentSession, AppState, Status};
+use crate::terminals::TerminalAdapter;
 
 /// How long a pushed title is trusted to still be on the console. Spawned
 /// console processes (bash.exe, pwsh.exe — every command the agent runs)
@@ -49,16 +50,119 @@ const REASSERT_MS: i64 = 5_000;
 #[derive(Default)]
 pub struct TerminalTitles {
     pids: Mutex<HashMap<String, Vec<u32>>>,
-    last: Mutex<HashMap<String, (String, i64)>>,
+    /// Per row: the title last written, when it was last *asserted*, and when it
+    /// last *changed*.
+    ///
+    /// Two instants because two readers need different facts. `REASSERT_MS` asks
+    /// how long since we last asserted, so it must count re-pushes of an unchanged
+    /// string. The staleness check's propagation grace asks how long since the
+    /// tab had something new to catch up with, and must not: a re-push of the
+    /// identical string starts no propagation, so counting it swallowed checks
+    /// triggered by a tab switch whenever any unrelated emit happened to re-assert
+    /// that row inside the grace — and since a re-push no longer requests a check,
+    /// nothing rescheduled the pass it ate.
+    last: Mutex<HashMap<String, (String, i64, i64)>>,
     /// Rows whose tab has been caught not following, keyed by chat_id: the
     /// caption it was stuck on, the title we had written when we first noticed,
     /// and whether it has been reported. See [`observe_caption`].
     pinned: Mutex<HashMap<String, (String, String, bool)>>,
+    /// The terminal window rendering each row's console, keyed by chat_id, as
+    /// `TerminalAdapter::attached_surface` answered at the moment its title was
+    /// last written.
+    ///
+    /// An opaque surface key (`terminals::FrontReading::surface`) rather than a
+    /// pid or a raw handle: one `WindowsTerminal.exe` hosts every window, so a
+    /// pid names the terminal and not the window, and it is the window that owns
+    /// a tab strip. The adapter mints it, so its own readings and this
+    /// attribution share one convention with nothing here to keep in step.
+    /// Absent means the last write found no surface this terminal recognized — a
+    /// hook console, a session in some other terminal, or a platform whose
+    /// adapter cannot answer at all — and every reader must treat absence as "do
+    /// not know", never as "not in this terminal", since a write that never
+    /// happened leaves no entry either.
+    hosts: Mutex<HashMap<String, String>>,
 }
 
 impl TerminalTitles {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Which row this dashboard wrote `title` for, among the rows whose console
+    /// is rendered by terminal window `host`.
+    ///
+    /// The resolution `terminals::stale_check` names a row with. It is given the
+    /// *pane's* console title rather than the tab's displayed name, so this is
+    /// matching a string we wrote against the record of writing it — exact, with
+    /// no `same_row` prefix reasoning and no tie-break, because both sides came
+    /// from `build_title`.
+    ///
+    /// Scoped by `host` so a second window showing a lookalike title cannot name
+    /// a row this one renders. Rows with no recorded host stay eligible: absence
+    /// means the last write found no terminal *or* never happened, and excluding
+    /// them would retire the check for a row whose attribution simply has not
+    /// been established yet.
+    ///
+    /// Holds no two locks at once, deliberately. `sync` takes `pids`, then
+    /// `last`, and holds both across its write loop while reaching for `hosts` —
+    /// so locking `hosts` and then `last` here would invert that order and could
+    /// deadlock. Cloning the first (as `observe_caption` does) drops its guard at
+    /// the end of the statement, which makes the order moot rather than merely
+    /// correct.
+    ///
+    /// Not platform-gated, and that is not an oversight: its body is plain
+    /// `HashMap` logic, and its caller `terminals::stale_check` is generic by
+    /// design. Gating it broke the macOS build outright — a Windows-only
+    /// `cargo check` cannot see a `cfg(not(windows))` break, so only CI's
+    /// macos-latest job or a Mac would have caught it.
+    ///
+    /// **A draw is refused, not resolved by iteration order.** Two rows can hold
+    /// identical titles — `custom_names::set` does not stop two being renamed
+    /// alike — and a row whose console is in no recognized terminal has no
+    /// `hosts` entry, so it is eligible in *every* window. Taking the first match
+    /// off a `HashMap` therefore aimed the badge and the Telegram alert at an
+    /// arbitrary one of them, and at a different one between passes. That is the
+    /// forbidden direction, and it is the same hazard `observe_caption` already
+    /// refuses with its own `drawn` counter. A row whose recorded host *is* this
+    /// surface outranks a host-less one, since that is positive attribution
+    /// against mere eligibility; anything still tied answers `None`.
+    ///
+    /// Returns the row and **when its title last changed**, because the caller
+    /// needs both: a comparison made while a write is still propagating disagrees
+    /// about a healthy surface. It is the *change* instant and not the write
+    /// instant, since re-asserting the identical string starts no propagation for
+    /// a tab to lag behind.
+    pub(crate) fn row_for_title(&self, title: &str, host: &str) -> Option<(String, i64)> {
+        let hosts: HashMap<String, String> = self.hosts.lock().unwrap().clone();
+        let last = self.last.lock().unwrap();
+        let mut best: Option<(&String, i64, bool)> = None;
+        let mut drawn = 1;
+        for (id, (_, _, changed_at)) in last.iter().filter(|(_, (t, _, _))| t == title) {
+            // A row attributed to a *different* surface is excluded outright.
+            //
+            // Ranking it last instead was tried and reverted. The argument for it
+            // — that the matched string is `real`, the console title we wrote, so
+            // a unique match proves the console is in this surface — does not
+            // hold: `last[row] == real` says only that we once wrote that string
+            // for that row, not that *this* pane is the console we wrote it to. A
+            // console still holding a title we later re-wrote elsewhere would then
+            // name the row from the wrong window, which is the accusing direction
+            // and the one this whole ordering exists to close. The cost of
+            // excluding is a tab dragged into another window going unjudged until
+            // the row's next status change re-attributes it, which is a miss that
+            // repairs itself.
+            let attributed = match hosts.get(id) {
+                Some(h) if h == host => true,
+                Some(_) => continue,
+                None => false,
+            };
+            match best {
+                Some((_, _, b)) if b && !attributed => {}
+                Some((_, _, b)) if b == attributed => drawn += 1,
+                _ => (best, drawn) = (Some((id, *changed_at, attributed)), 1),
+            }
+        }
+        best.filter(|_| drawn == 1).map(|(id, changed_at, _)| (id.clone(), changed_at))
     }
 
     /// Record the console-pid candidates a hook event reported for `chat_id`.
@@ -153,7 +257,14 @@ fn with_console<T>(candidates: impl IntoIterator<Item = u32>, f: impl Fn(u32) ->
 pub fn read_title(pid: u32) -> Option<String> {
     with_console([pid], |_| {
         let mut buf = [0u16; 512];
-        let len = unsafe { GetConsoleTitleW(buf.as_mut_ptr(), buf.len() as u32) } as usize;
+        // Clamped, and not defensively: `GetConsoleTitleW` is documented to
+        // return the length of the *console's* title rather than the number of
+        // characters it copied, so a title longer than the buffer yields an index
+        // past its end and `&buf[..len]` panics — inside `with_console`, holding
+        // `ATTACH_LOCK`, in an always-on-top widget. Truncation is the right
+        // outcome anyway: a truncated title is not one we wrote, so it names no
+        // row, which is the safe direction.
+        let len = (unsafe { GetConsoleTitleW(buf.as_mut_ptr(), buf.len() as u32) } as usize).min(buf.len());
         (len > 0).then(|| String::from_utf16_lossy(&buf[..len]))
     })
 }
@@ -161,10 +272,17 @@ pub fn read_title(pid: u32) -> Option<String> {
 /// How long a write is given to reach the tab before a mismatch means anything.
 ///
 /// Measured on this machine, a console title change reaches the tab in 5.8 to
-/// 33.7 ms, and that figure *includes* the probe's own round-trip, so the real
-/// propagation is smaller still. Two seconds is ~60x the worst observation, which
-/// is the margin a detector that must never cry wolf wants.
+/// 33.7 ms typically and 90.8 ms at its worst, and those figures *include* the
+/// probe's own round-trip, so the real propagation is smaller still. Two seconds
+/// is ~20x the worst observation, which is the margin a detector that must never
+/// cry wolf wants.
 const GRACE_MS: i64 = 2_000;
+
+/// [`GRACE_MS`], for the staleness checker in `terminals::stale_check`, which
+/// needs the same window for the same reason and must not keep its own copy.
+pub fn grace_ms() -> i64 {
+    GRACE_MS
+}
 
 /// Whether a terminal tab is still showing what this dashboard wrote for it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -252,11 +370,26 @@ pub fn pin_verdict(caption: &str, written: &str, written_at: i64, now: i64, live
 /// so separates `bga` from `bga assistant` outright, the candidates here are
 /// titles and every label is drawn from the *caption*: against the short caption
 /// `🟢 bga` both the `bga` title and the `bga assistant` title yield the same
-/// label `bga`, a permanent draw. Refusing it would leave a row whose stale flag
-/// is already set with no path to `Pin::Following`, so the `≠` badge and its
-/// Telegram alert could never be cleared — the exact case the comment below
-/// calls worse than a late warning. A caption byte-equal to what we wrote names
+/// label `bga`, a permanent draw. A caption byte-equal to what we wrote names
 /// that row and no other, which is the same test `pin_verdict` opens with.
+///
+/// **This function observes and logs; it does not write `terminal_stale_at`.**
+/// `terminals::stale_check` is the only thing that decides it per row. The one
+/// other writer sets no verdict: `clear_all_terminal_stale` blanks every flag
+/// when title writing is turned off, since with nothing being written nothing can
+/// disagree. The caption path holds no verdict because these two oracles are not
+/// equal in strength. `pin_verdict` answers `Following` on a caption
+/// *byte-equal to a string we wrote*, which is exactly what an accidentally
+/// pinned tab shows every time its row returns to the status it was pinned on
+/// — so this oracle would retract, on coincidence, a verdict `stale_check`
+/// reached by comparing two independently-sourced readings. It did exactly
+/// that: the flag cleared, the outstanding Telegram message deleted, and the
+/// next confirmation re-stamped `terminal_stale_at` with a fresh instant,
+/// restarting the `stale_tab_alert_ms` countdown, so a tab stuck for hours
+/// could starve its own alert forever. Two writers to one flag with no
+/// coordination is the whole defect; one writer makes it unexpressible. The
+/// `title_pinned` / `title_unpinned` lines stay, because a second independent
+/// observation is worth having in the log even when it decides nothing.
 ///
 /// What stays refused is a draw with no exact match, and two candidates that are
 /// byte-equal to the caption (two rows with literally identical titles). Both
@@ -265,23 +398,32 @@ pub fn pin_verdict(caption: &str, written: &str, written_at: i64, now: i64, live
 /// sibling's cannot be *reported* while both are titled, since a stale caption
 /// for it draws against the sibling with nothing to break the tie.
 ///
-/// Known limit. A caption is judged against the row whose title it resembles,
-/// because Windows Terminal offers no way to learn which window hosts which
-/// session — so a *second* window sitting on a lookalike caption is judged
-/// against that row too. The two-sample rule absorbs the ordinary case, since a
-/// caption that ever moves stops being a suspect; a permanently static lookalike
-/// would be reported, which is why this writes a log line rather than anything
-/// the user has to act on.
-pub fn observe_caption(app: &AppHandle, caption: &str, now: i64) {
+/// **Candidates are restricted to rows whose console this window owns**, which
+/// closes the limit this doc comment used to record as accepted: a second window
+/// sitting on a lookalike caption was judged against that row too, because
+/// Windows Terminal was thought to offer no way to learn which window hosts
+/// which session. It does, indirectly — `TerminalAdapter::attached_surface`
+/// resolves each session's console to the surface rendering it at write time
+/// (`TerminalTitles::hosts`), so a caption arriving from surface H can only ever
+/// accuse a row H renders. Rows with no recorded host stay eligible: absence
+/// means the last write found no terminal *or* never happened, and excluding
+/// them would silently retire the sensor for every row on a platform or a
+/// terminal where the attribution does not answer.
+pub fn observe_caption(app: &AppHandle, caption: &str, now: i64, window: Option<&str>) {
     let Some(titles) = app.try_state::<TerminalTitles>() else { return };
+    let hosts = titles.hosts.lock().unwrap().clone();
+    let eligible = |chat_id: &str| match (window, hosts.get(chat_id)) {
+        (Some(w), Some(h)) => h == w,
+        _ => true,
+    };
     let Some((chat_id, written, written_at)) = ({
         let last = titles.last.lock().unwrap();
         // Rank on (is it byte-equal, then how much of the caption it names), so an
         // exact match outranks every prefix sibling and a draw is a draw only
         // among equals on both.
-        let mut best: Option<(&String, &(String, i64), (bool, usize))> = None;
+        let mut best: Option<(&String, &(String, i64, i64), (bool, usize))> = None;
         let mut drawn = 1;
-        for (id, entry) in last.iter() {
+        for (id, entry) in last.iter().filter(|(id, _)| eligible(id)) {
             let Some(len) = shared_label(caption, &entry.0).map(str::len) else { continue };
             let score = (entry.0 == caption, len);
             match best {
@@ -290,27 +432,22 @@ pub fn observe_caption(app: &AppHandle, caption: &str, now: i64) {
                 _ => (best, drawn) = (Some((id, entry, score)), 1),
             }
         }
-        best.filter(|_| drawn == 1).map(|(id, (t, at), _)| (id.clone(), t.clone(), *at))
+        best.filter(|_| drawn == 1).map(|(id, (t, at, _), _)| (id.clone(), t.clone(), *at))
     }) else {
         return;
     };
     let live = live_session_count(app, &chat_id);
-    // The verdict and the bookkeeping happen under the lock; the flag and the
-    // emit happen after it, so nothing downstream can re-enter this map.
-    let flag = {
+    {
         let mut pinned = titles.pinned.lock().unwrap();
         match pin_verdict(caption, &written, written_at, now, live) {
-            Pin::Following => match pinned.remove(&chat_id) {
-                Some((_, _, true)) => {
+            Pin::Following => {
+                if let Some((_, _, true)) = pinned.remove(&chat_id) {
                     tracing::info!(decision = "title_unpinned", chat_id = %chat_id, caption, "the tab is following this row again");
-                    Some(false)
                 }
-                _ => Some(false),
-            },
+            }
             Pin::Suspect => match pin_step(pinned.get(&chat_id).map(|(c, w, r)| (c.as_str(), w.as_str(), *r)), caption, &written) {
                 Step::Record => {
                     pinned.insert(chat_id.clone(), (caption.to_string(), written.clone(), false));
-                    None
                 }
                 Step::Report => {
                     pinned.insert(chat_id.clone(), (caption.to_string(), written.clone(), true));
@@ -321,21 +458,10 @@ pub fn observe_caption(app: &AppHandle, caption: &str, now: i64) {
                         written = %written,
                         "this tab has stopped following the row, so its status is stale on screen. Most often a Windows Terminal custom tab name (right-click the tab -> Reset tab title); otherwise a leftover tab whose session has exited"
                     );
-                    Some(true)
                 }
-                Step::Hold => None,
+                Step::Hold => {}
             },
-            Pin::Unknown => None,
-        }
-    };
-    // `set_terminal_stale` answers whether anything moved, so the emit is on the
-    // edge only. Clearing is unconditional on `Following` rather than gated on
-    // having reported: the flag can outlive this process's memory of why it was
-    // set — a restart drops `pinned` while the row's flag is restored from
-    // nothing — and a warning nobody can clear is worse than a late one.
-    if let Some(stale) = flag {
-        if app.try_state::<AppState>().is_some_and(|s| s.set_terminal_stale(&chat_id, stale, now)) {
-            crate::commands::emit_sessions_updated(app);
+            Pin::Unknown => {}
         }
     }
 }
@@ -386,7 +512,7 @@ fn pin_step(recorded: Option<(&str, &str, bool)>, caption: &str, written: &str) 
 /// to that one answer credits a row with sessions that are not its own and leaves
 /// the other at zero, and which way round depends on directory-read order. Both
 /// readings then miss `Some(1)` and the detector goes quiet for both rows.
-fn live_session_count(app: &AppHandle, chat_id: &str) -> Option<usize> {
+pub(crate) fn live_session_count(app: &AppHandle, chat_id: &str) -> Option<usize> {
     let registry = app.try_state::<crate::session_registry::SessionRegistry>()?;
     let root = app.try_state::<ConfigState>().and_then(|c| c.config.lock().unwrap().projects_root.clone());
     let anchors = app.try_state::<crate::chat_id_registry::ChatIdRegistry>();
@@ -501,7 +627,7 @@ pub fn shared_label<'a>(a: &'a str, b: &str) -> Option<&'a str> {
 /// It lives beside [`status_glyph`] and [`build_title`] rather than in either
 /// reader, because the two halves of one map must not be able to drift: the
 /// round-trip test below is what keeps the glyphs distinct when a seventh status
-/// is added. Two readers depend on it — `attention::resolve_row`, which wants
+/// is added. Its readers include `attention::resolve_row`, which wants
 /// only the name, and `session_restore`, which wants the status a tab has been
 /// holding for us across a restart.
 ///
@@ -563,6 +689,11 @@ pub fn sync(app: &AppHandle, sessions: &[AgentSession]) {
     };
     let cfg = app.try_state::<ConfigState>().map(|s| s.snapshot());
     let enabled = cfg.as_ref().map(|c| c.terminal_titles).unwrap_or(true);
+    // Built once per sync rather than per write: the constructor is a handle
+    // clone, but a title push runs per row and this is the seam every one of
+    // them has to reach.
+    let adapter = crate::terminals::for_platform(app);
+    let adapter = adapter.as_deref();
     let mut pids = titles.pids.lock().unwrap();
     let mut last = titles.last.lock().unwrap();
     let now = crate::commands::now_ms();
@@ -590,9 +721,9 @@ pub fn sync(app: &AppHandle, sessions: &[AgentSession]) {
     // from `pids` and present in `last`, and sweeping `pids` left our own last
     // glyph sitting on a tab whose row had gone — which is exactly the stale
     // title `session_restore` reads back on the next start.
-    let blank = |chat_id: &str, last: &mut HashMap<String, (String, i64)>| {
+    let blank = |chat_id: &str, last: &mut HashMap<String, (String, i64, i64)>| {
         last.remove(chat_id);
-        push_title(&resolve(chat_id, pids.get(chat_id).map_or(&[][..], Vec::as_slice)), "");
+        push_title(adapter, &resolve(chat_id, pids.get(chat_id).map_or(&[][..], Vec::as_slice)), "");
     };
 
     if !enabled {
@@ -602,8 +733,11 @@ pub fn sync(app: &AppHandle, sessions: &[AgentSession]) {
             blank(&chat_id, &mut last);
         }
         // With nothing being written there is nothing a tab can disagree with,
-        // so a standing stale-tab warning would outlive its evidence.
+        // so a standing stale-tab warning would outlive its evidence. `hosts`
+        // goes with them: an HWND is recycled, so an attribution left behind can
+        // silently come to name a live, unrelated window.
         titles.pinned.lock().unwrap().clear();
+        titles.hosts.lock().unwrap().clear();
         if let Some(state) = app.try_state::<AppState>() {
             state.clear_all_terminal_stale(now);
         }
@@ -615,6 +749,10 @@ pub fn sync(app: &AppHandle, sessions: &[AgentSession]) {
         blank(&chat_id, &mut last);
     }
     pids.retain(|chat_id, _| live.contains(chat_id.as_str()));
+    // The same pruning the two maps above get. Without it every chat_id this
+    // process ever titled keeps an entry, and a dead row keeps a window handle
+    // that has since been reused.
+    titles.hosts.lock().unwrap().retain(|chat_id, _| live.contains(chat_id.as_str()));
 
     let context_threshold = cfg.as_ref().and_then(|c| c.terminal_title_context_percent).unwrap_or(0.0);
     let empty_tokens = HashMap::new();
@@ -626,22 +764,80 @@ pub fn sync(app: &AppHandle, sessions: &[AgentSession]) {
             continue;
         }
         let title = build_title(s, context_threshold, window_tokens);
-        if let Some((prev, at)) = last.get(&s.id) {
+        if let Some((prev, at, _)) = last.get(&s.id) {
             if *prev == title && now - at < REASSERT_MS {
                 continue;
             }
         }
-        if push_title(&candidates, &title) {
-            last.insert(s.id.clone(), (title, now));
+        let changed = last.get(&s.id).is_none_or(|(prev, _, _)| prev != &title);
+        let pushed = push_title(adapter, &candidates, &title);
+        if pushed.as_ref().is_some_and(|p| p.ok) {
+            let changed_at = if changed { now } else { last.get(&s.id).map_or(now, |(_, _, c)| *c) };
+            last.insert(s.id.clone(), (title, now, changed_at));
+        }
+        // Recorded only on the write's own terms. `Some(Pushed)` means a console
+        // was reached and the adapter was actually asked, so its answer is an
+        // answer: `Some(host)` replaces a stale attribution, and `None` removes
+        // one, because a session that moved into a hook console or out to another
+        // terminal must stop being attributed to the window it used to live in.
+        //
+        // `None` — no candidate would attach — is not an answer at all, and the
+        // attribution is left exactly as it was. Treating it as one removed the
+        // row's host while `last` kept its entry (that is also guarded on `ok`),
+        // so the row stayed a `row_for_title` candidate but became eligible in
+        // *every* window: a failed write silently reopened the cross-window
+        // misattribution the host scoping exists to close. This is the line
+        // `sessions`, `front_readings` and `stale_check` all draw, and the one
+        // place it had not been drawn.
+        if let Some(host) = pushed.as_ref().map(|p| p.host.clone()) {
+            let mut hosts = titles.hosts.lock().unwrap();
+            match host {
+                Some(h) => hosts.insert(s.id.clone(), h),
+                None => hosts.remove(&s.id),
+            };
+        }
+        // Ask for this row's terminal window to be looked at once the write has
+        // had time to land. Keyed by the *window*, not the row: the check reads
+        // whichever tab is in front of it, and several rows share one window.
+        // Not gated on the host being known: `hosts`' own doc says absence means
+        // "do not know", never "not in a terminal", and gating here made this
+        // reader treat it as the latter. The request carries no payload and the
+        // checker re-enumerates surfaces itself, so a write with no attribution
+        // costs one abstaining pass.
+        // Not platform-gated: `stale_check` names no terminal and its `spawn`
+        // already decides per adapter whether to run at all, so a `cfg` here
+        // would be a second, quieter answer to the same question — and the
+        // wrong one the day a second adapter implements `front_readings`, which
+        // would then start a checker that could never receive a trigger.
+        // Only on a title that actually *moved*.
+        //
+        // A `REASSERT_MS` re-push exists because something else may have
+        // overwritten the console since we last wrote — that is the whole point of
+        // re-asserting — so it is not literally true that nothing can have
+        // changed. What is true is that it carries no information about *this*
+        // dashboard's view: the string is the one we already believe is there, so
+        // a re-push tells the checker nothing it did not know one cycle ago. It
+        // cost a great deal for that: with several live rows a re-push lands every
+        // few seconds, so `rx.recv()` never blocked and the worker ran a full
+        // cross-process UIA enumeration of every terminal window roughly every two
+        // seconds for as long as any session was alive. A tab that stops following
+        // between two of our writes is still caught, by the caption event and by
+        // the next real title change.
+        if changed && pushed.as_ref().is_some_and(|p| p.ok) {
+            crate::terminals::stale_check::request();
         }
     }
 }
 
-/// Set the console title of the first reachable candidate pid. Returns true
-/// when a title was actually written — a false return leaves the `last` cache
-/// untouched so the next sync retries.
+/// Set the console title of the first reachable candidate pid.
+///
+/// `None` means no candidate would attach, so nothing was written and nothing was
+/// learned. `Some` means a console was reached: `ok` says whether the title
+/// actually went in (false leaves the `last` cache untouched so the next sync
+/// retries), and `host` is what the adapter made of that console — `None` there
+/// being *do not know*, never "not in a terminal we recognize".
 #[cfg(windows)]
-fn push_title(candidates: &[u32], title: &str) -> bool {
+fn push_title(adapter: Option<&dyn TerminalAdapter>, candidates: &[u32], title: &str) -> Option<Pushed> {
     let wide: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
     // Far-to-near: the hook reports candidates ordered nearest-first (its own
     // console processes, then parent, grandparent, …). The near end is transient
@@ -649,15 +845,43 @@ fn push_title(candidates: &[u32], title: &str) -> bool {
     // CREATE_NO_WINDOW) — a title written there is lost. The far end is GUI
     // ancestors (Windows Terminal, explorer) where attach simply fails. So
     // walking from the far end, the first successful attach is the user's shell
-    // or Claude Code itself — the real terminal console. (GetConsoleWindow can't
-    // discriminate instead: conPTY consoles report no window on current Windows
-    // 11, same as invisible ones.)
+    // or Claude Code itself — the real terminal console.
+    //
+    // The attached console *can* discriminate, contrary to what this comment
+    // said until 2026-09-03: measured on Windows 11, a ConPTY console reports a
+    // real (invisible, 0x0) window and the consoles reporting **none** are
+    // exactly the hook-side `CREATE_NO_WINDOW` ones. So the walk is kept for its
+    // own sake — it costs one attach and needs no window at all — while
+    // `TerminalAdapter::attached_surface` reads that same console for the
+    // question the walk cannot answer: which of the terminal's surfaces this
+    // console is rendered in.
     with_console(candidates.iter().rev().copied(), |pid| {
         let ok = unsafe { SetConsoleTitleW(wide.as_ptr()) } != 0;
-        tracing::debug!(pid, ok, title, "terminal title written");
-        Some(ok)
+        // Asked inside the attach, which is the only place the answer means
+        // anything. That it is cheap enough to sit under `ATTACH_LOCK` is a
+        // requirement on the trait rather than an observation here — this call
+        // site cannot see any adapter's body, so a claim about the cost would be
+        // unfalsifiable from where it is written and false for the second
+        // implementor.
+        let host = adapter.and_then(|a| a.attached_surface(pid));
+        tracing::debug!(pid, ok, title, host = host.as_deref().unwrap_or(""), "terminal title written");
+        Some(Pushed { ok, host })
     })
-    .unwrap_or(false)
+}
+
+/// What a title write learned: whether it landed, and which terminal window
+/// renders the console it landed on.
+///
+/// Two facts, matching the two fields. An earlier draft carried the console pid
+/// as a third, for a console read-back the comparison no longer performs; the
+/// field went and this doc had gone on promising it.
+///
+/// Deliberately not `Default`. A default value would be a `Pushed` describing a
+/// write that never happened, and the only reader that ever saw one read its
+/// empty `host` as the terminal disowning the row.
+struct Pushed {
+    ok: bool,
+    host: Option<String>,
 }
 
 /// macOS/Linux: resolve the candidate's controlling tty via `ps -o tty=` and
@@ -670,8 +894,14 @@ fn push_title(candidates: &[u32], title: &str) -> bool {
 /// past `??` is only safe because the chain stops at that process: an
 /// all-`??` chain means this session owns no terminal, and returning false
 /// leaves the title unwritten rather than climbing into someone else's tab.
+/// The `host` comes from the same `TerminalAdapter::attached_surface` the Windows
+/// arm asks, and is `None` for every adapter that has not overridden it — today
+/// all of them here. That is a gap rather than an impossibility: agterm has a
+/// control socket and per-window state files and could well name the surface
+/// holding `pid`. It is why every reader treats an absent host as "do not know"
+/// rather than as "not in a terminal we recognize".
 #[cfg(not(windows))]
-fn push_title(candidates: &[u32], title: &str) -> bool {
+fn push_title(adapter: Option<&dyn TerminalAdapter>, candidates: &[u32], title: &str) -> Option<Pushed> {
     use std::io::Write;
     for &pid in candidates {
         let Ok(out) = std::process::Command::new("ps").args(["-o", "tty=", "-p", &pid.to_string()]).output() else { continue };
@@ -682,11 +912,12 @@ fn push_title(candidates: &[u32], title: &str) -> bool {
         }
         let Ok(mut dev) = std::fs::OpenOptions::new().write(true).open(format!("/dev/{tty}")) else { continue };
         if dev.write_all(format!("\x1b]0;{title}\x07").as_bytes()).is_ok() {
-            tracing::debug!(pid, tty, title, "terminal title written");
-            return true;
+            let host = adapter.and_then(|a| a.attached_surface(pid));
+            tracing::debug!(pid, tty, title, host = host.as_deref().unwrap_or(""), "terminal title written");
+            return Some(Pushed { ok: true, host });
         }
     }
-    false
+    None
 }
 
 #[cfg(test)]
@@ -1027,6 +1258,69 @@ mod tests {
         s.display_name = Some("printlab".into());
         s.status = Status::Blocked;
         assert_eq!(build_title(&s, 50.0, &w), "✋ printlab [90%]");
+    }
+
+    /// Seed the title cache directly. The tuple is (title, asserted_at,
+    /// changed_at); `row_for_title` reads the third, so the second is deliberately
+    /// a different value in these tests to catch a reader taking the wrong one.
+    fn titled(t: &TerminalTitles, id: &str, title: &str, host: Option<&str>) {
+        t.last.lock().unwrap().insert(id.to_string(), (title.to_string(), 9_999, 100));
+        if let Some(h) = host {
+            t.hosts.lock().unwrap().insert(id.to_string(), h.to_string());
+        }
+    }
+
+    #[test]
+    fn row_for_title_returns_the_change_instant_not_the_write_instant() {
+        // The propagation grace is about how long the tab has had to catch up
+        // with a *new* string, so re-asserting the identical one must not reset
+        // it. Taking the write instant swallowed checks triggered by a tab
+        // switch whenever an unrelated emit re-asserted that row inside 2s.
+        let t = TerminalTitles::new();
+        titled(&t, "web", "⚪ web", Some("hwnd:A"));
+        assert_eq!(t.row_for_title("⚪ web", "hwnd:A"), Some(("web".to_string(), 100)));
+    }
+
+    #[test]
+    fn row_for_title_prefers_the_row_this_surface_renders() {
+        // Two rows carry the same title; only one is attributed here. Positive
+        // attribution beats mere eligibility, so this is not a draw.
+        let t = TerminalTitles::new();
+        titled(&t, "mine", "⚪ web", Some("hwnd:A"));
+        titled(&t, "hostless", "⚪ web", None);
+        assert_eq!(t.row_for_title("⚪ web", "hwnd:A").map(|(id, _)| id), Some("mine".to_string()));
+    }
+
+    #[test]
+    fn row_for_title_excludes_a_row_another_surface_renders() {
+        // The whole cross-window guard: a console attributed to window B cannot
+        // be named from window A, however well the title matches.
+        let t = TerminalTitles::new();
+        titled(&t, "elsewhere", "⚪ web", Some("hwnd:B"));
+        assert_eq!(t.row_for_title("⚪ web", "hwnd:A"), None);
+    }
+
+    #[test]
+    fn row_for_title_refuses_a_draw_rather_than_picking_one() {
+        // Two equally-ranked candidates must answer None, and must do so
+        // whichever order the map iterates — this decides which row gets accused,
+        // and `HashMap` order is unstable, so first-match would flag an arbitrary
+        // one and a different one between passes.
+        for _ in 0..16 {
+            let t = TerminalTitles::new();
+            titled(&t, "a", "⚪ web", Some("hwnd:A"));
+            titled(&t, "b", "⚪ web", Some("hwnd:A"));
+            assert_eq!(t.row_for_title("⚪ web", "hwnd:A"), None);
+        }
+    }
+
+    #[test]
+    fn row_for_title_needs_an_exact_title_not_a_prefix() {
+        // It matches on the whole string, unlike the caption path, because the
+        // string it is given is one this dashboard wrote.
+        let t = TerminalTitles::new();
+        titled(&t, "web", "⚪ web", Some("hwnd:A"));
+        assert_eq!(t.row_for_title("⚪ web [61%]", "hwnd:A"), None);
     }
 
     #[test]

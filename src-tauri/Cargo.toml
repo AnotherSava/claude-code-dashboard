@@ -40,3 +40,15 @@ anyhow = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 open = "5"
 fontdue = "0.9"
+
+# The only place this project does not declare its own Win32 signatures. Every
+# other Windows call here is a flat C export (`FreeConsole`, `SetWinEventHook`,
+# `EnumWindows`, `auto_resize::nchittest`) where a wrong signature is a link
+# error the compiler catches. UI Automation is `CoCreateInstance` plus vtable
+# dispatch across four interfaces with BSTR and VARIANT marshalling, where a
+# miscounted slot is a silent call through the wrong function pointer — no
+# compiler check, and a crash the user sees in an always-on-top widget. Keep the
+# version in step with what tauri/tao/wry already resolve to (0.61.3), so cargo
+# unifies rather than compiling a second copy.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Variant", "Win32_UI_Accessibility"] }
