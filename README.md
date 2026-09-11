@@ -4,7 +4,9 @@
 
 A desktop app for Windows and macOS — a compact always-on-top widget that lists your agents with each one's current status and the task it's working on. The header tracks your 5-hour and 7-day Anthropic usage limits.
 
-![Claude Code Dashboard](docs/screenshots/screenshot.png)
+![The widget's agent rows with the 5-hour and 7-day usage bars in the header (Windows)](docs/screenshots/hero-windows.png)
+
+*Windows. The macOS screenshot hasn't been taken yet.*
 
 ## Features
 

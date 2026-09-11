@@ -1,0 +1,12 @@
+{%- comment -%}
+  The "this exists on one platform only" chip.
+
+    {% include os_chip.html os="windows" %}
+
+  Used directly above a block of single-platform prose, and from figure.html's
+  only= branch. It is a label, never a control: a reader who sees a control
+  knows two platforms are in play, and that is half the distinction between
+  "we haven't taken that screenshot" and "there is nothing there to photograph".
+{%- endcomment -%}
+{%- assign p = site.data.platforms | where: 'key', include.os | first -%}
+<p class="os-chip">{{ p.name }} only</p>

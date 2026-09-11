@@ -1,0 +1,20 @@
+name: Docs
+
+# Its own job rather than a step in `build.yml`: that workflow is a two-OS
+# matrix provisioning a Rust toolchain and a Node toolchain, and this reads some
+# JSON and some PNGs. Folding it in would run it twice, on the two machines
+# least suited to it, behind a Rust build.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  figures:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: pip install pillow pyyaml
+      - run: python docs/screenshots/check-figures.py

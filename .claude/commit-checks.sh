@@ -10,8 +10,10 @@
 # it is a differently-scoped one, and it reports success just as confidently.
 #
 # So the rule this file enforces is: don't approximate the gate, run it. Keep
-# the commands below identical to `.github/workflows/build.yml`, in the same
-# order — if that workflow changes, change this with it.
+# the commands below identical to the ones the workflows in `.github/workflows/`
+# run, in the same order — `build.yml` for the first three, `docs.yml` for the
+# last. If a workflow changes, change this with it, and if a new workflow gates
+# `main`, add it here too.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
@@ -23,5 +25,8 @@ cargo test --manifest-path src-tauri/Cargo.toml --lib
 
 echo "==> npm run build"
 npm run build
+
+echo "==> python docs/screenshots/check-figures.py"
+python docs/screenshots/check-figures.py
 
 echo "All CI checks passed."

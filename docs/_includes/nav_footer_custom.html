@@ -1,2 +1,18 @@
-<!-- Blank on purpose. The theme falls back to its own attribution line unless
-     this include renders something, so the comment is the payload. -->
+{%- comment -%}
+  This include renders more than once per page — the sidebar's site-footer on
+  desktop, the page footer on mobile — so nothing here may carry an id, and the
+  script must update every copy.
+
+  It also has a side effect worth knowing: the theme prints its own attribution
+  line whenever this include comes back empty, which is what the previous
+  comment-only version of this file existed to suppress. Real content suppresses
+  it too, so the attribution stays off.
+{%- endcomment -%}
+<div class="os-pick">
+  <span class="os-pick-label">Screenshots</span>
+  <span class="os-seg" role="group" aria-label="Screenshot platform">
+    {%- for p in site.data.platforms %}
+    <button type="button" class="os-btn os-seg-btn" data-set-os="{{ p.key }}" aria-pressed="false">{{ p.name }}</button>
+    {%- endfor %}
+  </span>
+</div>

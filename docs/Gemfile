@@ -1,0 +1,10 @@
+# Builds this site the way GitHub Pages does, so the theme hooks, the Liquid in
+# `_includes/figure.html` and the no-JS render can be looked at before they ship.
+# GitHub Pages ignores this file — it resolves its own gem set — so the pin here
+# exists to keep a local build honest rather than to configure the deploy.
+source "https://rubygems.org"
+
+gem "github-pages", group: :jekyll_plugins
+
+# Windows and JRuby do not include zoneinfo files.
+gem "tzinfo-data", platforms: [:mingw, :x64_mingw, :mswin, :jruby]

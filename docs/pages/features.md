@@ -32,15 +32,17 @@ Each badge is color-coded, and BLOCK and ERROR pulse to draw your eye when a ses
 
 Turn on the tray's **Compact view** toggle for a denser widget: each row drops its current prompt and time-in-state, and the 5-hour / 7-day usage bars shrink to just their percentage and reset time — the segmented track giving way to a slim border that fills left-to-right and shifts green → amber → red as each limit climbs. What's left is the state badge, token count, and usage figures — nothing that needs reading, just glanceable numbers. Off by default.
 
-![The widget in compact view — rows without prompts or timers, and the usage bars reduced to their percentage](../screenshots/compact.png)
+{% include figure.html id="compact-mode" alt="The widget in compact view — rows without prompts or timers, and the usage bars reduced to their percentage" %}
 
 ## Color terminal tabs
 
 Each session's status is mirrored onto the terminal tab it runs in, next to the session name — 🔵 working, ⏳ background work still running, ✋ blocked on you, 🟢 done, 🔴 error, ⚪ idle. Because a finished session drops to idle once you've read it, 🟢 marks the ones still waiting on you and ⚪ the ones you've been through — see [Finished, and not yet read](#finished-and-not-yet-read). Two of them deliberately aren't circles: an orange and a red circle read too alike at tab size, and no light-blue circle exists to mirror the widget's WAIT pill. A glance at your terminal tabs shows which session needs attention, even without the widget on screen. The title updates the moment the status changes and clears when the session ends. On by default; the tray's **Color terminal tabs** toggle turns it off.
 
-![Terminal sessions listed with a status glyph each — blue working, green done, grey idle, a raised hand for one blocked on the user — two carrying their context percentage](../screenshots/terminal-tabs.png)
+{% include figure.html id="terminal-tabs" alt_windows="Windows Terminal's tab strip, each tab carrying its session's status glyph — blue for one working, a raised hand for one blocked on the user, green for one finished (Windows)" alt_macos="agterm's session sidebar, each session carrying its status glyph — blue working, green done, grey idle, a raised hand for one blocked on the user — two of them carrying their context percentage (macOS)" caption_windows="Windows Terminal" caption_macos="agterm" %}
 
 Once a session's context usage climbs past a threshold (50% by default), the tab title also shows it — `🔵 printlab [67%]` — so a tab that's filling toward a `/compact` stands out among the rest. The number falls off again when a new task or `/clear` frees the context. See [Settings](settings#color-terminal-tabs) to change the threshold or turn the number off.
+
+{% include os_chip.html os="windows" %}
 
 One thing can stop a tab keeping up: if you rename a tab yourself in Windows Terminal, it holds that name for good and quietly ignores everything the widget writes to it afterwards. Nothing outside Windows Terminal can undo that. Right-click the tab and choose **Reset tab title** and it starts following again.
 
@@ -98,7 +100,7 @@ The row shows the session's live context usage, updated as Claude works. The cou
 
 Hover a session row for a quick tooltip listing its task prompts so far — one per line, with the current task marked. For the whole story, click the text below a session's name to open a History window — a chronological recap of your prompts and Claude's reply to each, with a separator marking the start of a new session. Useful for scrolling back through a long-running conversation without leaving the dashboard. The window opens maximized on the dashboard's screen; with **Save window position** enabled it reopens where you last left it.
 
-![The History window, showing prompts and Claude's replies in order](../screenshots/history.png)
+{% include figure.html id="history-window" alt="The History window, showing prompts and Claude's replies in order" %}
 
 Ctrl+`+` and Ctrl+`-` cycle through five font sizes; Esc closes the window. The choice persists to `config.json`.
 
@@ -130,7 +132,7 @@ When the badge is on, the tray icon also flags the moment any session's context 
 
 A separate window — opened from the tray's **Work intensity** item — charts how hard your agents have been working over time. Each bar covers a short slice of time and grows taller and warmer the busier that slice was. A **Days** view lays out one week as seven rows, one per day; a **Weeks** view gives one row per week and scrolls back through your history. Each view also totals the active time. With [multi-device sync](#multi-device-sync) configured, the chart covers your other devices too, so it shows the work done on the account as a whole rather than just here.
 
-![The Work intensity chart in its Days view — one row per day, ten-minute bars, red where a bar passes twice the pace, and a dashed line marking the full 5-hour pace](../screenshots/work-intensity.png)
+{% include figure.html id="work-intensity" alt="The Work intensity chart in its Days view — one row per day, ten-minute bars, red where a bar passes twice the pace, and a dashed line marking the full 5-hour pace" %}
 
 A **Percent | Tokens** switch picks what the bars measure, and the two answer different questions:
 

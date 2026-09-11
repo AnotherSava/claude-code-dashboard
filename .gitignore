@@ -40,3 +40,15 @@ config/deploy.env
 # Timestamped backups written by the cleanup skill before it wipes app data
 # (BACKUP_FILES in config/deploy.env decides what gets saved).
 .cleanup-backups/
+
+# Scratch space for screenshot contact sheets, probe captures and saved
+# originals — written inside the repo so the file tools can read them back,
+# which they refuse to do for anything under the system temp directory.
+/tmp/
+
+# Local Jekyll build of the docs site. GitHub Pages builds from source and never
+# reads any of these; they exist so the site can be looked at before it ships.
+/docs/_site/
+/docs/.jekyll-cache/
+/docs/vendor/
+/docs/.bundle/

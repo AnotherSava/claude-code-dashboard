@@ -1,0 +1,132 @@
+// --- Per-OS screenshots -----------------------------------------------------
+// Every variant that exists is in the HTML. Which one shows is a CSS question
+// keyed on <html data-os>, set before first paint by the script in
+// _includes/head_custom.html. With no JS there is no data-os, so every variant
+// renders under its own platform badge and nobody is shown one platform's
+// picture as if it were theirs.
+
+.os-figure {
+  margin: 1.5rem 0 2rem;
+
+  .os-frame { margin: 0 0 1.5rem; }
+  .os-frame:last-child { margin-bottom: 0; }
+  img { display: block; max-width: 100%; height: auto; }
+}
+
+// Only ever applied to a paired figure, so a figure with one variant is shown
+// to everyone — the fallback is the absence of a rule, not a rule of its own.
+html[data-os="windows"] .os-figure-paired .os-frame[data-frame-os="macos"],
+html[data-os="macos"]   .os-figure-paired .os-frame[data-frame-os="windows"] {
+  display: none;
+}
+
+// A printed page has no reader to ask, so it carries both variants.
+@media print {
+  .os-figure-paired .os-frame { display: block !important; }
+  // Both variants are on the page, so a control offering to show one of
+  // them is printing a lie next to the picture it names.
+  .os-swap, .os-pick { display: none !important; }
+}
+
+.os-cap { display: block; margin-bottom: 0.4rem; }
+
+.os-cap-row {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+// State: which platform this picture is.
+.os-badge {
+  display: inline-block;
+  padding: 0 0.45rem;
+  border-radius: 4px;
+  background-color: $grey-lt-100;
+  // $grey-dk-000 on this background measures 2.58:1 -- below WCAG AA for 12px
+  // text, and this string is the only thing telling a reader which OS a picture
+  // is. $grey-dk-100 is the theme's own body colour and clears AA at 6.86:1.
+  color: $grey-dk-100;
+  font-size: 0.75rem;
+  line-height: 1.6;
+  white-space: nowrap;
+}
+.os-badge:focus { outline: 2px solid $link-color; outline-offset: 1px; }
+
+// Scope: this feature exists on one platform. A label, never a control — the
+// presence of a control is what tells a reader two platforms are in play.
+.os-chip {
+  display: inline-block;
+  margin: 0 0 0.4rem;
+  padding: 0 0.45rem;
+  border-radius: 4px;
+  background-color: $grey-lt-100;
+  color: $grey-dk-100;
+  font-size: 0.75rem;
+  line-height: 1.6;
+  white-space: nowrap;
+}
+.os-cap-row .os-chip { margin-bottom: 0; }
+
+// Action: show the other platform. No resting underline — the outline says it
+// is a control, and the underline arrives on hover the way a link's does.
+.os-btn {
+  padding: 0 0.45rem;
+  border: 1px solid $border-color;
+  border-radius: 4px;
+  background: none;
+  color: $link-color;
+  font: inherit;
+  font-size: 0.75rem;
+  line-height: 1.6;
+  white-space: nowrap;
+  cursor: pointer;
+  text-decoration: none;
+}
+.os-btn:hover { text-decoration: underline; }
+.os-btn:focus-visible { outline: 2px solid $link-color; outline-offset: 1px; }
+
+// In the sidebar there is no picture to be the badge, so the active segment
+// takes the badge's look. Driven from data-os, not from aria-pressed, so it is
+// correct at first paint; aria-pressed follows a tick later, for announcement.
+html[data-os="windows"] .os-pick .os-seg-btn[data-set-os="windows"],
+html[data-os="macos"]   .os-pick .os-seg-btn[data-set-os="macos"] {
+  border-color: $grey-lt-200;
+  background-color: $grey-lt-100;
+  color: $grey-dk-100;
+  cursor: default;
+  text-decoration: none;
+}
+
+.os-cap-text { color: $grey-dk-100; font-size: 0.75rem; }
+
+// Shown to every reader, on every platform, with or without JS: the gap is a
+// fact about this site's coverage, not about who is reading.
+.os-note {
+  display: block;
+  margin-top: 0.4rem;
+  padding-left: 0.75rem;
+  border-left: 2px solid #c98a00;
+  color: $grey-dk-100;
+  font-size: 0.75rem;
+}
+
+.os-figure-error {
+  padding: 0.5rem 0.75rem;
+  border-left: 3px solid $red-300;
+}
+
+// --- The site-wide picker ---------------------------------------------------
+
+.os-pick { margin-top: 0.75rem; }
+.os-pick-label { display: block; margin-bottom: 0.25rem; font-size: 0.75rem; color: $grey-dk-100; }
+.os-seg { display: inline-flex; gap: 0.25rem; }
+
+// A control that cannot act does not render, and a control that would lie is
+// worse than absent. Both apply to the same two states: with no JS, and on a
+// platform detection could not name, every variant is on screen -- so the
+// sidebar picker cannot act, and a figure's swap button would offer to "show
+// the macOS screenshot" while it is already visible directly below.
+html:not(.js) .os-pick { display: none; }
+html:not(.js) .os-swap,
+html:not([data-os]) .os-swap { display: none; }

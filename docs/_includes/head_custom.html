@@ -1,0 +1,68 @@
+<script>
+  /* Block comments only, never `//`. The theme renders through a compressing
+     layout that collapses this whole script onto one line, at which point a
+     line comment silently swallows every statement after it — the switch then
+     does nothing, the page falls back to its no-JS render, and nothing errors.
+     Caught in a browser; invisible in the source. */
+  (function () {
+    var KEY = 'ccd-os';          /* prefixed: a *.github.io user site is one origin */
+    var root = document.documentElement;
+    root.classList.add('js');
+
+    function detect() {
+      var uad = navigator.userAgentData;
+      var p = (uad && uad.platform) || navigator.platform || '';
+      /* A touch iPad reports MacIntel. Guessing "macOS" from that is a guess
+         dressed as a reading, so it stays unset instead. */
+      if (navigator.maxTouchPoints > 1 && /Mac/i.test(p)) return null;
+      if (/Win/i.test(p)) return 'windows';
+      if (/Mac/i.test(p)) return 'macos';
+      return null;
+    }
+
+    function sync() {
+      var os = root.getAttribute('data-os');
+      var seg = document.querySelectorAll('.os-pick button[data-set-os]');
+      for (var i = 0; i < seg.length; i++) {
+        seg[i].setAttribute('aria-pressed', seg[i].getAttribute('data-set-os') === os ? 'true' : 'false');
+      }
+    }
+
+    function setOs(os, persist) {
+      if (os) root.setAttribute('data-os', os); else root.removeAttribute('data-os');
+      if (persist) { try { localStorage.setItem(KEY, os); } catch (e) {} }
+      sync();
+    }
+
+    var stored = null;
+    try { stored = localStorage.getItem(KEY); } catch (e) {}
+    /* A detected value is never written back: only a click is a decision. */
+    setOs(stored === 'windows' || stored === 'macos' ? stored : detect(), false);
+
+    document.addEventListener('DOMContentLoaded', sync);
+    document.addEventListener('click', function (e) {
+      var b = e.target.closest ? e.target.closest('button[data-set-os]') : null;
+      if (!b) return;
+      var want = b.getAttribute('data-set-os');
+      /* Clicking the platform already chosen clears the choice rather than
+         re-asserting it. Without this the decision is one-way: the two segments
+         are the two platforms, so once either is stored there is no control that
+         returns to the unset state -- the one that shows both variants -- short
+         of clearing site data. */
+      if (root.getAttribute('data-os') === want) {
+        try { localStorage.removeItem(KEY); } catch (e) {}
+        setOs(null, false);
+        return;
+      }
+      setOs(want, true);
+      /* Announce the swap at the picture that changed, rather than silently.
+         Scoped to the figure the button belongs to: an unscoped lookup would
+         move focus to whichever paired figure comes first on the page, which
+         on features.md is never the one that was clicked. */
+      var fig = b.closest ? b.closest('.os-figure') : null;
+      if (!fig) return;
+      var badge = fig.querySelector('[data-frame-os="' + want + '"] .os-badge');
+      if (badge) badge.focus();
+    });
+  })();
+</script>

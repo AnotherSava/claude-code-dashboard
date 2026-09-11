@@ -1,0 +1,111 @@
+{%- comment -%}
+  A documentation figure with one variant per operating system.
+
+    {% include figure.html id="compact-mode" alt="..." %}
+
+  id     required. Variants are read from screenshots/<id>-windows.png and
+         screenshots/<id>-macos.png, each of which is one entry in
+         screenshots/screenshots.json under the matching id.
+  alt    the description used for both variants; the platform name is appended
+         by this include, so write it without one.
+  alt_windows / alt_macos
+         per-variant descriptions, for a figure whose two variants are not the
+         same picture. Override alt, and no platform is appended, because the
+         supplied text already names the application.
+  caption_windows / caption_macos
+         a visible line beside the badge, ONLY for a figure whose variants show
+         different third-party UI. Absent everywhere else.
+  only   "windows" or "macos" when the FEATURE is single-platform. Absent means
+         the feature runs on both, so a missing variant is a picture nobody has
+         taken rather than one that cannot exist. That is the difference the
+         chip and the sentence are drawing, and no directory listing supplies it.
+
+  Which variants exist is read off disk, never declared: a declared list would
+  be a second copy of what the directory already holds, and it would go stale
+  the first time somebody added a PNG.
+
+  KNOWN AND ACCEPTED: the figcaption's text reaches the site search index.
+  just-the-docs builds search-data.json from `page.content | markdownify |
+  strip_html`, which keeps every word and drops every attribute, so the badge,
+  the swap button and the not-yet-taken note are all indexed as if the section
+  had written them. Searching for a platform name therefore also returns every
+  section that merely carries a screenshot of that platform.
+
+  Naming those sections here was tried and removed: the list was wrong the day it
+  was written -- it missed one of the paired figures on features.md -- and it
+  would rot on the next figure added, which is the same trap the "read off disk,
+  never declared" rule above exists to avoid.
+
+  Three reasons it is left alone rather than worked around: those hits are
+  arguably right, since the section really does carry a screenshot of the
+  platform searched for; the only lever short of dropping the badge is overriding
+  the theme's own search template, which is not vendored here (remote_theme, so
+  there is no local file to override from); and the one genuinely wrong entry --
+  a backlog sentence about an uncaptured frame -- removes itself the day the
+  frame is captured.
+{%- endcomment -%}
+
+{%- comment -%}
+  Liquid treats an empty string as truthy, so `only=""` would otherwise match
+  neither platform and render the red no-variant banner. Normalise it once.
+{%- endcomment -%}
+{%- assign only = include.only | default: '' | strip -%}
+{%- if only == '' -%}{%- assign only = nil -%}{%- endif -%}
+
+{%- assign present = '' -%}
+{%- for p in site.data.platforms -%}
+  {%- assign probe = '/screenshots/' | append: include.id | append: '-' | append: p.key | append: '.png' -%}
+  {%- assign hit = site.static_files | where: 'path', probe | first -%}
+  {%- if hit -%}
+    {%- if only == nil or only == p.key -%}
+      {%- assign present = present | append: p.key | append: ' ' -%}
+    {%- endif -%}
+  {%- endif -%}
+{%- endfor -%}
+{%- assign shown = present | strip | split: ' ' -%}
+
+{%- assign missing = '' -%}
+{%- unless only -%}
+  {%- for p in site.data.platforms -%}
+    {%- unless present contains p.key -%}{%- assign missing = p.key -%}{%- endunless -%}
+  {%- endfor -%}
+{%- endunless -%}
+
+{%- if shown.size == 0 -%}
+<p class="os-figure-error">Figure <code>{{ include.id }}</code> has no variant on disk.</p>
+{%- else -%}
+{%- assign wrap = 'os-figure' -%}
+{%- if shown.size > 1 -%}{%- assign wrap = 'os-figure os-figure-paired' -%}{%- endif -%}
+<div class="{{ wrap }}"{% if missing != '' %} data-missing="{{ missing }}"{% endif %}>
+{%- for key in shown -%}
+  {%- assign p = site.data.platforms | where: 'key', key | first -%}
+  {%- assign other = site.data.platforms | where_exp: 'q', 'q.key != key' | first -%}
+  {%- assign alt_key = 'alt_' | append: key -%}
+  {%- assign cap_key = 'caption_' | append: key -%}
+  {%- assign alt = include[alt_key] -%}
+  {%- unless alt -%}{%- assign alt = include.alt | append: ' (' | append: p.name | append: ')' -%}{%- endunless -%}
+  <figure class="os-frame" data-frame-os="{{ key }}">
+    <figcaption class="os-cap">
+      <span class="os-cap-row">
+        {%- if only -%}
+        {% include os_chip.html os=only %}
+        {%- else -%}
+        <span class="os-badge" tabindex="-1">{{ p.name }}</span>
+        {%- endif -%}
+        {%- if shown.size > 1 %}
+        <button type="button" class="os-btn os-swap" data-set-os="{{ other.key }}" data-figure="{{ include.id }}" aria-label="Show the {{ other.name }} screenshot">{{ other.name }}</button>
+        {%- endif %}
+        {%- if include[cap_key] %}
+        <span class="os-cap-text">{{ include[cap_key] }}</span>
+        {%- endif %}
+      </span>
+      {%- if missing != '' -%}
+        {%- assign gone = site.data.platforms | where: 'key', missing | first %}
+      <span class="os-note"><strong>Read this one as {{ p.name }}.</strong> The {{ gone.name }} screenshot hasn't been taken yet.</span>
+      {%- endif %}
+    </figcaption>
+    <img src="{{ '/screenshots/' | append: include.id | append: '-' | append: key | append: '.png' | relative_url }}" alt="{{ alt | escape }}" loading="lazy" decoding="async">
+  </figure>
+{%- endfor -%}
+</div>
+{%- endif -%}

@@ -12,5 +12,18 @@ heading_anchors: true
 mermaid:
   version: "11.4.1"
 
+# Setting `exclude` replaces Jekyll's defaults rather than adding to them, so the
+# list it ships with is repeated here. Without them a local `bundle install` puts
+# a whole gem tree under `docs/vendor/`, which Jekyll then tries to render as
+# site content — and `Gemfile` and `Gemfile.lock` get published alongside it.
 exclude:
+  - Gemfile
+  - Gemfile.lock
+  - node_modules
+  - vendor/bundle/
+  - vendor/cache/
+  - vendor/gems/
+  - vendor/ruby/
   - plans/
+  - screenshots/check-figures.py
+  - screenshots/capture/

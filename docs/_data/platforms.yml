@@ -1,0 +1,8 @@
+# The two operating systems the app ships on, in the order their variants appear
+# inside a figure and in the sidebar control. `key` is the filename suffix, the
+# manifest id suffix and the value of <html data-os>; `name` is the one place
+# either OS is spelled, so sentence case is enforced in one spot.
+- key: windows
+  name: Windows
+- key: macos
+  name: macOS
