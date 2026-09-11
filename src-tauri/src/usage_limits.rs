@@ -10,9 +10,10 @@ use tokio::sync::Notify;
 
 use crate::commands::{emit_usage_limits_updated, now_ms};
 use crate::config::ConfigState;
+use crate::usage_cache::UsageCacheStore;
 use crate::usage_history::{UsageHistoryRecord, UsageHistoryStore};
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LimitBucket {
     pub utilization: f32,
     pub resets_at: Option<i64>,
@@ -53,6 +54,13 @@ pub struct UsageLimitsState {
     /// attempts to one per `REFRESH_COOLDOWN_SECS` so a sequence of failed
     /// refreshes doesn't hammer Anthropic.
     last_refresh_attempt: Mutex<Option<Instant>>,
+    /// Last time `poll_once` started, successful or not. The refresh gate reads
+    /// this rather than the snapshot's `updated`, because `updated` answers a
+    /// different question: it is the age of the last *reading*, and a transient
+    /// failure that keeps the previous buckets deliberately leaves it frozen. So
+    /// a gate on `updated` opens wider the longer the endpoint stays unhappy,
+    /// asking most often exactly when it is refusing.
+    last_poll_attempt: Mutex<Option<Instant>>,
     /// Set the first time a poll observes an expired access token; cleared
     /// when a fresh token is observed. The first expired poll only sets
     /// this and reports auth_expired — refresh is deferred to the next
@@ -67,6 +75,7 @@ impl UsageLimitsState {
             inner: RwLock::new(UsageLimits::empty()),
             wake: Arc::new(Notify::new()),
             last_refresh_attempt: Mutex::new(None),
+            last_poll_attempt: Mutex::new(None),
             saw_expired_last_poll: AtomicBool::new(false),
         }
     }
@@ -84,23 +93,39 @@ impl UsageLimitsState {
     /// return `false`, so spam from the frontend can't exceed the Anthropic
     /// rate-limit floor.
     pub fn request_refresh(&self) -> bool {
-        let updated = self.snapshot().updated;
-        // Special-case the pre-first-poll state: `updated == 0` means we've
-        // never written a snapshot yet, so `now_ms() - 0` would log a
-        // wall-clock-since-epoch value that looks like a bug.
-        if updated == 0 {
-            tracing::debug!("refresh request granted, waking poller (no prior poll)");
-            self.wake.notify_one();
-            return true;
-        }
-        let age_ms = now_ms() - updated;
-        if age_ms < (MIN_POLL_SECS * 1000) as i64 {
+        let since = *self.last_poll_attempt.lock().unwrap();
+        let Some(since) = since else {
+            // No attempt yet means the poller is inside its own opening poll, or
+            // about to be: it polls at the top of its loop rather than waiting
+            // first. Waking it here bought a *second* poll one moment after the
+            // first, because `Notify::notify_one` parks a permit that is redeemed
+            // the instant the opening poll returns — measured as two requests in
+            // the same second on every launch, which is what tripped the
+            // endpoint's rate limiter.
+            tracing::debug!("refresh request denied (opening poll already covers it)");
+            return false;
+        };
+        let age_ms = since.elapsed().as_millis() as u64;
+        if age_ms < MIN_POLL_SECS * 1000 {
             tracing::debug!(age_ms, "refresh request denied (inside floor)");
             return false;
         }
         tracing::debug!(age_ms, "refresh request granted, waking poller");
         self.wake.notify_one();
         true
+    }
+
+    /// Stamped at the top of every poll, before any network call, so a request
+    /// arriving mid-poll is measured against the poll already running.
+    fn mark_poll_attempt(&self) {
+        *self.last_poll_attempt.lock().unwrap() = Some(Instant::now());
+    }
+
+    /// Whether this process has run a poll cycle yet. False only before the
+    /// opening one, which is the single moment a sample from the *previous*
+    /// process can stand in for a request.
+    fn has_polled(&self) -> bool {
+        self.last_poll_attempt.lock().unwrap().is_some()
     }
 
     /// Reserve a refresh-attempt slot if the cooldown has elapsed. Returns
@@ -324,9 +349,36 @@ fn write_credentials(
 #[derive(Debug)]
 enum PollError {
     Auth(reqwest::StatusCode),
-    HttpStatus(reqwest::StatusCode, String),
+    /// Status, a body snippet, and the endpoint's own `Retry-After` in seconds
+    /// when it sent a usable one.
+    HttpStatus(reqwest::StatusCode, String, Option<i64>),
     Network(String),
     JsonParse(String),
+}
+
+/// `Retry-After` in seconds. RFC 9110 allows either delta-seconds or an
+/// HTTP-date, and both have to be handled because the sender chooses.
+///
+/// A non-positive result is `None` rather than zero: `retry-after: 0` has been
+/// captured from this very route alongside a 429 that kept refusing, so taking
+/// it literally would mean "retry immediately" against an endpoint that had just
+/// said no. Absent and useless are the same instruction here.
+fn parse_retry_after(raw: &str) -> Option<i64> {
+    let raw = raw.trim();
+    if let Ok(secs) = raw.parse::<i64>() {
+        return (secs > 0).then_some(secs);
+    }
+    let at = chrono::DateTime::parse_from_rfc2822(raw).ok()?;
+    let secs = at.timestamp() - (now_ms() / 1000);
+    (secs > 0).then_some(secs)
+}
+
+/// One header as an owned string, or `None` when absent or not valid UTF-8.
+fn header_str(resp: &reqwest::Response, name: &str) -> Option<String> {
+    resp.headers()
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned)
 }
 
 async fn fetch_usage(
@@ -347,9 +399,37 @@ async fn fetch_usage(
         return Err(PollError::Auth(status));
     }
     if !status.is_success() {
+        // Read the headers BEFORE the body: `text()` consumes the response and
+        // takes the header map with it. That is why this app could report "no
+        // Retry-After observed" for months without ever having looked -- the one
+        // field that would say how long a 429 lasts was dropped on every failure.
+        // ACTED ON, not just logged: the parsed value rides out on
+        // `PollError::HttpStatus` and `poll_once` hands it to
+        // `UsageCacheStore::block_for`, which persists a deadline in
+        // `usage_cache.json` and skips every poll until it lapses -- so a
+        // frozen-looking poller with no outgoing requests is explained there and
+        // survives a restart, which is the whole point of it and also why
+        // restarting does not clear it. Captures in the wild have carried
+        // `retry-after: 272`, `retry-after: 0` and none at all; `parse_retry_after`
+        // settles the last two as "told us nothing" rather than "retry now".
+        let retry_after = header_str(&resp, "retry-after");
+        tracing::warn!(
+            status = status.as_u16(),
+            retry_after = ?retry_after,
+            request_id = ?header_str(&resp, "request-id"),
+            cf_ray = ?header_str(&resp, "cf-ray"),
+            ratelimit = ?resp
+                .headers()
+                .iter()
+                .filter(|(k, _)| k.as_str().starts_with("anthropic-ratelimit"))
+                .map(|(k, v)| format!("{k}={}", v.to_str().unwrap_or("?")))
+                .collect::<Vec<_>>(),
+            "usage endpoint refused; headers captured"
+        );
+        let wait = retry_after.as_deref().and_then(parse_retry_after);
         let body = resp.text().await.unwrap_or_default();
         let snippet = body.chars().take(200).collect::<String>();
-        return Err(PollError::HttpStatus(status, snippet));
+        return Err(PollError::HttpStatus(status, snippet, wait));
     }
     let body = resp
         .text()
@@ -421,7 +501,14 @@ impl UsageLimitsPoller {
                         )
                     })
                     .unwrap_or((None, None));
-                let secs = next_poll_secs(configured, delay, five_reset, seven_reset, now_ms());
+                let reading_age_secs = app
+                    .try_state::<UsageLimitsState>()
+                    .map(|s| s.snapshot().updated)
+                    .filter(|u| *u > 0)
+                    .map_or(0, |u| ((now_ms() - u).max(0) / 1000) as u64);
+                let scheduled = next_poll_secs(configured, delay, five_reset, seven_reset, now_ms(), reading_age_secs);
+                let blocked_until = app.try_state::<UsageCacheStore>().and_then(|c| c.blocked_until(now_ms()));
+                let secs = sleep_secs_honouring_block(scheduled, blocked_until, now_ms());
                 let wake = app
                     .try_state::<UsageLimitsState>()
                     .map(|s| s.wake.clone());
@@ -559,11 +646,17 @@ fn next_poll_secs(
     five_reset: Option<i64>,
     seven_reset: Option<i64>,
     now_ms: i64,
+    reading_age_secs: u64,
 ) -> u64 {
     let interval_ms = configured_secs as i64 * 1000;
     let delay_ms = reset_delay_secs as i64 * 1000;
     // Resets within one interval ahead (or just passed) override the regular
     // cadence; pick the soonest and aim for `reset_delay` after it.
+    //
+    // The reset window is measured against the FULL interval, not the shortened
+    // one below: it asks "is a reset close enough that the next ordinary poll
+    // would straddle it", which is a fact about the cadence and not about how
+    // old the reading on screen happens to be.
     let aligned_target = [five_reset, seven_reset]
         .into_iter()
         .flatten()
@@ -572,15 +665,132 @@ fn next_poll_secs(
         .min();
     let secs = match aligned_target {
         Some(target) => (target - now_ms).max(0) as u64 / 1000,
-        None => configured_secs,
+        // Schedule from the READING, not from this moment. After a poll they are
+        // the same thing (the reading is seconds old), so this changes nothing in
+        // steady state -- but a replayed sample is already part-way through its
+        // interval, and sleeping a full one from here would let it reach twice
+        // the age any displayed figure is ever supposed to have.
+        None => configured_secs.saturating_sub(reading_age_secs),
     };
     secs.max(MIN_POLL_SECS)
 }
 
+/// Whether the opening poll of this process would only re-ask a question the
+/// previous one already has an answer to.
+///
+/// This is the remaining half of "app restarts must not cost usage requests".
+/// The first half was a launch firing *two* requests; this is the one every
+/// launch still fires. It matters because restarts here are not rare events: a
+/// deploy is a restart, and a working session can produce a dozen, which is what
+/// a rate limiter sees as a dozen requests in ten minutes however idle the app is.
+///
+/// The test is simply whether the stored reading is younger than the interval a
+/// running app would have waited anyway. If it is, polling now is asking sooner
+/// than the configured cadence — the exact thing the cadence exists to prevent —
+/// and the sample already on disk is no staler than what a running instance
+/// would be showing at this moment.
+///
+/// A negative age (a sample stamped in the future, from a clock change) is not
+/// fresh: it is unreadable, so it does not get to suppress a real poll.
+fn opening_poll_is_redundant(sample_age_ms: i64, interval_secs: u64) -> bool {
+    sample_age_ms >= 0 && sample_age_ms < interval_secs as i64 * 1000
+}
+
+/// Never wake before a deadline the endpoint set, whatever the cadence says.
+///
+/// Without this the two mechanisms fight, and the fight is visible in the log: a
+/// blocked poller cannot refresh its reading, the reading therefore ages without
+/// bound, and `next_poll_secs`' age subtraction drives the cadence down to
+/// [`MIN_POLL_SECS`] — so the loop wakes every minute for the length of a
+/// 40-minute refusal to run a check it already knows the answer to. No request
+/// goes out, so it costs nothing on the wire, which is exactly why it would have
+/// gone unnoticed. Scheduling from the reading's age only makes sense while
+/// refreshing that reading is permitted.
+///
+/// Takes the later of the two: a reset alignment further out than the deadline
+/// still wins, since the deadline is a floor on when we may ask, not a request to
+/// ask the moment it lapses.
+fn sleep_secs_honouring_block(scheduled_secs: u64, blocked_until: Option<i64>, now_ms: i64) -> u64 {
+    match blocked_until.filter(|until| *until > now_ms) {
+        Some(until) => scheduled_secs.max(((until - now_ms) as u64).div_ceil(1000)),
+        None => scheduled_secs,
+    }
+}
+
 async fn poll_once(app: &AppHandle, client: &reqwest::Client) {
     let Some(state) = app.try_state::<UsageLimitsState>() else { return };
-    let previous = state.snapshot();
+    let cache = app.try_state::<UsageCacheStore>();
     let now = now_ms();
+
+    // The endpoint told us when to come back; asking sooner is what turned a
+    // ~14-minute wait into hours of refusals, because a 10-minute poll re-asks
+    // before every window expires. The deadline is on disk, so a restart -- and
+    // every deploy is one -- cannot reset it.
+    if let Some(cache) = cache.as_ref() {
+        if let Some(until) = cache.blocked_until(now) {
+            tracing::debug!(in_ms = until - now, "usage poll skipped; the endpoint asked to be left alone");
+            // Replay before returning, or the one situation this whole file
+            // exists for is the one it does not cover: restarted (every deploy
+            // is a restart) while the endpoint is refusing. Nothing else
+            // replays at startup -- the failure branch below does it, and a
+            // skipped poll never reaches it -- so without this the bars sit at
+            // `--%` for the length of the block, which is exactly the "broken
+            // feature" look the stored sample was added to remove.
+            //
+            // Only when there is nothing to show. A poll that has already
+            // succeeded this run holds a fresher reading than the file does,
+            // and `replay` reports `NetworkError`, so overwriting would
+            // downgrade a good snapshot on a later skip.
+            if state.snapshot().five_hour.is_none() {
+                if let Some(stale) = cache.replay(UsageStatus::NetworkError) {
+                    tracing::debug!(age_ms = now - stale.updated, "replaying the stored usage sample while blocked");
+                    state.replace(stale);
+                    emit_usage_limits_updated(app);
+                }
+            }
+            // Stamp the attempt even though nothing was sent. `request_refresh`
+            // reads a missing stamp as "the opening poll is about to cover this"
+            // and refuses -- true on a cold start, false here, where polls have
+            // been running and skipping for as long as the deadline lasts. Left
+            // unstamped, the user cannot force a refresh even after the deadline
+            // lapses, and the log line explaining the refusal is itself wrong.
+            state.mark_poll_attempt();
+            return;
+        }
+    }
+
+    // A restart must not re-ask a question the last run already answered.
+    // Every deploy is a restart and a working session makes a dozen, so the
+    // one-request-per-launch this skips is not a rounding error: it is what a
+    // rate limiter sees as a dozen requests in ten minutes from an app that was
+    // idle throughout, and it is how this endpoint was tripped on 2026-09-11.
+    //
+    // Replayed as `Ok` rather than as stale, because it is not stale: it is
+    // younger than the interval, which is the most any figure on screen ever is.
+    // The attempt is stamped so `request_refresh` measures against this cycle --
+    // unstamped, its cold-start branch would refuse a user-triggered refresh on
+    // the grounds that an opening poll is coming, and none is.
+    if !state.has_polled() {
+        if let Some(cache) = cache.as_ref() {
+            let interval = poll_interval_seconds(app);
+            if let Some(recent) = cache.replay(UsageStatus::Ok) {
+                if opening_poll_is_redundant(now - recent.updated, interval) {
+                    tracing::debug!(
+                        age_ms = now - recent.updated,
+                        interval_secs = interval,
+                        "opening poll skipped; the stored reading is younger than the interval"
+                    );
+                    state.replace(recent);
+                    state.mark_poll_attempt();
+                    emit_usage_limits_updated(app);
+                    return;
+                }
+            }
+        }
+    }
+
+    state.mark_poll_attempt();
+    let previous = state.snapshot();
 
     let token = match read_credentials() {
         Ok(t) => {
@@ -659,12 +869,16 @@ async fn poll_once(app: &AppHandle, client: &reqwest::Client) {
             if let Some(history) = app.try_state::<UsageHistoryStore>() {
                 history.append(&to_history_record(&usage, now));
             }
-            state.replace(UsageLimits {
+            let fresh = UsageLimits {
                 five_hour: usage.five_hour.map(to_bucket),
                 seven_day: usage.seven_day.map(to_bucket),
                 status: UsageStatus::Ok,
                 updated: now,
-            });
+            };
+            if let Some(cache) = cache.as_ref() {
+                cache.store_sample(&fresh);
+            }
+            state.replace(fresh);
             emit_usage_limits_updated(app);
         }
         Err(err) => {
@@ -675,13 +889,25 @@ async fn poll_once(app: &AppHandle, client: &reqwest::Client) {
             tracing::warn!(?err, "usage limits poll failed");
             // Keep last-known buckets visible on transient failures; the
             // tooltip's "updated Ns ago" carries the staleness signal.
-            let keep_prev = matches!(status, UsageStatus::NetworkError)
-                && previous.five_hour.is_some();
+            if let (Some(cache), PollError::HttpStatus(_, _, Some(secs))) = (cache.as_ref(), &err) {
+                if let Some(until) = cache.block_for(*secs, now) {
+                    tracing::warn!(retry_after_s = secs, in_ms = until - now, "usage endpoint asked to be left alone");
+                }
+            }
+            // A restart leaves no in-memory predecessor, so without the stored
+            // sample the bars collapse to `--%` -- which is what made a rate
+            // limit look like a broken feature. Replay the last real reading
+            // with its own age instead; `updated` is what the UI renders as
+            // "as of N ago".
+            let fallback = cache.as_ref().and_then(|c| c.replay(UsageStatus::NetworkError));
+            let prev = if previous.five_hour.is_some() { Some(previous.clone()) } else { fallback };
+            let keep_prev = matches!(status, UsageStatus::NetworkError) && prev.is_some();
+            let prev = prev.unwrap_or_else(UsageLimits::empty);
             state.replace(UsageLimits {
-                five_hour: if keep_prev { previous.five_hour.clone() } else { None },
-                seven_day: if keep_prev { previous.seven_day.clone() } else { None },
+                five_hour: if keep_prev { prev.five_hour.clone() } else { None },
+                seven_day: if keep_prev { prev.seven_day.clone() } else { None },
                 status,
-                updated: if keep_prev { previous.updated } else { now },
+                updated: if keep_prev { prev.updated } else { now },
             });
             emit_usage_limits_updated(app);
         }
@@ -698,9 +924,75 @@ mod tests {
     const HOUR: i64 = 3_600_000;
 
     #[test]
+    fn a_live_deadline_outranks_the_cadence() {
+        // Caught in production 2026-09-11: while blocked, the reading cannot be
+        // refreshed, so its age runs away and the age-aware cadence collapses to
+        // the floor -- the loop woke every 60s for a 40-minute refusal.
+        let collapsed = next_poll_secs(600, 120, None, None, NOW, 6_000);
+        assert_eq!(collapsed, MIN_POLL_SECS, "the age subtraction does bottom out");
+        assert_eq!(
+            sleep_secs_honouring_block(collapsed, Some(NOW + 40 * 60_000), NOW),
+            40 * 60,
+            "but the deadline decides, so there is exactly one wake"
+        );
+    }
+
+    #[test]
+    fn a_lapsed_or_absent_deadline_changes_nothing() {
+        assert_eq!(sleep_secs_honouring_block(600, None, NOW), 600);
+        assert_eq!(sleep_secs_honouring_block(600, Some(NOW - 1), NOW), 600);
+        // A deadline nearer than the cadence is a floor on asking, not a demand
+        // to ask the moment it lapses.
+        assert_eq!(sleep_secs_honouring_block(600, Some(NOW + 30_000), NOW), 600);
+    }
+
+    #[test]
+    fn a_reading_already_part_way_through_its_interval_is_re_polled_sooner() {
+        // Steady state is unchanged: a poll that just succeeded leaves a reading
+        // seconds old, so the next one is a full interval away.
+        assert_eq!(next_poll_secs(600, 120, None, None, NOW, 0), 600);
+        // But a replayed sample is already 7 minutes into its 10-minute life, so
+        // waiting another 10 would show a 17-minute-old figure -- older than any
+        // running instance ever shows.
+        assert_eq!(next_poll_secs(600, 120, None, None, NOW, 420), 180);
+        // The floor still holds against a reading older than the interval.
+        assert_eq!(next_poll_secs(600, 120, None, None, NOW, 5_000), MIN_POLL_SECS);
+    }
+
+    #[test]
+    fn an_imminent_reset_still_outranks_the_readings_age() {
+        // The reset window is measured against the FULL interval, so shortening
+        // the cadence must not stop a reset 9 minutes out from taking over --
+        // otherwise a stale reading would quietly disable reset alignment.
+        let secs = next_poll_secs(600, 120, Some(NOW + 540_000), None, NOW, 420);
+        assert_eq!(secs, 660, "aligned to reset_delay after the reset, not to the shortened cadence");
+    }
+
+    #[test]
+    fn a_sample_younger_than_the_interval_makes_the_opening_poll_redundant() {
+        // The whole point: a deploy restarts the app, and the reading the last
+        // process stored is no staler than what it would still be displaying.
+        assert!(opening_poll_is_redundant(30_000, 600));
+        assert!(opening_poll_is_redundant(599_999, 600));
+        // One interval old is exactly when a running app would have re-asked.
+        assert!(!opening_poll_is_redundant(600_000, 600));
+        assert!(!opening_poll_is_redundant(4 * HOUR, 600));
+    }
+
+    #[test]
+    fn a_sample_from_the_future_never_suppresses_a_poll() {
+        // A clock change can stamp a sample ahead of now. That reading cannot be
+        // aged, so it does not get to stand in for a real request -- erring
+        // toward one extra poll rather than toward bars frozen until the clock
+        // catches up.
+        assert!(!opening_poll_is_redundant(-1, 600));
+        assert!(!opening_poll_is_redundant(-(4 * HOUR), 600));
+    }
+
+    #[test]
     fn next_poll_uses_interval_when_no_reset_is_near() {
         // Both resets are more than one interval away → plain configured cadence.
-        let secs = next_poll_secs(600, 120, Some(NOW + 5 * HOUR), Some(NOW + 7 * 24 * HOUR), NOW);
+        let secs = next_poll_secs(600, 120, Some(NOW + 5 * HOUR), Some(NOW + 7 * 24 * HOUR), NOW, 0);
         assert_eq!(secs, 600);
     }
 
@@ -708,7 +1000,7 @@ mod tests {
     fn next_poll_aligns_to_reset_plus_delay_within_interval() {
         // 5h reset 5 min out (< 10-min interval) → poll 120s after it (300+120),
         // skipping the regular tick.
-        let secs = next_poll_secs(600, 120, Some(NOW + 300_000), Some(NOW + 7 * 24 * HOUR), NOW);
+        let secs = next_poll_secs(600, 120, Some(NOW + 300_000), Some(NOW + 7 * 24 * HOUR), NOW, 0);
         assert_eq!(secs, 420);
     }
 
@@ -717,7 +1009,7 @@ mod tests {
         // Reset 9 min out (still within the 10-min interval): aiming for reset+2min
         // = 11 min means one longer sleep that skips the regular 10-min poll, so the
         // two don't fire close together and trip a 429.
-        let secs = next_poll_secs(600, 120, Some(NOW + 540_000), None, NOW);
+        let secs = next_poll_secs(600, 120, Some(NOW + 540_000), None, NOW, 0);
         assert_eq!(secs, 660);
     }
 
@@ -725,14 +1017,14 @@ mod tests {
     fn next_poll_retries_at_floor_after_a_reset_passed() {
         // Reset passed by more than the delay (target in the past) → floor to
         // MIN_POLL_SECS, re-polling once a minute until the fresh window lands.
-        let secs = next_poll_secs(600, 120, Some(NOW - 200_000), None, NOW);
+        let secs = next_poll_secs(600, 120, Some(NOW - 200_000), None, NOW, 0);
         assert_eq!(secs, MIN_POLL_SECS);
     }
 
     #[test]
     fn next_poll_picks_the_soonest_near_reset() {
         // 7d reset also happens to be near; the sooner one (5h) drives the schedule.
-        let secs = next_poll_secs(600, 120, Some(NOW + 480_000), Some(NOW + 120_000), NOW);
+        let secs = next_poll_secs(600, 120, Some(NOW + 480_000), Some(NOW + 120_000), NOW, 0);
         assert_eq!(secs, 240, "aligns to the sooner 2-min reset (+120s delay)");
     }
 
@@ -827,25 +1119,59 @@ mod tests {
     }
 
     #[test]
+    fn retry_after_takes_either_form_and_rejects_useless_values() {
+        assert_eq!(parse_retry_after("832"), Some(832), "delta-seconds, as this route sent");
+        assert_eq!(parse_retry_after("  60 "), Some(60));
+        // Captured in the wild on this route beside a 429 that kept refusing.
+        assert_eq!(parse_retry_after("0"), None, "zero is not an instruction to retry now");
+        assert_eq!(parse_retry_after("-1"), None);
+        assert_eq!(parse_retry_after("soon"), None);
+        assert_eq!(parse_retry_after(""), None);
+        // An HTTP-date already past says nothing either.
+        assert_eq!(parse_retry_after("Wed, 21 Oct 2015 07:28:00 GMT"), None);
+        let future = chrono::Utc::now() + chrono::Duration::seconds(300);
+        let got = parse_retry_after(&future.to_rfc2822()).expect("a future date parses");
+        assert!((295..=300).contains(&got), "got {got}");
+    }
+
+    #[test]
+    fn refresh_is_denied_before_the_opening_poll() {
+        // The poller polls at the top of its loop, so a mount-time refresh that
+        // arrives first is asking for a poll that is already happening. Waking it
+        // parked a `Notify` permit that was redeemed the moment the opening poll
+        // returned, producing two requests in the same second on every launch --
+        // the doubled log lines that tripped the endpoint's rate limiter.
+        let state = UsageLimitsState::new();
+        assert!(!state.request_refresh());
+    }
+
+    #[test]
     fn request_refresh_respects_min_poll_floor() {
         let state = UsageLimitsState::new();
-        // Seed updated 30s ago — inside the 60s floor; refresh is dropped.
-        state.replace(UsageLimits {
-            five_hour: None,
-            seven_day: None,
-            status: UsageStatus::Ok,
-            updated: now_ms() - 30_000,
-        });
-        assert!(!state.request_refresh());
 
-        // Seed updated 61s ago — outside the floor; refresh wakes the poller.
+        state.mark_poll_attempt();
+        assert!(!state.request_refresh(), "an attempt just now is inside the floor");
+
+        *state.last_poll_attempt.lock().unwrap() =
+            Some(Instant::now() - Duration::from_secs(MIN_POLL_SECS + 1));
+        assert!(state.request_refresh(), "past the floor, the poller is woken");
+    }
+
+    #[test]
+    fn a_frozen_updated_does_not_open_the_gate() {
+        // A transient failure keeps the previous buckets and deliberately leaves
+        // `updated` at the last *reading*, so it ages without bound while the
+        // endpoint is unhappy. The old gate read `updated` and therefore granted
+        // every request during exactly the stretch it should have been quietest.
+        let state = UsageLimitsState::new();
         state.replace(UsageLimits {
             five_hour: None,
             seven_day: None,
-            status: UsageStatus::Ok,
-            updated: now_ms() - 61_000,
+            status: UsageStatus::NetworkError,
+            updated: now_ms() - 3_600_000,
         });
-        assert!(state.request_refresh());
+        state.mark_poll_attempt();
+        assert!(!state.request_refresh());
     }
 
     #[test]

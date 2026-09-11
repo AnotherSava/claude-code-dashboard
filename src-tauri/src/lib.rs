@@ -38,6 +38,7 @@ mod token_history;
 mod token_scan;
 mod tray;
 mod tray_badge;
+mod usage_cache;
 mod usage_history;
 mod usage_limits;
 mod waiting_settle;
@@ -464,6 +465,9 @@ pub fn run() {
     ));
     app.manage(auto_start_store::AutoStartStore::new(
         app_data.join(auto_start_store::FILE_NAME),
+    ));
+    app.manage(usage_cache::UsageCacheStore::new(
+        app_data.join("usage_cache.json"),
     ));
     app.manage(usage_history::UsageHistoryStore::new(
         app_data.join("usage_history.jsonl"),

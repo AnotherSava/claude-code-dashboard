@@ -38,14 +38,17 @@
       ? Math.max(1, Math.min(segmentCount, Math.round(utilization * segmentCount)))
       : 0,
   )
+  // A held bucket shows its figure whatever the status says. The two strings
+  // this replaced -- 'NO DATA' and compact's '??' -- could only ever appear
+  // WITH a bucket in hand, since a missing one is already '--%' above: the
+  // segments were drawn, the reset countdown was ticking, and the number beside
+  // them claimed there was nothing. Restarting while the usage endpoint is
+  // rate-limiting is the case that made it plain -- the last real reading is
+  // replayed from disk precisely so the header keeps saying something, and it
+  // arrived to be labelled as absent.
+  const stale = $derived(hasData && status !== 'ok')
   const percentText = $derived(
-    !hasData || !bucket
-      ? '--%'
-      : status === 'ok'
-        ? `${Math.round(bucket.utilization * 100)}%`
-        : compact
-          ? '??'
-          : 'NO DATA',
+    !hasData || !bucket ? '--%' : `${Math.round(bucket.utilization * 100)}%`,
   )
   const timeText = $derived(
     !hasData || !bucket
@@ -78,7 +81,23 @@
     else if (s === 'auth_expired') lines.push('Token expired — run Claude Code to refresh')
     else if (s === 'network_error') {
       if (resets) lines.push(resets)
-      lines.push(`Anthropic API unreachable — last try ${formatAgo(n - u)}`)
+      // Two different facts, and only one of them is `updated`. With a bucket in
+      // hand `updated` is the moment of the READING on show — the backend keeps
+      // the previous snapshot's timestamp when it holds its buckets, and replays
+      // a stored sample under its own — so the age belongs to the number above
+      // and "last try" would date it by something else entirely. With no bucket
+      // there is no reading, and `updated` is the failed attempt.
+      //
+      // It deliberately does not say how long the API has been unreachable.
+      // A replayed sample can be from before a weekend the app spent closed,
+      // during which nothing was tried and nothing was unreachable; and the
+      // commonest case here is not unreachability at all but a 429 whose
+      // Retry-After we are honouring, where the endpoint answered and we chose
+      // not to call. "Could not refresh" covers both without claiming either.
+      lines.push(
+        b ? `Reading from ${formatAgo(n - u)} — could not refresh`
+          : `Anthropic API unreachable — last try ${formatAgo(n - u)}`,
+      )
     } else if (s === 'ok' && b) {
       lines.push(resets ?? 'No usage yet', `updated ${formatAgo(n - u)}`)
     }
@@ -107,7 +126,7 @@
 </script>
 
 <div class="bar" class:compact style:--sev={fillColor} style:--lvl={levelPct + '%'} title={tooltip} data-tauri-drag-region>
-  <span class="cap cap-left" data-tauri-drag-region>{percentText}</span>
+  <span class="cap cap-left" class:stale data-tauri-drag-region>{percentText}</span>
   {#if !compact}
     <div
       class="segments"
@@ -157,6 +176,12 @@
     background:
       linear-gradient(#2a2a2d, #2a2a2d) padding-box,
       linear-gradient(90deg, var(--sev) var(--lvl), var(--track) var(--lvl)) border-box;
+  }
+  /* A figure nobody has been able to re-check. Dimmed rather than annotated:
+     the exact age is in the tooltip, and a second glyph beside the number would
+     be the duplicate state signal the row badges are kept free of. */
+  .cap.stale {
+    opacity: 0.55;
   }
   .segments {
     position: relative;

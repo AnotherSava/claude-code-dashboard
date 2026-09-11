@@ -8,7 +8,7 @@ use crate::config::{ConfigState, StateNotify};
 use crate::custom_names::CustomNamesStore;
 use crate::state::{AgentSession, AppState, Attention, DialogRole, Status};
 use crate::telegram::{SyncOutcome, TelegramNotifier};
-use crate::usage_limits::UsageLimitsState;
+use crate::usage_limits::{UsageLimitsState, UsageStatus};
 
 /// Upper bound on the reading-time delay [`reading_time_ms`] can add to a
 /// notification window, so an enormous message can't defer an actionable ping
@@ -976,8 +976,22 @@ impl NotificationManager {
                     // runs whenever creds are set (even with the feature off) so
                     // the tracker stays seeded and turning the threshold on
                     // mid-window can't false-fire on a stale window.
+                    // Only a SUCCESSFUL reading is evidence about a reset. The
+                    // snapshot can now also carry a sample replayed from disk at
+                    // startup (`usage_cache`), whose `updated` is from a previous
+                    // run -- and an unguarded seed from one is worse than no seed:
+                    // it hands the tracker a `resets_at` and a `peak_pct` from
+                    // before the downtime, so the first real poll sees the window
+                    // jump forward and fires a `limit_reset` ping for a reset that
+                    // happened while the app was closed. Before the replay existed
+                    // a restart could not do this, because the post-restart
+                    // snapshot held no buckets and `observe` no-opped on `None`;
+                    // the `status` gate is what restores that.
                     if let Some(usage) = app.try_state::<UsageLimitsState>().map(|s| s.snapshot()) {
-                        if usage.updated != 0 && usage.updated != last_usage_updated {
+                        if usage.status == UsageStatus::Ok
+                            && usage.updated != 0
+                            && usage.updated != last_usage_updated
+                        {
                             last_usage_updated = usage.updated;
                             let five = (
                                 usage.five_hour.as_ref().map(|b| b.utilization * 100.0),
