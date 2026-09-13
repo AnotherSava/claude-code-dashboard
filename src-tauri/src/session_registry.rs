@@ -336,6 +336,9 @@ impl SessionRegistry {
     /// `None` versus `Some(vec![])` carries the same weight as in
     /// [`live_sessions`](Self::live_sessions): could not look, versus nothing
     /// running.
+    // Read by `terminals::windows`, which titles per console rather than per tab,
+    // and by nothing on any other platform — see the note on `observe_caption`.
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub fn live_records(&self, now: i64) -> Option<Vec<(u32, String)>> {
         let mut cached = self.cached.lock().unwrap();
         Self::refresh(&mut cached, now).map(|recs| recs.iter().map(|r| (r.pid, r.cwd.clone())).collect())

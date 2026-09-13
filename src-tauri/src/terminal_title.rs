@@ -409,6 +409,14 @@ pub fn pin_verdict(caption: &str, written: &str, written_at: i64, now: i64, live
 /// means the last write found no terminal *or* never happened, and excluding
 /// them would silently retire the sensor for every row on a platform or a
 /// terminal where the attribution does not answer.
+// Reached from `terminals::windows` and nowhere else, so on every other platform
+// this and the cluster below it — `pin_verdict`, `pin_step`, `same_row`,
+// `shared_label`, `live_session_count`, `Pin`, `Step` — are unreachable by
+// construction. Marking the root is enough: rustc seeds its live-symbol walk from
+// allow-annotated items, so the callees go quiet with it. `cfg_attr` rather than a
+// bare `allow` so that on Windows, where these ARE reachable, a genuinely dead one
+// is still reported.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn observe_caption(app: &AppHandle, caption: &str, now: i64, window: Option<&str>) {
     let Some(titles) = app.try_state::<TerminalTitles>() else { return };
     let hosts = titles.hosts.lock().unwrap().clone();

@@ -38,6 +38,8 @@ Compiles the Rust backend, starts Vite on `localhost:1420`, and launches the nat
 - `npm run check` — TypeScript + Svelte check (no build).
 - `npm run tauri icon <path/to/1024.png>` — regenerate the Windows / macOS icon set from a source PNG.
 - `cargo test --manifest-path src-tauri/Cargo.toml --lib` — Rust unit tests (state machine, transcript parser, merge policy, Claude adapter, label policy).
+- `RUSTFLAGS="-D warnings" cargo check --manifest-path src-tauri/Cargo.toml --all-targets` — compile every target under both cfgs with warnings as errors. The test run above sees only the test cfg, so this is the only command that catches a warning in the plain build, in the bin, or in `build.rs`.
+- `bash .claude/commit-checks.sh` — everything CI will run, in CI's order, in about ten seconds. Run it before committing.
 
 ## Architecture
 
@@ -97,7 +99,7 @@ Under the repo root `claude-code-dashboard/`:
 - `integrations/claude_hook.py` — thin Claude Code hook that forwards the stdin payload to /api/event
 - `docs/` — this site
 - `.github/workflows/`
-  - `build.yml` — CI: check + cargo test + frontend build on push/PR (Windows + macOS matrix)
+  - `build.yml` — CI: check + `cargo check --all-targets` with warnings denied + cargo test + frontend build on push/PR (Windows + macOS matrix)
   - `release.yml` — CI: build NSIS + DMG installers on tag push (Windows + macOS matrix)
   - `notify-tap.yml` — CI: on a published release, tells the `AnotherSava/homebrew-tap` repo to bump its cask to the new version
 

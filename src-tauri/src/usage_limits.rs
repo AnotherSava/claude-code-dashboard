@@ -917,7 +917,12 @@ async fn poll_once(app: &AppHandle, client: &reqwest::Client) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Both serve the credentials-path tests only, which are gated the same way
+    // because macOS reads those credentials from the Keychain instead. Gated
+    // rather than `allow`ed so the import carries the same condition its users do.
+    #[cfg(not(target_os = "macos"))]
     use std::io::Write;
+    #[cfg(not(target_os = "macos"))]
     use std::sync::{Mutex, OnceLock};
 
     const NOW: i64 = 1_000_000_000_000;

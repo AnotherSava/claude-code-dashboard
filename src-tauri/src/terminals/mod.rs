@@ -437,6 +437,9 @@ mod stale_tests {
     /// construct; the list is also the reminder to add the next one.
     #[test]
     fn every_remedy_splices_into_a_sentence() {
+        // `mut` for the Windows push below; nothing mutates it elsewhere, and the
+        // list grows with the next adapter.
+        #[cfg_attr(not(target_os = "windows"), allow(unused_mut))]
         let mut remedies = vec![FALLBACK_STALE_REMEDY];
         #[cfg(target_os = "windows")]
         remedies.push(windows::STALE_REMEDY);
