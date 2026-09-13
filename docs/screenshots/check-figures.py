@@ -2,6 +2,9 @@
 """Reconcile the four places a documentation screenshot is named: the pages that
 include it, the PNGs on disk, the entries in screenshots.json, and README.md.
 
+It also validates the one manifest field whose value nothing else reads --
+`verifiedAt` -- because a wrong value there is otherwise invisible.
+
 Errors are contradictions and fail the build. Two things are reported and never
 failed, because both are legitimate resting states of this repo and a check that
 goes red on a known state is one somebody disables within a week:
@@ -13,6 +16,7 @@ Both print even when the count is zero, so silence never reads as "nothing to do
 """
 import json
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -41,6 +45,32 @@ RAW_IMG = re.compile(
 README_IMG = re.compile(r"docs/screenshots/([A-Za-z0-9._-]+\.png)")
 # The README's hand-written stand-in for the note figure.html derives; see main().
 UNTAKEN = "hasn't been taken yet"
+
+
+# The sentinel `verifiedAt` carries when a shot was examined as part of the very
+# commit that introduces it -- see the note in `main`. Resolve it with
+# `git log -1 --format=%h -- docs/screenshots/<id>.png`.
+AT_CAPTURE = "at-capture"
+
+
+def commit_exists(sha: str) -> bool:
+    """Whether `sha` names a commit here.
+
+    Answers True for anything it cannot rule out, which is the direction that
+    matters: this runs in CI and in `commit-checks.sh`, so a checkout without git
+    -- a source tarball, a vendored copy -- must not fail the build over a field
+    nothing reads at runtime. Only a live repo that positively denies the object
+    is an error. The two cases are separated deliberately: folding them together
+    is how the first version of this returned True for a sha that did not exist.
+    """
+    try:
+        in_repo = subprocess.run(["git", "rev-parse", "--git-dir"], cwd=SHOTS, capture_output=True, timeout=10)
+        if in_repo.returncode != 0:
+            return True                    # not a repository: nothing to check against
+        r = subprocess.run(["git", "cat-file", "-t", sha], cwd=SHOTS, capture_output=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return True                        # no git, or it hung: not this check's business
+    return r.returncode == 0 and r.stdout.strip() == b"commit"
 
 
 def arg(name: str, blob: str) -> str | None:
@@ -143,6 +173,23 @@ def main() -> int:
     entries = {e["id"]: e for e in manifest["screenshots"]}
     if len(entries) != len(manifest["screenshots"]):
         errors.append("screenshots.json: two entries share an id")
+
+    # `verifiedAt` is either a commit sha or the sentinel `at-capture`; absent
+    # means never examined. The skill's references/screenshot-manifest.md defines
+    # all three and why the sentinel exists — in short, the sha of the commit that
+    # CARRIES a shot cannot be written while composing that commit, so recording
+    # one would otherwise cost a second commit per change.
+    #
+    # Checked here because nothing reads the value, so a wrong one is invisible:
+    # a date was written into this field on 2026-09-13 and nothing noticed.
+    for eid, e in entries.items():
+        v = e.get("verifiedAt")
+        if v is None or v == AT_CAPTURE:
+            continue
+        if not re.fullmatch(r"[0-9a-f]{7,40}", v):
+            errors.append(f"{eid}: verifiedAt is {v!r}, which is neither a commit sha nor {AT_CAPTURE!r}")
+        elif not commit_exists(v):
+            errors.append(f"{eid}: verifiedAt {v!r} is not a commit in this repository")
 
     on_disk = {p.name for p in SHOTS.glob("*.png")}
     claimed: dict[str, str] = {}

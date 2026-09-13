@@ -46,7 +46,7 @@
           "ROUNDED CORNERS, which the widget draws itself as of 2026-09-11 \u2014 see the compact-mode-macos entry for the four things that had to agree before `transparent: true` took effect. A capture should ramp 0, 0, 0, 0, 0, 70, 255 down the diagonal, against 0, 0, 0, 64, 114, 255 on hero-windows, where Windows 11 rounds the window itself."
         ]
       },
-      "verifiedAt": "2026-09-13"
+      "verifiedAt": "at-capture"
     },
     {
       "id": "compact-mode-windows",
