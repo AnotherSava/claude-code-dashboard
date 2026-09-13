@@ -154,7 +154,12 @@ function Add-Hairline {
     # stop. A remedy that differs from what the code runs is worse than none.
     $flags = @('--require')
     if ($Opaque) { $flags += '--opaque' }
-    $suggest = "python `"$hairline`" $($flags -join ' ') `"$Path`""
+    # The interpreter in the remedy is the one we RESOLVED, not a hardcoded name.
+    # `python` was hardcoded here, so on a machine carrying only `python3` the two
+    # throws below suggested a command that does not run -- the same drift as the
+    # flags, one level down. It falls back to `python` only when nothing resolved,
+    # which is the branch that tells you to install it.
+    $suggest = "$(if ($py) { $py } else { 'python' }) `"$hairline`" $($flags -join ' ') `"$Path`""
     if (-not $py) { throw "Saved $Path but python is not on PATH, so it has no border. Install python or run: $suggest" }
     if (-not (Test-Path $hairline)) { throw "Saved $Path but $hairline is missing. The capture scripts call the documentation skill's shared tooling; install the dotfiles and run: $suggest" }
     & $py $hairline @flags $Path
