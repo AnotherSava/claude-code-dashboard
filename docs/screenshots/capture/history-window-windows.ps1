@@ -70,6 +70,9 @@ Start-Sleep -Milliseconds 1500
 $out = if ($Method -eq 'Alpha') { Get-ShotPath 'history-window-windows' }
        else { Join-Path (Split-Path $PSScriptRoot -Parent | Split-Path -Parent | Split-Path -Parent) 'tmp/history-window-probe.png' }
 Invoke-WindowShotWithoutWidget @{ ProcessName = 'claude-code-dashboard'; Title = $title; Method = $Method; Out = $out }
+# Only the Alpha path writes the committed frame; a PrintWindow probe goes to a
+# scratch file and must not be dressed up to look like one.
+if ($Method -eq 'Alpha') { Add-Hairline -Path $out -Opaque }
 
 # Put the window back the way the user finds it. `save_window_position` is on by
 # default, and lib.rs writes `history_window_position` when the history window is

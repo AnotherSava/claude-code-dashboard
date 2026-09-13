@@ -106,6 +106,61 @@ function Invoke-WindowShotWithoutWidget {
     }
 }
 
+# Give a saved frame the documentation set's shared border.
+#
+# Shelled out to the documentation skill's hairline.py rather than implemented
+# here, and for the same reason window-shot.ps1 already shells out to
+# trim_halo.py: the macOS half of this project is Python and cannot read a
+# PowerShell function, so a shared script is the only place the two platforms
+# can hold ONE implementation. The alternative is the same border written twice,
+# drifting in width or colour on two frames the README prints side by side.
+#
+# -Opaque REPLACES a translucent border rather than tinting it, and every Windows
+# frame here needs it. Windows draws its window frames translucent (alpha 119 on
+# the undecorated widget, ~130 on a decorated window), so a border left as the OS
+# drew it takes its shade from whatever is behind the page: measured, those frames
+# read 159-183 on a white page and 53-54 on a dark one, against a flat 189 on
+# every macOS frame. GitHub renders a README in dark mode, so that is not a corner
+# case. With -Opaque all ten frames measure 2px of #BDBDBD at full alpha and read
+# 189 on both.
+#
+# This is deliberately NOT folded into Invoke-WindowShot. terminal-tabs-windows
+# captures to a temp file and crops it before saving, so a stroke applied at shot
+# time would land where that crop cuts it away AND be stroked again afterwards,
+# giving a doubled edge on the two sides that keep the window's own border. The
+# caller knows whether it is saving a window or a crop; the shot helper does not.
+function Add-Hairline {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [switch]$Opaque
+    )
+    $hairline = Join-Path $env:USERPROFILE '.claude\skills\documentation\scripts\hairline.py'
+    $py = if (Get-Command python -ErrorAction SilentlyContinue) { 'python' }
+          elseif (Get-Command python3 -ErrorAction SilentlyContinue) { 'python3' }
+          else { $null }
+    # --require turns a SKIP into a failure. Without it, hairline.py's "this frame
+    # already has an edge" path exits 0, which is indistinguishable from success to
+    # this function -- so a frame whose border was never applied ships silently. The
+    # caller only reaches here when it wants a border, so being left alone is only
+    # acceptable if the edge already present is the one we would have drawn, and
+    # --require is what checks that rather than assuming it.
+    #
+    # THE FLAGS ARE BUILT ONCE AND USED FOR BOTH THE CALL AND THE SUGGESTED REMEDY,
+    # because those two drifted: the throw messages below used to compose their own
+    # command and omitted --require from it. Someone who hit a guard and copied the
+    # suggested fix would then run the version WITHOUT the check -- and on a frame
+    # that trips has_own_edge would get "already has an edge of its own", exit 0,
+    # and an off-shade border, which is the precise failure --require exists to
+    # stop. A remedy that differs from what the code runs is worse than none.
+    $flags = @('--require')
+    if ($Opaque) { $flags += '--opaque' }
+    $suggest = "python `"$hairline`" $($flags -join ' ') `"$Path`""
+    if (-not $py) { throw "Saved $Path but python is not on PATH, so it has no border. Install python or run: $suggest" }
+    if (-not (Test-Path $hairline)) { throw "Saved $Path but $hairline is missing. The capture scripts call the documentation skill's shared tooling; install the dotfiles and run: $suggest" }
+    & $py $hairline @flags $Path
+    if ($LASTEXITCODE -ne 0) { throw "hairline.py failed on $Path; the frame has no border, or the wrong one. Reproduce with: $suggest" }
+}
+
 function Get-ShotPath {
     param([Parameter(Mandatory = $true)][string]$Id)
     # capture/lib -> capture -> screenshots

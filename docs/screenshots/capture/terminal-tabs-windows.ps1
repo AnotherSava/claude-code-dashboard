@@ -152,6 +152,31 @@ try {
         $out = Get-ShotPath 'terminal-tabs-windows'
         $crop.Save($out, [System.Drawing.Imaging.ImageFormat]::Png)
         Write-Host "$out  $($crop.Width)x$($crop.Height)  strip height ${stripH}px"
+
+        # Give the crop an edge. A region crop never brings one: this keeps the
+        # window's own translucent border along its top and left, and its right
+        # and bottom are wherever the bounds above were measured -- bare content
+        # at (46, 46, 46), which on a dark page has nothing to stop the picture.
+        #
+        # AFTER the save, not before, because the border has to trace the cropped
+        # shape; stroking the whole window first would put the edge where this
+        # crop cuts it away.
+        #
+        # The script is the documentation skill's, shared with the macOS capture
+        # rather than reimplemented here: one border, one width, one colour, on
+        # two frames the README prints side by side. It decides for itself whether
+        # a frame needs one, so the widget captures -- which arrive with Windows'
+        # own border -- are left alone by it.
+        #
+        # -Opaque because this frame in particular keeps a border on two sides and
+        # is cut bare on the other two, and Windows' own is translucent: left as
+        # it is, the kept sides take their colour from whatever is behind the page
+        # and vanish on a dark one while the stroked sides stay bright. The flag
+        # replaces all four with one opaque band so the crop has a single border.
+        # It is passed here rather than decided in the skill because which frames
+        # are crops of a translucent-bordered window is something this project
+        # knows and that script cannot see.
+        Add-Hairline -Path $out -Opaque
     } finally { $crop.Dispose() }
 } finally {
     $bmp.Dispose()

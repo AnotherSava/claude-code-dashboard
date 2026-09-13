@@ -62,5 +62,6 @@ Start-Sleep -Milliseconds 1200
 
 $out = Get-ShotPath 'hero-windows'
 Invoke-WindowShot @{ ProcessName = 'claude-code-dashboard'; Title = 'Claude Code Dashboard'; Method = 'Alpha'; Out = $out }
+Add-Hairline -Path $out -Opaque
 
 if (-not $Force) { Assert-HeroSpread 'after the shot' }

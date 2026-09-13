@@ -63,4 +63,6 @@ Invoke-DashboardWindow @{ action = 'resize'; label = 'intensity'; width = $Width
 # before the header decides whether it fits on one line.
 Start-Sleep -Milliseconds 2500
 
-Invoke-WindowShotWithoutWidget @{ ProcessName = 'claude-code-dashboard'; Title = 'Work intensity'; Method = 'Alpha'; Out = (Get-ShotPath 'work-intensity-windows') }
+$out = Get-ShotPath 'work-intensity-windows'
+Invoke-WindowShotWithoutWidget @{ ProcessName = 'claude-code-dashboard'; Title = 'Work intensity'; Method = 'Alpha'; Out = $out }
+Add-Hairline -Path $out -Opaque
