@@ -196,13 +196,16 @@ function Assert-Publishable {
     $pyArgs = @($lib, 'assert-publishable', '--where', $Where)
     foreach ($n in $Name) { if ($n) { $pyArgs += @('--name', $n) } }
     if ($LocalOnly) { $pyArgs += '--local-only' }
-    $suggest = "$(if ($py) { $py } else { 'python' }) `"$lib`" assert-publishable --where `"$Where`""
+    # `python` literally, not $py: this string is only ever read in the branch
+    # where $py is null, so interpolating it would always render the fallback and
+    # the conditional would be an unreachable arm pretending to be a choice.
+    $suggest = "python `"$lib`" assert-publishable --where `"$Where`""
     if (-not $py) { throw "Cannot check which projects would be in $Where because python is not on PATH, and a frame publishes every project name it shows. Install python, or check by eye and re-run. Manual: $suggest" }
 
     $port = Get-DashboardPort
     $roster = Invoke-WebRequest -Uri "http://127.0.0.1:$port/api/agents" -TimeoutSec 10 -UseBasicParsing
     $roster.Content | & $py @pyArgs
-    if ($LASTEXITCODE -ne 0) { throw "Refused to capture $Where -- see above. Nothing was written." }
+    if ($LASTEXITCODE -ne 0) { throw "Refused to capture $Where -- see above. Nothing was written. Re-check with: $suggest" }
 }
 
 function Get-ShotPath {

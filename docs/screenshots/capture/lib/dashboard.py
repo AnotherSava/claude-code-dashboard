@@ -29,6 +29,7 @@ and refuses every value one can be set to — including the plausible
 `http://127.0.0.1:9077`, which answers 403 `csrf`. Setting it "properly" is the
 mistake that looks like a fix.
 """
+import argparse
 import json
 import os
 import shutil
@@ -514,8 +515,6 @@ def assert_publishable(names, allowed=PUBLISHABLE_PROJECTS, where: str = "the fr
 # refusal on stderr. `--name` adds strings the roster does not carry — a window
 # title, a tab caption — which are checked against the same list.
 def _cli(argv: list[str]) -> int:
-    import argparse
-
     ap = argparse.ArgumentParser(prog="dashboard.py", description=__doc__.splitlines()[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
     ck = sub.add_parser("assert-publishable", help="refuse if the roster on stdin would put a non-publishable project on screen")
