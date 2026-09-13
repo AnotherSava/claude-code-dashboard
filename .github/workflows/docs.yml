@@ -15,6 +15,15 @@ jobs:
   figures:
     runs-on: ubuntu-latest
     steps:
+      # Full history: `check-figures.py` resolves each figure's `verifiedAt` sha
+      # against the repository, and checkout's default depth of 1 leaves only the
+      # tip commit — so every entry reported "is not a commit in this repository"
+      # and the job failed on three consecutive pushes while the identical script
+      # passed locally. Fixing it here rather than making the script shrug at an
+      # unresolvable sha, which would disarm the check exactly where it runs
+      # unattended.
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
       - run: pip install pillow pyyaml
       - run: python docs/screenshots/check-figures.py
