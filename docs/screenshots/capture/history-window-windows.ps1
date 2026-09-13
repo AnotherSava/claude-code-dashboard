@@ -1,4 +1,4 @@
-<#
+﻿<#
   Windows variant of the `history-window` figure.
 
   Opens the History window on one session and captures it with its native title

@@ -1,4 +1,4 @@
-<#
+﻿<#
   Shared helpers for the Windows capture scripts.
 
   EVERY SCRIPT THAT DOTS THIS FILE DECLARES [CmdletBinding()], and it is not

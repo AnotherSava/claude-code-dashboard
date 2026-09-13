@@ -1,4 +1,4 @@
-<#
+﻿<#
   Windows variant of the `work-intensity` figure.
 
   Opens the Work intensity window on a chosen week, sizes it wide enough that the
