@@ -40,6 +40,60 @@
   // about / intensity render their own root, never `.widget`, so their
   // widgetEl is permanently absent and would otherwise read as a readiness gap.
   const isMainWindow = getWindowLabelSync() === 'main'
+
+  // Only the widget's window is transparent, so only its page may be.
+  //
+  // This component is the root of ALL FOUR windows — it routes to HistoryApp,
+  // AboutApp and IntensityApp below — so a `:global(html, body)` rule here
+  // reaches every one of them. Making that rule transparent outright is what
+  // turned the Work intensity chart into light-on-light: its window is opaque,
+  // so a transparent page shows the OS's default white behind the text.
+  // IntensityApp and AboutApp each set their own `:global(html, body)` to the
+  // dark theme colour, which did not save them — the two rules have equal
+  // specificity, so the later one in the bundle simply won.
+  //
+  // The class is set here rather than in `onMount` because it has to be on the
+  // element before the first paint, and module-scope runs during component init
+  // while `onMount` runs after the first render.
+  if (isMainWindow && typeof document !== 'undefined') document.documentElement.classList.add('transparent-shell')
+  // Whether the pointer is really over the header — see the `.hide-btn.shown`
+  // rule for why `header:hover` cannot answer that on a transparent window.
+  //
+  // The listeners are attached here rather than written as `onpointerenter` in
+  // the markup because svelte-check refuses both spellings of that: a `<header>`
+  // carrying pointer handlers "must have an ARIA role", and giving it the
+  // `banner` role it already implies is "redundant". Binding the element sides
+  // with the linter on both counts and keeps `npm run check` at zero warnings,
+  // which is the state this repo's gate is kept in.
+  let headerEl: HTMLElement | undefined = $state()
+  let headerHovered = $state(false)
+  $effect(() => {
+    const el = headerEl
+    if (!el) return
+    // ASKED OF EVERY MOVE, not of crossings. A crossing event is exactly what
+    // this window does not get reliably: entering was never observed when the
+    // widget was moved under a stationary pointer, and leaving is missed often
+    // enough that the button stayed visible after the pointer had gone — with
+    // `header:hover` stale-true at the same time, so neither half could clear
+    // it. A position test has no such state to lose: every move re-answers the
+    // question from where the pointer actually is.
+    const update = (e: PointerEvent) => {
+      const r = el.getBoundingClientRect()
+      headerHovered = e.clientX >= r.left && e.clientX <= r.right && e.clientY >= r.top && e.clientY <= r.bottom
+    }
+    // The two ways the pointer stops producing moves in here: it left the page,
+    // and the window lost focus. Both mean "not hovering" until a move says
+    // otherwise, and any real move corrects them immediately.
+    const clear = () => (headerHovered = false)
+    window.addEventListener('pointermove', update, true)
+    document.documentElement.addEventListener('pointerleave', clear)
+    window.addEventListener('blur', clear)
+    return () => {
+      window.removeEventListener('pointermove', update, true)
+      document.documentElement.removeEventListener('pointerleave', clear)
+      window.removeEventListener('blur', clear)
+    }
+  })
   let sessions = $state<AgentSession[]>([])
   let startApprovals = $state<PendingStart[]>([])
   let config = $state<Config | null>(null)
@@ -652,7 +706,7 @@
   <IntensityApp />
 {:else}
 <div class="widget" bind:this={widgetEl}>
-  <header data-tauri-drag-region>
+  <header bind:this={headerEl} data-tauri-drag-region>
     <span class="title" data-tauri-drag-region>AI AGENTS</span>
     <div class="limits" class:compact={config?.compact_mode} data-tauri-drag-region>
       <LimitBar
@@ -676,7 +730,7 @@
         compact={config?.compact_mode ?? false}
       />
     </div>
-    <button class="hide-btn" onclick={onHide} aria-label="Hide to tray" title="Hide to tray">×</button>
+    <button class="hide-btn" class:shown={headerHovered} onclick={onHide} aria-label="Hide to tray" title="Hide to tray">×</button>
   </header>
   <StartApprovals pending={startApprovals} />
   {#if config}
@@ -698,12 +752,20 @@
     margin: 0;
     padding: 0;
     height: 100%;
-    /* Match the .widget bg so WKWebView's first-paint snapshot on macOS is
-       dark even before the .widget layout completes — otherwise the layer
-       backing flashes white briefly before the Svelte tree composits. */
+    /* Dark, not transparent, because this rule reaches all four windows and
+       three of them sit on an opaque window where a transparent page shows the
+       OS's white. It also keeps WKWebView's first-paint snapshot dark instead of
+       flashing white before the Svelte tree composites. */
     background: #1c1c1e;
     overflow: hidden;
     font-family: system-ui, 'Segoe UI', Roboto, sans-serif;
+  }
+  /* The widget's window alone is `transparent: true`, and this is the layer its
+     rounded corners are cut out of: anything opaque here fills them back in.
+     The class is put on <html> by the script above, for the main window only. */
+  :global(html.transparent-shell),
+  :global(html.transparent-shell body) {
+    background: transparent;
   }
   :global(*) {
     box-sizing: border-box;
@@ -717,6 +779,17 @@
     color: #d6d6d6;
     user-select: none;
     -webkit-user-select: none;
+    /* The widget draws its own rounded corners, because nothing else will.
+       macOS rounds a *titled* window's frame at the compositor, and this window
+       is `decorations: false`, so it got square corners while every comparable
+       floating panel on the platform is round — and while the same widget on
+       Windows 11, which rounds the window itself, was round already. The two
+       builds disagreed about the shape of one widget.
+
+       `overflow: hidden` is what makes the radius bite: the header and the
+       session list are opaque and would otherwise paint over the curve. */
+    border-radius: 10px;
+    overflow: hidden;
   }
   header {
     display: flex;
@@ -769,7 +842,27 @@
     margin-left: auto;
     flex-shrink: 0;
   }
-  header:hover .hide-btn {
+  /* BOTH a real pointer event and `:hover` are required, and the redundancy is
+     deliberate: each one alone fails in a different direction. `:hover` alone
+     shows the button when nothing is near it — on a transparent window WebKit's
+     hover hit-test cannot be trusted. A JS flag alone would be the only thing
+     standing between the user and a button that never appears, on a mechanism
+     that could not be verified from here: pointer control is blocked in this
+     environment, and moving the window under the pointer produced no crossing
+     event, so the positive path was never observed. Requiring both means the
+     worst a wrong flag can do is leave the button hidden on a hover, which the
+     tray's Show / Hide already covers, rather than publish a stray × on every
+     reveal. Measured
+     2026-09-11 with the pointer at screen (1354, 58) and the widget at
+     (1036, 511, 420x297) — well outside it, and above it: the button rendered
+     fully hovered, background and all, every time the window was shown. In
+     window coordinates that pointer is x=318, which is exactly this button's
+     column, and y=-453, which is not in the window at all, so the negative y
+     appears to be clamped onto the header. The same test on an opaque window
+     showed no button, so this is transparency's doing and not a pre-existing
+     fault. A hit-test artefact still matches `:hover` in the style engine; it
+     does not deliver a `pointerenter`, which is why the state moved to JS. */
+  header:hover .hide-btn.shown {
     opacity: 1;
   }
   .hide-btn:hover {

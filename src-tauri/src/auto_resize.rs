@@ -363,15 +363,29 @@ pub fn set_dark_window_background(window: &WebviewWindow) {
     win_chrome::set_class_background(hwnd.0 as isize);
 }
 
-/// Set NSWindow.backgroundColor (and the WKWebView's underlay) to the dark
-/// theme color so the very first frame after `show()` is dark instead of
-/// flashing white. `tauri.conf.json`'s `backgroundColor` field is supposed
-/// to do this but isn't applied early enough on macOS — the runtime call is
-/// reliable.
+/// Clear NSWindow.backgroundColor (and the WKWebView's underlay) so the window
+/// is actually transparent where the frontend does not paint.
+///
+/// THE ALPHA IS THE WHOLE POINT, and it used to be `0xff`. The widget is
+/// `decorations: false`, so macOS rounds nothing for it — the compositor rounds
+/// a *titled* window's frame — and the frontend draws its own `border-radius`
+/// instead, which only shows if the window beneath it is transparent. This call
+/// runs after the window is created and so wins over `tauri.conf.json`, which is
+/// why `transparent: true` there was not enough on its own: the config said
+/// transparent and this said opaque dark, and the square corners that reached
+/// two committed documentation frames were this line.
+///
+/// The colour it used to paint was there so the first frame after `show()` was
+/// dark rather than white. That is covered without it: the window is created
+/// `visible: false` and is shown only once the frontend has painted, which is
+/// what 1f2411b added. The Windows arm above is unrelated and unchanged — it
+/// replaces a window-class brush to stop an OS-painted white flash during a
+/// horizontal resize, which is a different mechanism on a window that has no
+/// transparency to preserve.
 #[cfg(target_os = "macos")]
 pub fn set_dark_window_background(window: &WebviewWindow) {
     use tauri::window::Color;
-    if let Err(e) = window.set_background_color(Some(Color(0x1c, 0x1c, 0x1e, 0xff))) {
+    if let Err(e) = window.set_background_color(Some(Color(0x1c, 0x1c, 0x1e, 0x00))) {
         tracing::warn!(?e, "set_background_color failed on macOS");
     }
 }

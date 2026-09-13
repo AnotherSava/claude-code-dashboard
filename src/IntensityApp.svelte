@@ -676,6 +676,17 @@
   }
 
   // Redraw whenever the active view or its data changes.
+  //
+  // The tooltip is dropped on the same signal, and it has to be dropped *here*
+  // rather than in the four callers that swap the chart: `hover` names one
+  // bucket of the chart currently drawn, so every one of those swaps invalidates
+  // it, and a rule spread over four call sites is one a fifth caller misses.
+  // Nothing else would take it down either — `onMouseLeave` is the only other
+  // clear, and a pointer that never moves fires no mouse event at all, so a
+  // tooltip raised over last week's chart stays painted over this week's. It
+  // reached a committed documentation screenshot that way: the frame for the
+  // week of Aug 31 carried a tooltip reading "Tue, Sep 1 07:10-07:20", a bucket
+  // from the week that had been on screen before.
   $effect(() => {
     view
     unit
@@ -684,6 +695,7 @@
     tokChart
     tokWeeks
     weekBottomOffset
+    hover = null
     draw()
   })
 
