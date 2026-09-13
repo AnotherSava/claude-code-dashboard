@@ -33,13 +33,14 @@ jobs:
 
       - run: npm run check
 
-      # A warning fails this. `cargo test` compiles only the test cfg, so a
-      # warning in the plain build never reaches it; `--all-targets` compiles both
-      # cfgs and all three targets — lib, the bin, and `build.rs`. Each leg of the
-      # matrix is also the only thing that sees the other platform's unreachable
-      # code: the cluster behind `observe_caption` is live on Windows and dead on
-      # macOS. Mirrored in `.claude/commit-checks.sh`, which must keep running the
-      # same commands in the same order and carries the full reasoning.
+      # A warning fails this. `cargo test` compiles only the test cfg, so a warning
+      # in the plain build never reaches it; `--all-targets` adds the one build
+      # `--lib --tests` never performs — the bin's plain one, where an item live
+      # only under `cfg(test)` would otherwise escape. Each leg of the matrix is
+      # also the only thing that sees the other platform's unreachable code: the
+      # cluster behind `observe_caption` is live on Windows and dead on macOS.
+      # Mirrored in `.claude/commit-checks.sh`, which must keep running the same
+      # commands in the same order and carries the full reasoning.
       - run: cargo check --manifest-path src-tauri/Cargo.toml --all-targets
         env:
           RUSTFLAGS: -D warnings

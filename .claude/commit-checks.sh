@@ -25,12 +25,14 @@ npm run check
 echo "==> cargo check --all-targets (a warning fails the build)"
 # `cargo test` below compiles only the TEST cfg, so a warning that exists solely
 # in the plain build is invisible to it — which is how nine dead-code warnings
-# sat in every `deploy` unread. Both cfgs matter, and so does every target: this
-# crate has three (`cargo metadata` lists lib, the `src/main.rs` bin, and the
-# `build.rs` custom-build), and a first cut of this check said `--lib --tests`,
-# which compiled none of the last two. Both were proved by injecting an unused fn
-# into each and watching it pass. `--all-targets` covers lib, bins, tests,
-# benches and examples in one pass and costs nothing measurable here.
+# sat in every `deploy` unread. `--all-targets` rather than the `--lib --tests`
+# this check first said, for one measured reason and not the one first written
+# here: that pair already forces `build.rs` (a build script is compiled before
+# anything else in the package) and already compiles `src/main.rs` as the bin's
+# TEST target, so a plainly-dead fn in either is caught by both commands. What it
+# never performs is the bin's PLAIN build, so an item live only under `cfg(test)`
+# there escapes it — measured, `--lib --tests` exits 0 on exactly that and
+# `--all-targets` exits 101. One hole, not the three targets claimed before.
 #
 # The platform axis is the other half: the cluster behind `observe_caption` is
 # dead on macOS and live on Windows, so each leg of the CI matrix is the only
