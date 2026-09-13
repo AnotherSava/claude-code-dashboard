@@ -1,0 +1,7 @@
+---
+created: 2026-08-27 15:24:00
+---
+
+# adjust usage based on subscription change [DONE, by adding a second unit rather than rescaling.
+
+The premise that history could be normalized turned out to be false: only percentages of the then-current quota were ever stored (1,169 local + 11,608 synced samples, all integer), and the API exposes nothing absolute — `limit_dollars` is null and no field names a plan — so every cross-era conversion would have been a stored percentage times an assumed ratio. The Max 5x→20x switch is visible in the data at 2026-08-27 15:10 (both counters zeroed while `seven_day_resets_at` held), and the 5h ratio is exactly 4.00x, but the 7d ratio is only fittable (~1.86, ±15%). Rejected: auto-detecting the boundary (19 zeroing signatures in 84 days, 18 of them ordinary resets) and rescaling history behind a hatch. Built instead a token-based intensity view from Claude Code's own transcripts — plan-independent by construction, so no future tier change or promo needs handling — behind a Percent|Tokens toggle, with the percentage chart untouched for the "am I burning my quota" question. The promo turned out to be a non-issue for the bars: it is weekly-only and started 2026-05-13, before the history begins. Token history syncs across devices on an append-`seq` watermark. Caveat: the token series only reaches back to transcript retention (2026-07-28 here), and earlier stretches are marked unknown rather than idle.]

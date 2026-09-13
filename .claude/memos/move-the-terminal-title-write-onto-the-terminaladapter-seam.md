@@ -1,0 +1,7 @@
+---
+created: 2026-09-09 01:18:00
+---
+
+# Move the terminal title WRITE onto the TerminalAdapter seam, so the seam owns writing as well as reading.
+
+Today terminal_title::push_title has two #[cfg] arms - SetConsoleTitleW under a console attach on Windows, an OSC 0 escape to the controlling tty elsewhere - and it is the last terminal-specific logic living outside terminals/. It is NOT a cross-platform bug: cfg is compile-time, both arms exist, and CI builds the [windows-latest, macos-latest] matrix on every push, so both platforms work today. Two things are wrong with it anyway. (1) Platform is the right axis only by luck: SetConsoleTitleW writes the console object and the terminal merely renders it, so one mechanism covers Windows Terminal, VS Code's terminal and bare conhost alike, and OSC 0 to a tty likewise covers agterm, Terminal.app and iTerm - but the day a platform needs two different write mechanisms for two terminals, this shape cannot express it. (2) It carries a verification blind spot: a Windows-only cargo check cannot see a break in the cfg(not(windows)) arm, which is exactly how the macOS build was broken once in this feature's history and caught only by a reviewer. The shape is already there: TerminalAdapter::attached_surface(pid) was given a pid parameter precisely so a terminal whose write target is not ambient process state could implement it, and a write method would take the same pid. Do this as its own change with its own review, not folded into a diff about something else.
