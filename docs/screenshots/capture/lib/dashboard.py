@@ -490,3 +490,58 @@ def assert_publishable(names, allowed=PUBLISHABLE_PROJECTS, where: str = "the fr
             f"({', '.join(allowed)}). A frame publishes the project name, and outside compact mode the session's prompt too. "
             f"End those sessions before capturing, or pass --publishable NAME ... if the project really is public."
         )
+
+
+# --- Command-line entry point, for the PowerShell capture scripts -------------
+#
+# The Windows half of this project is PowerShell and cannot import a Python
+# module, so without this the publishable-names rule would have to be written
+# twice — and the list's own comment above says why that is the thing to avoid:
+# a copy per caller is a copy to forget to update. `window-shot.ps1` already
+# shells out to `trim_halo.py`, so the shape is proven on that machine.
+#
+# WHAT CROSSES THE BOUNDARY IS THE ROSTER, NOT THE NAMES, deliberately. Handing
+# over a list of names would put `names_in_frame` — the rule about what a row
+# actually draws — on the PowerShell side, which is the half most likely to
+# drift: it encodes what `SessionItem.svelte` renders, and a renamed row is
+# exactly the case a hand-rolled extraction gets wrong. So the caller pipes the
+# `/api/agents` response in verbatim and this decides both what is on screen and
+# whether it may be published.
+#
+#     ... | python lib/dashboard.py assert-publishable --where "the frame" [--name X] [--publishable A B]
+#
+# Exit 0 to say nothing would be published that should not be; exit 1 with the
+# refusal on stderr. `--name` adds strings the roster does not carry — a window
+# title, a tab caption — which are checked against the same list.
+def _cli(argv: list[str]) -> int:
+    import argparse
+
+    ap = argparse.ArgumentParser(prog="dashboard.py", description=__doc__.splitlines()[0])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    ck = sub.add_parser("assert-publishable", help="refuse if the roster on stdin would put a non-publishable project on screen")
+    ck.add_argument("--where", default="the frame", help="what is being photographed, for the refusal message")
+    ck.add_argument("--name", action="append", default=[], metavar="NAME", help="an extra on-screen string the roster does not carry; repeatable")
+    ck.add_argument("--publishable", nargs="+", metavar="NAME", default=list(PUBLISHABLE_PROJECTS), help="project names allowed on screen; replaces the built-in list rather than extending it")
+    ck.add_argument("--local-only", action="store_true", help="check only rows the roster marks local (a frame taken with sync off)")
+    args = ap.parse_args(argv)
+
+    blob = sys.stdin.read().strip()
+    if not blob:
+        print("dashboard.py: nothing on stdin; pipe the /api/agents response in.", file=sys.stderr)
+        return 2
+    rows = json.loads(blob).get("agents", [])
+    if args.local_only:
+        rows = [r for r in rows if r.get("local")]
+    names = [n for r in rows for n in names_in_frame(r)] + list(args.name)
+    allowed = tuple(sorted({n.strip() for n in args.publishable if n.strip()}))
+    try:
+        assert_publishable(names, allowed=allowed, where=args.where)
+    except CaptureError as e:
+        print(f"dashboard.py: {e}", file=sys.stderr)
+        return 1
+    print(f"publishable: {len(names)} name(s) checked in {args.where}, all on the list")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_cli(sys.argv[1:]))

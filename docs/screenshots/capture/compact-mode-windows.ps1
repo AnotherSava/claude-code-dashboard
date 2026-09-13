@@ -48,6 +48,7 @@ try {
     Set-CompactMode $true
     Invoke-DashboardWindow @{ action = 'show' } | Out-Null
     Start-Sleep -Milliseconds 1200
+    Assert-Publishable -Where 'the compact-mode frame' -LocalOnly
     $out = Get-ShotPath 'compact-mode-windows'
     Invoke-WindowShot @{ ProcessName = 'claude-code-dashboard'; Title = 'Claude Code Dashboard'; Method = 'Alpha'; Out = $out }
     Add-Hairline -Path $out -Opaque

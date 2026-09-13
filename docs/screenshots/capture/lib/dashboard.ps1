@@ -166,6 +166,45 @@ function Add-Hairline {
     if ($LASTEXITCODE -ne 0) { throw "hairline.py failed on $Path; the frame has no border, or the wrong one. Reproduce with: $suggest" }
 }
 
+# Refuse to photograph a project that is not cleared for publication.
+#
+# Shelled out to lib/dashboard.py rather than reimplemented here, for the reason
+# that file's own list comment gives: a copy per caller is a copy to forget to
+# update, and this one would be a copy per PLATFORM, which is worse — the two
+# would drift silently and only the committed frame would show it. The macOS
+# capture scripts import the same function; window-shot.ps1 already shells out to
+# trim_halo.py, so the shape is proven here.
+#
+# THE ROSTER GOES ACROSS, NOT THE NAMES. Extracting "what is on screen" from a row
+# is `names_in_frame` on the Python side, and it belongs there: it encodes what
+# SessionItem.svelte draws, including the case a hand-rolled extraction gets wrong,
+# where a renamed row publishes its display_name rather than its project. So this
+# pipes /api/agents in verbatim and lets the shared rule decide.
+#
+# -Name adds strings the roster does not carry, such as a window title.
+# -LocalOnly is for a frame taken with sync off, where a peer's rows are not drawn.
+function Assert-Publishable {
+    param(
+        [string]$Where = 'the frame',
+        [string[]]$Name = @(),
+        [switch]$LocalOnly
+    )
+    $py = if (Get-Command python -ErrorAction SilentlyContinue) { 'python' }
+          elseif (Get-Command python3 -ErrorAction SilentlyContinue) { 'python3' }
+          else { $null }
+    $lib = Join-Path $PSScriptRoot 'dashboard.py'
+    $pyArgs = @($lib, 'assert-publishable', '--where', $Where)
+    foreach ($n in $Name) { if ($n) { $pyArgs += @('--name', $n) } }
+    if ($LocalOnly) { $pyArgs += '--local-only' }
+    $suggest = "$(if ($py) { $py } else { 'python' }) `"$lib`" assert-publishable --where `"$Where`""
+    if (-not $py) { throw "Cannot check which projects would be in $Where because python is not on PATH, and a frame publishes every project name it shows. Install python, or check by eye and re-run. Manual: $suggest" }
+
+    $port = Get-DashboardPort
+    $roster = Invoke-WebRequest -Uri "http://127.0.0.1:$port/api/agents" -TimeoutSec 10 -UseBasicParsing
+    $roster.Content | & $py @pyArgs
+    if ($LASTEXITCODE -ne 0) { throw "Refused to capture $Where -- see above. Nothing was written." }
+}
+
 function Get-ShotPath {
     param([Parameter(Mandatory = $true)][string]$Id)
     # capture/lib -> capture -> screenshots

@@ -60,6 +60,7 @@ if (-not $row) {
 }
 $title = if ($row.display_name) { $row.display_name } else { $row.id }
 
+Assert-Publishable -Where "the history window's title bar, with that session's conversation under it" -Name $title
 Invoke-DashboardWindow @{ action = 'history'; id = $Session } | Out-Null
 # The window opens maximized and then pulls its dialog in; resizing before that
 # lands leaves the text reflowing under the capture.

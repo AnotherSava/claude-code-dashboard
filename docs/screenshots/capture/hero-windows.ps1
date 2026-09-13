@@ -55,7 +55,10 @@ function Assert-HeroSpread([string]$When) {
     }
 }
 
-if (-not $Force) { Assert-HeroSpread 'before the shot' }
+if (-not $Force) {
+    Assert-HeroSpread 'before the shot'
+    Assert-Publishable -Where 'the hero frame' -LocalOnly
+}
 
 Invoke-DashboardWindow @{ action = 'show' } | Out-Null
 Start-Sleep -Milliseconds 1200

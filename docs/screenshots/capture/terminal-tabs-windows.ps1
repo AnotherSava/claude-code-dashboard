@@ -57,6 +57,27 @@ if ($Hwnd -ne 0) {
     if ($TitleLike) { $shot.TitleLike = $TitleLike }
 }
 
+# Refuse a non-publishable project before the shutter. This frame publishes a
+# session name per tab, and a tab strip is the figure most likely to carry one
+# nobody meant to include, because it shows whatever is in that window rather
+# than what the dashboard chose to draw.
+#
+# THE COVERAGE IS PARTIAL AND THAT IS WORTH STATING RATHER THAN IMPLYING. The
+# check reads the dashboard's roster, so it covers every tab backed by a session
+# the dashboard tracks -- which is every tab this figure is about. It CANNOT see
+# a tab the dashboard knows nothing about: a shell, an editor, a session whose
+# hook never fired. Those carry whatever title their program set, and no roster
+# lookup will reach them. So this closes the common case and the manifest's
+# instruction to read the strip by eye still stands for the rest; a guard that
+# silently covered less than it appeared to would be worse than none.
+#
+# -TitleLike is the window's own caption, which Windows Terminal sets from the
+# ACTIVE tab, so it is a name in frame that the roster may not match verbatim --
+# it carries a status glyph and possibly a [N%] suffix. It is passed as-is and
+# checked on its own; a caption that is not a bare project name simply fails to
+# match the list and is reported, which is the safe direction.
+Assert-Publishable -Where 'the tab strip' -LocalOnly
+
 Invoke-WindowShotWithoutWidget $shot | Write-Host
 
 $bmp = [System.Drawing.Bitmap]::FromFile($raw)
