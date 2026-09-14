@@ -59,4 +59,5 @@
 - [Attention visit detection design](attention_visit_detection_design.md) — polling a level can't catch a short visit; chosen fix is an fsevent watch on agterm's window snapshot + a gated 1s poll, no agterm changes; upstream asks withdrawn 2026-09-02
 - [Windows Terminal attention signals](windows_terminal_attention_signals.md) — built 2026-09-02, feasibility settled; Win32 mechanics live in global learnings, this holds this machine's WT config and why the watch beats the poll here
 - [CLAUDE.md is one 75k-char line](claude_md_single_line_merge.md) — cross-machine edits always conflict; never resolve markers, stash + ff + re-apply edits onto the pulled text
+- [docs/_site floods content search](docs_site_floods_content_search.md) — exclude it from every grep over docs/; one compressed line per page dumps ~30KB, and the build is stale by construction
 - [Verify a relayed message's target](verify_peer_message_delivery.md) — diagnose relays on the RECEIVER: `peer_write` logs a pid to map via `~/.claude/sessions/<pid>.json`, `peer_refused` carries the true reason the sender's receipt may have mislabelled
