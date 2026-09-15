@@ -208,6 +208,46 @@ function Assert-Publishable {
     if ($LASTEXITCODE -ne 0) { throw "Refused to capture $Where -- see above. Nothing was written. Re-check with: $suggest" }
 }
 
+# Refuse a frame whose right edge came back unrendered.
+#
+# A Windows capture reads the window's own surface rather than the screen, which
+# is what lets it shoot a window that is partly off-display -- but only the part
+# the compositor rendered comes back. The rest is FLAT BLACK at full alpha, the
+# same size as the window, so the file looks complete and the loss is silent: the
+# first end-to-end run of work-intensity-windows.ps1 committed a 1522px frame
+# whose last 239px were a black band where the right gutter and two controls
+# should have been, and nothing in the pipeline objected.
+#
+# Checked on a column just inside the right edge, over the vertical middle, which
+# is where the band lands: this window furniture is never pure black (the chart's
+# own background is #1c1c1e), so an opaque 0,0,0 run there is unrendered surface
+# and not a dark design. Windows only -- `screencapture -l` on macOS reads the
+# backing store and returns the full width regardless of what is on screen.
+function Assert-Rendered {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [int]$Inset = 8
+    )
+    Add-Type -AssemblyName System.Drawing
+    $bmp = [System.Drawing.Bitmap]::FromFile($Path)
+    try {
+        $x = $bmp.Width - 1 - $Inset
+        $y0 = [int]($bmp.Height * 0.2)
+        $y1 = [int]($bmp.Height * 0.8)
+        $black = 0
+        for ($y = $y0; $y -lt $y1; $y++) {
+            $p = $bmp.GetPixel($x, $y)
+            if ($p.A -eq 255 -and $p.R -eq 0 -and $p.G -eq 0 -and $p.B -eq 0) { $black++ }
+        }
+        $n = $y1 - $y0
+        if ($black -eq $n) {
+            throw "The right edge of $Path is $n/$n opaque black, so the window was only partly rendered -- it was most likely hanging off the edge of its display. Nothing usable was written. Move the window fully onto one screen and re-run."
+        }
+    } finally {
+        $bmp.Dispose()
+    }
+}
+
 function Get-ShotPath {
     param([Parameter(Mandatory = $true)][string]$Id)
     # capture/lib -> capture -> screenshots

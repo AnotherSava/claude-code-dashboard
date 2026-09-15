@@ -174,6 +174,12 @@ try {
         $crop.Save($out, [System.Drawing.Imaging.ImageFormat]::Png)
         Write-Host "$out  $($crop.Width)x$($crop.Height)  strip height ${stripH}px"
 
+        # Checked on the crop rather than the whole window: an unrendered band is
+        # inherited by whatever is cut out of it, and the crop is the frame that
+        # gets committed. Its right edge is bare tab-strip grey, so an opaque
+        # black column there is the fault and not the design.
+        Assert-Rendered -Path $out
+
         # Give the crop an edge. A region crop never brings one: this keeps the
         # window's own translucent border along its top and left, and its right
         # and bottom are wherever the bounds above were measured -- bare content

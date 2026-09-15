@@ -8,24 +8,26 @@
   this figure has always shown. A re-shoot keeps it. The chart is the one figure
   here whose content is a moving window over live data, so re-running this script
   next month with the same arguments would quietly photograph a different week --
-  and the prose beside the figure, which talks about the pace line and the red
-  over-2x bars, was written against this one.
+  and the prose beside the figure, which talks about the bars and the per-row
+  numbers, was written against this one.
 
   That is why the week is a DATE and not the -Offset the window's API actually
   takes. An offset is relative to whenever the script runs, so it names a
   different week every week while looking like a constant; -WeekStart is resolved
   against today at run time and the offset is derived from it. Pass -Offset only
   to look around, and -List to see what is worth looking at: the frame has to
-  argue something, and the pace reference line and the over-2x red bars only show
-  up in a week that was actually busy.
+  argue something, and only a week that was actually busy fills the bars and the
+  numbers beside them.
 
   The macOS half of this figure still shows Aug 10 - Aug 16 and should move to
   this week when it is re-shot -- a paired figure is read as two pictures of one
   thing, and two different weeks make it a puzzle instead of a comparison.
 
-  Width is 1520 logical px. Below roughly 1280 the header controls collide (a
-  known open defect); at 1320 they merely wrap onto two lines. 1520 is the first
-  width where "Navigation" and "Legend" sit on the same line as the date range.
+  Width is 1520 logical px, and it is no longer about the header: the Navigation
+  and Legend hints that used to crowd it are gone, and what is left fits on one
+  line at the window's own 1000px default. The width buys horizontal resolution
+  instead -- 144 ten-minute slots have to be told apart across the plot, and the
+  shape of a day is what the figure is arguing.
 #>
 [CmdletBinding()]
 param(
@@ -58,6 +60,16 @@ if (-not $PSBoundParameters.ContainsKey('Offset')) {
 
 Invoke-DashboardWindow @{ action = 'intensity'; offset = $Offset; view = 'day' } | Out-Null
 Start-Sleep -Milliseconds 800
+# Put the window on the primary display before sizing it. A capture reads the
+# window's own surface, not the screen, but only the part of that surface the
+# compositor actually rendered -- so whatever hangs off a display's edge comes
+# back BLACK rather than missing, and the frame looks complete at the wrong
+# width. Measured on the first end-to-end run of this script: the chart happened
+# to be sitting on a 1440-wide portrait monitor at x=3989, so 239px of the right
+# gutter and the Days/Weeks toggle were a black band in a 1522px
+# frame. The window remembers where it last was, so this cannot be left to luck.
+Invoke-DashboardWindow @{ action = 'move'; label = 'intensity'; x = 0; y = 0 } | Out-Null
+Start-Sleep -Milliseconds 400
 Invoke-DashboardWindow @{ action = 'resize'; label = 'intensity'; width = $Width; height = $Height } | Out-Null
 # The chart animates its bars in, and the window has to settle at the new size
 # before the header decides whether it fits on one line.
@@ -65,4 +77,5 @@ Start-Sleep -Milliseconds 2500
 
 $out = Get-ShotPath 'work-intensity-windows'
 Invoke-WindowShotWithoutWidget @{ ProcessName = 'claude-code-dashboard'; Title = 'Work intensity'; Method = 'Alpha'; Out = $out }
+Assert-Rendered -Path $out
 Add-Hairline -Path $out -Opaque
