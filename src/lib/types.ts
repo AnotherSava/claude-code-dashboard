@@ -66,8 +66,6 @@ export interface UsageColors {
 export type AutoResize = 'none' | 'up' | 'down'
 
 export type HistoryFontSize = 'smallest' | 'small' | 'regular' | 'large' | 'largest'
-// Which unit the Work intensity chart plots, orthogonal to its Days/Weeks view.
-export type IntensityUnit = 'percent' | 'tokens'
 
 export interface Config {
   server_port: number
@@ -83,8 +81,8 @@ export interface Config {
   limit_bar_segments: number
   auto_resize: AutoResize
   history_font_size: HistoryFontSize
-  intensity_unit: IntensityUnit
   intensity_axis_max_tokens: number | null
+  intensity_min_week_tokens: number | null
   // Compact view: hide each row's current prompt and time-in-state, and
   // collapse the usage bars down to their bare percentage. Toggled from the
   // tray's "Compact view" checkbox.
@@ -111,47 +109,26 @@ export interface SetupState {
   has_history: boolean
 }
 
-// One 10-minute bar of the work-intensity chart. `intensity` is the percent of
-// the 5h limit consumed in the slot (>= 0); `has_data` distinguishes genuine
-// idle (true, 0) from a gap where the app was closed (false). See the Rust
-// `WeekBucket` / `build_week_chart` — these mirror its serialized shape.
-export interface WeekBucket {
-  intensity: number
-  has_data: boolean
-}
-
-// Per-day roll-up shown to the right of each day row. `active_minutes` counts
-// 10-min buckets with work; `weekly_pct` is the day's share of the 7-day quota.
-export interface DaySummary {
-  active_minutes: number
-  weekly_pct: number
-}
-
-export interface WeekChart {
-  week_start_ms: number
-  week_end_ms: number
-  buckets: WeekBucket[]
-  days: DaySummary[]
-  data_min_ms: number | null
-  data_max_ms: number | null
-  full_intensity: number
-}
-
-// Token-unit twins of the three above, mirroring the Rust `TokenBucket` /
-// `TokenDaySummary` / `TokenWeekChart`. `tokens` is input + cache creation +
-// output — cache reads are stored but excluded, being 97% of the raw sum and a
-// measure of conversation length rather than work. `has_data` here means "inside
-// the span we hold token records for"; unlike the percentage chart it does not
-// track whether the dashboard was running, since transcripts are written by
-// Claude Code itself and the scanner catches up afterwards.
+// One 10-minute bar of the work intensity chart, mirroring the Rust
+// `TokenBucket` / `TokenDaySummary` / `TokenWeekChart`. `tokens` is input +
+// cache creation + output — cache reads are stored but excluded, being 97% of
+// the raw sum and a measure of conversation length rather than work. `has_data`
+// means "inside the span we hold token records for", not whether the dashboard
+// was running: transcripts are written by Claude Code itself and the scanner
+// catches up afterwards.
 export interface TokenBucket {
   tokens: number
   has_data: boolean
 }
 
+// Per-day roll-up shown to the right of each day row. `active_minutes` counts
+// 10-min buckets with work; `weekly_pct` is the day's share of the 7-day quota,
+// which comes from the usage poller rather than from the transcripts and so
+// covers days that have no token records at all.
 export interface TokenDaySummary {
   active_minutes: number
   tokens: number
+  weekly_pct: number
 }
 
 export interface TokenWeekChart {
@@ -159,8 +136,9 @@ export interface TokenWeekChart {
   week_end_ms: number
   buckets: TokenBucket[]
   days: TokenDaySummary[]
+  // Oldest record either source holds, so "prev" can be disabled at the end of
+  // the history. Wider than the span `has_data` is marked from.
   data_min_ms: number | null
-  data_max_ms: number | null
   // Full-height value for one 10-min bar. A stated ceiling, not a derived one:
   // tokens have no quota to be a fraction of.
   axis_max_tokens: number

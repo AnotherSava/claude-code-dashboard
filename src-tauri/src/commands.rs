@@ -187,7 +187,7 @@ pub fn refresh_usage_limits(state: State<UsageLimitsState>) -> bool {
 /// Resolve the start of a week in **local time** (Monday 00:00) as ms-epoch.
 /// `week_offset` is relative to the current local week: `0` = this week, `-1` =
 /// last week, etc. Keeping week alignment here (vs. the client) means the pure,
-/// tz-free `build_week_chart` never has to know about timezones.
+/// tz-free chart builders never have to know about timezones.
 ///
 /// DST caveat: the bucket grid is a fixed 7×24×6 layout, so a week containing a
 /// clock change is off by ±1h in its final bucket. Acceptable for a personal
@@ -209,10 +209,10 @@ fn local_week_start_ms(week_offset: i32) -> Result<i64, String> {
 /// Local usage samples unioned with every synced peer's, sorted ascending by
 /// `ts`. The 5h/7d counter is account-wide, so a peer's polls during the
 /// windows this device's app was closed describe the same timeline — merging
-/// them fills the Work-intensity chart's gaps (`build_week_chart` walks the
-/// combined timeline and clamps each step to a non-negative delta, so the
-/// extra interleaved points are harmless where coverage overlaps). Tolerant of
-/// either store being absent.
+/// them completes the quota figures beside the chart (`build_weekly_quota`
+/// walks the combined timeline and clamps each step to a non-negative delta, so
+/// the extra interleaved points are harmless where coverage overlaps). Tolerant
+/// of either store being absent.
 fn merged_usage_records(app: &AppHandle) -> Vec<crate::usage_history::UsageHistoryRecord> {
     let mut records = app
         .try_state::<crate::usage_history::UsageHistoryStore>()
@@ -223,40 +223,6 @@ fn merged_usage_records(app: &AppHandle) -> Vec<crate::usage_history::UsageHisto
     }
     records.sort_by_key(|r| r.ts);
     records
-}
-
-/// Build the work-intensity chart for one week (see `local_week_start_ms`).
-#[tauri::command]
-pub fn get_usage_intensity_week(week_offset: i32, app: AppHandle) -> Result<crate::usage_history::WeekChart, String> {
-    let week_start_ms = local_week_start_ms(week_offset)?;
-    let records = merged_usage_records(&app);
-    Ok(crate::usage_history::build_week_chart(&records, week_start_ms))
-}
-
-/// Build a chart for every week from the current one back to the week that holds
-/// the oldest record, newest first. Powers the "by week" overview (one row per
-/// week). Reads the history once and reuses it across weeks.
-#[tauri::command]
-pub fn get_usage_intensity_weeks(app: AppHandle) -> Result<Vec<crate::usage_history::WeekChart>, String> {
-    let records = merged_usage_records(&app);
-    let Some(first) = records.first() else {
-        return Ok(Vec::new());
-    };
-    let data_min = first.ts;
-    let mut weeks = Vec::new();
-    let mut offset = 0;
-    loop {
-        let week_start_ms = local_week_start_ms(offset)?;
-        weeks.push(crate::usage_history::build_week_chart(&records, week_start_ms));
-        if week_start_ms <= data_min {
-            break; // this week already covers the oldest record
-        }
-        offset -= 1;
-        if offset < -520 {
-            break; // ~10-year safety cap against an absurd clock
-        }
-    }
-    Ok(weeks)
 }
 
 /// Every token record this device holds, reduced to one row per `message.id`.
@@ -288,37 +254,95 @@ fn token_axis_max(app: &AppHandle) -> f64 {
         .unwrap_or(crate::token_history::DEFAULT_AXIS_MAX_TOKENS)
 }
 
-/// Token-unit twin of [`get_usage_intensity_week`], for the chart's Tokens view.
-#[tauri::command]
-pub fn get_token_intensity_week(week_offset: i32, app: AppHandle) -> Result<crate::token_history::TokenWeekChart, String> {
-    let week_start_ms = local_week_start_ms(week_offset)?;
-    let records = merged_token_records(&app);
-    Ok(crate::token_history::build_token_week_chart(&records, week_start_ms, token_axis_max(&app)))
+/// How far back the chart lets the user go: the start of the oldest week that
+/// holds real work.
+///
+/// Not the oldest record, and deliberately not the oldest *usage* sample either.
+/// The bars are token counts, so a week with no transcripts left to scan has
+/// nothing to draw however much the account spent that week — and the first
+/// weeks the scanner can reach are a trickle rather than a start, one or two
+/// sessions whose whole week renders as hatching with a hair of a bar in it.
+/// [`token_history::oldest_week_with_work`] trims those leading weeks; anything
+/// after the floor is kept, quiet weeks included.
+///
+/// Falls back to the oldest record when no week clears the bar, so a fresh
+/// install shows what it has instead of nothing.
+fn intensity_floor_ms(records: &[crate::token_history::TokenRecord], min_tokens: f64) -> Result<Option<i64>, String> {
+    let Some(oldest) = records.iter().map(|r| r.ts).min() else {
+        return Ok(None);
+    };
+    let starts = week_starts_back_to(oldest)?;
+    let floor = crate::token_history::oldest_week_with_work(records, &starts, min_tokens);
+    Ok(Some(floor.unwrap_or(oldest)))
 }
 
-/// Token-unit twin of [`get_usage_intensity_weeks`]. Reads and reduces the
-/// history once, then reuses it across every week.
+/// Local week starts from the current week back to the one holding `bound_ms`,
+/// newest first — the grid both intensity commands walk, one to weigh each week
+/// and one to build it.
+///
+/// The 520 is not a limit on how much history may be shown: every caller passes
+/// a bound drawn from real records, so it is only a refusal to loop forever on a
+/// clock that reads 1970.
+fn week_starts_back_to(bound_ms: i64) -> Result<Vec<i64>, String> {
+    let mut starts = Vec::new();
+    for offset in 0..=520i32 {
+        let week_start_ms = local_week_start_ms(-offset)?;
+        starts.push(week_start_ms);
+        if week_start_ms <= bound_ms {
+            break;
+        }
+    }
+    Ok(starts)
+}
+
+/// How much work a leading week must hold to be worth showing, from config.
+/// `null` restores the default; `0` trims nothing. Negatives are clamped rather
+/// than refused — every week clears a threshold of zero, which is the same
+/// answer a negative one was asking for.
+fn min_week_tokens(app: &AppHandle) -> f64 {
+    app.try_state::<ConfigState>()
+        .and_then(|c| c.snapshot().intensity_min_week_tokens)
+        .map(|v| v.max(0.0))
+        .unwrap_or(crate::token_history::MIN_WEEK_TOKENS)
+}
+
+/// Build the work intensity chart for one week (see `local_week_start_ms`):
+/// token bars from the transcript scan, plus each day's share of the 7-day
+/// quota from the usage poller.
 #[tauri::command]
-pub fn get_token_intensity_weeks(app: AppHandle) -> Result<Vec<crate::token_history::TokenWeekChart>, String> {
+pub fn get_intensity_week(week_offset: i32, app: AppHandle) -> Result<crate::token_history::TokenWeekChart, String> {
+    let week_start_ms = local_week_start_ms(week_offset)?;
     let records = merged_token_records(&app);
-    let Some(data_min) = records.iter().map(|r| r.ts).min() else {
+    let usage = merged_usage_records(&app);
+    let quota = crate::usage_history::build_weekly_quota(&usage, week_start_ms);
+    Ok(crate::token_history::build_token_week_chart(
+        &records,
+        week_start_ms,
+        token_axis_max(&app),
+        &quota,
+        intensity_floor_ms(&records, min_week_tokens(&app))?,
+    ))
+}
+
+/// Build a chart for every week from the current one back to the oldest week
+/// worth showing (see `intensity_floor_ms`), newest first. Powers the "by week"
+/// overview (one row per week). Reads both histories once and reuses them across
+/// weeks.
+#[tauri::command]
+pub fn get_intensity_weeks(app: AppHandle) -> Result<Vec<crate::token_history::TokenWeekChart>, String> {
+    let records = merged_token_records(&app);
+    let usage = merged_usage_records(&app);
+    let Some(data_min) = intensity_floor_ms(&records, min_week_tokens(&app))? else {
         return Ok(Vec::new());
     };
     let axis_max = token_axis_max(&app);
-    let mut weeks = Vec::new();
-    let mut offset = 0;
-    loop {
-        let week_start_ms = local_week_start_ms(offset)?;
-        weeks.push(crate::token_history::build_token_week_chart(&records, week_start_ms, axis_max));
-        if week_start_ms <= data_min {
-            break;
-        }
-        offset -= 1;
-        if offset < -520 {
-            break; // ~10-year safety cap against an absurd clock
-        }
-    }
-    Ok(weeks)
+    Ok(week_starts_back_to(data_min)?
+        .into_iter()
+        .map(|week_start_ms| {
+            let quota = crate::usage_history::build_weekly_quota(&usage, week_start_ms);
+            crate::token_history::build_token_week_chart(&records, week_start_ms, axis_max, &quota, Some(data_min))
+        })
+        .collect())
 }
 
 /// Resize the main window to fit `physical_height` physical px. The frontend
@@ -938,18 +962,6 @@ pub fn set_history_font_size(size: crate::config::HistoryFontSize, app: AppHandl
         let _ = state.save_to_disk();
     }
     crate::tray::sync_history_font_checks(&app, size);
-    emit_config_updated(&app);
-}
-
-/// Switch the Work intensity chart between the percent-of-quota and token
-/// units. Persisted so the choice survives closing the window; no tray item,
-/// since the chart carries its own control.
-#[tauri::command]
-pub fn set_intensity_unit(unit: crate::config::IntensityUnit, app: AppHandle) {
-    if let Some(state) = app.try_state::<crate::config::ConfigState>() {
-        state.with_mut(|c| c.intensity_unit = unit);
-        let _ = state.save_to_disk();
-    }
     emit_config_updated(&app);
 }
 

@@ -130,14 +130,13 @@ When the badge is on, the tray icon also flags the moment any session's context 
 
 ## Work intensity
 
-A separate window — opened from the tray's **Work intensity** item — charts how hard your agents have been working over time. Each bar covers a short slice of time and grows taller and warmer the busier that slice was. A **Days** view lays out one week as seven rows, one per day; a **Weeks** view gives one row per week and scrolls back through your history. Each view also totals the active time. With [multi-device sync](#multi-device-sync) configured, the chart covers your other devices too, so it shows the work done on the account as a whole rather than just here.
+A separate window — opened from the tray's **Work intensity** item — charts how hard your agents have been working over time. Each bar covers a short slice of time and grows taller and warmer the busier that slice was. A **Days** view lays out one week as seven rows, one per day; a **Weeks** view gives one row per week and scrolls back through your history. With [multi-device sync](#multi-device-sync) configured, the chart covers your other devices too, so it shows the work done on the account as a whole rather than just here.
 
-{% include figure.html id="work-intensity" alt="The Work intensity chart in its Days view — one row per day, ten-minute bars, red where a bar passes twice the pace, and a dashed line marking the full 5-hour pace" %}
+{% include figure.html id="work-intensity" alt="The Work intensity chart in its Days view — one row per day, ten-minute bars, red where a bar reaches the top of the scale, and each row's active time, tokens and share of the weekly quota in the right margin" %}
 
-A **Percent | Tokens** switch picks what the bars measure, and the two answer different questions:
+The bars count the work itself, from Claude Code's own records: because that isn't a share of anything, it stays comparable when your quota changes — switching plans or a promotional bump leaves it alone. It reaches back as far as Claude Code's stored history — beginning at the first week with real work in it, because the oldest weeks it can reach are usually a session or two and draw as an empty row — and slices with nothing recorded are marked as unknown rather than shown as idle.
 
-- **Percent** — how much of your 5-hour limit each slice burned, with a reference line marking the pace that would use the whole limit in five hours straight; anything past twice that pace is flagged red. This is the view for "am I about to run out".
-- **Tokens** — how much work actually happened, counted from Claude Code's own records. Because it doesn't measure a share of anything, it stays comparable when your quota changes: switching plans or a promotional bump moves the percentages but leaves this view alone. It reaches back only as far as Claude Code's stored history, and stretches with nothing recorded are marked as unknown rather than shown as idle.
+Beside each row are its numbers: how long your agents were busy, how much work that came to, and what it cost of your weekly limit. The last of those comes from the usage counter rather than from the records behind the bars, so it's there for days the bars can say nothing about.
 
 ## Multi-device sync
 

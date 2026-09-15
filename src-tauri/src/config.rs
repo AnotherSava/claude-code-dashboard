@@ -59,9 +59,6 @@ pub struct Config {
     /// edge fixed; None leaves the window manually sized.
     pub auto_resize: AutoResize,
     pub history_font_size: HistoryFontSize,
-    /// Which unit the Work intensity chart plots — see [`IntensityUnit`]. Set
-    /// from the chart's own Percent|Tokens control, so it has no tray item.
-    pub intensity_unit: IntensityUnit,
     pub history_window_position: Option<WindowPosition>,
     /// Whether the history window was maximized when last closed. Persisted
     /// separately from `history_window_position` because a maximized window's
@@ -109,16 +106,27 @@ pub struct Config {
     /// Read by `terminal_title::sync`; needs `terminal_titles` on to appear at
     /// all. Same percentage as the token counter (`notifications::context_percent`).
     pub terminal_title_context_percent: Option<f32>,
-    /// Full-height value for one 10-minute bar of the Work intensity chart's
-    /// token view. Unlike the percentage view there is no quota to be a fraction
-    /// of, so this is a stated ceiling rather than a derived one: bars at or
-    /// above it clip. The default clips 4.5% of active buckets (measured p50
+    /// Full-height value for one 10-minute bar of the Work intensity chart.
+    /// Tokens have no quota to be a fraction of, so this is a stated ceiling
+    /// rather than a derived one: bars at or above it clip. The default clips
+    /// 4.5% of active buckets (measured p50
     /// 77k, p90 666k, p99 1517k) — raise it to flatten the chart, lower it for
     /// more resolution on ordinary work, at the cost of clipping more of a busy
     /// day. The Weeks view sums groups of three buckets
     /// and scales this by the same factor, so a full-height bar means the same
     /// rate in both views. `null` or `0` falls back to the default.
     pub intensity_axis_max_tokens: Option<f64>,
+    /// Work tokens a week must hold for the Work intensity chart's history to
+    /// start there. Only *leading* weeks are trimmed — the scanner's reach into
+    /// Claude Code's transcripts begins as a trickle, a session or two whose
+    /// whole week draws as hatching with a hair of a bar — so a quiet week
+    /// between two busy ones always stays. `null` restores the default
+    /// ([`crate::token_history::MIN_WEEK_TOKENS`]); `0` trims nothing and shows
+    /// every week the records reach. Note that unlike `intensity_axis_max_tokens`
+    /// above, `0` is a meaningful value here rather than a second way of saying
+    /// "default": a scale of zero says nothing, a threshold of zero says
+    /// "everything".
+    pub intensity_min_week_tokens: Option<f64>,
     /// Revert a `Working` row to its pre-prompt status when its turn was
     /// cancelled with Esc — which emits no lifecycle hook. Gated by this flag,
     /// `log_watcher` detects the cancel from the "[Request interrupted by user]"
@@ -414,19 +422,6 @@ pub enum HistoryFontSize {
     Largest,
 }
 
-/// Which unit the Work intensity chart plots. Orthogonal to its Days/Weeks
-/// toggle. `Percent` is the default: it keeps the chart answering "am I burning
-/// my quota", the question the reference line and the clip threshold were built
-/// around. `Tokens` answers "how much work happened" instead — immune to a plan
-/// change, but only covering the span transcripts reach back to.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum IntensityUnit {
-    #[default]
-    Percent,
-    Tokens,
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct NotificationsConfig {
@@ -636,7 +631,6 @@ impl Default for Config {
             limit_bar_segments: 16,
             auto_resize: AutoResize::None,
             history_font_size: HistoryFontSize::Regular,
-            intensity_unit: IntensityUnit::Percent,
             history_window_position: None,
             history_window_maximized: false,
             start_minimized: false,
@@ -645,6 +639,7 @@ impl Default for Config {
             terminal_titles: true,
             terminal_title_context_percent: Some(50.0),
             intensity_axis_max_tokens: Some(crate::token_history::DEFAULT_AXIS_MAX_TOKENS),
+            intensity_min_week_tokens: Some(crate::token_history::MIN_WEEK_TOKENS),
             detect_cancelled_turns: true,
             reap_exited_sessions: true,
             attention_tracking: true,

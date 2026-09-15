@@ -18,23 +18,19 @@ so the operator can see which week it picked. Pass --offset only to look around,
 and only together with --probe, which writes to tmp/; --offset on its own is
 refused rather than allowed to overwrite the pinned frame with another week. The
 chart is the one figure here whose content is a moving window over live data, and
-the prose beside it was written against this week's pace reference line and its
-over-2x red bars, which only a week that was actually busy has at all.
+the prose beside it was written against this week's bars and the numbers in its
+right margin, which only a week that was actually busy has at all.
 
-WIDTH IS 1520 LOGICAL PX, A WINDOWS NUMBER THAT HAS BEEN RE-MEASURED HERE; THE
-TWO NARROWER ONES HAVE NOT. The thresholds below it -- header controls collide
-below roughly 1280, and merely wrap onto two lines at 1320 -- were measured on
-the Windows box against that machine's text metrics and have NOT been re-measured
-on macOS. The two platforms lay that header out with different fonts, so read
-them as the Windows variant's numbers; if a narrower macOS frame is ever wanted,
-probe for the macOS ones and pin them here with what they were measured against,
-the way the Windows header records its own. What IS measured on macOS is 1520
-itself, confirmed from the frame this script captured on 2026-09-11: at that
-width the header keeps the date range, Active, Weekly quota usage, Navigation,
-Legend, Percent/Tokens and Days/Weeks on one line. 1520 is also what the Windows
-variant uses -- the same pairing argument as the week -- and --height follows its
-700 for the same reason: two frames of one chart are easiest to read against each
-other when the chart has the same proportions in both.
+WIDTH IS 1520 LOGICAL PX, AND IT IS NO LONGER ABOUT THE HEADER. The Navigation
+and Legend hints that used to sit there are gone, and what is left -- the date
+range, the three totals under one "This week:" and Days/Weeks -- fits on one
+line down to about 900px, so the old collide-below-1280 / wrap-at-1320
+thresholds no longer describe anything. The width now buys horizontal resolution:
+144 ten-minute slots have to be told apart across the plot, and a day's shape is
+what the figure is arguing. 1520 is also what the Windows variant uses -- the
+same pairing argument as the week -- and --height follows its 700 for the same
+reason: two frames of one chart are easiest to read against each other when the
+chart has the same proportions in both.
 
 A 1520pt WINDOW DOES NOT FIT THIS DISPLAY, which is 1470pt wide, so it cannot sit
 fully on screen at this width. That turned out to be harmless: `screencapture -l`
@@ -56,16 +52,10 @@ WHAT THE OPERATOR STAGES BY HAND, since no argument here can do it:
     pointer that never moves, where whether WebKit synthesizes the mouseleave is
     not established either way. And if the pointer cannot be read at all the run
     says so on stderr and goes ahead UNCHECKED, rather than passing silently.
-  * Leave the chart on the Percent unit. The `/api/window` route sets the week
-    and the view and nothing else, and the unit cannot be reached by writing
-    config either -- see `assert_percent_unit`. The guard below refuses a chart
-    left on Tokens.
-
-There is deliberately no --force. Each of the three refusals has a one-action
-remedy (move the pointer; click Percent in the window; add --probe), so an
-override could only ever defeat a guard that was right. The pointer and unit
-guards also run for a --probe: a probe that skips them is not a rehearsal of the
-shot.
+There is deliberately no --force. Each refusal has a one-action remedy (move the
+pointer; add --probe), so an override could only ever defeat a guard that was
+right. The pointer guard also runs for a --probe: a probe that skips it is not a
+rehearsal of the shot.
 
 Nothing in this frame carries a session's name or prompt text, so the rule that
 every session visible in a frame be a public repo has nothing to bite on here --
@@ -89,12 +79,11 @@ as component state, and the chart webview is hidden rather than destroyed on
 close, so a week this script asked for would otherwise be the week the user's
 chart opens on for the rest of the app's life. The Days/Weeks toggle is the one
 thing NOT restored -- no API reads it back, so a run leaves the chart on Days
-rather than on a guess. The unit is read here and never written.
+rather than on a guess.
 """
 import argparse
 import ctypes
 import ctypes.util
-import json
 import sys
 import time
 from datetime import date, datetime, timedelta
@@ -133,29 +122,6 @@ def resolve_offset(week_start: str) -> int:
     if offset > 0:
         raise dash.CaptureError(f"--week-start {week_start} is in the future.")
     return offset
-
-
-def assert_percent_unit() -> None:
-    """Refuse a chart left on the Tokens unit, which is not what this figure shows.
-
-    The unit is the half of the required state the window API cannot set, and
-    writing config would not reach it either: `IntensityApp` reads
-    `intensity_unit` exactly once, at mount, and mount is app start -- the chart
-    webview is declared in tauri.conf.json and kept warm across closes -- so a
-    config write here would change what the NEXT launch shows and nothing about
-    what is on screen now. What config does hold is the unit the user last
-    clicked, the switch persisting it, and that is what this reads.
-
-    So this is the hero's caveat in another shape: the guard reads the config file
-    and the frame photographs the screen. The two disagree only if config was
-    edited behind the running window, and clicking Tokens then Percent in the
-    window itself puts them back in step.
-    """
-    if not dash.CONFIG.exists():
-        raise dash.CaptureError(f"No config at {dash.CONFIG} — is the dashboard installed?")
-    unit = json.loads(dash.CONFIG.read_text(encoding="utf-8")).get("intensity_unit") or "percent"
-    if unit != "percent":
-        raise dash.CaptureError(f"The chart's unit is {unit!r}, and this figure shows Percent. Click Percent in the Work intensity window, then run this again.")
 
 
 class _CGPoint(ctypes.Structure):
@@ -267,7 +233,6 @@ def main() -> int:
     else:
         offset, week = resolve_offset(args.week_start), f"week {args.week_start}"
 
-    assert_percent_unit()
     out = dash.probe_path("work-intensity-probe") if args.probe else dash.shot_path(FIGURE)
 
     with dash.widget_hidden():

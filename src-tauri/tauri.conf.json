@@ -58,6 +58,8 @@
         "title": "Work intensity",
         "width": 1000,
         "height": 560,
+        "minWidth": 1000,
+        "minHeight": 440,
         "decorations": true,
         "resizable": true,
         "visible": false,

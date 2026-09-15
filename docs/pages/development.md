@@ -85,6 +85,9 @@ Under the repo root `claude-code-dashboard/`:
     - `telegram.rs` — reqwest-based Telegram Bot API client
     - `usage_limits.rs` — Anthropic OAuth usage poller + refresh (5h / 7d buckets)
     - `usage_history.rs` — appends each successful usage poll to `usage_history.jsonl`
+    - `token_history.rs` — one record per Claude API response in `token_history.jsonl`, and the Work intensity chart built from them
+    - `token_scan.rs` — 60s scan of Claude Code's own transcripts, which is what fills that file
+    - `remote_tokens.rs` — per-device remote token records under `remote_tokens/`
     - `prompt_history.rs` — per-session dialog persistence to `prompt_history.json`
     - `remote_history.rs` — per-device remote-session dialog persistence under `remote_history/`
     - `chat_id_registry.rs` — persisted `session_id → chat_id` lock in `session_chat_ids.json`
@@ -106,7 +109,7 @@ Under the repo root `claude-code-dashboard/`:
 ### Where state lives at runtime
 
 - **In-memory** — `AppState` (sessions) and `ConfigState` (config) via `tauri::State`.
-- **On disk** — `config.json`, `widget.jsonl`, `prompt_history.json`, `session_chat_ids.json`, `custom_names.json`, `usage_history.jsonl`, and the `remote_history/` directory under `app_data_dir()`:
+- **On disk** — `config.json`, `widget.jsonl`, `prompt_history.json`, `session_chat_ids.json`, `custom_names.json`, `usage_history.jsonl`, `token_history.jsonl`, and the `remote_history/`, `remote_usage/` and `remote_tokens/` directories under `app_data_dir()`:
   - Windows: `%APPDATA%\com.anothersava.claude-code-dashboard\`
   - macOS: `~/Library/Application Support/com.anothersava.claude-code-dashboard/`
 

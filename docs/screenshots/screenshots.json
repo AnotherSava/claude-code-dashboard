@@ -188,43 +188,46 @@
       "files": [
         "work-intensity-windows.png"
       ],
-      "shows": "Windows. Work intensity window, Days view in Percent unit, one week of 10-minute bars with the full-5h-pace reference line, under a native Windows title bar",
+      "shows": "Windows. Work intensity window, Days view, one week of 10-minute token bars with each row's active time, tokens and share of the weekly quota in the right margin, under a native Windows title bar",
       "policy": "confirm",
       "capture": {
         "command": "pwsh -File docs/screenshots/capture/work-intensity-windows.ps1",
         "steps": [
-          "SUBJECT: the week of Aug 31 – Sep 6, 2026. Pinned by date (-WeekStart), not by the -Offset the window's API takes, because an offset is relative to the run date and would photograph a different week every week while looking like a constant. A re-shoot keeps this week: the prose beside the figure was written against its pace line and its over-2x red bars, and work-intensity-macos shows the same week, which is what makes the pair two pictures of one thing.",
+          "SUBJECT: the week of Aug 31 – Sep 6, 2026. Pinned by date (-WeekStart), not by the -Offset the window's API takes, because an offset is relative to the run date and would photograph a different week every week while looking like a constant. A re-shoot keeps this week: work-intensity-macos shows the same week, which is what makes the pair two pictures of one thing.",
           "Windows. The macOS half of this figure is work-intensity-macos.",
           "Deploy the current build",
-          "1520 logical px wide. Below roughly 1280 the header controls collide, which is a separate open defect; at 1320 they merely wrap onto two lines, and 1520 is the first width that keeps the date range, Navigation and Legend on one line.",
-          "The script parks the mouse pointer clear of the window: hovering a bar raises a tooltip that then sits in the committed frame"
+          "1520 logical px wide, and that is about the plot rather than the header now: the Navigation and Legend hints are gone and what is left fits on one line at the window's own 1000px default, so the old collide-below-1280 / wrap-at-1320 thresholds describe nothing. The width buys horizontal resolution — 144 ten-minute slots across the plot, and the shape of a day is what the figure argues.",
+          "The script parks the mouse pointer clear of the window: hovering a bar raises a tooltip that then sits in the committed frame",
+          "The script places the window at the top-left of the PRIMARY display before sizing it, and `Assert-Rendered` refuses the frame if the right edge came back opaque black. Both exist because the first end-to-end run of this script found the chart on a 1440-wide portrait monitor and committed a 1522px frame whose last 239px were a black band: a Windows capture reads the window's surface, so the part hanging off a display returns unrendered rather than missing, at the full window size.",
+          "Frame size is unchanged at 2284x1097, 144dpi — 1520 logical px on the 150% primary display. A run that finds it 1522x732 has shot it on a 100% monitor, which is the wrong one: at that size the plot has two thirds of the horizontal resolution the 144 ten-minute slots need.",
+          "Header contents as shot: one scope (\"This week:\" in Days, \"Week average:\" in Weeks) over Active / Tokens / Quota, with Active rounded to whole hours. The Navigation and Legend hints that used to sit right of the totals are gone, and the ← → buttons keep reserved slots either side of the date so nothing moves when the view switches."
         ]
       },
-      "verifiedAt": "d0e142c"
+      "verifiedAt": "at-capture"
     },
     {
       "id": "work-intensity-macos",
       "files": [
         "work-intensity-macos.png"
       ],
-      "shows": "macOS. Work intensity window, Days view in Percent unit, one week of 10-minute bars with the full-5h-pace reference line",
+      "shows": "macOS. Work intensity window, Days view, one week of 10-minute token bars with each row's active time, tokens and share of the weekly quota in the right margin",
       "policy": "confirm",
       "capture": {
         "command": "python3 docs/screenshots/capture/work-intensity-macos.py",
         "steps": [
           "macOS. The Windows half of this figure is work-intensity-windows.",
           "Deploy the current build",
-          "SUBJECT: the week of Aug 31 – Sep 6, 2026, the week work-intensity-windows shows. Pinned by date (`--week-start`), not by the offset the window's API takes, because an offset is relative to the run date and would photograph a different week every week while looking like a constant. A re-shoot keeps this week, which is busy enough to carry the pace reference and the over-2x red bars the prose beside the figure was written against; `--offset` is for looking around, with `--probe` beside it.",
-          "The script opens the window and sets the Days view; the Percent unit it can only check. IntensityApp reads `intensity_unit` once at mount and the chart webview is kept warm across closes, so writing config would change what the next launch shows rather than what is on screen — click Percent in the window itself, and the run refuses a chart left on Tokens.",
-          "1520 logical px wide, matching the Windows variant: the frame on disk is 3040x1400 device px at 2x, and at that width the header keeps the date range, Active, Weekly quota usage, Navigation, Legend, Percent/Tokens and Days/Weeks on one line — measured on macOS from that frame. The surrounding thresholds — controls colliding below roughly 1280, merely wrapping at 1320 — were measured on Windows and have not been re-measured on macOS.",
+          "STALE — RE-SHOOT. This frame predates the whole rework of this window: the percent view and its Percent|Tokens switch were removed (it shows a unit toggle the app no longer has, a dashed full-5h-pace line that is gone, and two stat lines per row where there are now three — active time, tokens, share of the weekly quota), the header's Navigation and Legend hints were removed, the three totals were put under one scope with Active rounded to whole hours, and the nav buttons gained reserved slots. Compare against work-intensity-windows, which is current.",
+          "SUBJECT: the week of Aug 31 – Sep 6, 2026, the week work-intensity-windows shows. Pinned by date (`--week-start`), not by the offset the window's API takes, because an offset is relative to the run date and would photograph a different week every week while looking like a constant. A re-shoot keeps this week, which is busy enough to fill the bars and the margin numbers the prose beside the figure was written against; `--offset` is for looking around, with `--probe` beside it.",
+          "The script opens the window and sets the Days view; there is nothing else about the chart's state to set.",
+          "1520 logical px wide, matching the Windows variant: the frame on disk is 3040x1400 device px at 2x. The width is about the plot rather than the header — the Navigation and Legend hints are gone and what is left fits on one line well below this — so it buys horizontal resolution for the 144 ten-minute slots, and the Windows thresholds recorded here before (collide below 1280, wrap at 1320) no longer describe anything.",
           "Expect the window to hang off the right edge: this display is 1470pt wide, so a 1520pt window cannot sit fully on screen. It does not affect the capture — screencapture -l reads the window's backing store rather than the screen, and the frame came back the full 3040px.",
           "Leave the mouse pointer off the chart window: hovering a bar raises a tooltip that would then sit in the committed frame. The Windows half parks the pointer; this one only reads it and refuses when it is inside the window's rect, because moving it would be taking the machine over.",
           "Capture the window rect",
           "The compositor's drop shadow is out of the picture at source: `dash.capture_window` shoots with `screencapture -l<id> -o` and then runs `lib/trim_halo.py` itself, on both platforms, so a re-shoot has no trim step to remember. The one-pixel transparent corner ring recorded against the earlier frame was the residue of trimming that shadow and is gone with it — measured on this frame, the top-left diagonal alpha ramps 0 … 0, 99, 255 with no hole, against 243, 163, 0, 99, 255 on the frame it replaced.",
           "Colour profile: a committed frame is sRGB. Output from `screencapture` is tagged with the display's own profile — Color LCD on this machine, a wide-gamut one — and the same colour is then stored as a less saturated number: re-tagging this frame back to that profile moves its three title-bar lights from saturation 1.00 to 0.80, 0.74 and 0.72, against the 0.55 floor check-figures.py uses to recognise a macOS window by its traffic lights. Conversion to sRGB is the last step of `dash.capture_window`, so a scripted capture needs no hand step; read a frame's tag back with `sips -g profile <png>`."
         ]
-      },
-      "verifiedAt": "5c248d5"
+      }
     }
   ],
   "declinedGaps": [
