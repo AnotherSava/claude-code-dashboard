@@ -11,7 +11,7 @@ has_children: true
 
 - **Rust** 1.70+ (`rustup default stable-msvc` on Windows; `rustup default stable` on macOS).
 - **Node.js** 24, as `.nvmrc` and `engines.node` both say. The range is enforced rather than advised — `.npmrc` sets `engine-strict=true`, so `npm install` on another major exits `EBADENGINE` instead of warning and carrying on.
-- **npm** is pinned by `packageManager` in `package.json`. Run `corepack enable npm` once per machine and npm shims itself to that exact version; plain `corepack enable` covers yarn and pnpm only, so without the explicit form the pin is silently ignored.
+- **npm** is pinned by `packageManager` in `package.json`. Run `corepack enable npm` and npm shims itself to that exact version; plain `corepack enable` covers yarn and pnpm only, so without the explicit form the pin is silently ignored. Run it again after every Node upgrade — the upgrade replaces the Node install and takes the shim with it, after which `npm -v` quietly answers with the bundled npm while `package.json` still reads correctly. Comparing `npm -v` against the field is the only check that sees it.
 - **Platform toolchain**:
   - **Windows**: Microsoft C++ Build Tools (Visual Studio Installer → "Desktop development with C++") and WebView2 (preinstalled on Windows 10 1803+; the installer fetches it if missing on older machines).
   - **macOS**: Xcode Command Line Tools (`xcode-select --install`). WKWebView ships with the OS — nothing to install.

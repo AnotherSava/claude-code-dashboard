@@ -1,26 +1,22 @@
 ---
 name: node_toolchain_pin_ahead_of_node
-description: "packageManager pins npm@12.0.2 while this Windows box runs Node 24.13.0, below npm 12's floor — bump Node, never lower the pin"
+description: "This repo pins npm@12.0.2, which needs Node >=24.15.0; if npm -v disagrees with the field, a Node upgrade reset corepack and the pin is inert"
 metadata: 
   node_type: memory
   type: project
 ---
 
-`package.json` pins `"packageManager": "npm@12.0.2"` while `.nvmrc` says `24`, and this Windows
-machine runs Node 24.13.0 — below npm 12's supported range, `^22.22.2 || ^24.15.0 || >=26.0.0`.
-Corepack is enabled for npm here, so it fetches npm 12 anyway and every npm command in this repo
-prints `npm warn cli npm v12.0.2 does not support Node.js v24.13.0`, including both npm steps of
-`.claude/commit-checks.sh`. The gate still passes.
+`package.json` pins `"packageManager": "npm@12.0.2"` and `.nvmrc` says `24`. npm 12 supports
+`^22.22.2 || ^24.15.0 || >=26.0.0`, so the two agree only above 24.15.0 — this box was on 24.13.0
+when the pin was chosen on 2026-09-18 and was upgraded to 24.19.0 the same day to close the gap.
+**Bump Node rather than lowering the pin** if they ever disagree again.
 
-Chosen deliberately on 2026-09-18, with the incompatibility stated before the choice, over the
-`npm@11.18.0` this box was already running.
+**The check that matters is `npm -v` inside the repo, not the field.** `package.json` carrying the
+pin proves the intent; only corepack's shim makes it take effect, and a Node upgrade replaces the
+install directory and takes that shim with it — silently, with `npm -v` reverting to the bundled
+version and the `package-manager-pin` rule still passing, because it asserts the field's shape and
+the field is untouched. Repair is `corepack enable npm` in an elevated shell. Mechanics and the
+measured case are in `learnings/corepack-packagemanager-pin.md`.
 
-**The repair is bumping Node here to the latest 24.x — never lowering the pin.** A future session
-reading only the warning will be tempted to edit `packageManager` back down; that undoes a decision
-rather than fixing the machine.
-
-CI is unaffected: `build.yml` and `release.yml` both use `setup-node` with `node-version: '24'`,
-which installs the newest 24.x and so sits above npm 12's floor.
-
-See [[project_config_wiped_on_deploy]] for why toolchain state belongs in committed files rather
-than in `config.json`.
+The gate's own npm steps are where a mismatch shows up first, as a warning line above `npm run
+check` and `npm run build` rather than as a failure — so it is easy to read past.
