@@ -227,7 +227,8 @@
           "The compositor's drop shadow is out of the picture at source: `dash.capture_window` shoots with `screencapture -l<id> -o` and then runs `lib/trim_halo.py` itself, on both platforms, so a re-shoot has no trim step to remember. The one-pixel transparent corner ring recorded against the earlier frame was the residue of trimming that shadow and is gone with it — measured on this frame, the top-left diagonal alpha ramps 0 … 0, 99, 255 with no hole, against 243, 163, 0, 99, 255 on the frame it replaced.",
           "Colour profile: a committed frame is sRGB. Output from `screencapture` is tagged with the display's own profile — Color LCD on this machine, a wide-gamut one — and the same colour is then stored as a less saturated number: re-tagging this frame back to that profile moves its three title-bar lights from saturation 1.00 to 0.80, 0.74 and 0.72, against the 0.55 floor check-figures.py uses to recognise a macOS window by its traffic lights. Conversion to sRGB is the last step of `dash.capture_window`, so a scripted capture needs no hand step; read a frame's tag back with `sips -g profile <png>`."
         ]
-      }
+      },
+      "verifiedAt": "68c3525"
     }
   ],
   "declinedGaps": [
