@@ -16,8 +16,22 @@
 # workflow gates `main`, add it here too. That rule runs both ways: a check added
 # here belongs in the workflow as well, or the two disagree about what `main`
 # requires and the stricter one is whichever you happened to run.
+#
+# The conventions checker below is the one deliberate exception to that lockstep,
+# and it belongs in no workflow: it measures the machine-local conventions this
+# repo has adopted (`.claude/conventions` says how far), several of which are
+# about files and links that only exist on a developer's box. Nothing else
+# invokes it, so without this line every rule the repo takes on would be measured
+# exactly once — by the `/adopt` walk, on the day it ran — and the migrations
+# would be done with the enforcement nowhere. It runs first because a convention
+# violation should be reported before the slow suites, and `python` rather than
+# `python3` to match the figure check at the bottom and the Windows box this is
+# most often run on.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
+
+echo "==> python ~/.claude/conventions/check.py ."
+python ~/.claude/conventions/check.py .
 
 echo "==> npm run check"
 npm run check

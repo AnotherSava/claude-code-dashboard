@@ -1,6 +1,12 @@
 title: Claude Code Dashboard
 description: A live monitor for your Claude Code sessions.
-remote_theme: just-the-docs/just-the-docs
+# Pinned to a tag. Without the `@<ref>` this resolved to the theme's default
+# branch on every rebuild, so the version serving this site was not knowable from
+# here and moved under it with nothing committed — and which version serves
+# decides whether `_includes/nav_footer_custom.html` and the `_sass/` overrides
+# still shadow the theme files they are named after. Bump it deliberately; the
+# theme's releases run months behind its default branch.
+remote_theme: just-the-docs/just-the-docs@v0.12.0
 baseurl: /claude-code-dashboard
 plugins:
   - jekyll-remote-theme

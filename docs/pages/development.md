@@ -10,7 +10,8 @@ has_children: true
 ### Prerequisites
 
 - **Rust** 1.70+ (`rustup default stable-msvc` on Windows; `rustup default stable` on macOS).
-- **Node.js** 20+ and **npm** 10+ (CI uses Node 24).
+- **Node.js** 24, as `.nvmrc` and `engines.node` both say. The range is enforced rather than advised — `.npmrc` sets `engine-strict=true`, so `npm install` on another major exits `EBADENGINE` instead of warning and carrying on.
+- **npm** is pinned by `packageManager` in `package.json`. Run `corepack enable npm` once per machine and npm shims itself to that exact version; plain `corepack enable` covers yarn and pnpm only, so without the explicit form the pin is silently ignored.
 - **Platform toolchain**:
   - **Windows**: Microsoft C++ Build Tools (Visual Studio Installer → "Desktop development with C++") and WebView2 (preinstalled on Windows 10 1803+; the installer fetches it if missing on older machines).
   - **macOS**: Xcode Command Line Tools (`xcode-select --install`). WKWebView ships with the OS — nothing to install.
@@ -39,7 +40,7 @@ Compiles the Rust backend, starts Vite on `localhost:1420`, and launches the nat
 - `npm run tauri icon <path/to/1024.png>` — regenerate the Windows / macOS icon set from a source PNG.
 - `cargo test --manifest-path src-tauri/Cargo.toml --lib` — Rust unit tests (state machine, transcript parser, merge policy, Claude adapter, label policy).
 - `RUSTFLAGS="-D warnings" cargo check --manifest-path src-tauri/Cargo.toml --all-targets` — compile every target, in both configurations, with warnings as errors. The test run above sees only the test cfg, and `--lib --tests` never performs the bin's plain build, so this is the only command that catches an item in `src/main.rs` that is live under `cfg(test)` and dead without it.
-- `bash .claude/commit-checks.sh` — everything CI will run, in CI's order, in about ten seconds. Run it before committing.
+- `bash .claude/commit-checks.sh` — everything CI will run, in CI's order, in about ten seconds, preceded by a conventions check that CI does not run. Run it before committing.
 
 ## Architecture
 

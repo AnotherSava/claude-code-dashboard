@@ -61,3 +61,5 @@
 - [CLAUDE.md is one 75k-char line](claude_md_single_line_merge.md) — cross-machine edits always conflict; never resolve markers, stash + ff + re-apply edits onto the pulled text
 - [docs/_site floods content search](docs_site_floods_content_search.md) — exclude it from every grep over docs/; one compressed line per page dumps ~30KB, and the build is stale by construction
 - [Verify a relayed message's target](verify_peer_message_delivery.md) — diagnose relays on the RECEIVER: `peer_write` logs a pid to map via `~/.claude/sessions/<pid>.json`, `peer_refused` carries the true reason the sender's receipt may have mislabelled
+- [npm pin sits ahead of this box's Node](node_toolchain_pin_ahead_of_node.md) — packageManager is npm@12.0.2 against Node 24.13.0 on purpose; bump Node, never lower the pin
+- [A done memo that is not done](done_memo_that_is_not_done.md) — the Homebrew tap memo is filed in done/ with its install never verified from a Mac; two done memos carry no close date
