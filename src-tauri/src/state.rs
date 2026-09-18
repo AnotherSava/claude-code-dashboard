@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -406,6 +407,10 @@ pub struct AppState {
     /// Sessions synced from peer dashboards, keyed by device name. BTreeMap
     /// so the emit-time merge produces a stable row order across emits.
     pub remote: Mutex<BTreeMap<String, RemoteDevice>>,
+    /// Ticket counter behind [`AppState::snapshot_versioned`]. Starts at 0 so
+    /// the first snapshot is 1 and 0 can mean "no snapshot", which is what a
+    /// consumer compares against before it has applied anything.
+    snapshot_seq: AtomicU64,
 }
 
 /// Append a session-boundary separator to a session's dialog in place. Returns
@@ -436,7 +441,34 @@ impl AppState {
     }
 
     pub fn snapshot(&self) -> Vec<AgentSession> {
-        self.sessions.lock().unwrap().clone()
+        self.snapshot_versioned().1
+    }
+
+    /// The local rows, paired with a ticket saying how recent they are relative
+    /// to every other snapshot this process has taken.
+    ///
+    /// The ticket is minted **inside** the `sessions` lock, and that is the whole
+    /// of it: every mutation takes the same lock, so lock order is content order,
+    /// and a higher ticket therefore cannot describe an older set of rows. Minting
+    /// it after the clone instead would order snapshots by when they finished
+    /// copying, which a slow clone reverses — and the clone is the expensive part
+    /// (a `Vec<AgentSession>` carrying every dialog, megabytes in practice).
+    ///
+    /// It exists because a snapshot and the thing built from it are not taken and
+    /// published atomically: `commands::emit_sessions_updated` reads here and then
+    /// races other emits for the locks downstream, so the emit holding the *older*
+    /// snapshot could publish last. Where that publication is corrected by the
+    /// next emit, the reordering costs nothing and this is ignorable. Where it is
+    /// not — a terminal tab title outlives this process, so a wrong glyph sits
+    /// there until some later emit happens to move it, measured at three minutes
+    /// on 2026-09-18 — the consumer compares this ticket against the newest it has
+    /// applied and stands down when its own is older. See `terminal_title::sync`.
+    pub fn snapshot_versioned(&self) -> (u64, Vec<AgentSession>) {
+        let sessions = self.sessions.lock().unwrap();
+        // Relaxed is enough: the ordering this establishes is the mutex's, not
+        // the atomic's — the counter is only ever touched while holding it.
+        let seq = self.snapshot_seq.fetch_add(1, Ordering::Relaxed) + 1;
+        (seq, sessions.clone())
     }
 
     /// Flattened snapshot of all remote-device sessions, for the emit-time
@@ -1097,6 +1129,39 @@ mod tests {
         assert_eq!(s.status, Status::Working, "the live status survives");
         assert_eq!(s.label, "live prompt");
         assert_eq!(s.state_entered_at, 500_000, "and its clock is untouched");
+    }
+
+    #[test]
+    fn a_snapshot_taken_after_a_mutation_outranks_one_taken_before_it() {
+        // The property `terminal_title::sync` decides with. Two emits are in
+        // flight, each snapshotted at a different moment; the one holding the
+        // newer rows must carry the higher ticket, or the older one writes its
+        // glyph last and the tab contradicts the row until some later emit moves
+        // it. What this cannot pin is the part that makes it true under
+        // concurrency — that the ticket is minted inside the `sessions` lock —
+        // since a test that races the two would pass on a broken implementation
+        // most of the time.
+        let state = AppState::new();
+        let (before, rows_before) = state.snapshot_versioned();
+        state.apply_set(set("dash", Status::Blocked, "has a question"), 1_000, NO_CONTINUATIONS, None);
+        let (after, rows_after) = state.snapshot_versioned();
+        assert!(after > before, "a snapshot of the newer rows must outrank one of the older: {after} vs {before}");
+        assert!(rows_before.is_empty(), "the earlier snapshot predates the row");
+        assert_eq!(rows_after[0].status, Status::Blocked, "and the later one carries it");
+    }
+
+    #[test]
+    fn tickets_are_strictly_increasing_and_never_zero() {
+        // Strictly increasing, because `sync` stands down on `<=`: two snapshots
+        // taken between the same pair of mutations would otherwise tie, and the
+        // second would be dropped rather than re-asserting the title — which is
+        // what the `REASSERT_MS` re-push exists to do. Never zero, because that is
+        // `commands::resolved_snapshot_versioned`'s "there was no `AppState` to
+        // ask", and every consumer reads it as older than anything it has applied.
+        let state = AppState::new();
+        let first = state.snapshot_versioned().0;
+        assert_eq!(first, 1);
+        assert!(state.snapshot_versioned().0 > first);
     }
 
     #[test]

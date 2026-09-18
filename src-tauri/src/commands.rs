@@ -18,10 +18,22 @@ use tauri::{AppHandle, Emitter, Manager, State, WebviewWindow};
 /// too (keyed by their namespaced "{device}/{id}"), so renaming a remote row
 /// works and stays a local-only decoration.
 pub(crate) fn resolved_snapshot(app: &AppHandle) -> Vec<AgentSession> {
+    resolved_snapshot_versioned(app).1
+}
+
+/// [`resolved_snapshot`] plus the `AppState::snapshot_versioned` ticket for the
+/// *local* half, which is the half a terminal title is written from.
+///
+/// The remote half is deliberately outside the ticket: it comes from a second
+/// lock and no surface that outlives an emit is built from it, so ordering it
+/// would be bookkeeping nothing reads. A ticket of 0 means there was no
+/// `AppState` to ask — the only way to get one — and every consumer treats it as
+/// older than anything it has already applied.
+fn resolved_snapshot_versioned(app: &AppHandle) -> (u64, Vec<AgentSession>) {
     let Some(state) = app.try_state::<AppState>() else {
-        return Vec::new();
+        return (0, Vec::new());
     };
-    let mut sessions = state.snapshot();
+    let (seq, mut sessions) = state.snapshot_versioned();
     sessions.extend(state.remote_snapshot());
     if let Some(names) = app.try_state::<CustomNamesStore>() {
         names.apply(&mut sessions);
@@ -51,7 +63,7 @@ pub(crate) fn resolved_snapshot(app: &AppHandle) -> Vec<AgentSession> {
         }
     }
     stamp_name_sharing(app, &mut sessions);
-    sessions
+    (seq, sessions)
 }
 
 /// Count how many live sessions answer to each local row's *name*, for
@@ -127,11 +139,16 @@ fn name_counts(sessions: &[AgentSession], per_row: &HashMap<String, usize>) -> H
 /// this person see", which additionally depends on whether they have already read
 /// it. Only the frontend and the terminal titles want the second question.
 pub(crate) fn display_snapshot(app: &AppHandle) -> Vec<AgentSession> {
-    let mut sessions = resolved_snapshot(app);
+    display_snapshot_versioned(app).1
+}
+
+/// [`display_snapshot`] carrying the [`resolved_snapshot_versioned`] ticket.
+fn display_snapshot_versioned(app: &AppHandle) -> (u64, Vec<AgentSession>) {
+    let (seq, mut sessions) = resolved_snapshot_versioned(app);
     if app.try_state::<ConfigState>().is_some_and(|c| c.config.lock().unwrap().attention_tracking) {
         apply_read_as_idle(&mut sessions);
     }
-    sessions
+    (seq, sessions)
 }
 
 /// Show a finished local row the user has already read as `Idle`.
@@ -1028,7 +1045,15 @@ pub fn now_ms() -> i64 {
 }
 
 pub fn emit_sessions_updated(app: &AppHandle) {
-    let sessions = display_snapshot(app);
+    // The ticket rides with the snapshot as far as the one publisher that has to
+    // order itself against other emits — see `AppState::snapshot_versioned` and
+    // `terminal_title::sync`. Nothing here serializes the emits themselves: a
+    // lock held across this body would cover `tray_badge::refresh` and
+    // `lid_awake::sync`, both of which block on the Tauri main thread, while the
+    // main thread reaches this same function through `set_chat_name`,
+    // `attention::observe` and the tray menu — which is a mutual wait that
+    // freezes the app, measured and rejected on 2026-09-18.
+    let (seq, sessions) = display_snapshot_versioned(app);
     // Every state transition flows through this emit, so it doubles as the
     // single trigger for terminal tab-title reconciliation — the tab tracks
     // exactly what the row shows (watcher promotions, renames, removals)
@@ -1036,7 +1061,7 @@ pub fn emit_sessions_updated(app: &AppHandle) {
     // hand over only the local subset so remote rows can't even reach the
     // pid bookkeeping.
     let local: Vec<AgentSession> = sessions.iter().filter(|s| s.origin.is_none()).cloned().collect();
-    crate::terminal_title::sync(app, &local);
+    crate::terminal_title::sync(app, &local, seq);
     // Same chokepoint drives the lid-closed sleep veto: it must be armed while
     // an agent is busy *before* the lid shuts, since a lid close sleeps the Mac
     // instantly and leaves no window to react in. Local rows only — a remote

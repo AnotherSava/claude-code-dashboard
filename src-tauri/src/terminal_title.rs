@@ -81,6 +81,17 @@ pub struct TerminalTitles {
     /// not know", never as "not in this terminal", since a write that never
     /// happened leaves no entry either.
     hosts: Mutex<HashMap<String, String>>,
+    /// The newest `AppState::snapshot_versioned` ticket [`sync`] has written from.
+    ///
+    /// A tab title is the one thing this dashboard publishes that outlives the
+    /// emit which wrote it: the frontend repaints on the next emit whatever
+    /// happened, but a console title just sits there, so a glyph written from a
+    /// stale snapshot stays wrong until some later emit happens to move it —
+    /// three minutes, on the occasion this was measured. Two emits therefore have
+    /// to agree on which of them is newer, and a title cache cannot answer that:
+    /// it compares a title against the one it last wrote, never against when the
+    /// row behind it was read.
+    applied: Mutex<u64>,
 }
 
 impl TerminalTitles {
@@ -691,10 +702,38 @@ fn build_title(session: &AgentSession, context_threshold: f32, window_tokens: &H
 /// tab tracks everything the row shows, with no second state machine.
 /// Sessions that vanished (SessionEnd, row removed) get a blank title — the
 /// terminal falls back to its default — and are forgotten.
-pub fn sync(app: &AppHandle, sessions: &[AgentSession]) {
+///
+/// `seq` is the ticket `sessions` was snapshotted under. Two emits can be in
+/// flight at once and each snapshots before racing for the locks here, so the one
+/// holding the *older* rows can arrive last; it stands down rather than writing
+/// its glyphs over the newer ones. See [`TerminalTitles::applied`].
+pub fn sync(app: &AppHandle, sessions: &[AgentSession], seq: u64) {
     let Some(titles) = app.try_state::<TerminalTitles>() else {
         return;
     };
+    // Taken before the maps below and released with them, so "is this the newest
+    // snapshot" and "write from it" cannot be split by another emit. Held for the
+    // whole body like `pids` and `last` already are, which is why it adds no
+    // contention: two syncs already serialized here.
+    //
+    // First lock taken in this function and taken nowhere else, so it introduces
+    // no order to invert. Nothing under it blocks on the Tauri main thread — the
+    // console and window calls are made on the calling thread — which is what
+    // keeps a main-thread emit from waiting on something that is itself waiting
+    // for the main thread.
+    let mut applied = titles.applied.lock().unwrap();
+    if seq <= *applied {
+        // Logged because standing down and never racing are otherwise the same
+        // silence, and this module has a reverted fix behind it: without a line
+        // here, "the tab stopped contradicting the row" could equally mean the
+        // ordering works or that the two emits happened not to overlap that day.
+        // No chat_id — the ticket is per-snapshot, not per-row, so the rows this
+        // declined to write are the whole set — which `limit_reset` already
+        // establishes a `decision` line may do.
+        tracing::debug!(decision = "title_seq_stale", seq, applied = *applied, rows = sessions.len(), "a newer snapshot has already been written from; standing down");
+        return;
+    }
+    *applied = seq;
     let cfg = app.try_state::<ConfigState>().map(|s| s.snapshot());
     let enabled = cfg.as_ref().map(|c| c.terminal_titles).unwrap_or(true);
     // Built once per sync rather than per write: the constructor is a handle
