@@ -63,3 +63,4 @@
 - [Verify a relayed message's target](verify_peer_message_delivery.md) — diagnose relays on the RECEIVER: `peer_write` logs a pid to map via `~/.claude/sessions/<pid>.json`, `peer_refused` carries the true reason the sender's receipt may have mislabelled
 - [Check npm -v, not the packageManager field](node_toolchain_pin_ahead_of_node.md) — the pin needs Node >=24.15.0, and a Node upgrade silently resets corepack so the field stays right while the shim is gone
 - [A migration filed two open memos as done](done_memo_that_is_not_done.md) — v1 asserts presence, not location; both reopened 2026-09-18, and a misfiled memo is invisible rather than wrong-looking
+- [Memo backlog audited 2026-09-20](memo_backlog_audit_2026_09_20.md) — a memo can be done and left open (its body says so); the rest verified genuinely open, don't re-sweep
