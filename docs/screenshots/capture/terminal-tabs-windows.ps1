@@ -189,7 +189,7 @@ try {
         # shape; stroking the whole window first would put the edge where this
         # crop cuts it away.
         #
-        # The script is the documentation skill's, shared with the macOS capture
+        # The script is the docs-relevance skill's, shared with the macOS capture
         # rather than reimplemented here: one border, one width, one colour, on
         # two frames the README prints side by side. It decides for itself whether
         # a frame needs one, so the widget captures -- which arrive with Windows'

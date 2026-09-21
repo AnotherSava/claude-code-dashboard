@@ -67,6 +67,17 @@ cargo test --manifest-path src-tauri/Cargo.toml --lib
 echo "==> npm run build"
 npm run build
 
+# The second deliberate exception to the lockstep rule, and it belongs in no
+# workflow for the same reason the conventions checker above does not: it asserts
+# paths under the developer's `~/.claude`, which no runner has. It caught nothing
+# for three days once — the dotfiles renamed the `documentation` skill to
+# `docs-relevance` on 2026-09-17 and both capture libs kept resolving the old
+# path, which surfaces only at the shutter, after a window has been staged. It
+# runs before the figure check because a capture that cannot run at all is a
+# worse finding than a figure that has drifted.
+echo "==> python docs/screenshots/check-skill-scripts.py"
+python docs/screenshots/check-skill-scripts.py
+
 echo "==> python docs/screenshots/check-figures.py"
 python docs/screenshots/check-figures.py
 

@@ -108,7 +108,7 @@ function Invoke-WindowShotWithoutWidget {
 
 # Give a saved frame the documentation set's shared border.
 #
-# Shelled out to the documentation skill's hairline.py rather than implemented
+# Shelled out to the docs-relevance skill's hairline.py rather than implemented
 # here, and for the same reason window-shot.ps1 already shells out to
 # trim_halo.py: the macOS half of this project is Python and cannot read a
 # PowerShell function, so a shared script is the only place the two platforms
@@ -134,7 +134,10 @@ function Add-Hairline {
         [Parameter(Mandatory = $true)][string]$Path,
         [switch]$Opaque
     )
-    $hairline = Join-Path $env:USERPROFILE '.claude\skills\documentation\scripts\hairline.py'
+    # The skill was named `documentation` until the dotfiles renamed it on
+    # 2026-09-17. Keep this in step with SKILL_SCRIPTS in lib/dashboard.py, which
+    # is the macOS half of the same call and went stale alongside it.
+    $hairline = Join-Path $env:USERPROFILE '.claude\skills\docs-relevance\scripts\hairline.py'
     $py = if (Get-Command python -ErrorAction SilentlyContinue) { 'python' }
           elseif (Get-Command python3 -ErrorAction SilentlyContinue) { 'python3' }
           else { $null }
@@ -161,7 +164,7 @@ function Add-Hairline {
     # which is the branch that tells you to install it.
     $suggest = "$(if ($py) { $py } else { 'python' }) `"$hairline`" $($flags -join ' ') `"$Path`""
     if (-not $py) { throw "Saved $Path but python is not on PATH, so it has no border. Install python or run: $suggest" }
-    if (-not (Test-Path $hairline)) { throw "Saved $Path but $hairline is missing. The capture scripts call the documentation skill's shared tooling; install the dotfiles and run: $suggest" }
+    if (-not (Test-Path $hairline)) { throw "Saved $Path but $hairline is missing. The capture scripts call the docs-relevance skill's shared tooling; install the dotfiles and run: $suggest" }
     & $py $hairline @flags $Path
     if ($LASTEXITCODE -ne 0) { throw "hairline.py failed on $Path; the frame has no border, or the wrong one. Reproduce with: $suggest" }
 }

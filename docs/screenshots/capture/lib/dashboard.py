@@ -59,7 +59,7 @@ class CaptureError(RuntimeError):
     """Anything that should stop a capture rather than commit a wrong picture."""
 
 
-# Shared capture machinery lives in the documentation skill, not here.
+# Shared capture machinery lives in the docs-relevance skill, not here.
 #
 # The split is: anything a different project would want unchanged — taking the
 # picture, listing windows, trimming a halo, stroking an edge — belongs to the
@@ -68,15 +68,17 @@ class CaptureError(RuntimeError):
 # knows: which window, which state to stage, which sessions may appear in frame.
 # A `~`-relative path is not machine-specific — it resolves the same wherever
 # those dotfiles are installed, which is the same condition under which a capture
-# runs at all.
-SKILL_SCRIPTS = Path.home() / ".claude" / "skills" / "documentation" / "scripts"
+# runs at all. The skill was named `documentation` until the dotfiles renamed it
+# on 2026-09-17; the old path lived on here for three days, and every re-shoot on
+# either platform would have thrown `hairline.py is missing` until it was fixed.
+SKILL_SCRIPTS = Path.home() / ".claude" / "skills" / "docs-relevance" / "scripts"
 
 
 def skill_script(name: str) -> Path:
-    """A script from the documentation skill, or a refusal that says how to get it."""
+    """A script from the docs-relevance skill, or a refusal that says how to get it."""
     p = SKILL_SCRIPTS / name
     if not p.exists():
-        raise CaptureError(f"{name} is missing from {SKILL_SCRIPTS}. The capture scripts call the documentation skill's shared tooling; install the dotfiles (see their README) and run this again.")
+        raise CaptureError(f"{name} is missing from {SKILL_SCRIPTS}. The capture scripts call the docs-relevance skill's shared tooling; install the dotfiles (see their README) and run this again.")
     return p
 
 
@@ -162,7 +164,7 @@ def probe_path(name: str) -> Path:
 # ------------------------------------------------------------------- the window
 
 def list_windows() -> list[dict]:
-    """Every on-screen top-level window, via the documentation skill's `window_list.swift`."""
+    """Every on-screen top-level window, via the docs-relevance skill's `window_list.swift`."""
     try:
         r = subprocess.run(["swift", str(skill_script("window_list.swift"))], capture_output=True, timeout=60)
     except FileNotFoundError as e:

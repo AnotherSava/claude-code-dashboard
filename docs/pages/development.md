@@ -40,7 +40,7 @@ Compiles the Rust backend, starts Vite on `localhost:1420`, and launches the nat
 - `npm run tauri icon <path/to/1024.png>` — regenerate the Windows / macOS icon set from a source PNG.
 - `cargo test --manifest-path src-tauri/Cargo.toml --lib` — Rust unit tests (state machine, transcript parser, merge policy, Claude adapter, label policy).
 - `RUSTFLAGS="-D warnings" cargo check --manifest-path src-tauri/Cargo.toml --all-targets` — compile every target, in both configurations, with warnings as errors. The test run above sees only the test cfg, and `--lib --tests` never performs the bin's plain build, so this is the only command that catches an item in `src/main.rs` that is live under `cfg(test)` and dead without it.
-- `bash .claude/commit-checks.sh` — everything CI will run, in CI's order, in about ten seconds, preceded by a conventions check that CI does not run. Run it before committing.
+- `bash .claude/commit-checks.sh` — everything CI will run, in CI's order, in about ten seconds, plus the checks that read files under `~/.claude/` and so cannot run on a runner at all: the conventions checker, and an assertion that the shared scripts the screenshot capture shells out to still resolve. Run it before committing.
 
 ## Architecture
 
