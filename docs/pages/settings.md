@@ -16,25 +16,27 @@ The tray's **Open config/logs location** shortcut opens this folder. The widget 
 
 ## Tray menu
 
-Right-click the tray icon for the controls you reach for most:
+Right-click the tray icon for the controls you reach for most.
+
+{% include figure.html id="tray-menu" alt="The tray menu, open: Show / Hide, the checkable toggles, the submenus, the Work intensity, config folder and Startable projects items, Help and Quit" %}
 
 - **Show / Hide** — toggle the window (also a left-click on the tray icon).
 - **Always on top** — keep the widget above your other windows.
 - **Save position on exit** — reopen where you left it, at the same size.
-- **Color terminal tabs** — show each session's status as a colored circle in its terminal tab title.
+- **Color terminal tabs** — show each session's status as a symbol in its terminal tab title.
 - **Compact view** — hide each row's current prompt and time-in-state, and collapse the usage bars down to their bare percentage.
 - **On system start** — launch at login: off, open the window, or start hidden in the tray.
-- **Auto-resize** — fit the window height to its content, growing upward or downward. The widget owns its height while this is on, so dragging its top or bottom edge does nothing; the sides still resize the width.
+- **Auto resize** — fit the window height to its content, growing upward or downward. The widget owns its height while this is on, so dragging its top or bottom edge does nothing; the sides still resize the width.
 - **History font size** — pick one of five sizes for the history window.
 - **Tray usage badge** — show the 5-hour or 7-day usage on the tray icon, as the recolored traffic light or a number (or none).
 - **Keep awake while working** (macOS) — stop the Mac's idle timer sleeping it while an agent is still working (on by default). Holds off only the idle timer, so the screen still sleeps and closing the lid still works as usual. See [Features](features#keeping-the-mac-awake-while-an-agent-works).
 - **Keep awake with lid closed** (macOS) — stop the Mac sleeping when you shut the lid while an agent is still working: off, only on battery, or always, plus a **Start now** button that holds once regardless. The title shows how long a hold lasts, and the first time you use it you're asked for your password. See [Features](features#keeping-the-mac-awake-with-the-lid-closed).
 - **Show high context usage** — flag a session that's filling its context window on the tray icon (on by default). Has no visible effect unless a tray usage badge is on.
 - **High alert** — send every configured state notification (blocked, done, error) to Telegram the instant it happens, skipping the usual delays (off by default). Doesn't affect the context-usage or usage-limit alerts.
-- **Work intensity** — open the chart of how hard your agents have been working, by day or by week.
+- **Work intensity** — open the [Work intensity](features#work-intensity) chart.
 - **Open config/logs location** — open the app data folder.
-- **Startable projects** — open the list of projects a message from another machine may start a session in.
-- **Help** — About, and the instructions for connecting a new machine.
+- **Startable projects** — open the list of projects an agent's message may start a session in. See [Startable projects](#startable-projects).
+- **Help** — **About** shows the version and a link to these docs; **Connect instructions** brings back the setup panel with the hook snippet.
 - **Quit** — close the widget.
 
 ## Config file
@@ -140,8 +142,8 @@ Set autostart through the tray's **On system start** submenu — it writes both 
 
 ### Color terminal tabs
 
-- `terminal_titles` — mirror each session's status onto its terminal tab as a colored circle next to the session name (🔵 working, 🟠 waiting, 🟢 done, 🔴 error, ⚪ idle). See [Features → color terminal tabs](features#color-terminal-tabs).
-- `terminal_title_context_percent` — once a session's context usage reaches this percent of its model's window, append it to the terminal tab title as ` [N%]` (e.g. `🔵 printlab [67%]`), so a tab filling toward `/compact` stands out. `null` or `0` turns the number off (the colored circle + name still show); it needs `terminal_titles` on to appear at all.
+- `terminal_titles` — mirror each session's status onto its terminal tab as a symbol next to the session name (🔵 working, ⏳ background work still running, ✋ blocked on you, 🟢 done, 🔴 error, ⚪ idle). See [Features → color terminal tabs](features#color-terminal-tabs).
+- `terminal_title_context_percent` — once a session's context usage reaches this percent of its model's window, append it to the terminal tab title as ` [N%]` (e.g. `🔵 printlab [67%]`), so a tab filling toward `/compact` stands out. `null` or `0` turns the number off (the status symbol and name still show); it needs `terminal_titles` on to appear at all.
 
 ### Behavior
 
@@ -254,13 +256,13 @@ A typical two-device setup — desktop: `"listen": true, "peers": ["http://lapto
 
 Separate from `config.json`, in its own `auto_start.json` in the same folder — the tray's **Startable projects** item opens it. It lives apart because the widget writes to it when you approve a request, and `config.json` is overwritten every time the app is installed.
 
-It lists the projects a message from another machine may **start a session for**, written as `{"transcripts": "/Users/you/Projects/transcripts"}`. Empty (the default) means a message never starts anything. Each machine has its own — the folders are different — and the widget re-reads the file whenever it needs it, so removing a line takes a project off the list straight away, with no restart.
+It lists the projects an agent's message may **start a session for** — one from another machine, or one from an agent on this machine — written as `{"transcripts": "/Users/you/Projects/transcripts"}`. Empty (the default) means a message never starts anything. Each machine has its own — the folders are different — and the widget re-reads the file whenever it needs it, so removing a line takes a project off the list straight away, with no restart.
 
 **You don't have to write it by hand.** When an agent on your other machine messages a project that isn't running and isn't listed, the widget on *this* machine — the one you're sitting at — shows the request: who asked, what they wanted to reach, and the folders the other machine found that match the name. Pick one and press **Allow**, and the project is added over there for good; the message that prompted it is then delivered. Press **Not now** and nothing happens.
 
 The asking agent waits about a minute and a half. If you're away, it gives up and tells its own user plainly that nothing was delivered — nothing is queued, and no message text is ever stored on either machine. The request stays in your widget, though, so approving it later still saves the *next* message the same round trip. The agent can send again if what it had is still worth sending.
 
-**Allowing a project is a standing invitation.** From then on, any agent on any of your devices that has the shared `token` can, at any hour and with nobody sitting at that computer, open a terminal there and start Claude Code in that folder — with your permission settings, your hooks and your files. You're not approving one message; you're approving that a session may come into existence without you. The widget confirms which *computer* asked (via `peer_identity`, which it requires both for a start and for recording your approval), but nothing anywhere can confirm which *agent* did. The window it opens is deliberately a real one: it's how you see what the session is doing, and how you close it.
+**Allowing a project is a standing invitation.** From then on, any agent on this computer, and any agent on your other devices that has the shared `token`, can, at any hour and with nobody sitting at that computer, open a terminal there and start Claude Code in that folder — with your permission settings, your hooks and your files. You're not approving one message; you're approving that a session may come into existence without you. The widget confirms which *computer* asked (via `peer_identity`, which it requires both for a start and for recording your approval), but nothing anywhere can confirm which *agent* did. The window it opens is deliberately a real one: it's how you see what the session is doing, and how you close it.
 
 A session started this way is a normal one — an agterm tab in the project folder running `claude` the way your shell does, so it picks up `--continue` and everything else you'd get by hand. It stays after the conversation ends: quitting Claude leaves you at a prompt in that directory, and the tab is still there when you come back. macOS only for now; on Windows a start is turned away with a note saying so.
 

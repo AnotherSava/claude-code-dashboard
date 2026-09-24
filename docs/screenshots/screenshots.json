@@ -19,10 +19,11 @@
           "Turn sync listening off (`sync.listen`, start-only) so a peer's rows are not in frame; the script refuses while a peer is connected.",
           "Turn `restore_sessions` off and restart, so the widget starts empty and only the staged sessions get rows. With it on, every idle session the terminal can vouch for comes back and the frame is whatever happened to be running.",
           "Both usage bars must have a reading. Restarting the app repeatedly trips the usage endpoint's 429 backoff and the bars then render `--%`; this is the only frame that shows the header, so wait for a poll that succeeds after the restarts.",
-          "Captured with -Method Alpha: the window is photographed over a black and a white backdrop and the alpha solved per pixel, so the frame carries the real border and rounded corners with everything outside them transparent. Do not add -Client; the script refuses the combination."
+          "Captured with -Method Alpha: the window is photographed over a black and a white backdrop and the alpha solved per pixel, so the capture carries the window's content and its rounded outline with everything outside transparent. The border and corners in the committed frame are then drawn by Add-WindowFrame (see FRAME). Do not add -Client; the script refuses the combination.",
+          "FRAME: drawn by Add-WindowFrame, which runs the docs-relevance skill's `winframe.py`: everything outside the content Windows clips 2px in is drawn from DWM's own model (12px corners at 144 DPI flattened into 8 chords as Direct2D does, a 1px antialiasing ramp, a 2px border at 144 DPI), with a lighter uniform ring, rgba(146,146,146,0.69), and no shadow, chosen on 2026-09-24 so the edge reads 180 on a white page and 105 on a dark one on every side. A captured Windows border is the border mixed with the drop shadow behind it, which is why its bottom reads darker than its top; the model draws the border alone. The capture records its DPI in the PNG and the frame is sized from it. The untouched capture is kept in tmp/screenshot-raws/."
         ]
       },
-      "verifiedAt": "d0e142c"
+      "verifiedAt": "at-capture"
     },
     {
       "id": "hero-macos",
@@ -64,10 +65,11 @@
           "Deploy the current build",
           "The script writes `compact_mode`, captures, and puts it back. It writes the file whole and then touches it: the config watcher reads on the first notify event and debounces for 150ms, so a truncate-then-write hands it a half-written file and every setting silently falls back to its default.",
           "This frame carries no device pill, because a peer's rows would put that machine's project names in the picture. The macOS variant is the one that shows sync, and it can: this device's own project names are public.",
-          "Captured with -Method Alpha: the window is photographed over a black and a white backdrop and the alpha solved per pixel, so the frame carries the real border and rounded corners with everything outside them transparent. Do not add -Client; the script refuses the combination."
+          "Captured with -Method Alpha: the window is photographed over a black and a white backdrop and the alpha solved per pixel, so the capture carries the window's content and its rounded outline with everything outside transparent. The border and corners in the committed frame are then drawn by Add-WindowFrame (see FRAME). Do not add -Client; the script refuses the combination.",
+          "FRAME: drawn by Add-WindowFrame, which runs the docs-relevance skill's `winframe.py`: everything outside the content Windows clips 2px in is drawn from DWM's own model (12px corners at 144 DPI flattened into 8 chords as Direct2D does, a 1px antialiasing ramp, a 2px border at 144 DPI), with a lighter uniform ring, rgba(146,146,146,0.69), and no shadow, chosen on 2026-09-24 so the edge reads 180 on a white page and 105 on a dark one on every side. A captured Windows border is the border mixed with the drop shadow behind it, which is why its bottom reads darker than its top; the model draws the border alone. The capture records its DPI in the PNG and the frame is sized from it. The untouched capture is kept in tmp/screenshot-raws/."
         ]
       },
-      "verifiedAt": "d0e142c"
+      "verifiedAt": "at-capture"
     },
     {
       "id": "compact-mode-macos",
@@ -85,7 +87,7 @@
           "Have both local and synced rows live, so at least one device pill is in frame. The script refuses when no row is synced from another machine, and refuses any project name in frame that is not on the public list — `--publishable NAME ...` overrides that list for a project that really is public.",
           "Capture the window rect",
           "This frame was misfiled as a Windows capture until 2026-09-09. Two independent readings say otherwise: its device pills read CHROME, so the capturing machine is the other one; and its corner alpha ramp is byte-for-byte the shape terminal-tabs-macos has and hero-windows does not. The audit that got it wrong probed the top-left for macOS traffic-light hues, which cannot work on an undecorated window — it matched the DONE pill's green and nothing else.",
-          "ROUNDED CORNERS, which the widget draws itself as of 2026-09-11. The window is `decorations: false`, so macOS rounds nothing for it — the compositor rounds a titled window's frame — and it was square here while the same widget on Windows 11, which rounds the window itself, was round already. The fix is three things together and all three are required: `transparent: true` on the main window, `macOSPrivateApi: true` (the config doc says transparency on macOS needs it, and warns it bars the App Store, which costs nothing for a DMG and Homebrew build), and a `border-radius` with `overflow: hidden` on `.widget`. A fourth thing was overriding them all — `auto_resize::set_dark_window_background` re-set an OPAQUE `NSWindow.backgroundColor` at runtime, after the config, so `transparent: true` alone changed nothing; its alpha is now 0. A capture should ramp 0, 0, 0, 0, 0, 70, 255 down the diagonal, against 0, 0, 0, 64, 114, 255 on the Windows half.",
+          "ROUNDED CORNERS, which the widget draws itself as of 2026-09-11. The window is `decorations: false`, so macOS rounds nothing for it — the compositor rounds a titled window's frame — and it was square here while the same widget on Windows 11, which rounds the window itself, was round already. The fix is three things together and all three are required: `transparent: true` on the main window, `macOSPrivateApi: true` (the config doc says transparency on macOS needs it, and warns it bars the App Store, which costs nothing for a DMG and Homebrew build), and a `border-radius` with `overflow: hidden` on `.widget.rounded`, a class applied only where the user agent names the Macintosh (`roundsOwnCorners` in App.svelte), because Windows 11 rounds its own window and a radius there leaves a see-through arc inside its corner. A fourth thing was overriding them all — `auto_resize::set_dark_window_background` re-set an OPAQUE `NSWindow.backgroundColor` at runtime, after the config, so `transparent: true` alone changed nothing; its alpha is now 0. A capture should ramp 0, 0, 0, 0, 0, 70, 255 down the diagonal, against 0, 0, 0, 64, 114, 255 on the Windows half.",
           "The compositor's drop shadow is out of the picture at source: `dash.capture_window` shoots with `screencapture -l<id> -o` and then runs `lib/trim_halo.py` itself, on both platforms, so a re-shoot has no trim step to remember.",
           "Colour profile: a committed frame is sRGB. Output from `screencapture` is tagged with the display's own profile — Color LCD on this machine, a wide-gamut one — and the same colour is then stored as a less saturated number: re-tagging work-intensity-macos.png back to that profile moves its three title-bar lights from saturation 1.00 to 0.80, 0.74 and 0.72, against the 0.55 floor check-figures.py uses to recognise a macOS window by its traffic lights. This frame is the undecorated widget and has no lights for that check to read either way, but the conversion runs on every capture so that each committed frame's numbers mean the same thing. Conversion to sRGB is the last step of `dash.capture_window`, and the frame on disk carries that tag. Read it back with `sips -g profile <png>`."
         ]
@@ -108,10 +110,10 @@
           "Several sessions across projects showing a spread of glyphs",
           "The script hides the widget for the shot: it is always-on-top, and this is the one frame that has to be read off the desktop because PrintWindow returns a stale surface for Windows Terminal's XAML islands",
           "Both crops are measured, not hardcoded — the strip's height from where the flat bar colour ends, and its width from the last tab before a long empty run, so the window controls at the far right stay out",
-          "EDGE: the script strokes the saved crop with the docs-relevance skill's `hairline.py`, after the crop rather than before — a region crop brings no edge of its own, and this one kept the window's translucent border along its top and left while its right and bottom were bare content at (46, 46, 46), so on a dark page two sides had nothing to stop the picture. It is the same script the macOS captures call, so the two halves of this figure cannot drift apart in width or colour; it checks all four sides itself and declines a frame that already has a border, which is why the widget captures are untouched by it. Applied to the committed frame from the macOS side on 2026-09-12, so the file is correct now and a re-shoot on Windows keeps it."
+          "FRAME: drawn by Add-WindowFrame, which runs the docs-relevance skill's `winframe.py`: everything outside the content Windows clips 2px in is drawn from DWM's own model (12px corners at 144 DPI flattened into 8 chords as Direct2D does, a 1px antialiasing ramp, a 2px border at 144 DPI), with a lighter uniform ring, rgba(146,146,146,0.69), and no shadow, chosen on 2026-09-24 so the edge reads 180 on a white page and 105 on a dark one on every side. A captured Windows border is the border mixed with the drop shadow behind it, which is why its bottom reads darker than its top; the model draws the border alone. The capture records its DPI in the PNG and the frame is sized from it. The untouched capture is kept in tmp/screenshot-raws/. This frame is a crop: its top and left are the window's own edges with its rounded top-left corner, and its right and bottom are cuts, so the script passes -Cut right, bottom and the border runs straight along them with square corners. A maximized terminal window has no border or rounded corner, and the script refuses it before anything is written."
         ]
       },
-      "verifiedAt": "d0e142c"
+      "verifiedAt": "at-capture"
     },
     {
       "id": "terminal-tabs-macos",
@@ -153,10 +155,11 @@
           "Read the tail before capturing. prompt_history.json in the app data dir holds every stored dialog and is quicker to search than opening windows; the requirements a session has to meet are in the script's header.",
           "Probe with -Method PrintWindow first — it needs no foreground, so it costs no permission to take over the machine — then take the Alpha shot once",
           "The window's title is the session's display name, not the word History, which is what the capture matches on",
-          "The compositor's drop shadow is trimmed from the four corners automatically by lib/trim_halo.py"
+          "The compositor's drop shadow outside the corners is left in the capture and never reaches the committed frame: Add-WindowFrame draws everything outside the content Windows clips.",
+          "FRAME: drawn by Add-WindowFrame, which runs the docs-relevance skill's `winframe.py`: everything outside the content Windows clips 2px in is drawn from DWM's own model (12px corners at 144 DPI flattened into 8 chords as Direct2D does, a 1px antialiasing ramp, a 2px border at 144 DPI), with a lighter uniform ring, rgba(146,146,146,0.69), and no shadow, chosen on 2026-09-24 so the edge reads 180 on a white page and 105 on a dark one on every side. A captured Windows border is the border mixed with the drop shadow behind it, which is why its bottom reads darker than its top; the model draws the border alone. The capture records its DPI in the PNG and the frame is sized from it. The untouched capture is kept in tmp/screenshot-raws/."
         ]
       },
-      "verifiedAt": "d0e142c"
+      "verifiedAt": "at-capture"
     },
     {
       "id": "history-window-macos",
@@ -197,10 +200,11 @@
           "Windows. The macOS half of this figure is work-intensity-macos.",
           "Deploy the current build",
           "1520 logical px wide, and that is about the plot rather than the header now: the Navigation and Legend hints are gone and what is left fits on one line at the window's own 1000px default, so the old collide-below-1280 / wrap-at-1320 thresholds describe nothing. The width buys horizontal resolution — 144 ten-minute slots across the plot, and the shape of a day is what the figure argues.",
-          "The script parks the mouse pointer clear of the window: hovering a bar raises a tooltip that then sits in the committed frame",
+          "The script moves the pointer to the primary display's far corner BEFORE the window opens, and puts it back afterwards. A window that opens under a resting pointer shows the chart's hover tooltip, and moving the pointer off afterwards does not clear it: a re-shoot on 2026-09-23 came back with a tooltip over the Sunday row that way.",
           "The script places the window at the top-left of the PRIMARY display before sizing it, and `Assert-Rendered` refuses the frame if the right edge came back opaque black. Both exist because the first end-to-end run of this script found the chart on a 1440-wide portrait monitor and committed a 1522px frame whose last 239px were a black band: a Windows capture reads the window's surface, so the part hanging off a display returns unrendered rather than missing, at the full window size.",
           "Frame size is unchanged at 2284x1097, 144dpi — 1520 logical px on the 150% primary display. A run that finds it 1522x732 has shot it on a 100% monitor, which is the wrong one: at that size the plot has two thirds of the horizontal resolution the 144 ten-minute slots need.",
-          "Header contents as shot: one scope (\"This week:\" in Days, \"Week average:\" in Weeks) over Active / Tokens / Quota, with Active rounded to whole hours. The Navigation and Legend hints that used to sit right of the totals are gone, and the ← → buttons keep reserved slots either side of the date so nothing moves when the view switches."
+          "Header contents as shot: one scope (\"This week:\" in Days, \"Week average:\" in Weeks) over Active / Tokens / Quota, with Active rounded to whole hours. The Navigation and Legend hints that used to sit right of the totals are gone, and the ← → buttons keep reserved slots either side of the date so nothing moves when the view switches.",
+          "FRAME: drawn by Add-WindowFrame, which runs the docs-relevance skill's `winframe.py`: everything outside the content Windows clips 2px in is drawn from DWM's own model (12px corners at 144 DPI flattened into 8 chords as Direct2D does, a 1px antialiasing ramp, a 2px border at 144 DPI), with a lighter uniform ring, rgba(146,146,146,0.69), and no shadow, chosen on 2026-09-24 so the edge reads 180 on a white page and 105 on a dark one on every side. A captured Windows border is the border mixed with the drop shadow behind it, which is why its bottom reads darker than its top; the model draws the border alone. The capture records its DPI in the PNG and the frame is sized from it. The untouched capture is kept in tmp/screenshot-raws/."
         ]
       },
       "verifiedAt": "at-capture"
@@ -229,6 +233,27 @@
         ]
       },
       "verifiedAt": "68c3525"
+    },
+    {
+      "id": "tray-menu-windows",
+      "files": [
+        "tray-menu-windows.png"
+      ],
+      "shows": "Windows. The tray icon's menu, open: Show / Hide, the checkable toggles, its submenus closed, the Work intensity / config folder / Startable projects items, Help and Quit",
+      "policy": "auto",
+      "capture": {
+        "command": "pwsh -File docs/screenshots/capture/tray-menu-windows.ps1",
+        "steps": [
+          "Windows. No macOS half has been taken; its menu differs by one item, Keep awake with lid closed, which is macOS-only.",
+          "The running build must postdate the last change to src-tauri/src/tray.rs, or the frame shows a menu the code no longer builds. No deploy is needed otherwise, since the menu carries no session state.",
+          "The script posts the tray window tray-icon's WM_USER_TRAYICON with WM_RBUTTONUP, which runs the crate's own TrackPopupMenu path, so the frame is the menu a right-click opens. It places the pointer near the primary display's tray corner first, since the menu opens at the pointer, and puts it back afterwards.",
+          "Captured with -Method Alpha -Popup: the raise and the activating backdrop Show() are skipped, because either one ends the menu's modal loop and the frame would come back as two empty backdrops.",
+          "Checkmarks are the capturing machine's own settings. As first shot: Always on top, Save position on exit, Color terminal tabs and Show high context usage on; Compact view and High alert off.",
+          "No item may be highlighted. The pointer sits just outside the menu's bottom corner when it opens and is parked further out before the shutter; a highlighted row means the pointer entered the menu.",
+          "FRAME: drawn by Add-WindowFrame, which runs the docs-relevance skill's `winframe.py`: everything outside the content Windows clips 2px in is drawn from DWM's own model (a menu's own 6px corners at 144 DPI flattened into 4 chords, a 1px antialiasing ramp, a 2px border at 144 DPI), with a lighter uniform ring, rgba(146,146,146,0.69), and no shadow, chosen on 2026-09-24 so the edge reads 180 on a white page and 105 on a dark one on every side. A captured Windows border is the border mixed with the drop shadow behind it, which is why its bottom reads darker than its top; the model draws the border alone. The capture records its DPI in the PNG and the frame is sized from it. The untouched capture is kept in tmp/screenshot-raws/."
+        ]
+      },
+      "verifiedAt": "at-capture"
     }
   ],
   "declinedGaps": [
