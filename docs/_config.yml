@@ -31,5 +31,5 @@ exclude:
   - vendor/gems/
   - vendor/ruby/
   - plans/
-  - screenshots/check-figures.py
+  - screenshots/*.py
   - screenshots/capture/
