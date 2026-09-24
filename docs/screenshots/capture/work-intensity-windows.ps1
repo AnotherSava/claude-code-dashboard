@@ -58,24 +58,33 @@ if (-not $PSBoundParameters.ContainsKey('Offset')) {
     if ($Offset -gt 0) { throw "-WeekStart $WeekStart is in the future." }
 }
 
-Invoke-DashboardWindow @{ action = 'intensity'; offset = $Offset; view = 'day' } | Out-Null
-Start-Sleep -Milliseconds 800
-# Put the window on the primary display before sizing it. A capture reads the
-# window's own surface, not the screen, but only the part of that surface the
-# compositor actually rendered -- so whatever hangs off a display's edge comes
-# back BLACK rather than missing, and the frame looks complete at the wrong
-# width. Measured on the first end-to-end run of this script: the chart happened
-# to be sitting on a 1440-wide portrait monitor at x=3989, so 239px of the right
-# gutter and the Days/Weeks toggle were a black band in a 1522px
-# frame. The window remembers where it last was, so this cannot be left to luck.
-Invoke-DashboardWindow @{ action = 'move'; label = 'intensity'; x = 0; y = 0 } | Out-Null
-Start-Sleep -Milliseconds 400
-Invoke-DashboardWindow @{ action = 'resize'; label = 'intensity'; width = $Width; height = $Height } | Out-Null
-# The chart animates its bars in, and the window has to settle at the new size
-# before the header decides whether it fits on one line.
-Start-Sleep -Milliseconds 2500
+# Move the pointer to the far corner of the primary display BEFORE the window
+# opens, and put it back at the end. The window opens at the top-left of that
+# display, and one that appears under a resting pointer shows the chart's hover
+# tooltip; moving the pointer off afterwards, which window-shot.ps1 does, does
+# not clear it. A committed-looking frame came back with "Sun, Sep 6
+# 20:50-21:00 . idle" floating over the Sunday row that way.
+$area = Get-PrimaryWorkArea
+Invoke-WithPointerAt -X ($area.Right - 8) -Y ($area.Bottom - 8) -Do {
+    Invoke-DashboardWindow @{ action = 'intensity'; offset = $Offset; view = 'day' } | Out-Null
+    Start-Sleep -Milliseconds 800
+    # Put the window on the primary display before sizing it. A capture reads the
+    # window's own surface, not the screen, but only the part of that surface the
+    # compositor actually rendered -- so whatever hangs off a display's edge comes
+    # back BLACK rather than missing, and the frame looks complete at the wrong
+    # width. Measured on the first end-to-end run of this script: the chart happened
+    # to be sitting on a 1440-wide portrait monitor at x=3989, so 239px of the right
+    # gutter and the Days/Weeks toggle were a black band in a 1522px
+    # frame. The window remembers where it last was, so this cannot be left to luck.
+    Invoke-DashboardWindow @{ action = 'move'; label = 'intensity'; x = 0; y = 0 } | Out-Null
+    Start-Sleep -Milliseconds 400
+    Invoke-DashboardWindow @{ action = 'resize'; label = 'intensity'; width = $Width; height = $Height } | Out-Null
+    # The chart animates its bars in, and the window has to settle at the new size
+    # before the header decides whether it fits on one line.
+    Start-Sleep -Milliseconds 2500
 
-$out = Get-ShotPath 'work-intensity-windows'
-Invoke-WindowShotWithoutWidget @{ ProcessName = 'claude-code-dashboard'; Title = 'Work intensity'; Method = 'Alpha'; Out = $out }
-Assert-Rendered -Path $out
-Add-Hairline -Path $out -Opaque
+    $out = Get-ShotPath 'work-intensity-windows'
+    Invoke-WindowShotWithoutWidget @{ ProcessName = 'claude-code-dashboard'; Title = 'Work intensity'; Method = 'Alpha'; Out = $out }
+    Assert-Rendered -Path $out
+    Add-WindowFrame -Path $out
+}

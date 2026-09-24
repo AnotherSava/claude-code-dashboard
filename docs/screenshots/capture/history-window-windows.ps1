@@ -76,7 +76,7 @@ Invoke-WindowShotWithoutWidget @{ ProcessName = 'claude-code-dashboard'; Title =
 # partly unrendered when looking at it is the whole point of a probe.
 if ($Method -eq 'Alpha') {
     Assert-Rendered -Path $out
-    Add-Hairline -Path $out -Opaque
+    Add-WindowFrame -Path $out
 }
 
 # Put the window back the way the user finds it. `save_window_position` is on by

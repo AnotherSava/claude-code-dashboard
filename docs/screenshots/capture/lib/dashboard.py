@@ -7,7 +7,7 @@ Import it: `sys.path.insert(0, str(Path(__file__).parent / "lib"))` then
 of what the Windows capture needs.
 
 WHY THIS IS SO MUCH SMALLER THAN THE WINDOWS HALF, since a reader coming from
-`window-shot.ps1` will expect 455 lines and find sixty. That file is long because
+`window-shot.ps1` will expect several hundred lines and find sixty. That file is long because
 Windows fights the capture: the thread has to be made PerMonitorV2 aware or every
 geometry call reads back divided by the monitor scale; `GetWindowRect` includes
 about 7px of invisible resize margin that has to be subtracted via
@@ -330,11 +330,11 @@ def add_hairline(path: Path) -> None:
     """Give a capture the edge it has none of — see `lib/hairline.py`.
 
     Shelled out to rather than implemented here, and the same way
-    `capture_window` runs `trim_halo.py`: the Windows capture is PowerShell and
-    cannot import this module, so a shared script is the only place the two
-    platforms can hold one implementation. The alternative is the same border
-    written twice, drifting in width or colour or shape on two frames the README
-    prints side by side.
+    `capture_window` runs `trim_halo.py`: one implementation for every project,
+    in the skill that owns the machinery. The Windows half no longer calls it: a
+    Windows capture's frame is drawn afresh from DWM's own model by the skill's
+    `winframe.py`, because a captured Windows border is mixed with the shadow
+    behind it and cannot be kept or stroked over.
 
     It decides for itself whether the frame needs one: most captures arrive with
     the OS's own border and are left alone.
@@ -500,8 +500,8 @@ def assert_publishable(names, allowed=PUBLISHABLE_PROJECTS, where: str = "the fr
 # The Windows half of this project is PowerShell and cannot import a Python
 # module, so without this the publishable-names rule would have to be written
 # twice — and the list's own comment above says why that is the thing to avoid:
-# a copy per caller is a copy to forget to update. `window-shot.ps1` already
-# shells out to `trim_halo.py`, so the shape is proven on that machine.
+# a copy per caller is a copy to forget to update. `dashboard.ps1` already
+# shells out to the skill's `winframe.py`, so the shape is proven on that machine.
 #
 # WHAT CROSSES THE BOUNDARY IS THE ROSTER, NOT THE NAMES, deliberately. Handing
 # over a list of names would put `names_in_frame` — the rule about what a row

@@ -106,67 +106,66 @@ function Invoke-WindowShotWithoutWidget {
     }
 }
 
-# Give a saved frame the documentation set's shared border.
+# Draw a saved frame's Windows 11 frame again, from Windows' own model.
 #
-# Shelled out to the docs-relevance skill's hairline.py rather than implemented
-# here, and for the same reason window-shot.ps1 already shells out to
-# trim_halo.py: the macOS half of this project is Python and cannot read a
-# PowerShell function, so a shared script is the only place the two platforms
-# can hold ONE implementation. The alternative is the same border written twice,
-# drifting in width or colour on two frames the README prints side by side.
+# A captured Windows frame cannot be kept or cleaned: its border is translucent, so
+# it arrives mixed with the drop shadow and the backdrop behind it (the lighter-top,
+# darker-bottom shading a captured border shows is the shadow, not the border).
+# The docs-relevance skill's winframe.py keeps only the content inside the clip
+# Windows applies and draws the frame from DWM's measured model: 8 DIP corners (4
+# for a menu) flattened into chords, a 1 px antialiasing ramp, a 2 px border at 144
+# DPI. Drawn with Windows' own border and the window's own shadow it reproduces a
+# real capture to under one level RMS. Shelled out rather than written here for the reason every shared step
+# is: one implementation for every project, and the macOS half cannot read a
+# PowerShell function.
 #
-# -Opaque REPLACES a translucent border rather than tinting it, and every Windows
-# frame here needs it. Windows draws its window frames translucent (alpha 119 on
-# the undecorated widget, ~130 on a decorated window), so a border left as the OS
-# drew it takes its shade from whatever is behind the page: measured, those frames
-# read 159-183 on a white page and 53-54 on a dark one, against a flat 189 on
-# every macOS frame. GitHub renders a README in dark mode, so that is not a corner
-# case. With -Opaque all ten frames measure 2px of #BDBDBD at full alpha and read
-# 189 on both.
+# THE RING IS LIGHTER THAN WINDOWS' AND THERE IS NO SHADOW, chosen by eye on
+# 2026-09-24. Windows' own border, rgba(117,117,117,0.40), reads 200 on a white
+# page and 55 on GitHub's dark one, where a README renders for a dark-mode reader.
+# rgba(146,146,146,0.69) reads 180 and 105 on every side. The shadow is left out
+# because it is what makes the bottom of a captured border darker than its top.
 #
-# This is deliberately NOT folded into Invoke-WindowShot. terminal-tabs-windows
-# captures to a temp file and crops it before saving, so a stroke applied at shot
-# time would land where that crop cuts it away AND be stroked again afterwards,
-# giving a doubled edge on the two sides that keep the window's own border. The
-# caller knows whether it is saving a window or a crop; the shot helper does not.
-function Add-Hairline {
+# -Kind menu gives a menu's own shape, 4 DIP corners, rather than a window's.
+# -Cut names the sides of a crop that are cuts rather than the window's edges: they
+# get the border straight along them and square corners.
+#
+# The capture records its window's DPI in the PNG and winframe.py sizes the frame
+# from it. This runs once, on the raw capture; a copy of that raw is kept first.
+$WindowFrameRing = '929292:0.69'
+function Add-WindowFrame {
     param(
         [Parameter(Mandatory = $true)][string]$Path,
-        [switch]$Opaque
+        [ValidateSet('window', 'menu')][string]$Kind = 'window',
+        [ValidateSet('left', 'top', 'right', 'bottom')][string[]]$Cut = @()
     )
-    # The skill was named `documentation` until the dotfiles renamed it on
-    # 2026-09-17. Keep this in step with SKILL_SCRIPTS in lib/dashboard.py, which
-    # is the macOS half of the same call and went stale alongside it.
-    $hairline = Join-Path $env:USERPROFILE '.claude\skills\docs-relevance\scripts\hairline.py'
+    $winframe = Join-Path $env:USERPROFILE '.claude\skills\docs-relevance\scripts\winframe.py'
     $py = if (Get-Command python -ErrorAction SilentlyContinue) { 'python' }
           elseif (Get-Command python3 -ErrorAction SilentlyContinue) { 'python3' }
           else { $null }
-    # --require turns a SKIP into a failure. Without it, hairline.py's "this frame
-    # already has an edge" path exits 0, which is indistinguishable from success to
-    # this function -- so a frame whose border was never applied ships silently. The
-    # caller only reaches here when it wants a border, so being left alone is only
-    # acceptable if the edge already present is the one we would have drawn, and
-    # --require is what checks that rather than assuming it.
-    #
     # THE FLAGS ARE BUILT ONCE AND USED FOR BOTH THE CALL AND THE SUGGESTED REMEDY,
-    # because those two drifted: the throw messages below used to compose their own
-    # command and omitted --require from it. Someone who hit a guard and copied the
-    # suggested fix would then run the version WITHOUT the check -- and on a frame
-    # that trips has_own_edge would get "already has an edge of its own", exit 0,
-    # and an off-shade border, which is the precise failure --require exists to
-    # stop. A remedy that differs from what the code runs is worse than none.
-    $flags = @('--require')
-    if ($Opaque) { $flags += '--opaque' }
-    # The interpreter in the remedy is the one we RESOLVED, not a hardcoded name.
-    # `python` was hardcoded here, so on a machine carrying only `python3` the two
-    # throws below suggested a command that does not run -- the same drift as the
-    # flags, one level down. It falls back to `python` only when nothing resolved,
-    # which is the branch that tells you to install it.
-    $suggest = "$(if ($py) { $py } else { 'python' }) `"$hairline`" $($flags -join ' ') `"$Path`""
-    if (-not $py) { throw "Saved $Path but python is not on PATH, so it has no border. Install python or run: $suggest" }
-    if (-not (Test-Path $hairline)) { throw "Saved $Path but $hairline is missing. The capture scripts call the docs-relevance skill's shared tooling; install the dotfiles and run: $suggest" }
-    & $py $hairline @flags $Path
-    if ($LASTEXITCODE -ne 0) { throw "hairline.py failed on $Path; the frame has no border, or the wrong one. Reproduce with: $suggest" }
+    # because those two drifted once: the throw messages composed their own command
+    # and left a flag out of it. A remedy that differs from what the code runs is
+    # worse than none.
+    $flags = @('--kind', $Kind, '--shadow', 'none', '--ring', $WindowFrameRing)
+    if ($Cut.Count -gt 0) { $flags += @('--cut', ($Cut -join ',')) }
+    # KEEP THE RAW, and before anything can throw. The frame step rewrites the file
+    # in place, so without a copy the only way to try a different frame is to take
+    # the shot again -- which needs the app staged and the machine taken over. And
+    # a caller that stages its file in a temp directory deletes it in `finally`, so
+    # a guard that threw first would lose the capture outright. The copy goes to
+    # the repo's gitignored tmp/, named after the frame, and the remedy below reads
+    # from it for the same reason.
+    $raws = Join-Path (Resolve-Path (Join-Path $PSScriptRoot '..\..\..\..')).Path 'tmp\screenshot-raws'
+    New-Item -ItemType Directory -Force -Path $raws | Out-Null
+    $raw = Join-Path $raws (Split-Path -Leaf $Path)
+    Copy-Item -Force $Path $raw
+    # The interpreter in the remedy is the one we RESOLVED, falling back to `python`
+    # only in the branch that tells you to install it.
+    $suggest = "$(if ($py) { $py } else { 'python' }) `"$winframe`" $($flags -join ' ') `"$raw`" --out `"$Path`""
+    if (-not $py) { throw "Captured $Path but python is not on PATH, so it has no frame. The capture is kept at $raw. Install python (with numpy and scipy) and run: $suggest" }
+    if (-not (Test-Path $winframe)) { throw "Captured $Path but $winframe is missing, so it has no frame. The capture is kept at $raw. Install the dotfiles and run: $suggest" }
+    & $py $winframe @flags $Path
+    if ($LASTEXITCODE -ne 0) { throw "winframe.py failed on $Path; the frame was not drawn. The capture is kept at $raw. Reproduce with: $suggest" }
 }
 
 # Refuse to photograph a project that is not cleared for publication.
@@ -175,8 +174,8 @@ function Add-Hairline {
 # that file's own list comment gives: a copy per caller is a copy to forget to
 # update, and this one would be a copy per PLATFORM, which is worse — the two
 # would drift silently and only the committed frame would show it. The macOS
-# capture scripts import the same function; window-shot.ps1 already shells out to
-# trim_halo.py, so the shape is proven here.
+# capture scripts import the same function; Add-WindowFrame already shells out to
+# winframe.py, so the shape is proven here.
 #
 # THE ROSTER GOES ACROSS, NOT THE NAMES. Extracting "what is on screen" from a row
 # is `names_in_frame` on the Python side, and it belongs there: it encodes what
@@ -255,4 +254,44 @@ function Get-ShotPath {
     param([Parameter(Mandatory = $true)][string]$Id)
     # capture/lib -> capture -> screenshots
     return Join-Path (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)) "$Id.png"
+}
+
+# Move the pointer to (X, Y) for as long as -Do runs and put it back afterwards,
+# whatever -Do does. Two frames need the pointer somewhere in particular: a tray
+# menu opens at it, and a window that opens under a resting pointer shows its
+# hover tooltip, which moving the pointer away afterwards does not clear.
+#
+# Coordinates are physical pixels. Get-PrimaryWorkArea returns the rectangle to
+# aim at in the same units: the thread is made PerMonitorV2 aware first, or a
+# scaled display reports its work area divided by its scale.
+if (-not ('DashboardPointer' -as [type])) {
+    Add-Type @'
+using System;
+using System.Runtime.InteropServices;
+public class DashboardPointer {
+    [DllImport("user32.dll")] public static extern IntPtr SetThreadDpiAwarenessContext(IntPtr ctx);
+    [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT p);
+    [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
+    [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X, Y; }
+}
+'@
+}
+
+function Get-PrimaryWorkArea {
+    Add-Type -AssemblyName System.Windows.Forms
+    [void][DashboardPointer]::SetThreadDpiAwarenessContext([IntPtr](-4))
+    return [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+}
+
+function Invoke-WithPointerAt {
+    param(
+        [Parameter(Mandatory = $true)][int]$X,
+        [Parameter(Mandatory = $true)][int]$Y,
+        [Parameter(Mandatory = $true)][scriptblock]$Do
+    )
+    [void][DashboardPointer]::SetThreadDpiAwarenessContext([IntPtr](-4))
+    $was = New-Object DashboardPointer+POINT
+    [void][DashboardPointer]::GetCursorPos([ref]$was)
+    [void][DashboardPointer]::SetCursorPos($X, $Y)
+    try { & $Do } finally { [void][DashboardPointer]::SetCursorPos($was.X, $was.Y) }
 }

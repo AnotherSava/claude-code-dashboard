@@ -4,8 +4,8 @@
 
 .DESCRIPTION
   The shared Windows half of the screenshot capture recipes in ../. Every per-frame
-  script calls this rather than open-coding a capture, so the four documentation
-  frames cannot drift in DPI handling, cropping or border trimming.
+  script calls this rather than open-coding a capture, so the Windows documentation
+  frames cannot drift in DPI handling or cropping.
 
   Two things this gets right that a naive capture does not:
 
@@ -28,6 +28,14 @@
   window chrome (title bar, rounded corners, drop shadow) as the user sees it, and
   a WebView2 window under a decorated frame renders more faithfully this way.
 
+.PARAMETER Popup
+  The target is a popup menu (class #32768, opened by TrackPopupMenu) rather than a
+  window that can hold focus. Alpha only, and it changes two things. The raise is
+  skipped: a popup never becomes the foreground window, and the ALT press that
+  earns foreground rights would dismiss the menu outright. And the backdrops are
+  shown without activation, because a menu's modal loop ends the moment anything
+  else is activated -- so the capture would photograph two empty backdrops.
+
 .EXAMPLE
   window-shot.ps1 -List
   window-shot.ps1 -ProcessName claude-code-dashboard -Title 'Work intensity' -Method Screen -Out shot.png
@@ -49,6 +57,7 @@ param(
     # window is the one wanted — two Windows Terminal windows both titled after
     # the tab that was just opened in one of them, say.
     [switch]$First,
+    [switch]$Popup,
     [switch]$List
 )
 
@@ -144,6 +153,9 @@ if ($Client -and $Method -ne 'PrintWindow') {
     # failure mode worth an error.
     throw "-Client only applies to -Method PrintWindow; $Method captures the visible frame. Drop one of the two."
 }
+if ($Popup -and $Method -ne 'Alpha') {
+    throw "-Popup only changes the Alpha path, and -Method is ${Method}: Screen raises the target, whose ALT press dismisses a menu, and PrintWindow has nothing for -Popup to change. Use -Method Alpha."
+}
 
 $target = $null
 if ($Hwnd -ne 0) {
@@ -226,17 +238,19 @@ if ($Method -eq 'Alpha') {
     # real antialiasing instead of a re-drawn approximation.
     Add-Type -AssemblyName System.Windows.Forms
 
-    [void][WinShot]::keybd_event(0x12, 0, 0, [UIntPtr]::Zero)
-    [void][WinShot]::keybd_event(0x12, 0, 2, [UIntPtr]::Zero)
-    [void][WinShot]::BringWindowToTop($h)
-    [void][WinShot]::SetForegroundWindow($h)
-    $raised = $false
-    for ($i = 0; $i -lt 20; $i++) {
-        if ([WinShot]::GetForegroundWindow() -eq $h) { $raised = $true; break }
-        Start-Sleep -Milliseconds 100
+    if (-not $Popup) {
+        [void][WinShot]::keybd_event(0x12, 0, 0, [UIntPtr]::Zero)
+        [void][WinShot]::keybd_event(0x12, 0, 2, [UIntPtr]::Zero)
+        [void][WinShot]::BringWindowToTop($h)
         [void][WinShot]::SetForegroundWindow($h)
+        $raised = $false
+        for ($i = 0; $i -lt 20; $i++) {
+            if ([WinShot]::GetForegroundWindow() -eq $h) { $raised = $true; break }
+            Start-Sleep -Milliseconds 100
+            [void][WinShot]::SetForegroundWindow($h)
+        }
+        if (-not $raised) { throw 'Could not bring the window to the foreground, so a screen capture would photograph whatever is in front of it. Nothing was written.' }
     }
-    if (-not $raised) { throw 'Could not bring the window to the foreground, so a screen capture would photograph whatever is in front of it. Nothing was written.' }
     [void][WinShot]::DwmGetWindowAttribute($h, [WinShot]::DWMWA_EXTENDED_FRAME_BOUNDS, [ref]$frame, 16)
     $w = $frame.Right - $frame.Left
     $t = $frame.Bottom - $frame.Top
@@ -274,7 +288,9 @@ if ($Method -eq 'Alpha') {
 
     function Get-Over([System.Drawing.Color]$colour) {
         $back.BackColor = $colour
-        $back.Show()
+        # Behind a popup, the SetWindowPos below shows the backdrop on its own,
+        # with SWP_NOACTIVATE; Show() would activate it and end the menu.
+        if (-not $Popup) { $back.Show() }
         # SWP_NOACTIVATE|SWP_SHOWWINDOW: insert the backdrop directly BELOW the
         # target in z-order, which is what keeps a topmost target (the widget is
         # always-on-top) visible over a topmost backdrop, and keeps focus put.
@@ -435,21 +451,15 @@ if ($Method -eq 'Alpha') {
 
 $dir = Split-Path -Parent $Out
 if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+# Record the window's DPI in the PNG. The frame the docs-relevance skill's
+# winframe.py draws is sized from it, and nothing else in the file says which
+# display the window was on.
+$shotDpi = [WinShot]::GetDpiForWindow($h)
+if ($shotDpi -gt 0) { $bmp.SetResolution($shotDpi, $shotDpi) }
+# Saved untouched, the compositor's drop shadow included: the two-exposure solve
+# recovers it outside the corners because it is genuinely on screen. Nothing here
+# clears it, because every caller hands the file to Add-WindowFrame, which draws
+# everything outside the content Windows clips and keeps this file as the raw.
 $bmp.Save($Out, [System.Drawing.Imaging.ImageFormat]::Png)
-if ($Method -eq 'Alpha') {
-    # The two-exposure solve recovers the compositor's drop shadow along with the
-    # window, because the shadow is genuinely on screen and genuinely part-
-    # transparent. It is not part of the window, and on a light documentation page
-    # it reads as a pale square filling each corner outside the round. Clearing it
-    # is a flood fill from each corner rather than a threshold, so nothing inside
-    # the window is reachable -- see lib/trim_halo.py.
-    $trim = Join-Path $PSScriptRoot 'trim_halo.py'
-    $py = if (Get-Command python -ErrorAction SilentlyContinue) { 'python' }
-          elseif (Get-Command python3 -ErrorAction SilentlyContinue) { 'python3' }
-          else { $null }
-    if (-not $py) { throw "Captured $Out but python is not on PATH, so the corner shadow was left in it. Install python or run: python $trim `"$Out`"" }
-    & $py $trim $Out
-    if ($LASTEXITCODE -ne 0) { throw "trim_halo.py failed on $Out; the frame still carries its corner shadow." }
-}
 Write-Host "$Out  $($bmp.Width)x$($bmp.Height)  dpi=$([WinShot]::GetDpiForWindow($h))  method=$Method  title='$($target.Title)'"
 $bmp.Dispose()

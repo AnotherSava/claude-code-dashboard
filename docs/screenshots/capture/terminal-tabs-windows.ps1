@@ -21,8 +21,9 @@
             little padding, so the frame ends just past the new-tab button
             instead of carrying a metre of empty bar and the window controls.
 
-  -Method Alpha, like the other Windows frames: the strip keeps the window's own
-  rounded top corners and its border, with everything outside them transparent.
+  -Method Alpha, like the other Windows frames: the strip keeps the window's
+  rounded top-left corner, transparent outside it; its frame is then drawn by
+  Add-WindowFrame.
   It reads pixels off the screen, so the window has to be unobscured — which is
   also why the widget is hidden for the shot. PrintWindow is not an option here
   at all: it returns a stale or blank surface for Windows Terminal's XAML
@@ -39,8 +40,7 @@ param(
     # of its own: the staging knows which window it just created, and a title
     # match cannot tell two windows apart when both are showing the same tab.
     [int]$Hwnd = 0,
-    [int]$Pad = 16,
-    [ValidateSet('Alpha', 'Screen', 'PrintWindow')][string]$Method = 'Alpha'
+    [int]$Pad = 16
 )
 
 $ErrorActionPreference = 'Stop'
@@ -48,7 +48,7 @@ Add-Type -AssemblyName System.Drawing
 . (Join-Path $PSScriptRoot 'lib/dashboard.ps1')
 
 $raw = Join-Path ([System.IO.Path]::GetTempPath()) 'ccdash-wt-strip.png'
-$shot = @{ Method = $Method; Out = $raw }
+$shot = @{ Method = 'Alpha'; Out = $raw }
 if ($Hwnd -ne 0) {
     $shot.Hwnd = $Hwnd
 } else {
@@ -92,6 +92,15 @@ try {
         [System.Runtime.InteropServices.Marshal]::Copy($data.Scan0, $bytes, 0, $bytes.Length)
         $stride = $data.Stride
     } finally { $bmp.UnlockBits($data) }
+
+    # The frame drawn afterwards is a normal window's: rounded top-left corner and a
+    # border. A maximized window has neither -- every pixel of it is opaque -- so
+    # the frame would claim a shape the window never had. Refuse here, before
+    # anything is written, rather than after the crop has replaced the committed
+    # frame.
+    if ($bytes[[int]($bmp.Width / 2) * 4 + 3] -eq 255) {
+        throw 'The terminal window has no translucent border of its own, which is what a maximized window looks like. Restore it to a normal size and re-run. Nothing was written.'
+    }
 
     # BGRA
     function Get-Px([int]$x, [int]$y) {
@@ -169,42 +178,42 @@ try {
 
     $w = [math]::Min($bmp.Width, $right + $Pad + 1)
     $crop = $bmp.Clone((New-Object System.Drawing.Rectangle 0, 0, $w, $stripH), $bmp.PixelFormat)
+    # Carry the window's DPI to the crop: the frame is sized from it.
+    $crop.SetResolution($bmp.HorizontalResolution, $bmp.VerticalResolution)
     try {
+        # Saved beside the raw capture and moved into place only once every check
+        # and the border step have passed, so a failure leaves the committed frame
+        # as it was.
         $out = Get-ShotPath 'terminal-tabs-windows'
-        $crop.Save($out, [System.Drawing.Imaging.ImageFormat]::Png)
+        # Named after the frame, because Add-WindowFrame keeps a raw copy under the
+        # name it is given.
+        $stageDir = Join-Path ([System.IO.Path]::GetTempPath()) 'ccdash-shot'
+        New-Item -ItemType Directory -Force -Path $stageDir | Out-Null
+        $staged = Join-Path $stageDir (Split-Path -Leaf $out)
+        $crop.Save($staged, [System.Drawing.Imaging.ImageFormat]::Png)
         Write-Host "$out  $($crop.Width)x$($crop.Height)  strip height ${stripH}px"
 
         # Checked on the crop rather than the whole window: an unrendered band is
         # inherited by whatever is cut out of it, and the crop is the frame that
         # gets committed. Its right edge is bare tab-strip grey, so an opaque
         # black column there is the fault and not the design.
-        Assert-Rendered -Path $out
+        Assert-Rendered -Path $staged
 
-        # Give the crop an edge. A region crop never brings one: this keeps the
-        # window's own translucent border along its top and left, and its right
-        # and bottom are wherever the bounds above were measured -- bare content
-        # at (46, 46, 46), which on a dark page has nothing to stop the picture.
+        # Give the crop a frame. Its top and left are the window's own edges, with
+        # the rounded top-left corner; its right and bottom are cuts through bare
+        # content at (46, 46, 46), which on a dark page has nothing to stop the
+        # picture. Add-WindowFrame draws the window's frame round all four, straight
+        # and square-cornered along the cuts.
         #
-        # AFTER the save, not before, because the border has to trace the cropped
-        # shape; stroking the whole window first would put the edge where this
-        # crop cuts it away.
-        #
-        # The script is the docs-relevance skill's, shared with the macOS capture
-        # rather than reimplemented here: one border, one width, one colour, on
-        # two frames the README prints side by side. It decides for itself whether
-        # a frame needs one, so the widget captures -- which arrive with Windows'
-        # own border -- are left alone by it.
-        #
-        # -Opaque because this frame in particular keeps a border on two sides and
-        # is cut bare on the other two, and Windows' own is translucent: left as
-        # it is, the kept sides take their colour from whatever is behind the page
-        # and vanish on a dark one while the stroked sides stay bright. The flag
-        # replaces all four with one opaque band so the crop has a single border.
-        # It is passed here rather than decided in the skill because which frames
-        # are crops of a translucent-bordered window is something this project
-        # knows and that script cannot see.
-        Add-Hairline -Path $out -Opaque
-    } finally { $crop.Dispose() }
+        # AFTER the save, not before, because the frame has to follow the cropped
+        # shape; drawing it on the whole window first would put the edge where
+        # this crop cuts it away.
+        Add-WindowFrame -Path $staged -Cut right, bottom
+        Move-Item -Force $staged $out
+    } finally {
+        $crop.Dispose()
+        Remove-Item $staged -ErrorAction SilentlyContinue
+    }
 } finally {
     $bmp.Dispose()
     Remove-Item $raw -ErrorAction SilentlyContinue

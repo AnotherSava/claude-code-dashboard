@@ -14,8 +14,8 @@
   * The restore runs in `finally`. A capture that fails partway through must not
     leave the user's widget in a mode they did not choose.
 
-  As with the hero, -Method Alpha: the window with its real border and rounded
-  corners, transparent outside them.
+  As with the hero, -Method Alpha: the window's content and its rounded outline,
+  transparent outside it. The frame itself is then drawn by Add-WindowFrame.
 #>
 [CmdletBinding()]
 param(
@@ -52,7 +52,7 @@ try {
     $out = Get-ShotPath 'compact-mode-windows'
     Invoke-WindowShot @{ ProcessName = 'claude-code-dashboard'; Title = 'Claude Code Dashboard'; Method = 'Alpha'; Out = $out }
     Assert-Rendered -Path $out
-    Add-Hairline -Path $out -Opaque
+    Add-WindowFrame -Path $out
 } finally {
     Set-CompactMode $was
 }
