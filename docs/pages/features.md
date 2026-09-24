@@ -110,6 +110,14 @@ Get pinged when a session needs you — for example, when it finishes or sits wa
 
 When you want nothing held back — you're watching for anything at all — the tray's **High alert** toggle sends every notification the moment it happens, skipping the away-detection and reading delays entirely. It applies to the session states (finished, blocked, error) and leaves the context-usage and usage-limit pings on their own schedule.
 
+## Keeping the Mac awake while an agent works
+
+macOS only. Leave an agent running, step away, and the Mac's idle timer can put it to sleep mid-task — the turn dies with "Your computer went to sleep mid-response", and on battery that can happen within a minute of you walking off. The widget holds sleep off for as long as an agent is actually working and lets go once they have all finished. It is on out of the box, under the tray's **Keep awake while working**.
+
+Only the idle timer is held off. The screen still goes dark on its own schedule, and the Mac still sleeps for every other reason — you close the lid, the battery runs low, it gets too hot. It cannot leave a laptop awake in a bag, which is why it needs no setup and leaves nothing behind to undo.
+
+An agent that stops responding rather than finishing does not hold sleep off forever: a session that has gone quiet for long enough is treated as done with. The wait before that is deliberately long, because from the outside a single slow step — a long build, or work handed to a sub-agent — looks exactly like a stuck one. See [Settings](settings#keeping-the-mac-awake-while-an-agent-works) for the timings.
+
 ## Keeping the Mac awake with the lid closed
 
 macOS only. Shut the lid on a working agent and the Mac sleeps, taking the agent's task with it — which is exactly what happens when you pick the laptop up and walk somewhere. The tray's **Keep awake with lid closed** submenu holds sleep off while an agent is still working, so a closed laptop keeps going on the way between desks.

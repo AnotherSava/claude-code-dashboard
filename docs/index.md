@@ -19,6 +19,7 @@ A desktop app for Windows and macOS — a compact always-on-top widget that list
 - **Finished, and not yet read** — DONE means an agent finished *and you haven't looked yet*; read it and the row drops to IDLE, and any Telegram ping about it is deleted, so what's still marked DONE is exactly what's still waiting for you.
 - **Sessions survive a restart** — update or reboot the widget and your agents are still listed, each at the status it was on, so a session parked on a question isn't invisible until you happen to go looking.
 - **Multi-device sync** — track sessions running on your other devices the same way as local ones, and let your agents message each other across machines — starting a session on the other side, with your approval, if nothing is running there.
+- **Keep awake while working** (macOS) — the Mac won't fall asleep out from under a running agent, so stepping away mid-task doesn't kill it. On by default.
 - **Keep awake with the lid closed** (macOS) — carry the laptop to another room mid-task without the Mac sleeping and stopping the agent, for a bounded window you set.
 - **Focus on the task** — once Claude resumes after a question, the row shows your original request, not the *yes* you typed.
 - **Context usage** — each row shows how full the model's context is, colored green → amber → red as it fills, so you can tell at a glance whether `/compact` is due.

@@ -233,6 +233,31 @@ pub struct Config {
     /// `LimitBar`); toggled from the tray's **Compact view** checkbox. Off by
     /// default.
     pub compact_mode: bool,
+    /// Keep macOS awake while a local agent is working, so a turn running with
+    /// the lid open isn't cut short by the idle-sleep timer. Held as an
+    /// unprivileged IOKit power assertion — the one `caffeinate -i` takes — so
+    /// it needs no setup, the display still sleeps, and the Mac still sleeps for
+    /// every reason that isn't the idle timer, low battery and thermal
+    /// emergency included. That bounded reach is why this one is on by default
+    /// where `lid_awake_mode` is not. macOS-only; a no-op elsewhere. Read by
+    /// `idle_awake::sync`; the tray's "Keep awake while working" checkbox
+    /// writes it.
+    pub idle_awake: bool,
+    /// How long a working session may go silent before the assertion is
+    /// released. A session whose process is alive but which has stopped
+    /// producing anything cannot be told from a wedged one, and the liveness
+    /// reaper doesn't help — it tests whether the process exists, not whether it
+    /// is progressing. Measured against `AgentSession::updated`, which the
+    /// transcript watcher bumps on every write a live turn makes.
+    ///
+    /// Generous on purpose, because the two errors cost different things: a
+    /// release that lands on a live turn causes the very sleep this prevents,
+    /// while a release that lands late costs battery until the low-battery
+    /// sleep no assertion can suppress takes over. A single long tool call and
+    /// anything running inside a subagent are both silent on this clock for
+    /// their whole duration. `null` or `0` holds for as long as the row stays
+    /// busy.
+    pub idle_awake_silence_ms: Option<u64>,
     /// Keep macOS awake with the lid closed while a local agent is working — the
     /// "carry the laptop between locations mid-task" case. macOS offers no API
     /// for this: every IOKit assertion carrying `AppliesOnLidClose` is refused
@@ -652,6 +677,8 @@ impl Default for Config {
             high_alert: false,
             instruction_canary_enabled: false,
             compact_mode: false,
+            idle_awake: true,
+            idle_awake_silence_ms: Some(1_800_000),
             lid_awake_mode: LidAwakeMode::Off,
             lid_awake_minutes: 15,
             lid_awake_release_grace_ms: 60_000,
@@ -1058,6 +1085,20 @@ mod tests {
         assert!(cfg.tray_context_alert_enabled, "checked by default");
         let off: Config = serde_json::from_str(r#"{ "tray_context_alert_enabled": false }"#).unwrap();
         assert!(!off.tray_context_alert_enabled);
+    }
+
+    /// The unprivileged tier ships on, unlike its lid-closed sibling below: it
+    /// installs nothing and cannot suppress the low-battery or thermal sleeps,
+    /// so there is nothing for a user to opt into.
+    #[test]
+    fn idle_awake_defaults_on_with_a_generous_silence_window() {
+        let cfg = Config::default();
+        assert!(cfg.idle_awake, "unprivileged and safe, so it is on out of the box");
+        assert_eq!(cfg.idle_awake_silence_ms, Some(1_800_000));
+        let off: Config = serde_json::from_str(r#"{ "idle_awake": false }"#).unwrap();
+        assert!(!off.idle_awake);
+        let uncapped: Config = serde_json::from_str(r#"{ "idle_awake_silence_ms": null }"#).unwrap();
+        assert_eq!(uncapped.idle_awake_silence_ms, None, "null holds for as long as the row stays busy");
     }
 
     #[test]

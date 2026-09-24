@@ -29,6 +29,7 @@ const MENU_TRAY_BADGE_5H_LIGHT: &str = "tray_badge_5h_light";
 const MENU_TRAY_BADGE_7D_LIGHT: &str = "tray_badge_7d_light";
 const MENU_TRAY_BADGE_5H_NUM: &str = "tray_badge_5h_num";
 const MENU_TRAY_BADGE_7D_NUM: &str = "tray_badge_7d_num";
+const MENU_IDLE_AWAKE: &str = "idle_awake";
 const MENU_LID_AWAKE_OFF: &str = "lid_awake_off";
 const MENU_LID_AWAKE_START_NOW: &str = "lid_awake_start_now";
 const MENU_LID_AWAKE_ON_BATTERY: &str = "lid_awake_on_battery";
@@ -83,6 +84,7 @@ pub struct TrayHandles {
     pub tray_badge_7d_num: CheckMenuItem<Wry>,
     pub context_alert: CheckMenuItem<Wry>,
     pub high_alert: CheckMenuItem<Wry>,
+    pub idle_awake: CheckMenuItem<Wry>,
     pub lid_awake_off: CheckMenuItem<Wry>,
     pub lid_awake_on_battery: CheckMenuItem<Wry>,
     pub lid_awake_always: CheckMenuItem<Wry>,
@@ -219,6 +221,14 @@ pub fn setup(app: &AppHandle) -> tauri::Result<()> {
         .items(&[&lid_awake_on_battery, &lid_awake_always])
         .build()?;
 
+    let idle_awake_initial = app
+        .try_state::<ConfigState>()
+        .map(|s| s.snapshot().idle_awake)
+        .unwrap_or(true);
+    let idle_awake = CheckMenuItem::with_id(
+        app, MENU_IDLE_AWAKE, "Keep awake while working", true, idle_awake_initial, None::<&str>,
+    )?;
+
     let context_alert_initial = app
         .try_state::<ConfigState>()
         .map(|s| s.snapshot().tray_context_alert_enabled)
@@ -261,6 +271,7 @@ pub fn setup(app: &AppHandle) -> tauri::Result<()> {
         &tray_badge_submenu,
     ];
     if cfg!(target_os = "macos") {
+        items.push(&idle_awake);
         items.push(&lid_awake_submenu);
     }
     items.extend([
@@ -299,6 +310,7 @@ pub fn setup(app: &AppHandle) -> tauri::Result<()> {
         tray_badge_7d_num: tray_badge_7d_num.clone(),
         context_alert: context_alert.clone(),
         high_alert: high_alert.clone(),
+        idle_awake: idle_awake.clone(),
         lid_awake_off: lid_awake_off.clone(),
         lid_awake_on_battery: lid_awake_on_battery.clone(),
         lid_awake_always: lid_awake_always.clone(),
@@ -370,6 +382,7 @@ fn handle_menu_event(app: &AppHandle, id: &str) {
         MENU_TRAY_BADGE_7D_LIGHT => select_tray_badge(app, TrayBadge::SevenDayLight),
         MENU_TRAY_BADGE_5H_NUM => select_tray_badge(app, TrayBadge::FiveHourNumber),
         MENU_TRAY_BADGE_7D_NUM => select_tray_badge(app, TrayBadge::SevenDayNumber),
+        MENU_IDLE_AWAKE => toggle_idle_awake(app),
         MENU_LID_AWAKE_OFF => select_lid_awake_mode(app, LidAwakeMode::Off),
         MENU_LID_AWAKE_START_NOW => start_lid_awake_now(app),
         MENU_LID_AWAKE_ON_BATTERY => select_lid_awake_mode(app, LidAwakeMode::OnBattery),
@@ -648,6 +661,21 @@ pub fn sync_lid_awake_state(app: &AppHandle, mode: LidAwakeMode, manual_remainin
     let _ = handles.lid_awake_off.set_checked(!holding && mode == LidAwakeMode::Off);
     let _ = handles.lid_awake_on_battery.set_checked(!holding && mode == LidAwakeMode::OnBattery);
     let _ = handles.lid_awake_always.set_checked(!holding && mode == LidAwakeMode::Always);
+}
+
+fn toggle_idle_awake(app: &AppHandle) {
+    let Some(state) = app.try_state::<ConfigState>() else { return };
+    let new_state = !state.snapshot().idle_awake;
+    state.with_mut(|c| c.idle_awake = new_state);
+    let _ = state.save_to_disk();
+    if let Some(handles) = app.try_state::<TrayHandles>() {
+        let _ = handles.idle_awake.set_checked(new_state);
+    }
+    emit_config_updated(app);
+    // Take or drop the assertion now rather than at the next tick. The config
+    // watcher cannot do it for us: it skips a write whose serialized value it
+    // already holds, which is exactly the write `save_to_disk` just made.
+    crate::idle_awake::reevaluate(app);
 }
 
 fn toggle_context_alert(app: &AppHandle) {

@@ -22,6 +22,22 @@ pub enum Status {
     Error,
 }
 
+impl Status {
+    /// True when a turn is in flight and sleeping the machine would suspend it.
+    ///
+    /// `Waiting` counts: the main turn settled but a background shell task or
+    /// subagent is still running. `Blocked` does not — the agent is parked on
+    /// the user, so nothing progresses while the Mac is asleep anyway.
+    ///
+    /// Both sleep holds read this — [`crate::lid_awake`] for the lid-closed
+    /// veto and [`crate::idle_awake`] for the idle-sleep assertion — and they
+    /// have to agree on what counts as work, since a row one of them protects
+    /// and the other does not would sleep by whichever rule is laxer.
+    pub fn is_live_work(self) -> bool {
+        matches!(self, Status::Working | Status::Waiting)
+    }
+}
+
 /// Whether a finished row is still waiting to be looked at — the "I haven't read
 /// this one yet" axis, orthogonal to [`Status`].
 ///
@@ -1063,6 +1079,19 @@ pub fn merge_dialog_entries(dialog: &mut Vec<DialogEntry>, incoming: &[DialogEnt
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn waiting_is_live_work_but_blocked_is_not() {
+        for st in [Status::Working, Status::Waiting] {
+            assert!(st.is_live_work(), "{st:?} is a turn in flight that sleeping would suspend");
+        }
+        // Blocked is parked on the user — nothing progresses while the Mac is
+        // asleep, so it must hold neither the lid veto (and with it, thermal
+        // safety sleep) nor the idle-sleep assertion.
+        for st in [Status::Idle, Status::Blocked, Status::Done, Status::Error] {
+            assert!(!st.is_live_work(), "{st:?} should not hold the Mac awake");
+        }
+    }
 
     fn set(id: &str, status: Status, label: &str) -> SetInput {
         SetInput {

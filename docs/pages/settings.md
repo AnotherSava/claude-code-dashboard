@@ -18,7 +18,7 @@ The tray's **Open config/logs location** shortcut opens this folder. The widget 
 
 Right-click the tray icon for the controls you reach for most:
 
-- **Show / Hide widget** — toggle the window (also a left-click on the tray icon).
+- **Show / Hide** — toggle the window (also a left-click on the tray icon).
 - **Always on top** — keep the widget above your other windows.
 - **Save position on exit** — reopen where you left it, at the same size.
 - **Color terminal tabs** — show each session's status as a colored circle in its terminal tab title.
@@ -27,10 +27,14 @@ Right-click the tray icon for the controls you reach for most:
 - **Auto-resize** — fit the window height to its content, growing upward or downward. The widget owns its height while this is on, so dragging its top or bottom edge does nothing; the sides still resize the width.
 - **History font size** — pick one of five sizes for the history window.
 - **Tray usage badge** — show the 5-hour or 7-day usage on the tray icon, as the recolored traffic light or a number (or none).
+- **Keep awake while working** (macOS) — stop the Mac's idle timer sleeping it while an agent is still working (on by default). Holds off only the idle timer, so the screen still sleeps and closing the lid still works as usual. See [Features](features#keeping-the-mac-awake-while-an-agent-works).
 - **Keep awake with lid closed** (macOS) — stop the Mac sleeping when you shut the lid while an agent is still working: off, only on battery, or always, plus a **Start now** button that holds once regardless. The title shows how long a hold lasts, and the first time you use it you're asked for your password. See [Features](features#keeping-the-mac-awake-with-the-lid-closed).
 - **Show high context usage** — flag a session that's filling its context window on the tray icon (on by default). Has no visible effect unless a tray usage badge is on.
 - **High alert** — send every configured state notification (blocked, done, error) to Telegram the instant it happens, skipping the usual delays (off by default). Doesn't affect the context-usage or usage-limit alerts.
+- **Work intensity** — open the chart of how hard your agents have been working, by day or by week.
 - **Open config/logs location** — open the app data folder.
+- **Startable projects** — open the list of projects a message from another machine may start a session in.
+- **Help** — About, and the instructions for connecting a new machine.
 - **Quit** — close the widget.
 
 ## Config file
@@ -92,6 +96,13 @@ Every field is optional — omit one and the built-in default applies. A complet
   "limit_bar_segments": 16,
   "usage_limits_poll_interval_seconds": 600,
   "usage_reset_poll_delay_seconds": 30,
+  "idle_awake": true,
+  "idle_awake_silence_ms": 1800000,
+  "lid_awake_mode": "off",
+  "lid_awake_minutes": 15,
+  "lid_awake_release_grace_ms": 60000,
+  "lid_awake_battery_floor_pct": 20,
+  "high_alert": false,
   "sync": {
     "device_name": "",
     "listen": false,
@@ -184,6 +195,13 @@ For the full classification logic see [Classification](development/classificatio
 - `tray_badge` — show a usage limit on the tray icon. Values: `"none"`; `"five_hour_light"` / `"seven_day_light"` (recolor the traffic-light icon by usage); `"five_hour_number"` / `"seven_day_number"` (show the percentage, all-red light at 100%). The hover tooltip always shows both figures. Set it from the tray's **Tray usage badge** submenu.
 - `tray_context_alert_enabled` — whether the tray icon flags high context usage at all (the **Show high context usage** tray checkbox; on by default). Turning it off keeps `tray_context_alert_percent` intact, so re-checking it restores the same threshold.
 - `tray_context_alert_percent` — flag the tray icon when any session's context usage reaches this percent of its model's window — an at-a-glance "an agent is filling its context" warning. The light modes draw a red border around the traffic-light icon; the number modes draw the digits over a red background. `null` or `0` turns it off, and it never shows when `tray_badge` is `"none"` (there's no badge to frame) or when **Show high context usage** is unchecked.
+
+### Keeping the Mac awake while an agent works
+
+macOS only. See [Features](features#keeping-the-mac-awake-while-an-agent-works) for what this does.
+
+- `idle_awake` — whether the Mac is held awake while any local agent is working (the **Keep awake while working** tray checkbox; on by default). It holds off the idle timer only, so it can never stop the Mac sleeping when the lid shuts, the battery runs low or it overheats — which is why, unlike the lid setting below, it needs no password and installs nothing.
+- `idle_awake_silence_ms` — how long a working session may go quiet before the Mac is allowed to sleep again, in milliseconds. Long by default (1800000, thirty minutes) because a single slow step looks the same as a stuck session from outside: a long build, and anything an agent hands to a sub-agent, both go quiet for their whole run. Letting go too early costs you the task; letting go late only costs battery, and the Mac still sleeps on a low battery regardless. The moment the session produces anything the hold resumes. `null` or `0` keeps holding for as long as the session stays marked as working.
 
 ### Keeping the Mac awake with the lid closed
 

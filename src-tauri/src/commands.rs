@@ -1067,6 +1067,10 @@ pub fn emit_sessions_updated(app: &AppHandle) {
     // instantly and leaves no window to react in. Local rows only — a remote
     // row's work is another machine's problem, and its device holds its own veto.
     crate::lid_awake::sync(app, &local);
+    // ...and the lid-open half: an unprivileged power assertion that stops the
+    // idle timer sleeping the Mac out from under a running turn. Local rows
+    // only, for the same reason — a peer's work is its own machine's to protect.
+    crate::idle_awake::sync(app, &local);
     // Per-session context usage feeds the tray's context-alert border, so this
     // emit chokepoint also keeps the tray icon in step as token counts change.
     crate::tray_badge::refresh(app);

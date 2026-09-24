@@ -103,6 +103,14 @@ pub fn spawn(app: AppHandle, path: PathBuf) {
             if new_cfg.lid_awake_mode == crate::config::LidAwakeMode::Off && prior.lid_awake_mode != crate::config::LidAwakeMode::Off {
                 crate::lid_awake::release_now(&app, "mode turned off in config.json");
             }
+            // The idle-sleep assertion is decided level-triggered, so this only
+            // buys promptness: without it an edit here waits out the module's
+            // own minutes-scale tick, while the same change made from the tray
+            // takes effect at once. Safe to call unconditionally — it re-reads
+            // the config and does nothing when the verdict is unchanged.
+            if new_cfg.idle_awake != prior.idle_awake || new_cfg.idle_awake_silence_ms != prior.idle_awake_silence_ms {
+                crate::idle_awake::reevaluate(&app);
+            }
             if new_cfg.lid_awake_minutes != prior.lid_awake_minutes {
                 crate::tray::sync_lid_awake_title(&app, new_cfg.lid_awake_minutes);
             }

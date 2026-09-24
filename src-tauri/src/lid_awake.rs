@@ -88,7 +88,7 @@ use tauri::{AppHandle, Manager};
 
 use crate::commands::now_ms;
 use crate::config::{ConfigState, LidAwakeMode};
-use crate::state::{AgentSession, AppState, Status};
+use crate::state::{AgentSession, AppState};
 
 /// Poll cadence. Drives lid-state detection, lease expiry, and the battery
 /// floor. The lease is minutes-scale, so this only needs to be fine enough that
@@ -241,15 +241,6 @@ fn release_reason(s: &Sample, lid_closed_since: Option<i64>) -> &'static str {
     }
 }
 
-/// True when a status counts as work that sleeping would suspend.
-///
-/// `Waiting` counts: it means the main turn settled but a background shell task
-/// or subagent is still running. `Blocked` does not — the agent is parked on the
-/// user, so nothing progresses while the Mac sleeps.
-fn is_busy(status: Status) -> bool {
-    matches!(status, Status::Working | Status::Waiting)
-}
-
 // ---------------------------------------------------------------------------
 // Tracked state
 // ---------------------------------------------------------------------------
@@ -283,7 +274,7 @@ pub struct LidAwakeState {
 /// already flows through, so arming reacts immediately rather than at the next
 /// tick. Local sessions only — a remote row is another machine's work.
 pub fn sync(app: &AppHandle, sessions: &[AgentSession]) {
-    let any_busy = sessions.iter().any(|s| is_busy(s.status));
+    let any_busy = sessions.iter().any(|s| s.status.is_live_work());
     if let Some(state) = app.try_state::<LidAwakeState>() {
         if any_busy {
             state.inner.lock().unwrap().last_busy_at = now_ms();
@@ -305,7 +296,7 @@ pub fn spawn(app: AppHandle) {
             ticker.tick().await;
             let any_busy = app
                 .try_state::<AppState>()
-                .is_some_and(|st| st.snapshot().iter().any(|s| is_busy(s.status)));
+                .is_some_and(|st| st.snapshot().iter().any(|s| s.status.is_live_work()));
             evaluate(&app, any_busy);
         }
     });
@@ -322,7 +313,7 @@ pub fn arm_manual(app: &AppHandle) {
     state.inner.lock().unwrap().manual_until = Some(now_ms() + lease_ms as i64);
     let any_busy = app
         .try_state::<AppState>()
-        .is_some_and(|st| st.snapshot().iter().any(|s| is_busy(s.status)));
+        .is_some_and(|st| st.snapshot().iter().any(|s| s.status.is_live_work()));
     evaluate(app, any_busy);
 }
 
@@ -1029,15 +1020,4 @@ mod tests {
         assert!(!s.wants_arm(None));
     }
 
-    #[test]
-    fn waiting_counts_as_busy_but_blocked_does_not() {
-        for st in [Status::Working, Status::Waiting] {
-            assert!(is_busy(st), "{st:?} is real work that sleeping would suspend");
-        }
-        // Blocked is parked on the user — nothing progresses while asleep, so it
-        // must not hold the veto (and with it, thermal safety sleep) open.
-        for st in [Status::Idle, Status::Blocked, Status::Done, Status::Error] {
-            assert!(!is_busy(st), "{st:?} should not hold the Mac awake");
-        }
-    }
 }

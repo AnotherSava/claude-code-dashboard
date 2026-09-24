@@ -10,6 +10,7 @@ mod config_watcher;
 mod custom_names;
 mod http_server;
 mod idle;
+mod idle_awake;
 mod label_policy;
 mod lid_awake;
 mod liveness;
@@ -149,6 +150,7 @@ pub fn run() {
         .manage(liveness::AgentPids::new())
         .manage(nonce_store::NonceStore::new())
         .manage(lid_awake::LidAwakeState::default())
+        .manage(idle_awake::IdleAwakeState::default())
         .manage(sync::SyncDirty(std::sync::Arc::new(tokio::sync::Notify::new())))
         .manage(sync::SyncListening::default())
         // Read only by the two message routes, never by the frontend, so
@@ -290,6 +292,10 @@ pub fn run() {
             // reboot, so a stranded flag would otherwise persist indefinitely.
             lid_awake::clear_on_start();
             lid_awake::spawn(app.handle().clone());
+            // The lid-open half of the same question. Nothing to clear at
+            // startup: the kernel released any assertion this process held the
+            // moment the previous one exited.
+            idle_awake::spawn(app.handle().clone());
             attention::spawn(app.handle().clone());
             session_restore::spawn(app.handle().clone());
             // Gated by neither the platform nor `terminal_titles`, and both are
