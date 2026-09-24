@@ -1,6 +1,6 @@
 ---
 name: debug-live-widget-testing
-description: Change widget state for live UI testing via config write-then-touch (not restart-spam, which 429s the usage poll → "??"); DPI-aware PrintWindow capture
+description: Change widget state for live UI testing via config write-then-touch (not restart-spam, which 429s the usage poll → "??"); capturing the widget to inspect it, on Windows and macOS
 metadata:
   type: project
 ---
@@ -12,3 +12,7 @@ Iterating on the widget UI (usage bars, compact view) means repeatedly flipping 
 **Restarting instead 429s the usage poll.** Each launch calls `refreshUsageLimits` on mount; enough rapid restarts trip the Anthropic OAuth usage endpoint's aggressive 429 → `status = network_error` → the compact caps render `??` and the bars go stale, which **blocks verifying colored numbers/levels** until a poll succeeds again (backoff can run minutes). Distinct from [[usage_endpoint_zeros_after_5h_cap]] (the post-5h-cap 0/null transient). So prefer the config-touch trigger over restart-spamming when iterating the usage UI; grep `widget.jsonl` for `HttpStatus(429` and `event usage_limits_updated` status.
 
 **Screenshot the frameless HiDPI widget at true resolution.** Make the capturing process DPI-aware first — `SetThreadDpiAwarenessContext(-4)` (PerMonitorV2) — or `GetWindowRect` + `PrintWindow` read ÷scale virtualized (a 454px window captures as 303px; see [[debug_dpi_unaware_probe_virtualization]]). `PrintWindow(hdc, 2)` (`PW_RENDERFULLCONTENT`) grabs the WebView2 content. A 3× nearest-neighbor upscale of the header strip lets you inspect per-pixel — baseline alignment, sub-pixel color, 1px vs 2px borders.
+
+**On macOS, go through the repo's own capture lib, and hand it an absolute path.** `docs/screenshots/capture/lib/dashboard.py` already wraps `screencapture -l<id> -o`, which writes the window at device resolution with real per-pixel alpha and no drop shadow — `dash.find_window`/`dash.list_windows` names the id and `dash.shot("Claude Code Dashboard", out, trim=False)` takes it. Two traps sit in that one call. `out` must be **absolute**: `shot()` finishes by printing `path.relative_to(REPO)`, which raises `ValueError` on a relative path *after* the PNG is on disk, so the capture actually succeeded and the traceback is only about the log line. And `trim=True`, the default, runs `trim_halo.py` — which crops away exactly the transparency you would be measuring.
+
+**Then settle a shape question on the alpha channel, not by eye.** Walking the inward diagonal from each corner separates rounded from square numerically: rounded reads `0 0 0 0 0 70 255 …` while square reads `255` at the very first pixel. Used on 2026-09-24 to confirm the widget's 10px radius still applied on macOS after it was gated behind a `navigator.userAgent` test — opaque from x=19, the 20 device px a 10px CSS radius predicts at DPR 2. Note the antialiased step differs per corner (70 at the top, 38 at the bottom) because the header and the last row are different colors; that is the same geometry, not a defect.
