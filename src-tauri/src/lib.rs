@@ -237,10 +237,11 @@ pub fn run() {
                 // Lock is inactive until apply() flips it on, so this is a
                 // no-op until the user picks an Up/Down mode.
                 auto_resize::install_resize_lock(&window);
-                // Force the window class's background brush to the dark
-                // theme color, so growing the window via left/right resize
-                // doesn't paint a brief flash of white before the webview
-                // renders into the new area.
+                // Windows: force the window class's background brush to the
+                // dark theme color, so growing the window via left/right
+                // resize doesn't paint a brief flash of white before the
+                // webview renders into the new area. macOS: clear the window's
+                // background, so the widget's own rounded corners show.
                 auto_resize::set_dark_window_background(&window);
 
                 // Safety net: if the frontend never calls `show_window`

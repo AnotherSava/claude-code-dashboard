@@ -56,6 +56,11 @@
   // element before the first paint, and module-scope runs during component init
   // while `onMount` runs after the first render.
   if (isMainWindow && typeof document !== 'undefined') document.documentElement.classList.add('transparent-shell')
+  // Whether the widget has to round its own corners, which only macOS needs —
+  // see `.widget.rounded`. Read off the user agent because this bundle only
+  // ever runs in two engines: WKWebView on macOS, whose agent names the
+  // Macintosh, and WebView2 on Windows, whose agent does not.
+  const roundsOwnCorners = typeof navigator !== 'undefined' && navigator.userAgent.includes('Macintosh')
   // Whether the pointer is really over the header — see the `.hide-btn.shown`
   // rule for why `header:hover` cannot answer that on a transparent window.
   //
@@ -705,7 +710,7 @@
 {:else if intensityMode}
   <IntensityApp />
 {:else}
-<div class="widget" bind:this={widgetEl}>
+<div class="widget" class:rounded={roundsOwnCorners} bind:this={widgetEl}>
   <header bind:this={headerEl} data-tauri-drag-region>
     <span class="title" data-tauri-drag-region>AI AGENTS</span>
     <div class="limits" class:compact={config?.compact_mode} data-tauri-drag-region>
@@ -760,9 +765,11 @@
     overflow: hidden;
     font-family: system-ui, 'Segoe UI', Roboto, sans-serif;
   }
-  /* The widget's window alone is `transparent: true`, and this is the layer its
-     rounded corners are cut out of: anything opaque here fills them back in.
-     The class is put on <html> by the script above, for the main window only. */
+  /* The widget's window alone is `transparent: true`. On macOS this is the layer
+     its rounded corners (`.widget.rounded`) are cut out of: anything opaque here
+     fills them back in. On Windows the widget is square and covers the whole
+     viewport, so nothing here shows. The class is put on <html> by the script
+     above, for the main window only. */
   :global(html.transparent-shell),
   :global(html.transparent-shell body) {
     background: transparent;
@@ -779,15 +786,20 @@
     color: #d6d6d6;
     user-select: none;
     -webkit-user-select: none;
-    /* The widget draws its own rounded corners, because nothing else will.
-       macOS rounds a *titled* window's frame at the compositor, and this window
-       is `decorations: false`, so it got square corners while every comparable
-       floating panel on the platform is round — and while the same widget on
-       Windows 11, which rounds the window itself, was round already. The two
-       builds disagreed about the shape of one widget.
+  }
+  /* On macOS the widget draws its own rounded corners, because nothing else
+     will. macOS rounds a *titled* window's frame at the compositor, and this
+     window is `decorations: false`, so it got square corners while every
+     comparable floating panel on the platform is round.
 
-       `overflow: hidden` is what makes the radius bite: the header and the
-       session list are opaque and would otherwise paint over the curve. */
+     NOT ON WINDOWS. Windows 11 rounds the window itself, at 8px, and draws its
+     border along that curve. A radius of our own on top of it sits inside that
+     curve, not on it, so a thin arc of the transparent window shows between
+     Windows' border and the content at every corner.
+
+     `overflow: hidden` is what makes the radius bite: the header and the
+     session list are opaque and would otherwise paint over the curve. */
+  .widget.rounded {
     border-radius: 10px;
     overflow: hidden;
   }

@@ -378,10 +378,12 @@ pub fn set_dark_window_background(window: &WebviewWindow) {
 /// The colour it used to paint was there so the first frame after `show()` was
 /// dark rather than white. That is covered without it: the window is created
 /// `visible: false` and is shown only once the frontend has painted, which is
-/// what 1f2411b added. The Windows arm above is unrelated and unchanged — it
+/// what 1f2411b added. The Windows arm above is a different mechanism: it
 /// replaces a window-class brush to stop an OS-painted white flash during a
-/// horizontal resize, which is a different mechanism on a window that has no
-/// transparency to preserve.
+/// horizontal resize. That window is `transparent: true` as well, since the
+/// config is global, but nothing on it is meant to show through: Windows 11
+/// rounds the window itself, so the widget stays square and opaque edge to edge
+/// there (see `.widget.rounded` in App.svelte).
 #[cfg(target_os = "macos")]
 pub fn set_dark_window_background(window: &WebviewWindow) {
     use tauri::window::Color;
