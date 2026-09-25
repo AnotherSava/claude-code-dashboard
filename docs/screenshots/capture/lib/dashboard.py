@@ -3,8 +3,9 @@
 
 Import it: `sys.path.insert(0, str(Path(__file__).parent / "lib"))` then
 `import dashboard as dash`. The macOS counterpart of `lib/dashboard.ps1` plus
-`lib/window-shot.ps1`, which are one file here because macOS needs almost none
-of what the Windows capture needs.
+the docs-relevance skill's `window-shot.ps1` and `windows-capture.ps1`, which
+are one file here because macOS needs almost none of what the Windows capture
+needs.
 
 WHY THIS IS SO MUCH SMALLER THAN THE WINDOWS HALF, since a reader coming from
 `window-shot.ps1` will expect several hundred lines and find sixty. That file is long because
@@ -500,7 +501,7 @@ def assert_publishable(names, allowed=PUBLISHABLE_PROJECTS, where: str = "the fr
 # The Windows half of this project is PowerShell and cannot import a Python
 # module, so without this the publishable-names rule would have to be written
 # twice — and the list's own comment above says why that is the thing to avoid:
-# a copy per caller is a copy to forget to update. `dashboard.ps1` already
+# a copy per caller is a copy to forget to update. The Windows frame step already
 # shells out to the skill's `winframe.py`, so the shape is proven on that machine.
 #
 # WHAT CROSSES THE BOUNDARY IS THE ROSTER, NOT THE NAMES, deliberately. Handing

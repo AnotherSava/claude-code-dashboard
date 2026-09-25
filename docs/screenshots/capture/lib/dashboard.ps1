@@ -34,7 +34,18 @@
   `config/local.json` is sometimes pointed at 9078 to keep a test instance off
   the live one, and a capture script that quietly talked to the wrong instance
   would produce a plausible screenshot of the wrong thing.
+
+  The shutter (window-shot.ps1) and the helpers any project needs unchanged --
+  the frame step, pointer placement, finding a process's windows -- come from
+  the docs-relevance skill's windows-capture.ps1, dot-sourced below, which every
+  project's Windows capture scripts share so a fix to one reaches all of them.
+  What stays here is what only this app needs, such as its loopback API and
+  getting its always-on-top widget out of the frame.
 #>
+
+$sharedCapture = Join-Path $env:USERPROFILE '.claude\skills\docs-relevance\scripts\windows-capture.ps1'
+if (-not (Test-Path $sharedCapture)) { throw "$sharedCapture is missing, and it holds the shutter every capture here uses. Install or pull the dotfiles and re-run. If the skill was renamed there, update this path and SKILL_SCRIPTS in lib/dashboard.py to match. Nothing was staged." }
+. $sharedCapture
 
 function Get-DashboardPort {
     $cfg = Join-Path $env:APPDATA 'com.anothersava.claude-code-dashboard\config.json'
@@ -76,14 +87,6 @@ function Get-DashboardAgents {
     return Invoke-RestMethod -Uri "http://127.0.0.1:$port/api/agents" -TimeoutSec 10
 }
 
-# Takes a hashtable and splats it, rather than collecting remaining arguments:
-# with -ValueFromRemainingArguments PowerShell resolves `-Out` against its own
-# common parameters first and fails on the ambiguity with -OutVariable.
-function Invoke-WindowShot {
-    param([Parameter(Mandatory = $true)][hashtable]$Params)
-    & (Join-Path $PSScriptRoot 'window-shot.ps1') @Params
-}
-
 # For every frame that is NOT the widget itself.
 #
 # The widget is always-on-top, so raising the target window does not get it out
@@ -106,76 +109,14 @@ function Invoke-WindowShotWithoutWidget {
     }
 }
 
-# Draw a saved frame's Windows 11 frame again, from Windows' own model.
-#
-# A captured Windows frame cannot be kept or cleaned: its border is translucent, so
-# it arrives mixed with the drop shadow and the backdrop behind it (the lighter-top,
-# darker-bottom shading a captured border shows is the shadow, not the border).
-# The docs-relevance skill's winframe.py keeps only the content inside the clip
-# Windows applies and draws the frame from DWM's measured model: 8 DIP corners (4
-# for a menu) flattened into chords, a 1 px antialiasing ramp, a 2 px border at 144
-# DPI. Drawn with Windows' own border and the window's own shadow it reproduces a
-# real capture to under one level RMS. Shelled out rather than written here for the reason every shared step
-# is: one implementation for every project, and the macOS half cannot read a
-# PowerShell function.
-#
-# THE RING IS LIGHTER THAN WINDOWS' AND THERE IS NO SHADOW, chosen by eye on
-# 2026-09-24. Windows' own border, rgba(117,117,117,0.40), reads 200 on a white
-# page and 55 on GitHub's dark one, where a README renders for a dark-mode reader.
-# rgba(146,146,146,0.69) reads 180 and 105 on every side. The shadow is left out
-# because it is what makes the bottom of a captured border darker than its top.
-#
-# -Kind menu gives a menu's own shape, 4 DIP corners, rather than a window's.
-# -Cut names the sides of a crop that are cuts rather than the window's edges: they
-# get the border straight along them and square corners.
-#
-# The capture records its window's DPI in the PNG and winframe.py sizes the frame
-# from it. This runs once, on the raw capture; a copy of that raw is kept first.
-$WindowFrameRing = '929292:0.69'
-function Add-WindowFrame {
-    param(
-        [Parameter(Mandatory = $true)][string]$Path,
-        [ValidateSet('window', 'menu')][string]$Kind = 'window',
-        [ValidateSet('left', 'top', 'right', 'bottom')][string[]]$Cut = @()
-    )
-    $winframe = Join-Path $env:USERPROFILE '.claude\skills\docs-relevance\scripts\winframe.py'
-    $py = if (Get-Command python -ErrorAction SilentlyContinue) { 'python' }
-          elseif (Get-Command python3 -ErrorAction SilentlyContinue) { 'python3' }
-          else { $null }
-    # THE FLAGS ARE BUILT ONCE AND USED FOR BOTH THE CALL AND THE SUGGESTED REMEDY,
-    # because those two drifted once: the throw messages composed their own command
-    # and left a flag out of it. A remedy that differs from what the code runs is
-    # worse than none.
-    $flags = @('--kind', $Kind, '--shadow', 'none', '--ring', $WindowFrameRing)
-    if ($Cut.Count -gt 0) { $flags += @('--cut', ($Cut -join ',')) }
-    # KEEP THE RAW, and before anything can throw. The frame step rewrites the file
-    # in place, so without a copy the only way to try a different frame is to take
-    # the shot again -- which needs the app staged and the machine taken over. And
-    # a caller that stages its file in a temp directory deletes it in `finally`, so
-    # a guard that threw first would lose the capture outright. The copy goes to
-    # the repo's gitignored tmp/, named after the frame, and the remedy below reads
-    # from it for the same reason.
-    $raws = Join-Path (Resolve-Path (Join-Path $PSScriptRoot '..\..\..\..')).Path 'tmp\screenshot-raws'
-    New-Item -ItemType Directory -Force -Path $raws | Out-Null
-    $raw = Join-Path $raws (Split-Path -Leaf $Path)
-    Copy-Item -Force $Path $raw
-    # The interpreter in the remedy is the one we RESOLVED, falling back to `python`
-    # only in the branch that tells you to install it.
-    $suggest = "$(if ($py) { $py } else { 'python' }) `"$winframe`" $($flags -join ' ') `"$raw`" --out `"$Path`""
-    if (-not $py) { throw "Captured $Path but python is not on PATH, so it has no frame. The capture is kept at $raw. Install python (with numpy and scipy) and run: $suggest" }
-    if (-not (Test-Path $winframe)) { throw "Captured $Path but $winframe is missing, so it has no frame. The capture is kept at $raw. Install the dotfiles and run: $suggest" }
-    & $py $winframe @flags $Path
-    if ($LASTEXITCODE -ne 0) { throw "winframe.py failed on $Path; the frame was not drawn. The capture is kept at $raw. Reproduce with: $suggest" }
-}
-
 # Refuse to photograph a project that is not cleared for publication.
 #
 # Shelled out to lib/dashboard.py rather than reimplemented here, for the reason
 # that file's own list comment gives: a copy per caller is a copy to forget to
 # update, and this one would be a copy per PLATFORM, which is worse — the two
 # would drift silently and only the committed frame would show it. The macOS
-# capture scripts import the same function; Add-WindowFrame already shells out to
-# winframe.py, so the shape is proven here.
+# capture scripts import the same function; the shared Add-WindowFrame already
+# shells out to winframe.py, so the shape is proven on this machine.
 #
 # THE ROSTER GOES ACROSS, NOT THE NAMES. Extracting "what is on screen" from a row
 # is `names_in_frame` on the Python side, and it belongs there: it encodes what
@@ -254,44 +195,4 @@ function Get-ShotPath {
     param([Parameter(Mandatory = $true)][string]$Id)
     # capture/lib -> capture -> screenshots
     return Join-Path (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)) "$Id.png"
-}
-
-# Move the pointer to (X, Y) for as long as -Do runs and put it back afterwards,
-# whatever -Do does. Two frames need the pointer somewhere in particular: a tray
-# menu opens at it, and a window that opens under a resting pointer shows its
-# hover tooltip, which moving the pointer away afterwards does not clear.
-#
-# Coordinates are physical pixels. Get-PrimaryWorkArea returns the rectangle to
-# aim at in the same units: the thread is made PerMonitorV2 aware first, or a
-# scaled display reports its work area divided by its scale.
-if (-not ('DashboardPointer' -as [type])) {
-    Add-Type @'
-using System;
-using System.Runtime.InteropServices;
-public class DashboardPointer {
-    [DllImport("user32.dll")] public static extern IntPtr SetThreadDpiAwarenessContext(IntPtr ctx);
-    [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT p);
-    [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
-    [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X, Y; }
-}
-'@
-}
-
-function Get-PrimaryWorkArea {
-    Add-Type -AssemblyName System.Windows.Forms
-    [void][DashboardPointer]::SetThreadDpiAwarenessContext([IntPtr](-4))
-    return [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
-}
-
-function Invoke-WithPointerAt {
-    param(
-        [Parameter(Mandatory = $true)][int]$X,
-        [Parameter(Mandatory = $true)][int]$Y,
-        [Parameter(Mandatory = $true)][scriptblock]$Do
-    )
-    [void][DashboardPointer]::SetThreadDpiAwarenessContext([IntPtr](-4))
-    $was = New-Object DashboardPointer+POINT
-    [void][DashboardPointer]::GetCursorPos([ref]$was)
-    [void][DashboardPointer]::SetCursorPos($X, $Y)
-    try { & $Do } finally { [void][DashboardPointer]::SetCursorPos($was.X, $was.Y) }
 }
