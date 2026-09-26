@@ -59,7 +59,6 @@ Under the repo root `claude-code-dashboard/`:
   - `main.ts` — mount entry point
   - `lib/`
     - `types.ts` — shared TS types and display helpers
-    - `mockSessions.ts` — dev-only fixtures (unused in release)
     - `api.ts` — invoke / listen wrappers
     - `components/`
       - `SessionList.svelte` — list container, empty-state
