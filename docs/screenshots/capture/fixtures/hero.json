@@ -1,0 +1,73 @@
+{
+  "about": "The hero figure's rows, replayed by lib/dashboard.py fixture-up. Local rows go through the dashboard's own /api/event, so the production classifier and state machine build them; rows with a device are pushed to its sync listener as that peer. The projects are the author's public repositories and every string is written for the frame. age_min is how long each row has been in its state when the shutter fires: local rows are replayed that many minutes early, and a pushed row carries it in its own timestamps. The two blocked rows are two minutes apart, 75 whole pulses of the BLOCK pill's 1.6s animation, so both pills are bright at once.",
+  "config": { "compact_mode": false },
+  "model": "claude-opus-5-5",
+  "rows": [
+    {
+      "project": "tauri-dashboard",
+      "expect": "working",
+      "age_min": 5,
+      "input_tokens": 874000,
+      "events": [
+        ["UserPromptSubmit", { "prompt": "show a subagent's permission prompt only while it is open" }]
+      ]
+    },
+    {
+      "project": "crop-stage",
+      "expect": "idle",
+      "age_min": 4,
+      "input_tokens": 58000,
+      "events": [
+        ["UserPromptSubmit", { "prompt": "remember the last crop ratio between sessions" }],
+        ["Stop", { "last_assistant_message": "The last crop ratio is now saved and restored on the next launch.", "background_tasks": [] }],
+        ["SessionStart", { "source": "resume" }]
+      ]
+    },
+    {
+      "project": "chrome-assistant",
+      "expect": "blocked",
+      "age_min": 2,
+      "input_tokens": 141000,
+      "events": [
+        ["UserPromptSubmit", { "prompt": "add a keyboard shortcut that opens the side panel" }],
+        ["Stop", { "last_assistant_message": "The side panel opens from the new command. Should the shortcut default to Ctrl+Shift+Y, or stay unassigned until you pick one?", "background_tasks": [] }]
+      ]
+    },
+    {
+      "project": "travel-map",
+      "expect": "done",
+      "age_min": 1,
+      "input_tokens": 96000,
+      "events": [
+        ["UserPromptSubmit", { "prompt": "add this year's trips to the map legend" }],
+        ["Stop", { "last_assistant_message": "The legend now lists this year's trips, each in its own colour.", "background_tasks": [] }]
+      ]
+    },
+    {
+      "project": "toolbox",
+      "expect": "blocked",
+      "age_min": 0,
+      "input_tokens": 37000,
+      "events": [
+        ["UserPromptSubmit", { "prompt": "clear out the old release builds" }],
+        ["PermissionRequest", { "tool_name": "Bash", "tool_input": { "command": "rm -rf dist/releases/old", "description": "Remove the old release builds" } }]
+      ]
+    },
+    {
+      "device": "AIR",
+      "project": "bga-assistant",
+      "expect": "waiting",
+      "age_min": 12,
+      "input_tokens": 312000,
+      "prompt": "re-run the parser tests against the new game export"
+    },
+    {
+      "device": "AIR",
+      "project": "achievement-overlay",
+      "expect": "done",
+      "age_min": 65,
+      "input_tokens": 188000,
+      "prompt": "stop the overlay flickering when a game switches to fullscreen"
+    }
+  ]
+}

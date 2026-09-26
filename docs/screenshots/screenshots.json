@@ -5,20 +5,19 @@
       "files": [
         "hero-windows.png"
       ],
-      "shows": "Windows. Main widget, one row blocked on its user, one working and one finished, with the 5h and 7d usage bars in the header — the hero image on both the README and the docs index",
+      "shows": "Windows. Main widget with seven rows spanning every status a session reports — working at high context, idle, blocked on a question, done, blocked on a permission — plus two rows synced from the AIR laptop, waiting and done; varied timers and token counts; and the 5h and 7d usage bars in the header. The hero image on both the README and the docs index",
       "policy": "confirm",
       "capture": {
         "command": "pwsh -File docs/screenshots/capture/hero-windows.ps1",
         "steps": [
           "Windows. The macOS half of this figure is hero-macos, which is its own entry and its own script.",
-          "ENFORCED, not just asked for: the script calls Assert-Publishable before the shutter, which pipes /api/agents to lib/dashboard.py — the same list and the same rule the macOS scripts import. A row not on PUBLISHABLE_PROJECTS refuses the capture. Renames are covered: the check reads display_name as well as the project, because the rename is the string in the picture.",
-          "MORE ROWS NEXT TIME. The README prints this beside hero-macos in a two-column table, so the pair is read as one picture and their heights should be comparable. As of 2026-09-13 they are not: hero-macos was re-shot with seven rows (840x594, aspect 0.71) while this is three rows (634x283, aspect 0.45), so at equal column width the macOS side renders about 1.58x the height of this one and the row looks lopsided. Whenever this frame is next redone, stage enough sessions to land near the macOS aspect — roughly seven rows, and the sibling entry's note on leaving sync ON is how it got them, since a peer's rows count toward the picture and are worth showing. Nothing is wrong with the current frame on its own; this is only about the pair.",
-          "Deploy the current build so the shot matches the working tree, not the installed release",
-          "Stage a real spread: one session genuinely blocked on its user, one mid-turn, one finished. The dashboard's hook does not fire on PostToolUse, so a session busy inside a long turn does not refresh its row — the working row has to be one that is mid-turn right now.",
-          "Sessions live in public repositories only. A row's label is its actual prompt, and a private project's task text ends up in the frame verbatim.",
-          "Turn sync listening off (`sync.listen`, start-only) so a peer's rows are not in frame; the script refuses while a peer is connected.",
-          "Turn `restore_sessions` off and restart, so the widget starts empty and only the staged sessions get rows. With it on, every idle session the terminal can vouch for comes back and the frame is whatever happened to be running.",
-          "Both usage bars must have a reading. Restarting the app repeatedly trips the usage endpoint's 429 backoff and the bars then render `--%`; this is the only frame that shows the header, so wait for a poll that succeeds after the restarts.",
+          "STAGED BY FIXTURE, not by live sessions. fixtures/hero.json lists the rows as the input that produces them. Invoke-DashboardFixture (lib/dashboard.py fixture-up) replays the local rows through the dashboard's own /api/event, so the classifier, the state machine and the widget run their production code, and pushes AIR's rows to the sync listener the way that peer's dashboard would. The projects are the author's public repositories and every string in the frame is written in that file, so no private project or prompt can reach the image. The fixture is also the subject anchor: a re-shoot replays the same rows.",
+          "fixture-up restarts the app on a capture config — restore_sessions off, no sync peers (the listener stays on only because the fixture pushes AIR's rows), the canary off, high_alert off and no Telegram block — so only the fixture's rows exist and nothing is pushed out or pinged. It replays the local rows oldest first so each is age_min old at the shutter (a local row's timer starts when its events arrive, so the run takes about five minutes), and pushes AIR's rows last because a peer's rows expire 90s after its push. fixture-down restarts the app on the original config byte for byte, puts back the history entries of the fixture's row ids, and restores remote_history/AIR.json. A run that dies in between is put back with `python docs/screenshots/capture/lib/dashboard.py fixture-down`.",
+          "ENFORCED: after the shutter the script refuses the frame unless the dashboard still holds exactly the fixture's rows in their expected statuses (fixture-check). A live session acting during the capture would put its own row, with its real prompt, in frame.",
+          "Deploy the current build first, so the shot matches the working tree rather than the installed release.",
+          "Both usage bars must have a reading. The capture restarts the app twice; the usage cache replays a recent reading at start, but if the endpoint is refusing and the cache is stale the bars render `--%`, so check the frame's header.",
+          "The pair with hero-macos: this frame has seven rows (634x465, aspect 0.73) against the macOS side's seven (840x594, aspect 0.71), so the two render at nearly the same height in the README's table. hero-macos still shows live sessions; replaying this fixture there too would give the pair one subject, once fixture-up can restart the app on macOS.",
+          "BLOCK pulses between full and 45% opacity every 1.6s. Invoke-WindowShotAtPulsePeak retakes the shot until `dashboard.py pulse-check` reads every BLOCK pill at 0.9 or more, and the fixture blocks its two BLOCK rows two minutes apart, 75 whole pulses, so they peak together.",
           "Captured with -Method Alpha: the window is photographed over a black and a white backdrop and the alpha solved per pixel, so the capture carries the window's content and its rounded outline with everything outside transparent. The border and corners in the committed frame are then drawn by Add-WindowFrame (see FRAME). Do not add -Client; the script refuses the combination.",
           "FRAME: drawn by Add-WindowFrame, which runs the docs-relevance skill's `winframe.py`: everything outside the content Windows clips 2px in is drawn from DWM's own model (12px corners at 144 DPI flattened into 8 chords as Direct2D does, a 1px antialiasing ramp, a 2px border at 144 DPI), with a lighter uniform ring, rgba(146,146,146,0.69), and no shadow, chosen on 2026-09-24 so the edge reads 180 on a white page and 105 on a dark one on every side. A captured Windows border is the border mixed with the drop shadow behind it, which is why its bottom reads darker than its top; the model draws the border alone. The capture records its DPI in the PNG and the frame is sized from it. The untouched capture is kept in tmp/screenshot-raws/."
         ]
@@ -48,7 +47,7 @@
           "ROUNDED CORNERS, which the widget draws itself as of 2026-09-11 — see the compact-mode-macos entry for the four things that had to agree before `transparent: true` took effect. A capture should ramp 0, 0, 0, 0, 0, 70, 255 down the diagonal, against 0, 0, 0, 64, 114, 255 on hero-windows, where Windows 11 rounds the window itself."
         ]
       },
-      "verifiedAt": "at-capture"
+      "verifiedAt": "76b44f3"
     },
     {
       "id": "compact-mode-windows",
@@ -69,7 +68,7 @@
           "FRAME: drawn by Add-WindowFrame, which runs the docs-relevance skill's `winframe.py`: everything outside the content Windows clips 2px in is drawn from DWM's own model (12px corners at 144 DPI flattened into 8 chords as Direct2D does, a 1px antialiasing ramp, a 2px border at 144 DPI), with a lighter uniform ring, rgba(146,146,146,0.69), and no shadow, chosen on 2026-09-24 so the edge reads 180 on a white page and 105 on a dark one on every side. A captured Windows border is the border mixed with the drop shadow behind it, which is why its bottom reads darker than its top; the model draws the border alone. The capture records its DPI in the PNG and the frame is sized from it. The untouched capture is kept in tmp/screenshot-raws/."
         ]
       },
-      "verifiedAt": "at-capture"
+      "verifiedAt": "76b44f3"
     },
     {
       "id": "compact-mode-macos",
@@ -92,7 +91,7 @@
           "Colour profile: a committed frame is sRGB. Output from `screencapture` is tagged with the display's own profile — Color LCD on this machine, a wide-gamut one — and the same colour is then stored as a less saturated number: re-tagging work-intensity-macos.png back to that profile moves its three title-bar lights from saturation 1.00 to 0.80, 0.74 and 0.72, against the 0.55 floor check-figures.py uses to recognise a macOS window by its traffic lights. This frame is the undecorated widget and has no lights for that check to read either way, but the conversion runs on every capture so that each committed frame's numbers mean the same thing. Conversion to sRGB is the last step of `dash.capture_window`, and the frame on disk carries that tag. Read it back with `sips -g profile <png>`."
         ]
       },
-      "verifiedAt": "5c248d5"
+      "verifiedAt": "76b44f3"
     },
     {
       "id": "terminal-tabs-windows",

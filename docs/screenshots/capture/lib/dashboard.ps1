@@ -109,6 +109,71 @@ function Invoke-WindowShotWithoutWidget {
     }
 }
 
+# The Python that lib/dashboard.py runs under, or $null when there is none.
+function Get-Python {
+    if (Get-Command python -ErrorAction SilentlyContinue) { return 'python' }
+    if (Get-Command python3 -ErrorAction SilentlyContinue) { return 'python3' }
+    return $null
+}
+
+# Show a fixture's rows in the dashboard for as long as -Do runs, then put the
+# dashboard back. The fixtures section of dashboard.py says what is pinned for the
+# run, how the rows are replayed and what is restored. fixture-down runs in
+# `finally`, so a capture that fails still leaves the dashboard on its own config.
+function Invoke-DashboardFixture {
+    param(
+        [Parameter(Mandatory = $true)][string]$Fixture,
+        [Parameter(Mandatory = $true)][scriptblock]$Do
+    )
+    $py = Get-Python
+    if (-not $py) { throw "A fixture capture drives the dashboard through lib/dashboard.py, and python is not on PATH." }
+    $lib = Join-Path $PSScriptRoot 'dashboard.py'
+    & $py $lib fixture-up $Fixture
+    if ($LASTEXITCODE -ne 0) {
+        # fixture-up records what to restore before it changes anything, so a
+        # failure partway through still has something to put back.
+        & $py $lib fixture-down
+        throw "fixture-up failed for $Fixture (see above); fixture-down was run to undo whatever it changed."
+    }
+    try {
+        & $Do
+    } finally {
+        & $py $lib fixture-down
+        if ($LASTEXITCODE -ne 0) { Write-Warning "fixture-down failed; the dashboard may still be on the capture config. Run: $py `"$lib`" fixture-down" }
+    }
+}
+
+# Take the shot, retaking it until every BLOCK pill in it is near full brightness.
+#
+# A BLOCK pill pulses between full and 45% opacity every 1.6s, so a single shot
+# catches it wherever the shutter lands. dashboard.py pulse-check measures each
+# pill in the result; this retries until the dimmest reads at least -MinOpacity,
+# or throws once -TimeoutSec has passed. Each attempt raises the window over the
+# backdrops again, so the timeout also bounds how long the screen is taken.
+function Invoke-WindowShotAtPulsePeak {
+    param(
+        [Parameter(Mandatory = $true)][hashtable]$Params,
+        [double]$MinOpacity = 0.9,
+        [int]$TimeoutSec = 60
+    )
+    $lib = Join-Path $PSScriptRoot 'dashboard.py'
+    $deadline = (Get-Date).AddSeconds($TimeoutSec)
+    while ($true) {
+        Invoke-WindowShot $Params
+        & (Get-Python) $lib pulse-check $Params.Out --min $MinOpacity
+        if ($LASTEXITCODE -eq 0) { return }
+        if ((Get-Date) -gt $deadline) { throw "No shot caught every BLOCK pill at $MinOpacity opacity or more within ${TimeoutSec}s; the last one is at $($Params.Out)." }
+    }
+}
+
+# Refuse unless the dashboard still shows exactly the fixture's rows. Run after the
+# shutter: a live session acting during the capture puts its own row in frame.
+function Assert-FixtureShown {
+    param([Parameter(Mandatory = $true)][string]$Fixture)
+    & (Get-Python) (Join-Path $PSScriptRoot 'dashboard.py') fixture-check $Fixture
+    if ($LASTEXITCODE -ne 0) { throw "The dashboard stopped showing exactly the fixture during the capture (see above), so the frame is not usable." }
+}
+
 # Refuse to photograph a project that is not cleared for publication.
 #
 # Shelled out to lib/dashboard.py rather than reimplemented here, for the reason
@@ -132,9 +197,7 @@ function Assert-Publishable {
         [string[]]$Name = @(),
         [switch]$LocalOnly
     )
-    $py = if (Get-Command python -ErrorAction SilentlyContinue) { 'python' }
-          elseif (Get-Command python3 -ErrorAction SilentlyContinue) { 'python3' }
-          else { $null }
+    $py = Get-Python
     $lib = Join-Path $PSScriptRoot 'dashboard.py'
     $pyArgs = @($lib, 'assert-publishable', '--where', $Where)
     foreach ($n in $Name) { if ($n) { $pyArgs += @('--name', $n) } }

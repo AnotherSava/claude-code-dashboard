@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Shared helpers for the macOS capture scripts.
+"""Shared helpers for the capture scripts: the macOS ones import it, and the Windows ones shell out to its command line.
 
 Import it: `sys.path.insert(0, str(Path(__file__).parent / "lib"))` then
 `import dashboard as dash`. The macOS counterpart of `lib/dashboard.ps1` plus
@@ -31,6 +31,7 @@ and refuses every value one can be set to — including the plausible
 mistake that looks like a fix.
 """
 import argparse
+import base64
 import json
 import os
 import shutil
@@ -42,12 +43,14 @@ import urllib.request
 from contextlib import contextmanager
 from pathlib import Path
 
+from PIL import Image
+
 LIB = Path(__file__).resolve().parent
 CAPTURE = LIB.parent
 SHOTS = CAPTURE.parent
 REPO = SHOTS.parent.parent
 
-APP_DATA = Path.home() / "Library" / "Application Support" / "com.anothersava.claude-code-dashboard"
+APP_DATA = (Path(os.environ["APPDATA"]) if sys.platform == "win32" else Path.home() / "Library" / "Application Support") / "com.anothersava.claude-code-dashboard"
 CONFIG = APP_DATA / "config.json"
 
 # The window is on screen before it is finished drawing: the widget animates its
@@ -430,6 +433,339 @@ def config_value(key: str, value):
         write(was, was_present)
 
 
+# -------------------------------------------------------------------- fixtures
+#
+# A fixture is a figure's rows written down as the input that produces them. A
+# local row is the hook events a session would send, replayed through the
+# dashboard's own `/api/event`, so the production classifier and state machine
+# build it. A row with a `device` is pushed to the dashboard's sync listener as
+# that peer, the way the peer's own dashboard would push it. Either way the frame
+# is the real widget rendering a state it reaches from real input, and every
+# string in it was written for the frame, so no live session is arranged and no
+# private prompt can appear.
+#
+# A row's `age_min` is how long it has been in its state when the shutter fires.
+# A local row can only start its state when its events arrive, so it is replayed
+# that many minutes before the others and `fixture_up` waits out the difference;
+# a pushed row carries its own timestamps, so it is simply dated back.
+#
+# `fixture_up` restarts the app on a capture config and replays the rows;
+# `fixture_down` restarts it on the original config, restored byte for byte, and
+# removes what the replay left in the app's stores. What `fixture_down` needs is
+# written to FIXTURE_STATE before anything changes, so a run that dies in between
+# is recovered by running `fixture-down` on its own.
+
+FIXTURE_STATE = REPO / "tmp" / "fixture-state.json"
+FIXTURE_SCRATCH = REPO / "tmp" / "fixture-run"
+HISTORY = APP_DATA / "prompt_history.json"
+REMOTE_HISTORY = APP_DATA / "remote_history"
+SESSION_IDS = APP_DATA / "session_chat_ids.json"
+APP_PROCESS = "claude-code-dashboard"
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+
+def load_fixture(path: Path) -> dict:
+    fx = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not fx.get("rows"):
+        raise CaptureError(f"{path} has no rows.")
+    return fx
+
+
+def _session_id(row: dict) -> str:
+    return f"fixture-{row['project']}"
+
+
+def capture_config(original: dict, fx: dict) -> dict:
+    """The config a fixture capture runs on: the user's own, minus whatever would
+    put something other than the fixture in frame or send its rows anywhere.
+
+    - `restore_sessions` off: live sessions would get their rows back from their
+      tab titles when the app starts.
+    - no `sync.peers`, so the pusher sends the fixture's rows to nobody, and
+      `sync.listen` off unless the fixture pushes rows of its own: a real peer's
+      rows would otherwise join the widget. When it is on, `check_shown` still
+      refuses a frame a real peer's push has reached.
+    - `instruction_canary_enabled` off: a replayed row would read amber, the "not
+      yet seen" canary colour, which the downloadable build never shows because it
+      ships the canary off.
+    - `high_alert` off and no `notifications`: a replayed BLOCK or DONE could ping
+      the phone. Telegram has no on/off switch, so its block is left out.
+
+    The fixture's own `config` goes on top, for the presentation its frame needs.
+    """
+    cfg = json.loads(json.dumps(original))
+    cfg.update({"restore_sessions": False, "instruction_canary_enabled": False, "high_alert": False})
+    cfg["sync"] = {**cfg.get("sync", {}), "listen": any(r.get("device") for r in fx["rows"]), "peers": []}
+    cfg.pop("notifications", None)
+    cfg.update(fx.get("config", {}))
+    return cfg
+
+
+def post_event(event: str, payload: dict) -> None:
+    """POST /api/event with a hook payload, the way `integrations/claude_hook.py` sends one.
+
+    `console_pids` is empty on purpose: it is what the dashboard titles a terminal
+    tab through, and a fixture row has no tab, so none of the user's is retitled.
+    """
+    body = {"client": "claude", "event": event, "payload": {"hook_event_name": event, **payload}, "console_pids": []}
+    req = urllib.request.Request(f"http://127.0.0.1:{dashboard_port()}/api/event", data=json.dumps(body).encode("utf-8"), headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            r.read()
+    except urllib.error.URLError as e:
+        raise CaptureError(f"POST /api/event ({event}) failed on port {dashboard_port()}: {e}. Is the dashboard running?") from e
+
+
+def _row_payload(fx: dict, row: dict, scratch: Path) -> dict:
+    """What every event of one row carries: its session, its directory, and a
+    transcript holding its token count when the fixture gives one.
+
+    The directory only has to derive the row's name, so it sits in the scratch
+    tree, where no real session lives. The transcript is one assistant entry,
+    which the dashboard's transcript watcher reads for the token column.
+    """
+    cwd = scratch / "projects" / row["project"]
+    cwd.mkdir(parents=True, exist_ok=True)
+    payload = {"session_id": _session_id(row), "cwd": str(cwd)}
+    if row.get("input_tokens"):
+        text = next((p.get("last_assistant_message", "") for e, p in reversed(row["events"]) if e == "Stop"), "")
+        usage = {"input_tokens": 1000, "cache_creation_input_tokens": 0, "cache_read_input_tokens": row["input_tokens"] - 1000, "output_tokens": 500}
+        entry = {"type": "assistant", "isSidechain": False, "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()), "message": {"model": fx.get("model", "claude-opus-5-5"), "role": "assistant", "content": [{"type": "text", "text": text}], "usage": usage}}
+        transcript = scratch / "transcripts" / f"{row['project']}.jsonl"
+        transcript.parent.mkdir(parents=True, exist_ok=True)
+        transcript.write_bytes((json.dumps(entry) + "\n").encode("utf-8"))
+        payload["transcript_path"] = str(transcript)
+    return payload
+
+
+def _age_ms(row: dict) -> int:
+    return int(row.get("age_min", 0) * 60_000)
+
+
+def replay(fx: dict, scratch: Path) -> None:
+    """Replay the local rows oldest first, each at the moment that leaves it
+    `age_min` old when the last one lands, then push the peers' rows.
+
+    The peers go last because a pushed row lasts only REMOTE_TTL_MS (90s) after
+    its push, so it has to arrive just before the shutter.
+    """
+    local = sorted((r for r in fx["rows"] if not r.get("device")), key=_age_ms, reverse=True)
+    lead = max((_age_ms(r) for r in local), default=0)
+    if lead:
+        print(f"fixture: replaying over {lead / 60_000:g} min so the rows' timers differ", flush=True)
+    start = time.monotonic()
+    for row in local:
+        time.sleep(max(0.0, start + (lead - _age_ms(row)) / 1000 - time.monotonic()))
+        base = _row_payload(fx, row, scratch)
+        for event, payload in row["events"]:
+            post_event(event, {**base, **payload})
+    time.sleep(max(0.0, start + lead / 1000 - time.monotonic()))
+    push_peer_rows(fx)
+
+
+def push_peer_rows(fx: dict) -> None:
+    """Push each device's rows to this dashboard's sync listener, as that peer's
+    own dashboard would.
+
+    A pushed row is a whole session record, so its clock is dated back by
+    `age_min` rather than waited for. Its `dialog_tip` is 0, so the receiver asks
+    the pretend peer for no content; the push is all there is.
+    """
+    sync = json.loads(CONFIG.read_text(encoding="utf-8")).get("sync", {})
+    now = int(time.time() * 1000)
+    devices: dict[str, list[dict]] = {}
+    for row in fx["rows"]:
+        if row.get("device"):
+            devices.setdefault(row["device"], []).append(row)
+    for device, rows in devices.items():
+        sessions = []
+        for r in rows:
+            entered = now - _age_ms(r)
+            session = {"id": r["project"], "status": r["expect"], "label": r["prompt"], "original_prompt": r["prompt"], "task_started_at": entered, "dialog": [], "source": "claude", "model": fx.get("model", "claude-opus-5-5"), "input_tokens": r.get("input_tokens"), "updated": now, "state_entered_at": entered, "working_accumulated_ms": _age_ms(r) if r["expect"] == "working" else 0}
+            sessions.append({"session": session, "dialog_tip": 0})
+        body = {"device_name": device, "listen_port": sync.get("listen_port", 9078), "sessions": sessions}
+        req = urllib.request.Request(f"http://127.0.0.1:{sync.get('listen_port', 9078)}/api/sync", data=json.dumps(body).encode("utf-8"), headers={"Content-Type": "application/json", "Authorization": f"Bearer {sync.get('token', '')}"}, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                resp.read()
+        except urllib.error.URLError as e:
+            raise CaptureError(f"Pushing {device}'s rows to the sync listener failed: {e}. The listener needs sync.token set in the config.") from e
+
+
+def check_shown(fx: dict, wait_s: float = 0) -> None:
+    """Refuse unless the dashboard holds exactly the fixture's rows, each in the
+    status the fixture expects.
+
+    Exactly, because this is also the publishing guard: a live session that acted
+    since the restart puts its own row, with its real prompt, into the frame.
+    """
+    want = {(f"{r['device']}/{r['project']}" if r.get("device") else r["project"]): r["expect"] for r in fx["rows"]}
+    deadline = time.monotonic() + wait_s
+    while True:
+        got = {a["id"]: a.get("status") for a in agents().get("agents", [])}
+        if got == want:
+            return
+        if time.monotonic() >= deadline:
+            raise CaptureError(f"The widget is not showing exactly the fixture: expected {want}, got {got}. A row the fixture does not name belongs to a live session that acted after the restart; wait for it to go quiet and run this again.")
+        time.sleep(0.5)
+
+
+def _app_running() -> bool:
+    r = subprocess.run(["tasklist", "/FI", f"IMAGENAME eq {APP_PROCESS}.exe", "/NH"], capture_output=True, text=True, timeout=30, creationflags=_NO_WINDOW)
+    return f"{APP_PROCESS}.exe" in r.stdout
+
+
+def _app_exe() -> str:
+    r = subprocess.run(["powershell", "-NoProfile", "-Command", f"(Get-Process '{APP_PROCESS}' -ErrorAction SilentlyContinue).Path"], capture_output=True, text=True, timeout=30, creationflags=_NO_WINDOW)
+    paths = [line.strip() for line in r.stdout.splitlines() if line.strip()]
+    if len(paths) != 1:
+        raise CaptureError(f"Expected one running {APP_PROCESS}, found {len(paths)}. Start the dashboard, or close the extra one, and run this again.")
+    return paths[0]
+
+
+def _stop_app() -> None:
+    subprocess.run(["taskkill", "/IM", f"{APP_PROCESS}.exe", "/F"], capture_output=True, timeout=30, creationflags=_NO_WINDOW)
+    deadline = time.monotonic() + 15
+    while _app_running():
+        if time.monotonic() >= deadline:
+            raise CaptureError(f"{APP_PROCESS} is still running 15s after taskkill.")
+        time.sleep(0.3)
+
+
+def _start_app(exe: str) -> None:
+    os.startfile(exe)
+    deadline = time.monotonic() + 30
+    while True:
+        try:
+            agents()
+            return
+        except CaptureError:
+            if time.monotonic() >= deadline:
+                raise CaptureError(f"{exe} started but its API did not answer within 30s.")
+            time.sleep(0.5)
+
+
+def _edit_json(path: Path, edit) -> None:
+    """Read a JSON object store, apply `edit` to it, and write it back as bytes, so
+    no Windows text-mode newline translation reaches the file."""
+    data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    edit(data)
+    path.write_bytes((json.dumps(data, indent=2, ensure_ascii=False) + "\n").encode("utf-8"))
+
+
+def fixture_up(path: Path) -> None:
+    """Restart the dashboard on a capture config and show the fixture's rows."""
+    if sys.platform != "win32":
+        raise CaptureError("Fixture capture restarts the app, and that part is written for Windows only so far.")
+    if FIXTURE_STATE.exists():
+        raise CaptureError(f"{FIXTURE_STATE} is left from a run that never finished. Run `python {Path(__file__).name} fixture-down` to put the dashboard back first.")
+    fx = load_fixture(path)
+    exe = _app_exe()
+    history = json.loads(HISTORY.read_text(encoding="utf-8")) if HISTORY.exists() else {}
+    # A history entry the fixture's row ids already have is put back as it was
+    # rather than deleted: the projects are real, so this machine has history for
+    # some of them. A pushed device's stored history is kept whole for the same
+    # reason; None records a file that did not exist.
+    local = [r["project"] for r in fx["rows"] if not r.get("device")]
+    devices = {r["device"] for r in fx["rows"] if r.get("device")}
+    stored = {d: (base64.b64encode(f.read_bytes()).decode("ascii") if (f := REMOTE_HISTORY / f"{d}.json").exists() else None) for d in devices}
+    state = {"fixture": str(Path(path).resolve()), "exe": exe, "config": base64.b64encode(CONFIG.read_bytes()).decode("ascii"), "history": {p: history.get(p) for p in local}, "remote_history": stored}
+    FIXTURE_STATE.parent.mkdir(parents=True, exist_ok=True)
+    FIXTURE_STATE.write_bytes(json.dumps(state).encode("utf-8"))
+    _stop_app()
+    CONFIG.write_bytes((json.dumps(capture_config(json.loads(base64.b64decode(state["config"])), fx), indent=2) + "\n").encode("utf-8"))
+    _start_app(exe)
+    replay(fx, FIXTURE_SCRATCH)
+    check_shown(fx, wait_s=8)
+    print(f"fixture: {len(fx['rows'])} rows shown from {Path(path).name}")
+
+
+def fixture_down() -> None:
+    """Put the dashboard back exactly as `fixture_up` found it.
+
+    Stopping the app drops the fixture's rows, so nothing is ended through the API.
+    What the rows left behind is undone in the stores while the app is down, where
+    none of its own writes can race the edit: the history entries of their row
+    ids, the session ids they mapped to rows, and a pushed device's stored history.
+    """
+    if not FIXTURE_STATE.exists():
+        raise CaptureError(f"No fixture run to put back: {FIXTURE_STATE} does not exist.")
+    state = json.loads(FIXTURE_STATE.read_text(encoding="utf-8"))
+    fx = load_fixture(Path(state["fixture"]))
+    _stop_app()
+    CONFIG.write_bytes(base64.b64decode(state["config"]))
+
+    def restore_history(data: dict) -> None:
+        for project, before in state["history"].items():
+            if before is None:
+                data.pop(project, None)
+            else:
+                data[project] = before
+
+    def forget_sessions(data: dict) -> None:
+        for row in fx["rows"]:
+            data.pop(_session_id(row), None)
+
+    _edit_json(HISTORY, restore_history)
+    _edit_json(SESSION_IDS, forget_sessions)
+    for device, before in state["remote_history"].items():
+        f = REMOTE_HISTORY / f"{device}.json"
+        if before is None:
+            f.unlink(missing_ok=True)
+        else:
+            f.write_bytes(base64.b64decode(before))
+    _start_app(state["exe"])
+    shutil.rmtree(FIXTURE_SCRATCH, ignore_errors=True)
+    FIXTURE_STATE.unlink()
+    print("fixture: dashboard restored")
+
+
+# The BLOCK pill's background (`.state-blocked` in SessionItem.svelte). Its
+# `pulse` animation runs its opacity between 1 and 0.45 every 1.6s, so a frame
+# catches it wherever the shutter lands.
+BLOCK_PILL = (0xB4, 0x53, 0x09)
+
+
+def pill_opacities(png: Path, pill: tuple[int, int, int] = BLOCK_PILL) -> list[float]:
+    """The opacity each pill of one colour was photographed at, top to bottom.
+
+    A pixel of a pill at opacity `o` over the row background `bg` reads
+    `bg + (pill - bg) * o` in every channel, so each channel gives its own
+    estimate of `o`. Pixels whose three estimates agree on an `o` above 0.25 are
+    pill. All three are needed: ClearType's coloured text fringes match the pill's
+    red and green but not its blue, and the pill's own text differs in hue
+    altogether. Pills are told apart by the gaps between their pixel rows; a
+    cluster too small to be a pill is dropped, and each pill reports its median.
+    """
+    im = Image.open(png).convert("RGBA")
+    w, h = im.size
+    px = im.load()
+    counts: dict[tuple[int, int, int], int] = {}
+    for y in range(0, h, 4):
+        for x in range(0, w, 4):
+            r, g, b, a = px[x, y]
+            if a == 255:
+                counts[(r, g, b)] = counts.get((r, g, b), 0) + 1
+    bg = max(counts, key=counts.get)
+    by_row: dict[int, list[float]] = {}
+    for y in range(h):
+        for x in range(w):
+            r, g, b, a = px[x, y]
+            if a < 200:
+                continue
+            o = [(c - base) / (target - base) for c, base, target in zip((r, g, b), bg, pill)]
+            if o[0] > 0.25 and max(o) - min(o) < 0.15:
+                by_row.setdefault(y, []).append(o[0])
+    pills: list[list[float]] = []
+    last = -10
+    for y in sorted(by_row):
+        if y - last > 2:
+            pills.append([])
+        pills[-1].extend(by_row[y])
+        last = y
+    return [sorted(v)[len(v) // 2] for v in pills if len(v) > 150]
+
+
 # ------------------------------------------------------------- what may be seen
 
 # Projects whose sessions may appear in a committed frame.
@@ -525,7 +861,31 @@ def _cli(argv: list[str]) -> int:
     ck.add_argument("--name", action="append", default=[], metavar="NAME", help="an extra on-screen string the roster does not carry; repeatable")
     ck.add_argument("--publishable", nargs="+", metavar="NAME", default=list(PUBLISHABLE_PROJECTS), help="project names allowed on screen; replaces the built-in list rather than extending it")
     ck.add_argument("--local-only", action="store_true", help="check only rows the roster marks local (a frame taken with sync off)")
+    for name, help_text in (("fixture-up", "restart the dashboard on a capture config and replay a fixture's rows"), ("fixture-check", "refuse unless the dashboard shows exactly a fixture's rows")):
+        sub.add_parser(name, help=help_text).add_argument("fixture", type=Path)
+    sub.add_parser("fixture-down", help="restore the dashboard a fixture-up changed")
+    pc = sub.add_parser("pulse-check", help="refuse a frame whose BLOCK pills were caught dimmer than --min")
+    pc.add_argument("png", type=Path)
+    pc.add_argument("--min", type=float, default=0.9, help="lowest acceptable pill opacity")
     args = ap.parse_args(argv)
+
+    if args.cmd == "pulse-check":
+        found = pill_opacities(args.png)
+        print(f"BLOCK pill opacity: {', '.join(f'{o:.2f}' for o in found) or 'none found'}")
+        return 0 if found and min(found) >= args.min else 1
+
+    if args.cmd.startswith("fixture-"):
+        try:
+            if args.cmd == "fixture-up":
+                fixture_up(args.fixture)
+            elif args.cmd == "fixture-check":
+                check_shown(load_fixture(args.fixture))
+            else:
+                fixture_down()
+        except CaptureError as e:
+            print(f"dashboard.py: {e}", file=sys.stderr)
+            return 1
+        return 0
 
     blob = sys.stdin.read().strip()
     if not blob:
