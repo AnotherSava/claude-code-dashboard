@@ -75,7 +75,7 @@
       "files": [
         "compact-mode-macos.png"
       ],
-      "shows": "macOS. Main widget in compact mode: seven rows, no label lines, showing IDLE/DONE/WORK/BLOCK badges and device pills on the three rows synced from another machine",
+      "shows": "macOS. Main widget in compact mode: eight rows, no label lines, showing IDLE/WORK/DONE/WAIT badges and device pills on the four rows synced from another machine",
       "policy": "confirm",
       "capture": {
         "command": "python3 docs/screenshots/capture/compact-mode-macos.py",
@@ -91,7 +91,7 @@
           "Colour profile: a committed frame is sRGB. Output from `screencapture` is tagged with the display's own profile — Color LCD on this machine, a wide-gamut one — and the same colour is then stored as a less saturated number: re-tagging work-intensity-macos.png back to that profile moves its three title-bar lights from saturation 1.00 to 0.80, 0.74 and 0.72, against the 0.55 floor check-figures.py uses to recognise a macOS window by its traffic lights. This frame is the undecorated widget and has no lights for that check to read either way, but the conversion runs on every capture so that each committed frame's numbers mean the same thing. Conversion to sRGB is the last step of `dash.capture_window`, and the frame on disk carries that tag. Read it back with `sips -g profile <png>`."
         ]
       },
-      "verifiedAt": "76b44f3"
+      "verifiedAt": "ccecb94"
     },
     {
       "id": "terminal-tabs-windows",
@@ -243,7 +243,7 @@
       "capture": {
         "command": "pwsh -File docs/screenshots/capture/tray-menu-windows.ps1",
         "steps": [
-          "Windows. No macOS half has been taken; its menu differs by one item, Keep awake with lid closed, which is macOS-only.",
+          "Windows. No macOS half has been taken; its menu carries two entries this one does not, the \"Keep awake while working\" checkbox and the \"Keep awake with lid closed (N min)\" submenu, both macOS-only.",
           "The running build must postdate the last change to src-tauri/src/tray.rs, or the frame shows a menu the code no longer builds. No deploy is needed otherwise, since the menu carries no session state.",
           "The script posts the tray window tray-icon's WM_USER_TRAYICON with WM_RBUTTONUP, which runs the crate's own TrackPopupMenu path, so the frame is the menu a right-click opens. It places the pointer near the primary display's tray corner first, since the menu opens at the pointer, and puts it back afterwards.",
           "Captured with -Method Alpha -Popup: the raise and the activating backdrop Show() are skipped, because either one ends the menu's modal loop and the frame would come back as two empty backdrops.",

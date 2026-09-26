@@ -1,5 +1,6 @@
 ---
 created: 2026-09-15 06:46:29
+platform: macos
 ---
 
 # Measure the Work intensity header's break width on macOS and set minWidth from it, so the window can be pulled in tight

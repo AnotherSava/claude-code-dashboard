@@ -1,5 +1,6 @@
 ---
 created: 2026-09-15 05:21:43
+platform: macos
 ---
 
 # Re-shoot work-intensity-macos once this change set is pushed: it still shows the removed Percent|Tokens switch
