@@ -59,9 +59,14 @@
 //!   those either — `waiting_settle` excludes subagent-held WAITs from its own
 //!   backstop for the same reason.
 //!
-//! A release that lands on one of those is corrected by the agent's next
-//! output, which re-takes the assertion within a tick. A `null` or `0` window
-//! holds for as long as the row stays busy.
+//! A release that lands on one of those is corrected only once the agent
+//! writes to the transcript the watcher is tailing — which, for a row held by a
+//! subagent, is not the subagent's work but the agent's own next turn. The two
+//! releases measured on 2026-09-26 were corrected after 3m16s and 27m46s, each
+//! by the workflow's completion waking the agent rather than by anything
+//! visible meanwhile: the blindness that causes the release is the blindness
+//! that delays the correction. A `null` or `0` window holds for as long as the
+//! row stays busy.
 //!
 //! `pmset -g assertions` lists the live assertion against this process, which
 //! is the only way to observe it from outside — unlike the lid veto, there is
