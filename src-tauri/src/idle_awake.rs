@@ -14,7 +14,9 @@
 //! # What it holds
 //!
 //! One `kIOPMAssertPreventUserIdleSystemSleep` assertion, taken while any local
-//! row is [`Status::is_live_work`] and released when none is. It is the
+//! row's main agent is [`Status::is_live_work`] and released when none is — the
+//! base status, so a workflow running under a subagent's permission dialog
+//! still counts as work. It is the
 //! assertion `caffeinate -i` takes: the display still sleeps, and the Mac still
 //! sleeps for every reason that is not the idle timer — the lid, low battery,
 //! thermal emergency, the Apple menu, an explicit Sleep.
@@ -134,7 +136,7 @@ impl Sample {
 /// does. Separate from [`Sample`] so the caller can feed it either the display
 /// snapshot the emit path already holds or the tick's own read.
 fn newest_busy_update(sessions: &[AgentSession]) -> Option<i64> {
-    sessions.iter().filter(|s| s.status.is_live_work()).map(|s| s.updated).max()
+    sessions.iter().filter(|s| s.base_status().is_live_work()).map(|s| s.updated).max()
 }
 
 // ---------------------------------------------------------------------------
@@ -460,6 +462,20 @@ mod tests {
         for status in [Status::Working, Status::Waiting] {
             assert_eq!(newest_busy_update(&rows(&[("x", status, 5)])), Some(5), "{status:?} is live work");
         }
+    }
+
+    #[test]
+    fn a_row_gated_over_live_work_still_counts_as_work() {
+        // A subagent's permission dialog shows the row BLOCK, but the main
+        // agent's workflow underneath is still running and must keep the hold.
+        let state = AppState::new();
+        let working = SetInput { id: "x".into(), status: Status::Working, label: None, source: None, model: None, input_tokens: None, dialog_entry: None, waiting_backstop_armed: false };
+        state.apply_set(working.clone(), 5, &[], None);
+        let prompt = crate::state::SubagentPromptRequest { agent_id: "a1".into(), session_id: "sess".into(), agent_type: None, tool_name: "Bash".into(), tool_input: serde_json::Value::Null, label: "needs approval: Bash".into(), subagents_dir: None };
+        state.open_subagent_prompt(working, prompt, 9, None);
+        let board = state.snapshot();
+        assert_eq!(board[0].status, Status::Blocked);
+        assert_eq!(newest_busy_update(&board), Some(9));
     }
 
     #[test]

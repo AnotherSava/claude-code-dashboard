@@ -54,6 +54,7 @@ pub fn build_settings_snippet(hook_path_for_command: &str) -> String {
     "Elicitation":         [{{"hooks": [{{"type": "command", "command": "{cmd}"}}]}}],
     "ElicitationResult":   [{{"hooks": [{{"type": "command", "command": "{cmd}"}}]}}],
     "PreCompact":          [{{"hooks": [{{"type": "command", "command": "{cmd}"}}]}}],
+    "SubagentStop":        [{{"hooks": [{{"type": "command", "command": "{cmd}"}}]}}],
     "SessionEnd":          [{{"hooks": [{{"type": "command", "command": "{cmd}"}}]}}],
     "PreToolUse": [{{
       "matcher": "^(AskUserQuestion|ExitPlanMode)$",
@@ -74,6 +75,15 @@ mod tests {
         assert!(snippet.contains("C:/Users/x/AppData/Roaming/app/claude_hook.py"));
         assert!(snippet.contains(PYTHON_CMD));
         assert!(snippet.contains("AskUserQuestion|ExitPlanMode"));
+    }
+
+    #[test]
+    fn snippet_subscribes_subagent_stop() {
+        // The exit that releases a subagent's permission prompt when the agent
+        // ends without a result in its transcript.
+        let snippet = build_settings_snippet("/x/claude_hook.py");
+        let parsed: serde_json::Value = serde_json::from_str(&snippet).expect("the snippet is JSON");
+        assert!(parsed["hooks"]["SubagentStop"][0]["hooks"][0]["command"].as_str().is_some_and(|c| c.contains("/x/claude_hook.py")));
     }
 
     #[test]

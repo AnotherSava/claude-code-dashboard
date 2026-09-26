@@ -30,6 +30,7 @@ mod session_restore;
 mod setup;
 mod start_approval;
 mod state;
+mod subagent_gate;
 mod sync;
 mod tailnet;
 mod telegram;
@@ -287,6 +288,7 @@ pub fn run() {
             UsageLimitsPoller::spawn(app.handle().clone());
             liveness_reaper::spawn(app.handle().clone());
             waiting_settle::spawn(app.handle().clone());
+            subagent_gate::spawn(app.handle().clone());
             token_scan::spawn(app.handle().clone());
             // Clear any `disablesleep` left set by a crash the deadman missed,
             // before the watcher can arm on top of it. `disablesleep` survives
@@ -700,6 +702,7 @@ fn seed_dev_sessions(app: &tauri::AppHandle) {
                 canary: crate::state::Canary::Off,
                 attended_at: None,
                 name_shared_by: None,
+                subagent_gate: None,
                 terminal_stale_at: None,
             }],
             last_seen: now,

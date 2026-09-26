@@ -274,7 +274,7 @@ pub struct LidAwakeState {
 /// already flows through, so arming reacts immediately rather than at the next
 /// tick. Local sessions only — a remote row is another machine's work.
 pub fn sync(app: &AppHandle, sessions: &[AgentSession]) {
-    let any_busy = sessions.iter().any(|s| s.status.is_live_work());
+    let any_busy = sessions.iter().any(|s| s.base_status().is_live_work());
     if let Some(state) = app.try_state::<LidAwakeState>() {
         if any_busy {
             state.inner.lock().unwrap().last_busy_at = now_ms();
@@ -296,7 +296,7 @@ pub fn spawn(app: AppHandle) {
             ticker.tick().await;
             let any_busy = app
                 .try_state::<AppState>()
-                .is_some_and(|st| st.snapshot().iter().any(|s| s.status.is_live_work()));
+                .is_some_and(|st| st.snapshot().iter().any(|s| s.base_status().is_live_work()));
             evaluate(&app, any_busy);
         }
     });
@@ -313,7 +313,7 @@ pub fn arm_manual(app: &AppHandle) {
     state.inner.lock().unwrap().manual_until = Some(now_ms() + lease_ms as i64);
     let any_busy = app
         .try_state::<AppState>()
-        .is_some_and(|st| st.snapshot().iter().any(|s| s.status.is_live_work()));
+        .is_some_and(|st| st.snapshot().iter().any(|s| s.base_status().is_live_work()));
     evaluate(app, any_busy);
 }
 

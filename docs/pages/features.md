@@ -19,7 +19,7 @@ The row's status badge tracks the agent in real time:
 
 - **WORK** — Claude is working on your task. Timer accumulates total time spent working on the same prompt across approval cycles.
 - **WAIT** — the main turn finished but background work Claude started (a subagent, or a background command like a dev server) is still running, so the row stays active (light-blue) rather than dropping to DONE while work continues. If you stop that work yourself instead of letting it finish, the row settles to DONE on its own after a while rather than staying stuck.
-- **BLOCK** — Claude is blocked on you. The row shows the agent's current question or permission request.
+- **BLOCK** — Claude is blocked on you. The row shows the agent's current question or permission request. A permission request from a subagent Claude started shows BLOCK until it's settled: once it's refused or times out, or once an approved command finishes, the row goes back to what the session was doing.
 - **IDLE** — the session is alive but not actively working, and nothing on it is waiting for you: a session you've just opened, one you've cleared, or one whose result you've already read. A task you cancel with Esc usually settles here too: cancelling sends no event of its own, but the dashboard notices the turn ended and settles the row back on its own — to idle, or back to a question it was waiting on (on by default, see [Settings](settings#behavior)).
 - **DONE** — Claude finished the task and you haven't read it yet. Timer shows time since it finished. Once you've looked, the row drops to IDLE — see [Finished, and not yet read](#finished-and-not-yet-read).
 - **ERROR** — the hook reported an error; the row shows the error text.

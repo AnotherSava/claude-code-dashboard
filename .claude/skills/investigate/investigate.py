@@ -17,6 +17,7 @@ import json
 import os
 import sys
 from collections import defaultdict, deque
+from datetime import datetime
 
 # The decision-log `reason` carries arbitrary assistant text — arrows, em
 # dashes, ellipses, emoji — so force UTF-8 output regardless of the console
@@ -56,8 +57,17 @@ def agent_of(fields):
 
 
 def status_from(fields):
-    """The status a decision line lands the row on, or None if it doesn't move it."""
+    """The status a decision line lands the row on, or None if it doesn't move it.
+
+    Read on its own, without the lines around it. `replay` is what accounts for
+    an open subagent prompt, under which these moves reach only the base."""
     d = fields.get("decision")
+    if d == "subagent_prompt_open":
+        return "Blocked"
+    if d == "subagent_prompt_settled":
+        return fields.get("status")
+    if d == "subagent_prompt_unmatched":
+        return None
     if d == "classify":
         return fields.get("status")
     if d == "apply_set":
@@ -85,6 +95,46 @@ def status_from(fields):
     return None
 
 
+def replay(trail):
+    """Each line with the status it put on the *visible* row, or None.
+
+    A subagent's permission prompt overlays the row: from `subagent_prompt_open`
+    until a `subagent_prompt_settled` with `released: true`, the row shows BLOCK
+    and the main agent's own transitions — its `classify` lines, and the
+    `apply_set`/`resume_working`/`revert_cancelled` lines logged `gated: true` —
+    move only the state underneath. Crediting one of those as the line that set
+    the BLOCK would explain it with a reason that says the opposite. A settle
+    that leaves other prompts open moves nothing either."""
+    gated = False
+    out = []
+    for ts, fields in trail:
+        d = fields.get("decision")
+        s = status_from(fields)
+        if d == "subagent_prompt_open":
+            gated = True
+        elif d == "subagent_prompt_settled":
+            if fields.get("released") is True:
+                gated = False
+            else:
+                s = None
+        elif d in ("session_clear", "restore_row"):
+            # The row is gone or rebuilt from scratch; either way no gate survives.
+            gated = False
+        elif gated or fields.get("gated") is True:
+            gated = True
+            s = None
+        out.append((ts, fields, s))
+    return out
+
+
+def local_ts(stamp):
+    """The log's UTC stamp in this machine's local time, to the second."""
+    try:
+        return datetime.fromisoformat(stamp.replace("Z", "+00:00")).astimezone().strftime("%Y-%m-%dT%H:%M:%S")
+    except ValueError:
+        return stamp[:19]
+
+
 def load_trails(wpath):
     trails = defaultdict(lambda: deque(maxlen=TRAIL))
     with open(wpath, encoding="utf-8", errors="replace") as fh:
@@ -101,30 +151,48 @@ def load_trails(wpath):
             agent = agent_of(fields)
             if not agent:
                 continue
-            trails[agent].append((entry.get("timestamp", "")[:19], fields))
+            trails[agent].append((local_ts(entry.get("timestamp", "")), fields))
     return trails
 
 
 def current(trail):
-    """Reconstruct (status, (setter_ts, setter_fields)) by replaying the trail.
+    """Reconstruct (status, setter, revealed) by replaying the trail.
 
-    Attributes the status to the most recent decision that established it,
-    preferring one that carries a `reason` (a `classify`/correction line) over
-    the reason-less `apply_set` mirror that immediately follows it."""
+    `setter` is (ts, fields) of the most recent decision that established the
+    status, preferring one that carries a `reason` (a `classify`/correction line)
+    over the reason-less `apply_set` mirror that immediately follows it.
+
+    When the status was uncovered by a subagent prompt's release, the release
+    only revealed it: the setter is then the line that put that status under the
+    prompt (the `Stop` that made the row WAIT, say), and `revealed` is the
+    release line. Otherwise `revealed` is None."""
+    lines = replay(trail)
     status = None
-    for _, fields in trail:
-        s = status_from(fields)
+    for _, _, s in lines:
         if s is not None:
             status = s
     if status is None:
-        return None, None
-    last_any = last_reason = None
-    for ts, fields in trail:
-        if status_from(fields) == status:
-            last_any = (ts, fields)
-            if fields.get("reason"):
-                last_reason = (ts, fields)
-    return status, (last_reason or last_any)
+        return None, None, None
+
+    def newest(match):
+        last_any = last_reason = None
+        for ts, fields, s in lines:
+            if match(fields, s):
+                last_any = (ts, fields)
+                if fields.get("reason"):
+                    last_reason = (ts, fields)
+        return last_reason or last_any
+
+    setter = newest(lambda fields, s: s == status)
+    if setter and setter[1].get("decision") == "subagent_prompt_settled":
+        before = lines[: next(i for i, (ts, f, _) in enumerate(lines) if f is setter[1])]
+        underneath = None
+        for ts, fields, _ in before:
+            if status_from(fields) == status and fields.get("decision") != "subagent_prompt_open" and fields.get("reason"):
+                underneath = (ts, fields)
+        if underneath:
+            return status, underneath, setter
+    return status, setter, None
 
 
 def chip(status):
@@ -134,13 +202,13 @@ def chip(status):
 def list_mode(trails, aliases):
     rows = []
     for agent, trail in trails.items():
-        status, setter = current(trail)
+        status, setter, _ = current(trail)
         if status == "(cleared)":
             continue  # session ended — not on the dashboard
         last_ts = setter[0] if setter else (trail[-1][0] if trail else "")
         rows.append((last_ts, agent, status))
     rows.sort(reverse=True)
-    print(f"{'last change (UTC)':21} {'agent':26} {'state':6} display-name")
+    print(f"{'last change (local)':21} {'agent':26} {'state':6} display-name")
     print("-" * 70)
     for ts, agent, status in rows:
         disp = aliases.get(agent, "")
@@ -161,7 +229,7 @@ def resolve(name, trails, aliases):
 
 def explain(agent, trails, aliases):
     trail = trails[agent]
-    status, setter = current(trail)
+    status, setter, revealed = current(trail)
     disp = aliases.get(agent)
     title = agent + (f"  (display: {disp})" if disp else "")
     print(f"Agent:          {title}")
@@ -177,11 +245,14 @@ def explain(agent, trails, aliases):
         label = f.get("label")
         if label and label not in ("None",):
             print(f"Label/row text: {label}")
+    if revealed:
+        ts, f = revealed
+        print(f"Revealed by:    {ts}  {f.get('decision')} via={f.get('via')}  (the subagent prompt that covered it closed)")
     print()
-    print("Recent decisions (oldest -> newest):")
-    for ts, f in list(trail)[-14:]:
-        s = status_from(f)
-        s = chip(s) if s else "  ·  "
+    print("Recent decisions (oldest -> newest, local time; a (chip) moved only the state under an open subagent prompt):")
+    for ts, f, s in replay(trail)[-14:]:
+        under = status_from(f)
+        s = chip(s) if s else (f"({chip(under)})" if under else "  ·  ")
         print(f"  {ts}  {f.get('decision'):20} {s:6} {f.get('reason', '')}")
 
 

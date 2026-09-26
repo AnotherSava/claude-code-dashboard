@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::net::SocketAddr;
 use tauri::{AppHandle, Emitter, Manager};
 
-use crate::adapters::{self, AdapterOutput};
+use crate::adapters::{self, AdapterOutput, SubagentEffect};
 use crate::chat_id_registry::ChatIdRegistry;
 use crate::commands::{emit_sessions_updated, now_ms, resolved_snapshot};
 use crate::config::ConfigState;
@@ -20,7 +20,7 @@ use crate::prompt_history::PromptHistoryStore;
 use crate::session_launcher;
 use crate::start_approval;
 use crate::session_registry::{Activity, LiveSession, SessionRegistry};
-use crate::state::{AgentSession, AppState, Status};
+use crate::state::{AgentSession, AppState, SettleScope, Status};
 use crate::sync::SyncListening;
 
 pub async fn run(app: AppHandle, port: u16) {
@@ -1137,12 +1137,15 @@ async fn post_event(
             AdapterOutput::Boundary { id } => {
                 *id = registry.resolve(session_id, id);
             }
+            AdapterOutput::SubagentStopped { id, .. } => {
+                *id = registry.resolve(session_id, id);
+            }
             AdapterOutput::Ignore => {}
         }
     }
 
     match output {
-        AdapterOutput::Set { input, transcript_path, reason } => {
+        AdapterOutput::Set { input, transcript_path, reason, subagent } => {
             // Permanent decision record: why this row landed in this state. The
             // `decision` field makes it greppable (the `investigate` skill reads
             // these), and `reason` carries the matched question-rule + a text
@@ -1156,11 +1159,16 @@ async fn post_event(
                 status = ?input.status,
                 label = ?input.label,
                 reason = %reason,
+                agent_id = ?req.payload.get("agent_id").and_then(|v| v.as_str()),
                 console_pids = ?req.console_pids,
                 agent_pid = ?req.agent_pid,
                 "event -> set"
             );
             let chat_id = input.id.clone();
+            // The event's own verdict, before a subagent prompt can overlay it:
+            // the canary below judges the turn the main agent just ended.
+            let classified = input.status;
+            let ends_all = matches!(subagent, SubagentEffect::AllEnded);
             // Remember which console hosts this session so terminal_title can
             // push tab-title updates. Cleanup is centralized in
             // `terminal_title::sync` — when the session row disappears (Clear,
@@ -1185,7 +1193,39 @@ async fn post_event(
             let restored = history.as_ref().and_then(|h| h.get(&chat_id));
             let now = now_ms();
             let watcher = app.try_state::<WatcherRegistry>();
-            let set_changed = state.apply_set(input, now, &cfg.continuation_prompts, restored);
+            // A subagent's permission dialog overlays the row instead of setting
+            // the main agent's status; everything else is the main agent's own.
+            let set_changed = match subagent {
+                SubagentEffect::PromptOpened(prompt) => {
+                    let (agent_id, agent_type, tool) = (prompt.agent_id.clone(), prompt.agent_type.clone(), prompt.tool_name.clone());
+                    let o = state.open_subagent_prompt(input, prompt, now, restored);
+                    tracing::debug!(
+                        chat_id = %chat_id,
+                        decision = "subagent_prompt_open",
+                        request = o.request,
+                        agent_id = %agent_id,
+                        agent_type = ?agent_type,
+                        tool = %tool,
+                        pending = o.pending,
+                        base_status = ?o.base_status,
+                        reason = %reason,
+                        "subagent prompt opened"
+                    );
+                    o.dialog_changed
+                }
+                SubagentEffect::AllEnded | SubagentEffect::Untouched => state.apply_set(input, now, &cfg.continuation_prompts, restored),
+            };
+            // A main turn that ended with no background work in flight leaves none
+            // of its session's subagents able to still be prompting, so release
+            // every prompt that session raised — after `apply_set`, so the release
+            // reveals the state this `Stop` set. Scoped to the session rather than
+            // the row: a sibling instance sharing the row (`--fork-session
+            // --resume`) finishing says nothing about the other's dialogs.
+            if ends_all {
+                if let Some(o) = state.settle_subagent_prompts(&chat_id, SettleScope::Session(session_id), now) {
+                    crate::subagent_gate::log_prompt_settled(&chat_id, &o, crate::subagent_gate::SettledVia::StopNoBackground, None, now);
+                }
+            }
             if set_changed {
                 if let Some(ref h) = history {
                     let sessions = state.sessions.lock().unwrap();
@@ -1239,7 +1279,9 @@ async fn post_event(
                             // workflow — e.g. a `/commit` reflection ending on a question)
                             // is deferred, not confirmed, and re-judged next turn (see
                             // `drift_action`), so a self-correcting skill turn never pings.
-                            let is_handback = state.status_of(&chat_id) == Some(crate::state::Status::Blocked);
+                            // Read off this `Stop`'s own classification: the row
+                            // may read Blocked because a subagent is prompting.
+                            let is_handback = classified == Status::Blocked;
                             let (action, reason) = drift_action(present, seen, is_handback);
                             let changed = match action {
                                 DriftAction::Clear => state.set_drift(&chat_id, false, now),
@@ -1259,6 +1301,17 @@ async fn post_event(
                 }
             }
             emit_sessions_updated(&app);
+        }
+        AdapterOutput::SubagentStopped { id, agent_id } => {
+            // Untagged because it moves no status by itself. It is the record
+            // of which agents' `SubagentStop` arrives at all, a workflow
+            // agent's included.
+            tracing::debug!(chat_id = %id, agent_id = %agent_id, "subagent stop received");
+            let now = now_ms();
+            if let Some(o) = state.settle_subagent_prompts(&id, SettleScope::Agent(&agent_id), now) {
+                crate::subagent_gate::log_prompt_settled(&id, &o, crate::subagent_gate::SettledVia::SubagentStop, None, now);
+                emit_sessions_updated(&app);
+            }
         }
         AdapterOutput::Clear { id } => {
             // Two Claude Code instances can hold one cwd — canonically a terminal
@@ -1376,6 +1429,7 @@ mod tests {
             canary: crate::state::Canary::Off,
             attended_at: None,
             name_shared_by: None,
+            subagent_gate: None,
             terminal_stale_at: None,
         }
     }

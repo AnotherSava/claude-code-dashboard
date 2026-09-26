@@ -205,6 +205,10 @@ pub fn split_complete(leftover: &str, chunk: &str) -> (Vec<String>, String) {
 /// update model / input_tokens. It cannot set terminal states (done, idle,
 /// blocked, error) — those are hook-authoritative. Returns true if anything
 /// actually changed.
+///
+/// The main transcript is the main agent's, so callers reach this through
+/// [`crate::state::with_base`]: under a pending subagent prompt a promotion
+/// moves the base and the row stays BLOCK.
 pub fn apply_watcher_update(
     session: &mut AgentSession,
     update: &InferredState,
@@ -245,14 +249,20 @@ pub fn apply_watcher_update(
 }
 
 // -------- Wire types for deserializing JSONL entries --------
+//
+// Shared with `subagent_gate`, which reads a subagent's transcript for the
+// `tool_result` of a gated call: one wire format, one set of wire types.
 
 #[derive(Deserialize)]
-struct TranscriptEntry {
+pub(crate) struct TranscriptEntry {
     #[serde(rename = "type")]
-    entry_type: String,
+    pub(crate) entry_type: String,
     #[serde(default, rename = "isSidechain")]
     is_sidechain: bool,
-    message: Option<TranscriptMessage>,
+    /// RFC3339, always UTC.
+    pub(crate) timestamp: Option<String>,
+    pub(crate) uuid: Option<String>,
+    pub(crate) message: Option<TranscriptMessage>,
     attachment: Option<TranscriptAttachment>,
 }
 
@@ -269,17 +279,28 @@ struct TranscriptAttachment {
 }
 
 #[derive(Deserialize)]
-struct TranscriptMessage {
+pub(crate) struct TranscriptMessage {
+    /// The API message id. An assistant message is written as one entry per
+    /// content block, and every one of them repeats it.
+    pub(crate) id: Option<String>,
     model: Option<String>,
     usage: Option<TranscriptUsage>,
-    content: Option<Vec<TranscriptBlock>>,
+    pub(crate) content: Option<Vec<TranscriptBlock>>,
 }
 
 #[derive(Deserialize)]
-struct TranscriptBlock {
+pub(crate) struct TranscriptBlock {
     #[serde(rename = "type")]
-    block_type: String,
+    pub(crate) block_type: String,
     text: Option<String>,
+    /// A `tool_use` block's id, name and input.
+    pub(crate) id: Option<String>,
+    pub(crate) name: Option<String>,
+    pub(crate) input: Option<serde_json::Value>,
+    /// A `tool_result` block's call id, and whether the call failed — a denial
+    /// or a permission timeout included.
+    pub(crate) tool_use_id: Option<String>,
+    pub(crate) is_error: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -468,28 +489,40 @@ async fn drain(app: &AppHandle, chat_id: &str, path: &Path, state: &Arc<Mutex<Dr
     apply_and_emit(app, chat_id, &update, text_entries);
 }
 
+/// Apply one inference pass to row `chat_id`. The main transcript moves the
+/// main agent's own state, so under a pending subagent prompt this runs
+/// through [`crate::state::with_base`] and the row stays BLOCK over it.
+///
+/// Returns whether anything changed, the main agent's status before and after,
+/// and whether a subagent prompt was overlaying the row. A missing row changes
+/// nothing.
+fn apply_to_row(app_state: &AppState, chat_id: &str, update: &InferredState, now: i64) -> (bool, Status, Status, bool) {
+    let mut sessions = app_state.sessions.lock().unwrap();
+    let Some(session) = sessions.iter_mut().find(|s| s.id == chat_id) else {
+        return (false, Status::Idle, Status::Idle, false);
+    };
+    let gated = session.subagent_gate.is_some();
+    let (changed, prior, new) = crate::state::with_base(session, |s| {
+        let prior = s.status;
+        let changed = apply_watcher_update(s, update, now);
+        (changed, prior, s.status)
+    });
+    (changed, prior, new, gated)
+}
+
 fn apply_and_emit(app: &AppHandle, chat_id: &str, update: &InferredState, text_entries: Vec<(DialogRole, String)>) {
     let Some(app_state) = app.try_state::<AppState>() else {
         return;
     };
     let now = now_ms();
-    let (metric_changed, prior_status, new_status) = {
-        let mut sessions = app_state.sessions.lock().unwrap();
-        match sessions.iter_mut().find(|s| s.id == chat_id) {
-            Some(session) => {
-                let prior = session.status;
-                let changed = apply_watcher_update(session, update, now);
-                (changed, prior, session.status)
-            }
-            None => (false, Status::Idle, Status::Idle),
-        }
-    };
+    let (metric_changed, prior_status, new_status, gated) = apply_to_row(&app_state, chat_id, update, now);
     if prior_status != Status::Working && new_status == Status::Working {
         // Carried a row back to Working without a lifecycle hook — e.g. the user
         // answered an AskUserQuestion and the agent resumed.
         tracing::debug!(
             chat_id,
             decision = "resume_working",
+            gated,
             reason = "transcript shows new activity (tool call or user turn) after a pause; promoted to Working",
             "decision"
         );
@@ -507,11 +540,12 @@ fn apply_and_emit(app: &AppHandle, chat_id: &str, update: &InferredState, text_e
     } else {
         None
     };
-    if let Some(status) = reverted_to {
+    if let Some((status, gated)) = reverted_to {
         tracing::debug!(
             chat_id,
             decision = "revert_cancelled",
             status = ?status,
+            gated,
             reason = "turn cancelled with Esc (interrupt marker, no lifecycle hook); reverted to pre-prompt status",
             "decision"
         );
@@ -1039,6 +1073,7 @@ mod tests {
             canary: crate::state::Canary::Off,
             attended_at: None,
             name_shared_by: None,
+            subagent_gate: None,
             terminal_stale_at: None,
         }
     }
@@ -1126,6 +1161,26 @@ mod tests {
             500,
         );
         assert!(!changed);
+    }
+
+    #[test]
+    fn promotion_under_a_subagent_gate_moves_only_the_base() {
+        // The main agent was blocked on its own dialog when a subagent's opened;
+        // the user approves the main one and the transcript shows it resumed.
+        let state = AppState::new();
+        let blocked = crate::state::SetInput { id: "s".into(), status: Status::Blocked, label: Some("needs approval: Write".into()), source: None, model: None, input_tokens: None, dialog_entry: None, waiting_backstop_armed: false };
+        state.apply_set(blocked.clone(), 1_000, &[], None);
+        let prompt = crate::state::SubagentPromptRequest { agent_id: "a1".into(), session_id: "sess".into(), agent_type: None, tool_name: "Bash".into(), tool_input: serde_json::Value::Null, label: "needs approval: Bash".into(), subagents_dir: None };
+        state.open_subagent_prompt(blocked, prompt, 2_000, None);
+
+        let update = InferredState { state: Some(Status::Working), ..Default::default() };
+        assert_eq!(apply_to_row(&state, "s", &update, 3_000), (true, Status::Blocked, Status::Working, true), "the base moved");
+        let row = state.snapshot().remove(0);
+        assert_eq!((row.status, row.state_entered_at, row.label.as_str()), (Status::Blocked, 1_000, "needs approval: Bash"), "the row stays BLOCK");
+
+        state.settle_subagent_prompts("s", crate::state::SettleScope::Session("sess"), 4_000).expect("settled");
+        let row = state.snapshot().remove(0);
+        assert_eq!((row.status, row.state_entered_at), (Status::Working, 3_000), "the release reveals the promotion on its own clock");
     }
 
     #[test]

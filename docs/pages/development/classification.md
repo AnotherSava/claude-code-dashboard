@@ -34,16 +34,23 @@ This derivation runs per event, but the result is only the **first-seen anchor**
 
 ## Event → status
 
-The adapter recognizes six event names. Anything else returns `Ignore` and the widget state is untouched.
+The adapter recognizes the events below. Anything else returns `Ignore` and the widget state is untouched.
 
-| Event              | Status produced                                                                     | Notes                                                          |
-|---                 |---                                                                                  |---                                                             |
-| `SessionStart`     | `idle` (no fields) — otherwise treated like `Notification`                          | Used to seed an empty row before any user activity.            |
-| `UserPromptSubmit` | `working`                                                                           | Label is the cleaned prompt; blank prompt → label `None`.      |
-| `Notification`     | `blocked` (default); `idle_prompt` is ignored outright                               | See the notification-type table below.                      |
-| `PreToolUse`       | `blocked` for `AskUserQuestion` / `ExitPlanMode` only; other tools ignored         | Label: `"has a question"` for `AskUserQuestion`, `"plan approval"` for `ExitPlanMode`. The matcher in `~/.claude/settings.json` should restrict the hook to these two tools (see [Installation → Wire the Claude Code hook](../install#2-wire-the-claude-code-hook)) — Claude Code buffers the `tool_use` block until the user answers, so the JSONL transcript can't carry the signal in flight. |
-| `Stop`             | `blocked` if the final assistant message ends on a question, else `waiting` if background work is still in flight, else `done` (see [detection rules](#question-detection)) | Settled here and not revisited: the payload carries the final text as `last_assistant_message` and any in-flight work as `background_tasks`, so `classify_stop` has everything it needs at `Stop` time. The question check ignores configured benign closers and openers. |
-| `SessionEnd`       | emits `Clear` (removes the row, unless a live sibling owns it)                       | Bypasses status classification entirely.                       |
+| Event                 | Status produced                                                                     | Notes                                                          |
+|---                    |---                                                                                  |---                                                             |
+| `SessionStart`        | `idle` (no fields) — otherwise treated like `Notification`                          | Used to seed an empty row before any user activity.            |
+| `UserPromptSubmit`    | `working`                                                                           | Label is the cleaned prompt; blank prompt → label `None`.      |
+| `UserPromptExpansion` | `working` for a slash command (`expansion_type` is `slash_command`); other expansions ignored | Label is the cleaned prompt. Fires before a skill's `!` context-gathering, so a skill launch shows `working` without waiting for the later `UserPromptSubmit`, which owns the dialog entry. |
+| `Notification`        | `blocked` (default); `idle_prompt` and `permission_prompt` are ignored outright     | See the notification-type table below.                         |
+| `PreToolUse`          | `blocked` for `AskUserQuestion` / `ExitPlanMode` only; other tools ignored         | Label: `"has a question"` for `AskUserQuestion`, `"plan approval"` for `ExitPlanMode`. The matcher in `~/.claude/settings.json` should restrict the hook to these two tools (see [Installation → Wire the Claude Code hook](../install#2-wire-the-claude-code-hook)) — Claude Code buffers the `tool_use` block until the user answers, so the JSONL transcript can't carry the signal in flight. |
+| `PermissionRequest`   | `blocked`                                                                           | Label: `"needs approval: <tool>"` from `payload.tool_name` (`"tool"` when absent), except that `AskUserQuestion` / `ExitPlanMode` keep the label their `PreToolUse` set. Without an `agent_id` it is the main agent's dialog and sets the row's status. With one, a subagent raised it: it opens a prompt over the row instead — see [Subagent permission prompts](#subagent-permission-prompts). |
+| `Elicitation`         | `blocked`                                                                           | An MCP tool asked for input. Label is the request's message (first 60 characters), else `"needs your input"`. |
+| `ElicitationResult`   | `working`                                                                           | The user answered the MCP prompt. No label of its own, so the task label stays. |
+| `Stop`                | `blocked` if the final assistant message ends on a question, else `waiting` if background work is still in flight, else `done` (see [detection rules](#question-detection)) | Settled here and not revisited: the payload carries the final text as `last_assistant_message` and any in-flight work as `background_tasks`, so `classify_stop` has everything it needs at `Stop` time. The question check ignores configured benign closers and openers. A `Stop` whose `background_tasks` is empty or absent also releases every open subagent prompt on the row. |
+| `StopFailure`         | `error`                                                                             | The turn ended on an API error, which fires no `Stop`. Label is the failure kind, else `"turn failed"`. |
+| `PreCompact`          | emits `Boundary` (a history separator; the stale context-token count is cleared)    | No status change: the session continues past the compaction.   |
+| `SubagentStop`        | emits `SubagentStopped` for the payload's `agent_id`; ignored without one            | No status of its own. Releases every open prompt from that agent. |
+| `SessionEnd`          | emits `Clear` (removes the row, unless a live sibling owns it)                       | Bypasses status classification entirely.                       |
 
 `SessionStart` and `Notification` share a code path because Claude Code occasionally emits notifications under either name; the dispatcher merges them.
 
@@ -55,7 +62,7 @@ The adapter recognizes six event names. Anything else returns `Ignore` and the w
 
 | `notification_type`  | Status                                                       | Label                                                |
 |---                   |---                                                           |---                                                   |
-| `permission_prompt`  | `blocked`                                                   | `"needs approval: <tool>"` — `<tool>` is the text after `"use "` in the message; falls back to `"tool"` if the marker is absent. |
+| `permission_prompt`  | none — the event is ignored                                  | none                                                 |
 | `plan_approval`      | `blocked`                                                   | `"plan approval"` (fixed)                            |
 | `idle_prompt`        | none — the event is ignored                                  | none                                                 |
 | anything else        | `blocked`                                                   | cleaned `payload.message`, truncated to 60 chars     |
@@ -64,6 +71,21 @@ The adapter recognizes six event names. Anything else returns `Ignore` and the w
 The 60-char truncation counts **characters, not bytes**, so multi-byte glyphs (emoji, CJK) are never split mid-codepoint.
 
 `idle_prompt` produces no classification at all: `Stop` has already settled the row from its own payload, so re-deriving a verdict here would be redundant, and the event is a flaky fixed timer besides. See [question detection](#question-detection).
+
+`permission_prompt` is ignored because it repeats a dialog `PermissionRequest` reported seconds earlier, with the tool named in a field rather than in message text. It carries no `agent_id` even when a subagent's dialog raised it, so applying it would relabel the row, and after a subagent prompt had been released it would bring the BLOCK back.
+
+### Subagent permission prompts
+
+A subagent — a Task agent, or one of a workflow's agents — can open a tool-permission dialog of its own. Its `PermissionRequest` carries the subagent's `agent_id` and the main session's `transcript_path`, and the adapter returns it as a `Set` whose `subagent` effect is `PromptOpened` rather than as a status for the main agent. The row shows `blocked` with the prompt's label while the main agent's own state keeps moving underneath (`AgentSession::subagent_gate` in `state.rs`). Once every open prompt has settled, the row shows that state again, with its own clock.
+
+Nothing in the hook stream says when a subagent's dialog closes, so a prompt is released by one of these, and never by a timer:
+
+- **The gated call's result.** Claude Code writes the call's `tool_result` to the agent's own transcript, `agent-<agent_id>.jsonl` under `<main transcript minus .jsonl>/subagents/`, whether the call was approved, rejected, timed out on the 120 s safety check, or aborted. `subagent_gate.rs` re-reads that file on a 2 s tick while prompts are open. The hook carries no `tool_use_id`, so the call is matched on what it does carry: a same-name call issued before the hook whose input equals the hook's `tool_input`, and with no exact match, every same-name call in the newest message that held one. The prompt settles only once every candidate call has its result. An approved call therefore holds the BLOCK until it finishes, since nothing records the approval itself.
+- **`SubagentStop` for that agent**, which releases every prompt the agent holds. It covers an agent that ends without writing a result: interrupted, or killed with its dialog open.
+- **A main `Stop` with no background work in flight** (`background_tasks` empty or absent), which releases every prompt that session raised, since none of its subagents can still be prompting. A second Claude Code instance sharing the row keeps its own prompts.
+- **Removal of the row** (`SessionEnd`, or the liveness reaper), which drops its prompts with it.
+
+Each `PermissionRequest` is its own prompt, so two from one agent, or from two agents, settle separately. While several are open, the row shows the newest one's label.
 
 ## Prompt and label cleaning
 
@@ -140,12 +162,17 @@ Every status-affecting decision is written to `widget.jsonl` (the same tracing s
 
 | `decision`                            | Emitted from              | Meaning                                                                                                                                                                      |
 |---                                    |---                        |---                                                                                                                                                                          |
-| `classify`                            | `http_server` (`event -> set`) | A hook event set the row's status. For `Stop` the `reason` reads `turn ended on a question [<rule>]: "<snippet>"` or `turn ended; final message is not a question: "<snippet>"`. |
+| `classify`                            | `http_server` (`event -> set`) | A hook event set the row's status. For `Stop` the `reason` reads `turn ended on a question [<rule>]: "<snippet>"` or `turn ended; final message is not a question: "<snippet>"`. Carries the hook's `agent_id`, `None` on the main agent's own events. |
 | `resume_working`                      | `log_watcher`             | The transcript watcher saw new activity (a tool call or user turn) after a pause and promoted the row back to `working` — the path that clears a stale `blocked` once the user answers an `AskUserQuestion`. |
 | `settle_waiting`                      | `waiting_settle`          | A row sat in `waiting` (light-blue WAIT) unchanged past `waiting_settle_ms` and was settled to `done` — the backstop for a background shell task the user killed, which ends silently and so fires no follow-up `Stop`. Carries `waited_ms` / `window_ms`. |
 | `revert_cancelled`                    | `log_watcher`             | An Esc-cancelled turn (no lifecycle hook) reverted to its pre-prompt status — the `status` field records where it landed.                                              |
 | `apply_set`                           | `state.rs`                | The state-machine transition: `prior_status` → `new_status`, plus `task_boundary` and `continuation_suppressed`.                                                            |
 | `session_clear` / `compact_boundary`  | `http_server`             | Session removed / context-compaction history separator inserted.                                                                                                            |
+| `subagent_prompt_open`                | `http_server`             | A subagent's `PermissionRequest` opened a prompt, and the row shows `blocked`. Carries `request` (the id the dashboard minted for it), `agent_id`, `agent_type`, `tool`, `pending` (how many prompts are now open on the row) and `base_status` (the main agent's own status underneath). |
+| `subagent_prompt_settled`             | `subagent_gate`, `http_server` | One or more prompts settled. `via` names the exit: `tool_result`, `subagent_stop` or `stop_no_background`. `released` says whether the last prompt went and the main agent's state came back, `status` is what the row shows afterwards, and `latency_ms` runs from the oldest settled prompt's opening. A `tool_result` settle also carries `tool_use_ids`, `is_error` and `matched_on` (`input` when the hook's input matched a call exactly, else `name`). |
+| `subagent_prompt_unmatched`           | `subagent_gate`           | Diagnosis only, logged once per prompt: the tick could not find the gated call. `outcome` is `no_transcript_path`, `no_transcript` or `no_tool_use`. The prompt stays open, and the row's status does not move. |
+
+`apply_set`, `resume_working` and `revert_cancelled` also carry a `gated` field. When it is `true`, a subagent prompt was open on the row: the statuses on the line are the main agent's own, and the row itself kept showing `blocked`.
 
 The project-local `investigate` skill (`.claude/skills/investigate/investigate.py`) reads these lines to reconstruct an agent's current state and its decision chain: `investigate.py <agent>` explains one session; no argument lists the active sessions to choose from.
 

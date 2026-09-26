@@ -10,7 +10,7 @@
 use std::path::PathBuf;
 
 use crate::config::Config;
-use crate::state::SetInput;
+use crate::state::{SetInput, SubagentPromptRequest};
 
 pub mod claude;
 
@@ -27,7 +27,15 @@ pub enum AdapterOutput {
         /// or the code — it carries the matched question-rule and a text
         /// snippet for the question path.
         reason: String,
+        /// What this event means for the subagent permission prompts open on
+        /// the row. A prompt that opens is applied instead of `input` as a
+        /// main-agent status (see `AppState::open_subagent_prompt`); one that
+        /// ends them all is applied after it.
+        subagent: SubagentEffect,
     },
+    /// A subagent ended (`SubagentStop`), so none of its permission prompts can
+    /// still be on screen: settle every one it holds on row `id`.
+    SubagentStopped { id: String, agent_id: String },
     /// Remove a session.
     Clear { id: String },
     /// Mark a context boundary in the session's dialog (a history separator)
@@ -37,6 +45,21 @@ pub enum AdapterOutput {
     /// Adapter does not handle this event — drop silently. Useful for
     /// lifecycle events we subscribe to but don't need (future-proofing).
     Ignore,
+}
+
+/// What a [`AdapterOutput::Set`] event says about subagent permission prompts.
+#[derive(Debug)]
+pub enum SubagentEffect {
+    /// Nothing: the event is the main agent's own.
+    Untouched,
+    /// A subagent's tool-permission dialog opened — a `PermissionRequest`
+    /// carrying an `agent_id`. The row shows BLOCK over the main agent's state
+    /// until the dialog settles.
+    PromptOpened(SubagentPromptRequest),
+    /// The main turn ended with no background work in flight (a `Stop` whose
+    /// `background_tasks` is empty or absent), so none of *this session's*
+    /// subagents can still be prompting and every prompt it raised is released.
+    AllEnded,
 }
 
 /// Dispatch an incoming event to the correct adapter by client id.

@@ -58,11 +58,18 @@ For reference, the copied snippet has this shape (your copy substitutes the real
 ```json
 {
   "hooks": {
-    "SessionStart":     [{"hooks": [{"type": "command", "command": "python3 \"<app-data>/claude_hook.py\""}]}],
-    "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "python3 \"<app-data>/claude_hook.py\""}]}],
-    "Notification":     [{"hooks": [{"type": "command", "command": "python3 \"<app-data>/claude_hook.py\""}]}],
-    "Stop":             [{"hooks": [{"type": "command", "command": "python3 \"<app-data>/claude_hook.py\""}]}],
-    "SessionEnd":       [{"hooks": [{"type": "command", "command": "python3 \"<app-data>/claude_hook.py\""}]}],
+    "SessionStart":        [{"hooks": [{"type": "command", "command": "python3 \"<app-data>/claude_hook.py\""}]}],
+    "UserPromptSubmit":    [{"hooks": [{"type": "command", "command": "python3 \"<app-data>/claude_hook.py\""}]}],
+    "UserPromptExpansion": [{"hooks": [{"type": "command", "command": "python3 \"<app-data>/claude_hook.py\""}]}],
+    "Notification":        [{"hooks": [{"type": "command", "command": "python3 \"<app-data>/claude_hook.py\""}]}],
+    "Stop":                [{"hooks": [{"type": "command", "command": "python3 \"<app-data>/claude_hook.py\""}]}],
+    "StopFailure":         [{"hooks": [{"type": "command", "command": "python3 \"<app-data>/claude_hook.py\""}]}],
+    "PermissionRequest":   [{"hooks": [{"type": "command", "command": "python3 \"<app-data>/claude_hook.py\""}]}],
+    "Elicitation":         [{"hooks": [{"type": "command", "command": "python3 \"<app-data>/claude_hook.py\""}]}],
+    "ElicitationResult":   [{"hooks": [{"type": "command", "command": "python3 \"<app-data>/claude_hook.py\""}]}],
+    "PreCompact":          [{"hooks": [{"type": "command", "command": "python3 \"<app-data>/claude_hook.py\""}]}],
+    "SubagentStop":        [{"hooks": [{"type": "command", "command": "python3 \"<app-data>/claude_hook.py\""}]}],
+    "SessionEnd":          [{"hooks": [{"type": "command", "command": "python3 \"<app-data>/claude_hook.py\""}]}],
     "PreToolUse": [{
       "matcher": "^(AskUserQuestion|ExitPlanMode)$",
       "hooks": [{"type": "command", "command": "python3 \"<app-data>/claude_hook.py\""}]

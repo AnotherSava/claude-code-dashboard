@@ -67,7 +67,7 @@ pub fn projects_root() -> Option<PathBuf> {
 
 /// Every `*.jsonl` under `root`, at any depth. Subagent transcripts live in a
 /// nested `subagents/` directory, so this cannot be a flat read_dir.
-fn transcript_files(root: &Path) -> Vec<PathBuf> {
+pub(crate) fn transcript_files(root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -118,7 +118,7 @@ pub fn parse_usage_line(line: &str) -> Option<TokenRecord> {
 
 /// Parse the RFC3339 timestamps Claude Code writes (always UTC, `...Z`) to ms
 /// since epoch.
-fn parse_rfc3339_ms(raw: &str) -> Option<i64> {
+pub(crate) fn parse_rfc3339_ms(raw: &str) -> Option<i64> {
     chrono::DateTime::parse_from_rfc3339(raw).ok().map(|dt| dt.timestamp_millis())
 }
 

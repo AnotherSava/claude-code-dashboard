@@ -29,26 +29,53 @@ Each decision line carries `"decision":"<code>"`, the resolved agent (`chat_id`
 or `id`), and a `reason`:
 
 - `classify` — a hook event set the row's status (fields: `event`, `status`,
-  `label`, `reason`). For a `Stop`/idle event the reason spells out the question
-  verdict: `turn ended on a question [<rule>]: "<snippet>"` or `… is not a question: "<snippet>"`.
+  `label`, `reason`, `agent_id`). For a `Stop` the reason spells out the question
+  verdict: `turn ended on a question [<rule>]: "<snippet>"` or `… is not a question: "<snippet>"`;
+  a `Stop` with background work still running lands on WAIT. `agent_id` names
+  the subagent on a `PermissionRequest` (and `PreToolUse`) a subagent raised, and
+  is `None` on the main agent's. It proves nothing on other events: a subagent's
+  `Notification`, `Elicitation`/`ElicitationResult` and `PreCompact` carry no
+  `agent_id` either, so they read exactly like the main agent's own.
 - `resume_working` — the transcript watcher saw new activity (a tool call or
   user turn) after a pause and promoted the row back to Working. This is the
   path that clears a stale BLOCK once the user answers an `AskUserQuestion`.
-- `enter_waiting` — the main turn settled but background subagents are still
-  running, so the row is held on WAIT (light-blue) rather than going Done.
-- `correct_to_blocked` / `correct_to_done` — the watcher re-judged the final
-  assistant turn once it flushed to disk, fixing a verdict `Stop` made too early.
 - `revert_cancelled` — an Esc-cancelled turn (no lifecycle hook) reverted to its
   pre-prompt status (`status` field = where it landed).
 - `apply_set` — the state-machine transition (`prior_status` → `new_status`,
   `task_boundary`, `continuation_suppressed`).
+- `gated: true` on `apply_set`, `resume_working` or `revert_cancelled` — a
+  subagent's permission prompt was open on the row. The statuses on the line
+  are the main agent's own, underneath; the row itself kept showing BLOCK.
+- `subagent_prompt_open` — a subagent's `PermissionRequest` put the row on
+  BLOCK over the main agent's state (`request`, `agent_id`, `agent_type`,
+  `tool`, `pending`, `base_status`).
+- `subagent_prompt_settled` — one or more of those prompts closed. `via` is
+  `tool_result` (the agent's transcript recorded the call's result; also
+  carries `is_error`, `matched_on`), `subagent_stop` or `stop_no_background`.
+  `status` is what the row shows afterwards; `released: false` means other
+  prompts still hold the BLOCK.
+- `subagent_prompt_unmatched` — diagnosis only, once per prompt: the gate could
+  not find the gated call (`outcome`: `no_transcript_path` / `no_transcript` /
+  `no_tool_use`). The prompt stays open and the status does not move. Only
+  `no_transcript_path` is final; after the other two the tick keeps looking and
+  can still settle the prompt `via=tool_result`.
 - `session_clear` / `compact_boundary` — session removed / context-compaction
   separator inserted.
+- `settle_waiting` — the backstop settled a WAIT held by a background shell
+  task to Done once it sat unchanged past the window (`waited_ms`,
+  `window_ms`): a task the user killed ends silently, so no later `Stop` comes.
+- `restore_row` — after a dashboard restart, a live session with no row got one
+  back, its `status` read from the tab title the dashboard last wrote.
 - `reap_exited` — the liveness reaper removed the row because its owning Claude
   process exited without a `SessionEnd` (e.g. you typed `exit` / closed the
   terminal). Carries the dead `pid` and the `prior_status` the row last held.
   This is a terminal decision: if it's the newest line, the row is gone on
   purpose, not stuck.
+
+Historical, only in logs written by older builds: `enter_waiting` (WAIT now
+comes from `classify` of a `Stop`), and `correct_to_blocked` /
+`correct_to_done` (the watcher's re-judging of a too-early `Stop`, removed
+once `Stop` carried its final message).
 
 ## Workflow
 
@@ -79,12 +106,21 @@ Translate the trail into a plain-language answer:
 - **Why it's in this state**: quote the `reason` of the setting decision. For a
   BLOCK, that's almost always a `classify` with a question rule (the agent ended
   its turn asking something) or a tool gate (`AskUserQuestion` / permission
-  dialog), or a `revert_cancelled` landing back on `Blocked`. A WAIT is an
-  `enter_waiting` — background agents still running after the turn settled.
+  dialog), a `subagent_prompt_open` (a subagent's permission dialog), or a
+  `revert_cancelled` landing back on `Blocked`. A WAIT is a `classify` of a
+  `Stop` whose background work was still running after the turn settled.
 - **Whether it's correct or stuck**: a BLOCK whose newest decision is the
   question/gate that caused it is genuinely waiting on the user. A BLOCK that the
-  user has already answered should show a later `resume_working` or
-  `correct_to_done`; if it doesn't, that's the bug to dig into.
+  user has already answered should show a later `resume_working` or a later
+  `classify`; if it doesn't, that's the bug to dig into. A BLOCK from
+  `subagent_prompt_open` clears on a `subagent_prompt_settled` with
+  `released: true`. If none has followed, look for a `subagent_prompt_unmatched`
+  line before concluding the user owes an answer. With `no_transcript_path` the
+  prompt waits on `SubagentStop`, a `Stop` from the same session with no
+  background work, or the row's removal; with the other outcomes the tick is
+  still reading the agent's transcript and a late result settles it. After a
+  release the script credits the status to the line that set it underneath and
+  prints the release as `Revealed by`.
 - Keep it short. Lead with the state and the one-line reason; include the
   timeline only if it adds clarity. Don't dump raw JSON.
 

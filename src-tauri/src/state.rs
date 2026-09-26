@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
@@ -281,9 +282,179 @@ pub struct AgentSession {
     /// be about that machine's tabs anyway.
     #[serde(default)]
     pub name_shared_by: Option<usize>,
+    /// The subagent permission prompts open on this row, and the main agent's
+    /// own state underneath them. `None` whenever no subagent is waiting on a
+    /// dialog, which is nearly always.
+    ///
+    /// While it is set the row reads `Blocked` with the newest prompt's label,
+    /// but that is an overlay: every main-agent writer runs through
+    /// [`with_base`], so a `Stop`, a new prompt or the watcher's promotion moves
+    /// the base and leaves the BLOCK standing. When the last prompt settles, the
+    /// base is written back exactly as stored, clock included.
+    ///
+    /// Internal and in-memory, like `status_before_working`: a restart loses it,
+    /// and the row then keeps the BLOCK until the main agent's next event.
+    #[serde(skip)]
+    pub subagent_gate: Option<SubagentGate>,
+}
+
+/// A subagent's tool-permission dialog, read off its `PermissionRequest`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SubagentPromptRequest {
+    /// The hook's `agent_id`, never empty — what `SubagentStop` settles by.
+    pub agent_id: String,
+    /// The Claude Code session that raised it — what a main `Stop` with no
+    /// background work settles by. Not the row: two instances can share a row
+    /// (a `--fork-session --resume` migration leaves both in one cwd), and one
+    /// instance finishing says nothing about the other's subagents.
+    pub session_id: String,
+    pub agent_type: Option<String>,
+    /// The gated tool, `"tool"` when the payload names none.
+    pub tool_name: String,
+    /// The gated call's input as the hook reported it, `Null` when absent. The
+    /// tick narrows same-name calls in the agent's transcript by it.
+    pub tool_input: serde_json::Value,
+    /// What the row shows while this is the newest open prompt.
+    pub label: String,
+    /// `<main transcript minus ".jsonl">/subagents`, where the agent's own
+    /// transcript lives. `None` when the hook carried no `transcript_path`, in
+    /// which case only the hook exits can settle the prompt.
+    pub subagents_dir: Option<PathBuf>,
+}
+
+/// One open subagent prompt.
+#[derive(Clone, Debug)]
+pub struct PendingPrompt {
+    /// Minted by [`AppState::open_subagent_prompt`]: starts at 1 and is unique
+    /// for the life of the process, so two prompts from one agent never merge.
+    pub request: u64,
+    /// When the hook was applied — the tick judges the transcript against it.
+    pub requested_at: i64,
+    pub prompt: SubagentPromptRequest,
+}
+
+/// The four fields a pending subagent prompt overlays, as the main agent's own
+/// events last left them.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BaseState {
+    pub status: Status,
+    pub label: String,
+    pub waiting_backstop_armed: bool,
+    pub state_entered_at: i64,
+}
+
+impl BaseState {
+    fn capture(s: &AgentSession) -> Self {
+        Self { status: s.status, label: s.label.clone(), waiting_backstop_armed: s.waiting_backstop_armed, state_entered_at: s.state_entered_at }
+    }
+
+    fn write_into(&self, s: &mut AgentSession) {
+        s.status = self.status;
+        s.label = self.label.clone();
+        s.waiting_backstop_armed = self.waiting_backstop_armed;
+        s.state_entered_at = self.state_entered_at;
+    }
+}
+
+/// See [`AgentSession::subagent_gate`]. Exists only while `pending` is
+/// non-empty; while it does the row's visible fields are `Blocked`, the newest
+/// pending prompt's label, a disarmed backstop, and `blocked_since`.
+#[derive(Clone, Debug)]
+pub struct SubagentGate {
+    pub base: BaseState,
+    /// The visible BLOCK's `state_entered_at`. It keeps the row's own clock when
+    /// the row was already blocked on the main agent, so one continuous BLOCK
+    /// never restarts its count.
+    pub blocked_since: i64,
+    /// Oldest first.
+    pub pending: Vec<PendingPrompt>,
+}
+
+/// Which open prompts a settle releases.
+#[derive(Clone, Copy, Debug)]
+pub enum SettleScope<'a> {
+    /// The one prompt the tick matched to a `tool_result`.
+    Request(u64),
+    /// Every prompt from one agent, on its `SubagentStop`.
+    Agent(&'a str),
+    /// Every prompt one session raised, on that session's main `Stop` with no
+    /// background work.
+    Session(&'a str),
+}
+
+impl SettleScope<'_> {
+    fn covers(self, p: &PendingPrompt) -> bool {
+        match self {
+            SettleScope::Request(r) => p.request == r,
+            SettleScope::Agent(a) => p.prompt.agent_id == a,
+            SettleScope::Session(s) => p.prompt.session_id == s,
+        }
+    }
+}
+
+/// What [`AppState::open_subagent_prompt`] did, for its decision log line.
+#[derive(Clone, Debug)]
+pub struct OpenOutcome {
+    pub request: u64,
+    /// How many prompts are open on the row now, this one included.
+    pub pending: usize,
+    /// The main agent's own status under the BLOCK.
+    pub base_status: Status,
+    /// Whether the dialog changed (only a freshly created row restoring its
+    /// history), which is what the caller persists on.
+    pub dialog_changed: bool,
+}
+
+/// What [`AppState::settle_subagent_prompts`] released.
+#[derive(Clone, Debug)]
+pub struct SettleOutcome {
+    pub settled: Vec<PendingPrompt>,
+    pub remaining: usize,
+    /// Whether the last prompt settled and the base came back.
+    pub released: bool,
+    /// The row's visible status after the settle.
+    pub status: Status,
+}
+
+/// Write the gate's four visible fields, if the row has a gate.
+fn show_gate(s: &mut AgentSession) {
+    let Some(gate) = s.subagent_gate.as_ref() else { return };
+    let Some(newest) = gate.pending.last() else { return };
+    let (label, blocked_since) = (newest.prompt.label.clone(), gate.blocked_since);
+    s.status = Status::Blocked;
+    s.label = label;
+    s.waiting_backstop_armed = false;
+    s.state_entered_at = blocked_since;
+}
+
+/// Run a main-agent write against the row's own state rather than the
+/// subagent-prompt overlay on top of it.
+///
+/// With no gate this is just `f(s)`. Under a gate the base is written into the
+/// row, `f` runs on it exactly as it would on an ungated row — so prior-status
+/// reads, task boundaries, `status_before_working`, the sticky label and the
+/// working-time bank all see the main agent's own state — and whatever `f` left
+/// becomes the new base before the BLOCK is shown again. Every writer of the
+/// four overlaid fields goes through here: `apply_set`, the watcher's promotion
+/// to Working and `revert_cancelled_turn`.
+pub(crate) fn with_base<R>(s: &mut AgentSession, f: impl FnOnce(&mut AgentSession) -> R) -> R {
+    let Some(mut gate) = s.subagent_gate.take() else { return f(s) };
+    gate.base.write_into(s);
+    let out = f(s);
+    gate.base = BaseState::capture(s);
+    s.subagent_gate = Some(gate);
+    show_gate(s);
+    out
 }
 
 impl AgentSession {
+    /// The main agent's own status: the base under a pending subagent prompt,
+    /// else the row's status. What the sleep holds read, so a workflow running
+    /// under a subagent's dialog still counts as work.
+    pub fn base_status(&self) -> Status {
+        self.subagent_gate.as_ref().map_or(self.status, |g| g.base.status)
+    }
+
     /// Name to show the user in notifications and titles: the custom display
     /// name if one is set, else the chat_id. `display_name` is only populated
     /// off the `CustomNamesStore` (see [`crate::custom_names::CustomNamesStore::apply`]),
@@ -427,6 +598,10 @@ pub struct AppState {
     /// the first snapshot is 1 and 0 can mean "no snapshot", which is what a
     /// consumer compares against before it has applied anything.
     snapshot_seq: AtomicU64,
+    /// Counter behind [`PendingPrompt::request`], advanced inside the
+    /// `sessions` lock like `snapshot_seq`. Starts at 0 so the first request
+    /// is 1.
+    next_prompt_request: AtomicU64,
 }
 
 /// Append a session-boundary separator to a session's dialog in place. Returns
@@ -528,92 +703,99 @@ impl AppState {
         let mut sessions = self.sessions.lock().unwrap();
         let dialog_entry = input.dialog_entry.clone();
         if let Some(existing) = sessions.iter_mut().find(|s| s.id == input.id) {
-            let prior = existing.status;
+            // A pending subagent prompt overlays the row, and this is the main
+            // agent's own event, so everything below reads and writes the base
+            // underneath it (see `with_base`); the row stays BLOCK when gated.
+            let gated = existing.subagent_gate.is_some();
+            with_base(existing, |existing| {
+                let prior = existing.status;
 
-            let raw_task_boundary = matches!(
-                prior,
-                Status::Done | Status::Idle | Status::Working | Status::Waiting
-            ) && input.status == Status::Working;
-            let is_continuation = raw_task_boundary
-                && input
-                    .label
-                    .as_deref()
-                    .is_some_and(|l| is_continuation_prompt(l, continuation_prompts));
-            let task_boundary = raw_task_boundary && !is_continuation;
+                let raw_task_boundary = matches!(
+                    prior,
+                    Status::Done | Status::Idle | Status::Working | Status::Waiting
+                ) && input.status == Status::Working;
+                let is_continuation = raw_task_boundary
+                    && input
+                        .label
+                        .as_deref()
+                        .is_some_and(|l| is_continuation_prompt(l, continuation_prompts));
+                let task_boundary = raw_task_boundary && !is_continuation;
 
-            if prior == Status::Working && input.status != Status::Working {
-                let delta = (now_ms - existing.state_entered_at).max(0) as u64;
-                existing.working_accumulated_ms = existing.working_accumulated_ms.saturating_add(delta);
-            }
+                if prior == Status::Working && input.status != Status::Working {
+                    let delta = (now_ms - existing.state_entered_at).max(0) as u64;
+                    existing.working_accumulated_ms = existing.working_accumulated_ms.saturating_add(delta);
+                }
 
-            // Remember where to revert if this turn is cancelled with Esc. Only
-            // capture on a real entry into Working (not Working → Working), so
-            // the snapshot is always a genuine pre-prompt status — typically the
-            // `Blocked` of a question the user is mid-answer to.
-            if input.status == Status::Working && prior != Status::Working {
-                existing.status_before_working = prior;
-            }
+                // Remember where to revert if this turn is cancelled with Esc. Only
+                // capture on a real entry into Working (not Working → Working), so
+                // the snapshot is always a genuine pre-prompt status — typically the
+                // `Blocked` of a question the user is mid-answer to.
+                if input.status == Status::Working && prior != Status::Working {
+                    existing.status_before_working = prior;
+                }
 
-            let (new_label, new_original_prompt) =
-                crate::label_policy::select(Some(&*existing), &input, task_boundary);
+                let (new_label, new_original_prompt) =
+                    crate::label_policy::select(Some(&*existing), &input, task_boundary);
 
-            if task_boundary {
-                existing.working_accumulated_ms = 0;
-            }
+                if task_boundary {
+                    existing.working_accumulated_ms = 0;
+                }
 
-            if prior != input.status || task_boundary {
-                existing.state_entered_at = now_ms;
-            }
+                if prior != input.status || task_boundary {
+                    existing.state_entered_at = now_ms;
+                }
 
-            tracing::debug!(
-                id = %input.id,
-                decision = "apply_set",
-                path = "existing",
-                prior_status = ?prior,
-                new_status = ?input.status,
-                task_boundary,
-                continuation_suppressed = is_continuation,
-                input_label = ?input.label,
-                prior_original_prompt = ?existing.original_prompt,
-                new_label = %new_label,
-                new_original_prompt = ?new_original_prompt,
-                "apply_set"
-            );
+                tracing::debug!(
+                    id = %input.id,
+                    decision = "apply_set",
+                    path = "existing",
+                    prior_status = ?prior,
+                    new_status = ?input.status,
+                    gated,
+                    task_boundary,
+                    continuation_suppressed = is_continuation,
+                    input_label = ?input.label,
+                    prior_original_prompt = ?existing.original_prompt,
+                    new_label = %new_label,
+                    new_original_prompt = ?new_original_prompt,
+                    "apply_set"
+                );
 
-            if task_boundary
-                && new_original_prompt.is_some()
-                && new_original_prompt != existing.original_prompt
-            {
-                existing.task_started_at = now_ms;
-            }
+                if task_boundary
+                    && new_original_prompt.is_some()
+                    && new_original_prompt != existing.original_prompt
+                {
+                    existing.task_started_at = now_ms;
+                }
 
-            existing.status = input.status;
-            existing.waiting_backstop_armed = input.waiting_backstop_armed;
-            existing.label = new_label;
-            existing.original_prompt = new_original_prompt;
-            if let Some(src) = input.source {
-                existing.source = src;
-            }
-            if input.model.is_some() {
-                existing.model = input.model;
-            }
-            if input.input_tokens.is_some() {
-                existing.input_tokens = input.input_tokens;
-            }
-            existing.updated = now_ms;
+                existing.status = input.status;
+                existing.waiting_backstop_armed = input.waiting_backstop_armed;
+                existing.label = new_label;
+                existing.original_prompt = new_original_prompt;
+                if let Some(src) = input.source {
+                    existing.source = src;
+                }
+                if input.model.is_some() {
+                    existing.model = input.model;
+                }
+                if input.input_tokens.is_some() {
+                    existing.input_tokens = input.input_tokens;
+                }
+                existing.updated = now_ms;
 
-            if let Some(pending) = dialog_entry {
-                let task_start = pending.role == DialogRole::User && task_boundary;
-                existing.dialog.push(DialogEntry {
-                    role: pending.role,
-                    text: pending.text,
-                    timestamp: now_ms,
-                    status: existing.status,
-                    task_start,
-                });
-                return true;
-            }
-            false
+                if let Some(pending) = dialog_entry {
+                    let task_start = pending.role == DialogRole::User && task_boundary;
+                    existing.dialog.push(DialogEntry {
+                        role: pending.role,
+                        text: pending.text,
+                        timestamp: now_ms,
+                        status: existing.status,
+                        task_start,
+                    });
+                    return true;
+                }
+                false
+            })
         } else {
             let (label, event_prompt) = crate::label_policy::select(None, &input, false);
             tracing::debug!(
@@ -661,6 +843,87 @@ impl AppState {
         let (session, _) = new_session(input, label, event_prompt, None, state_entered_at, now_ms, restored);
         sessions.push(session);
         true
+    }
+
+    /// Open a subagent's permission prompt on its row: the row reads `Blocked`
+    /// until the prompt settles, over a base the main agent keeps writing.
+    ///
+    /// Separate from [`apply_set`](Self::apply_set) because this is not the
+    /// main agent's event: the task boundary, `status_before_working`,
+    /// `original_prompt`, the dialog and the working-time bank all describe the
+    /// main agent and are left alone. The request id is minted and the prompt
+    /// recorded under the same lock that changes the status, so a settle can
+    /// never see one without the other.
+    ///
+    /// On an existing row the first prompt captures the base; later ones join
+    /// without re-capturing it, which is what lets two agents' prompts settle in
+    /// either order. A row this creates has nothing of the main agent's to
+    /// capture, so its base is an `Idle` stamped now.
+    pub fn open_subagent_prompt(&self, input: SetInput, prompt: SubagentPromptRequest, now_ms: i64, restored: Option<PersistedSession>) -> OpenOutcome {
+        let mut sessions = self.sessions.lock().unwrap();
+        // Relaxed for the reason `snapshot_versioned` gives: the ordering is the mutex's.
+        let request = self.next_prompt_request.fetch_add(1, Ordering::Relaxed) + 1;
+        let entry = PendingPrompt { request, requested_at: now_ms, prompt };
+        if let Some(s) = sessions.iter_mut().find(|s| s.id == input.id) {
+            let mut gate = s.subagent_gate.take().unwrap_or_else(|| SubagentGate {
+                base: BaseState::capture(s),
+                blocked_since: if s.status == Status::Blocked { s.state_entered_at } else { now_ms },
+                pending: Vec::new(),
+            });
+            gate.pending.push(entry);
+            let (pending, base_status) = (gate.pending.len(), gate.base.status);
+            s.subagent_gate = Some(gate);
+            show_gate(s);
+            s.updated = now_ms;
+            return OpenOutcome { request, pending, base_status, dialog_changed: false };
+        }
+        let (label, event_prompt) = crate::label_policy::select(None, &input, false);
+        let (mut session, seeded) = new_session(input, label, event_prompt, None, now_ms, now_ms, restored);
+        let base = BaseState { status: Status::Idle, label: String::new(), waiting_backstop_armed: false, state_entered_at: now_ms };
+        session.subagent_gate = Some(SubagentGate { base, blocked_since: now_ms, pending: vec![entry] });
+        show_gate(&mut session);
+        sessions.push(session);
+        OpenOutcome { request, pending: 1, base_status: Status::Idle, dialog_changed: seeded }
+    }
+
+    /// Settle the open subagent prompts `scope` covers on row `id`.
+    ///
+    /// When none remain, the base is written back exactly as stored — status,
+    /// label, backstop and clock — so the row reads as if the prompt had never
+    /// opened over whatever the main agent did meanwhile. Otherwise the row stays
+    /// BLOCK under the newest remaining prompt's label. Never goes through
+    /// `apply_set`: releasing a prompt is not a status the main agent entered,
+    /// so there is no task boundary to detect and no working time to bank.
+    ///
+    /// `None` when the row is gone or nothing matched, and then `updated` is
+    /// left alone, so a settle racing a `/clear` or a second exit is a no-op.
+    pub fn settle_subagent_prompts(&self, id: &str, scope: SettleScope, now_ms: i64) -> Option<SettleOutcome> {
+        let mut sessions = self.sessions.lock().unwrap();
+        let s = sessions.iter_mut().find(|s| s.id == id)?;
+        let gate = s.subagent_gate.as_mut()?;
+        let (settled, remaining): (Vec<PendingPrompt>, Vec<PendingPrompt>) = std::mem::take(&mut gate.pending).into_iter().partition(|p| scope.covers(p));
+        let left = remaining.len();
+        gate.pending = remaining;
+        if settled.is_empty() {
+            return None;
+        }
+        let released = left == 0;
+        if released {
+            if let Some(gate) = s.subagent_gate.take() {
+                gate.base.write_into(s);
+            }
+        } else {
+            show_gate(s);
+        }
+        s.updated = now_ms;
+        Some(SettleOutcome { settled, remaining: left, released, status: s.status })
+    }
+
+    /// Every open subagent prompt with the row it sits on, for the tick that
+    /// reads the agents' transcripts. Clones the prompts only, never a dialog.
+    pub fn pending_subagent_prompts(&self) -> Vec<(String, PendingPrompt)> {
+        let sessions = self.sessions.lock().unwrap();
+        sessions.iter().flat_map(|s| s.subagent_gate.iter().flat_map(|g| g.pending.iter().map(|p| (s.id.clone(), p.clone())))).collect()
     }
 }
 
@@ -730,6 +993,7 @@ fn new_session(
         canary: Canary::Off,
         attended_at: None,
         name_shared_by: None,
+        subagent_gate: None,
     };
     (session, has_new_entry || dialog_restored)
 }
@@ -768,21 +1032,28 @@ impl AppState {
     /// task that clobbers `original_prompt`. No-op unless still `Working`, so a
     /// turn that already moved on is left alone. Mirrors `apply_set`'s
     /// Working→non-Working accounting (banks the elapsed run, resets the timer).
-    /// Returns true if it acted.
-    /// Returns the status it reverted to (for the decision log), or `None` when
-    /// it was a no-op because the row had already left `Working`.
-    pub fn revert_cancelled_turn(&self, id: &str, now_ms: i64) -> Option<Status> {
+    ///
+    /// The Esc is the main agent's, so under a pending subagent prompt it
+    /// reverts the base and the row stays BLOCK (see [`with_base`]).
+    ///
+    /// Returns the base status it reverted to and whether a subagent prompt was
+    /// overlaying the row (both for the decision log), or `None` when it was a
+    /// no-op because the main agent had already left `Working`.
+    pub fn revert_cancelled_turn(&self, id: &str, now_ms: i64) -> Option<(Status, bool)> {
         let mut sessions = self.sessions.lock().unwrap();
         let s = sessions.iter_mut().find(|s| s.id == id)?;
-        if s.status != Status::Working {
-            return None;
-        }
-        let delta = (now_ms - s.state_entered_at).max(0) as u64;
-        s.working_accumulated_ms = s.working_accumulated_ms.saturating_add(delta);
-        s.status = s.status_before_working;
-        s.state_entered_at = now_ms;
-        s.updated = now_ms;
-        Some(s.status)
+        let gated = s.subagent_gate.is_some();
+        with_base(s, |s| {
+            if s.status != Status::Working {
+                return None;
+            }
+            let delta = (now_ms - s.state_entered_at).max(0) as u64;
+            s.working_accumulated_ms = s.working_accumulated_ms.saturating_add(delta);
+            s.status = s.status_before_working;
+            s.state_entered_at = now_ms;
+            s.updated = now_ms;
+            Some((s.status, gated))
+        })
     }
 
     /// Settle a stale `Waiting` row to `Done` — the backstop for background work
@@ -794,7 +1065,9 @@ impl AppState {
     /// can't clobber a row that just moved on — closing the settle-vs-event race.
     /// No-op unless still `Waiting`. `Waiting` isn't `Working`, so there's no
     /// run-time to bank (mirrors `revert_cancelled_turn`, which does). Returns
-    /// true if it acted.
+    /// true if it acted. A `Waiting` base under a pending subagent prompt reads
+    /// `Blocked`, so the status guard refuses it until the prompt settles and
+    /// the restored clock resumes the count.
     pub fn settle_stale_waiting(&self, id: &str, expect_updated: i64, now_ms: i64) -> bool {
         let mut sessions = self.sessions.lock().unwrap();
         let Some(s) = sessions.iter_mut().find(|s| s.id == id) else {
@@ -920,14 +1193,6 @@ impl AppState {
     pub fn drift_confirmed(&self, id: &str) -> bool {
         let sessions = self.sessions.lock().unwrap();
         sessions.iter().find(|s| s.id == id).is_some_and(|s| s.instruction_drift)
-    }
-
-    /// A row's current status (None when the row is gone). Used by the canary check
-    /// to tell a settled *completion* turn from a `Blocked` *handback* turn, which
-    /// defers a dropped-marker verdict rather than confirming drift.
-    pub fn status_of(&self, id: &str) -> Option<Status> {
-        let sessions = self.sessions.lock().unwrap();
-        sessions.iter().find(|s| s.id == id).map(|s| s.status)
     }
 
     /// Clear the instruction-drift flag on every local session — called when the
@@ -1354,7 +1619,7 @@ mod tests {
         let state = AppState::new();
         state.apply_set(set("a", Status::Working, "fix foo.py"), 0, NO_CONTINUATIONS, None);
 
-        assert_eq!(state.revert_cancelled_turn("a", 20_000), Some(Status::Idle));
+        assert_eq!(state.revert_cancelled_turn("a", 20_000), Some((Status::Idle, false)));
         let s = get(&state, "a");
         assert_eq!(s.status, Status::Idle);
         assert_eq!(s.working_accumulated_ms, 20_000, "elapsed run banked");
@@ -1375,7 +1640,7 @@ mod tests {
         state.apply_set(set("a", Status::Working, "ny"), 12_000, NO_CONTINUATIONS, None);
         // ...then cancels it with Esc (no Stop hook) — the watcher calls
         // revert_cancelled_turn on the interrupt marker.
-        assert_eq!(state.revert_cancelled_turn("a", 13_000), Some(Status::Blocked));
+        assert_eq!(state.revert_cancelled_turn("a", 13_000), Some((Status::Blocked, false)));
         let reverted = get(&state, "a");
         assert_eq!(reverted.status, Status::Blocked, "cancelled reply reverts to the pending question");
 
@@ -1449,15 +1714,13 @@ mod tests {
     }
 
     #[test]
-    fn status_of_and_drift_confirmed_read_the_row_or_none() {
+    fn drift_confirmed_reads_the_row_or_false() {
         let state = AppState::new();
         state.apply_set(set("a", Status::Blocked, "q"), 0, NO_CONTINUATIONS, None);
-        assert_eq!(state.status_of("a"), Some(Status::Blocked));
         assert!(!state.drift_confirmed("a"));
         state.set_drift("a", true, 1_000);
         assert!(state.drift_confirmed("a"));
-        // Missing row reads as absent / not-drifted.
-        assert_eq!(state.status_of("nope"), None);
+        // Missing row reads as not-drifted.
         assert!(!state.drift_confirmed("nope"));
     }
 
@@ -2013,6 +2276,7 @@ mod tests {
             canary: Canary::Off,
             attended_at: None,
             name_shared_by: None,
+            subagent_gate: None,
         });
     }
 
@@ -2281,6 +2545,7 @@ mod tests {
             canary: Canary::Off,
             attended_at: None,
             name_shared_by: None,
+            subagent_gate: None,
         }
     }
 
@@ -2307,5 +2572,295 @@ mod tests {
         assert!(state.remote.lock().unwrap().contains_key("fresh"));
         assert!(!state.remote.lock().unwrap().contains_key("stale"));
         assert!(!state.reap_remote(1500, 1000), "second reap is a no-op");
+    }
+
+    // -------- subagent permission prompts --------
+
+    fn prompt_from(agent: &str, tool: &str) -> SubagentPromptRequest {
+        SubagentPromptRequest { agent_id: agent.into(), session_id: "sess".into(), agent_type: None, tool_name: tool.into(), tool_input: serde_json::Value::Null, label: format!("needs approval: {tool}"), subagents_dir: None }
+    }
+
+    /// What `http_server` hands over for a subagent's `PermissionRequest`.
+    fn open(state: &AppState, id: &str, agent: &str, tool: &str, at: i64) -> OpenOutcome {
+        state.open_subagent_prompt(set(id, Status::Blocked, &format!("needs approval: {tool}")), prompt_from(agent, tool), at, None)
+    }
+
+    fn gate_of(state: &AppState, id: &str) -> Option<SubagentGate> {
+        get(state, id).subagent_gate
+    }
+
+    fn waiting_armed(id: &str, label: &str) -> SetInput {
+        let mut input = set(id, Status::Waiting, label);
+        input.waiting_backstop_armed = true;
+        input
+    }
+
+    #[test]
+    fn a_subagent_prompt_blocks_the_row_over_its_base() {
+        let state = AppState::new();
+        state.apply_set(waiting_armed("a", "run tests"), 1_000, NO_CONTINUATIONS, None);
+        let o = open(&state, "a", "agent-1", "Bash", 5_000);
+        assert_eq!((o.request, o.pending, o.base_status, o.dialog_changed), (1, 1, Status::Waiting, false));
+
+        let s = get(&state, "a");
+        assert_eq!(s.status, Status::Blocked);
+        assert_eq!(s.label, "needs approval: Bash");
+        assert!(!s.waiting_backstop_armed, "a blocked row is never time-settled");
+        assert_eq!(s.state_entered_at, 5_000);
+        assert_eq!(s.updated, 5_000);
+        let gate = s.subagent_gate.expect("gate");
+        assert_eq!(gate.base, BaseState { status: Status::Waiting, label: "run tests".into(), waiting_backstop_armed: true, state_entered_at: 1_000 });
+        assert_eq!(gate.blocked_since, 5_000);
+    }
+
+    #[test]
+    fn releasing_the_last_prompt_restores_the_base_verbatim() {
+        let state = AppState::new();
+        state.apply_set(waiting_armed("a", "run tests"), 1_000, NO_CONTINUATIONS, None);
+        let o = open(&state, "a", "agent-1", "Bash", 5_000);
+        let settled = state.settle_subagent_prompts("a", SettleScope::Request(o.request), 9_000).expect("settled");
+        assert!(settled.released);
+        assert_eq!((settled.remaining, settled.status), (0, Status::Waiting));
+
+        let s = get(&state, "a");
+        assert_eq!(s.status, Status::Waiting);
+        assert_eq!(s.label, "run tests");
+        assert!(s.waiting_backstop_armed);
+        assert_eq!(s.state_entered_at, 1_000, "the WAIT's own clock, not the release's");
+        assert_eq!(s.updated, 9_000);
+        assert!(s.subagent_gate.is_none());
+    }
+
+    #[test]
+    fn a_second_prompt_joins_without_resnapshotting() {
+        let state = AppState::new();
+        state.apply_set(set("a", Status::Working, "fix foo"), 1_000, NO_CONTINUATIONS, None);
+        let first = open(&state, "a", "agent-1", "Bash", 2_000);
+        let second = open(&state, "a", "agent-2", "Edit", 3_000);
+        assert_eq!((second.pending, second.base_status), (2, Status::Working));
+        let s = get(&state, "a");
+        assert_eq!(s.label, "needs approval: Edit", "the newest prompt names the row");
+        assert_eq!(s.state_entered_at, 2_000, "one BLOCK, one clock");
+        assert_eq!(gate_of(&state, "a").unwrap().base.state_entered_at, 1_000, "the base was not re-captured over the first BLOCK");
+
+        let partial = state.settle_subagent_prompts("a", SettleScope::Request(second.request), 4_000).expect("settled");
+        assert!(!partial.released);
+        assert_eq!((partial.remaining, partial.status), (1, Status::Blocked));
+        assert_eq!(get(&state, "a").label, "needs approval: Bash", "falls back to the prompt still open");
+
+        state.settle_subagent_prompts("a", SettleScope::Request(first.request), 5_000).expect("settled");
+        let s = get(&state, "a");
+        assert_eq!((s.status, s.label.as_str(), s.state_entered_at), (Status::Working, "fix foo", 1_000));
+    }
+
+    #[test]
+    fn two_prompts_from_one_agent_are_released_separately() {
+        let state = AppState::new();
+        state.apply_set(set("a", Status::Working, "task"), 0, NO_CONTINUATIONS, None);
+        let r1 = open(&state, "a", "agent-1", "Bash", 1_000).request;
+        let r2 = open(&state, "a", "agent-1", "Bash", 1_100).request;
+        assert_ne!(r1, r2, "a retry or a parallel call is its own prompt");
+
+        let o = state.settle_subagent_prompts("a", SettleScope::Request(r1), 2_000).expect("settled");
+        assert_eq!((o.settled.len(), o.remaining, o.status), (1, 1, Status::Blocked));
+        assert!(state.settle_subagent_prompts("a", SettleScope::Request(r1), 2_100).is_none(), "one result never releases twice");
+        assert!(state.settle_subagent_prompts("a", SettleScope::Request(r2), 3_000).expect("settled").released);
+    }
+
+    #[test]
+    fn settling_by_agent_releases_only_that_agents_prompts() {
+        let state = AppState::new();
+        state.apply_set(set("a", Status::Working, "task"), 0, NO_CONTINUATIONS, None);
+        open(&state, "a", "agent-1", "Bash", 1_000);
+        open(&state, "a", "agent-2", "Edit", 1_100);
+        open(&state, "a", "agent-1", "Write", 1_200);
+
+        let o = state.settle_subagent_prompts("a", SettleScope::Agent("agent-1"), 2_000).expect("settled");
+        assert_eq!((o.settled.len(), o.remaining, o.released), (2, 1, false));
+        assert_eq!(get(&state, "a").label, "needs approval: Edit");
+        assert!(state.settle_subagent_prompts("a", SettleScope::Agent("agent-1"), 2_100).is_none());
+    }
+
+    #[test]
+    fn settling_a_session_releases_every_prompt_it_raised_once() {
+        let state = AppState::new();
+        state.apply_set(set("a", Status::Working, "task"), 0, NO_CONTINUATIONS, None);
+        open(&state, "a", "agent-1", "Bash", 1_000);
+        open(&state, "a", "agent-2", "Edit", 1_100);
+        let o = state.settle_subagent_prompts("a", SettleScope::Session("sess"), 2_000).expect("settled");
+        assert_eq!((o.settled.len(), o.remaining, o.released, o.status), (2, 0, true, Status::Working));
+        assert!(state.settle_subagent_prompts("a", SettleScope::Session("sess"), 2_100).is_none(), "nothing left to release");
+    }
+
+    #[test]
+    fn a_sibling_sessions_stop_leaves_another_sessions_prompt_open() {
+        // Two instances share row "a" (a `--fork-session --resume` migration). The
+        // forked one's subagent is on a dialog; the other finishing proves nothing.
+        let state = AppState::new();
+        state.apply_set(set("a", Status::Waiting, "task"), 0, NO_CONTINUATIONS, None);
+        let forked = SubagentPromptRequest { session_id: "forked".into(), ..prompt_from("agent-1", "Bash") };
+        state.open_subagent_prompt(set("a", Status::Blocked, "needs approval: Bash"), forked, 1_000, None);
+        assert!(state.settle_subagent_prompts("a", SettleScope::Session("sess"), 2_000).is_none());
+        assert_eq!(get(&state, "a").status, Status::Blocked);
+        assert!(state.settle_subagent_prompts("a", SettleScope::Session("forked"), 3_000).expect("settled").released);
+    }
+
+    #[test]
+    fn settling_an_unknown_request_changes_nothing() {
+        let state = AppState::new();
+        state.apply_set(set("a", Status::Working, "task"), 0, NO_CONTINUATIONS, None);
+        open(&state, "a", "agent-1", "Bash", 5_000);
+        assert!(state.settle_subagent_prompts("a", SettleScope::Request(999), 9_000).is_none());
+        assert!(state.settle_subagent_prompts("nope", SettleScope::Session("sess"), 9_000).is_none());
+        let s = get(&state, "a");
+        assert_eq!((s.status, s.updated), (Status::Blocked, 5_000), "a no-op settle leaves `updated`, the reaper's guard, alone");
+    }
+
+    #[test]
+    fn a_main_agent_set_under_the_gate_moves_only_the_base() {
+        let state = AppState::new();
+        state.apply_set(set("a", Status::Working, "fix foo"), 1_000, NO_CONTINUATIONS, None);
+        open(&state, "a", "agent-1", "Bash", 5_000);
+        // The main turn's `Stop` arrives while the subagent's dialog is open.
+        state.apply_set(set_no_label("a", Status::Done), 7_000, NO_CONTINUATIONS, None);
+
+        let s = get(&state, "a");
+        assert_eq!((s.status, s.label.as_str(), s.state_entered_at), (Status::Blocked, "needs approval: Bash", 5_000), "still BLOCK");
+        assert_eq!(s.working_accumulated_ms, 6_000, "banked against the base's own Working clock");
+        assert_eq!(s.updated, 7_000);
+        assert_eq!(gate_of(&state, "a").unwrap().base, BaseState { status: Status::Done, label: "fix foo".into(), waiting_backstop_armed: false, state_entered_at: 7_000 });
+
+        state.settle_subagent_prompts("a", SettleScope::Session("sess"), 9_000).expect("settled");
+        let s = get(&state, "a");
+        assert_eq!((s.status, s.label.as_str(), s.state_entered_at), (Status::Done, "fix foo", 7_000), "Done, on Done's own clock");
+    }
+
+    #[test]
+    fn a_main_prompt_under_the_gate_is_what_the_release_reveals() {
+        let state = AppState::new();
+        state.apply_set(set("a", Status::Working, "fix foo"), 1_000, NO_CONTINUATIONS, None);
+        open(&state, "a", "agent-1", "Bash", 5_000);
+        state.apply_set(set("a", Status::Blocked, "needs approval: Write"), 6_000, NO_CONTINUATIONS, None);
+        assert_eq!(get(&state, "a").label, "needs approval: Bash", "the subagent's prompt still names the row");
+
+        state.settle_subagent_prompts("a", SettleScope::Session("sess"), 8_000).expect("settled");
+        let s = get(&state, "a");
+        assert_eq!((s.status, s.label.as_str(), s.state_entered_at), (Status::Blocked, "needs approval: Write", 6_000));
+    }
+
+    #[test]
+    fn entering_working_under_the_gate_records_the_base_as_revert_target() {
+        let state = AppState::new();
+        state.apply_set(set("a", Status::Working, "first task"), 0, NO_CONTINUATIONS, None);
+        state.apply_set(set_no_label("a", Status::Done), 1_000, NO_CONTINUATIONS, None);
+        open(&state, "a", "agent-1", "Bash", 2_000);
+        state.apply_set(set("a", Status::Working, "second task"), 3_000, NO_CONTINUATIONS, None);
+
+        let s = get(&state, "a");
+        assert_eq!(s.status_before_working, Status::Done, "the main agent's status, never the overlay's Blocked");
+        assert_eq!(s.original_prompt.as_deref(), Some("second task"), "Done -> Working is a task boundary on the base");
+        assert_eq!(s.working_accumulated_ms, 0);
+        assert_eq!(s.status, Status::Blocked);
+    }
+
+    #[test]
+    fn an_esc_under_the_gate_reverts_the_base_and_keeps_the_block() {
+        let state = AppState::new();
+        state.apply_set(set("a", Status::Working, "fix the parser"), 0, NO_CONTINUATIONS, None);
+        state.apply_set(set("a", Status::Blocked, "Push?"), 1_000, NO_CONTINUATIONS, None);
+        state.apply_set(set("a", Status::Working, "ny"), 2_000, NO_CONTINUATIONS, None);
+        open(&state, "a", "agent-1", "Bash", 3_000);
+
+        assert_eq!(state.revert_cancelled_turn("a", 4_000), Some((Status::Blocked, true)));
+        let s = get(&state, "a");
+        assert_eq!((s.status, s.state_entered_at, s.label.as_str()), (Status::Blocked, 3_000, "needs approval: Bash"), "the BLOCK stands");
+        assert_eq!(gate_of(&state, "a").unwrap().base.status, Status::Blocked, "the main agent is back on its question");
+        assert_eq!(gate_of(&state, "a").unwrap().base.state_entered_at, 4_000);
+        assert_eq!(state.revert_cancelled_turn("a", 5_000), None, "the base already left Working");
+    }
+
+    #[test]
+    fn the_block_clock_is_continuous_when_the_row_was_already_blocked() {
+        let state = AppState::new();
+        state.apply_set(set("a", Status::Blocked, "has a question"), 1_000, NO_CONTINUATIONS, None);
+        open(&state, "a", "agent-1", "Bash", 5_000);
+        assert_eq!(get(&state, "a").state_entered_at, 1_000);
+        assert_eq!(gate_of(&state, "a").unwrap().blocked_since, 1_000);
+    }
+
+    #[test]
+    fn a_prompt_for_an_unknown_row_creates_it_blocked_over_idle() {
+        let state = AppState::new();
+        let o = open(&state, "a", "agent-1", "Bash", 5_000);
+        assert_eq!((o.pending, o.base_status, o.dialog_changed), (1, Status::Idle, false));
+        let s = get(&state, "a");
+        assert_eq!((s.status, s.label.as_str(), s.state_entered_at), (Status::Blocked, "needs approval: Bash", 5_000));
+        assert_eq!(s.original_prompt, None, "a subagent's dialog is not a task");
+
+        state.settle_subagent_prompts("a", SettleScope::Session("sess"), 6_000).expect("settled");
+        let s = get(&state, "a");
+        assert_eq!((s.status, s.label.as_str(), s.state_entered_at), (Status::Idle, "", 5_000));
+
+        let restored = PersistedSession { dialog: vec![user_entry("old", 10)], original_prompt: None, task_started_at: 0 };
+        let o = state.open_subagent_prompt(set("b", Status::Blocked, "needs approval: Bash"), prompt_from("agent-1", "Bash"), 7_000, Some(restored));
+        assert!(o.dialog_changed, "a restored history is persisted like any new row's");
+    }
+
+    #[test]
+    fn a_gated_waiting_base_is_not_time_settled() {
+        let state = AppState::new();
+        state.apply_set(waiting_armed("a", "dev server"), 0, NO_CONTINUATIONS, None);
+        open(&state, "a", "agent-1", "Bash", 1_000);
+        assert!(!state.settle_stale_waiting("a", 1_000, 900_000), "the row reads Blocked");
+        assert_eq!(get(&state, "a").status, Status::Blocked);
+
+        state.settle_subagent_prompts("a", SettleScope::Session("sess"), 950_000).expect("settled");
+        assert!(state.settle_stale_waiting("a", 950_000, 960_000), "the restored WAIT resumes its own count");
+        assert_eq!(get(&state, "a").status, Status::Done);
+    }
+
+    #[test]
+    fn base_status_reads_through_the_gate() {
+        let state = AppState::new();
+        state.apply_set(set("a", Status::Working, "task"), 0, NO_CONTINUATIONS, None);
+        assert_eq!(get(&state, "a").base_status(), Status::Working);
+        open(&state, "a", "agent-1", "Bash", 1_000);
+        let s = get(&state, "a");
+        assert_eq!((s.status, s.base_status()), (Status::Blocked, Status::Working));
+        assert!(s.base_status().is_live_work(), "a workflow under a dialog still keeps the Mac awake");
+    }
+
+    #[test]
+    fn the_gate_never_reaches_the_wire() {
+        let state = AppState::new();
+        open(&state, "a", "agent-1", "Bash", 1_000);
+        let json = serde_json::to_value(get(&state, "a")).expect("serialize");
+        assert!(json.get("subagent_gate").is_none(), "the overlay is this process's bookkeeping");
+        assert_eq!(json.get("status").and_then(|v| v.as_str()), Some("blocked"), "the wire carries what the row shows");
+    }
+
+    #[test]
+    fn removing_a_row_drops_its_prompts() {
+        let state = AppState::new();
+        state.apply_set(set("a", Status::Working, "task"), 0, NO_CONTINUATIONS, None);
+        let r = open(&state, "a", "agent-1", "Bash", 1_000).request;
+        assert!(state.take_session("a", None, 2_000).is_some());
+        assert!(state.pending_subagent_prompts().is_empty());
+
+        state.apply_set(set_no_label("a", Status::Idle), 3_000, NO_CONTINUATIONS, None);
+        assert!(state.settle_subagent_prompts("a", SettleScope::Request(r), 4_000).is_none(), "the recreated row owes nothing");
+        assert_eq!(get(&state, "a").status, Status::Idle);
+    }
+
+    #[test]
+    fn pending_subagent_prompts_lists_every_open_request() {
+        let state = AppState::new();
+        state.apply_set(set("a", Status::Working, "task"), 0, NO_CONTINUATIONS, None);
+        state.apply_set(set("b", Status::Working, "task"), 0, NO_CONTINUATIONS, None);
+        let r1 = open(&state, "a", "agent-1", "Bash", 1_000).request;
+        let r2 = open(&state, "a", "agent-2", "Edit", 1_100).request;
+        let r3 = open(&state, "b", "agent-3", "Write", 1_200).request;
+        let listed: Vec<(String, u64, String)> = state.pending_subagent_prompts().into_iter().map(|(id, p)| (id, p.request, p.prompt.agent_id)).collect();
+        assert_eq!(listed, vec![("a".into(), r1, "agent-1".into()), ("a".into(), r2, "agent-2".into()), ("b".into(), r3, "agent-3".into())]);
     }
 }

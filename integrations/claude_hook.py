@@ -21,15 +21,23 @@ Install in `~/.claude/settings.json`:
         "Elicitation":         [{"hooks": [{"type": "command", "command": "python <repo>/integrations/claude_hook.py"}]}],
         "ElicitationResult":   [{"hooks": [{"type": "command", "command": "python <repo>/integrations/claude_hook.py"}]}],
         "PreCompact":          [{"hooks": [{"type": "command", "command": "python <repo>/integrations/claude_hook.py"}]}],
+        "SubagentStop":        [{"hooks": [{"type": "command", "command": "python <repo>/integrations/claude_hook.py"}]}],
         "SessionEnd":          [{"hooks": [{"type": "command", "command": "python <repo>/integrations/claude_hook.py"}]}],
         "PreToolUse":          [{"matcher": "^(AskUserQuestion|ExitPlanMode)$", "hooks": [{"type": "command", "command": "python <repo>/integrations/claude_hook.py"}]}]
       }
     }
 
 `StopFailure` (turn ended on an API error → ERROR), `PermissionRequest` and
-`Elicitation` (blocked on the user → WAIT), `ElicitationResult` (the user
+`Elicitation` (blocked on the user → BLOCK), `ElicitationResult` (the user
 answered the MCP prompt → resume Working), and `PreCompact` (context
 compaction → a history separator) cover gaps the core lifecycle events leave.
+
+A `PermissionRequest` raised by a subagent shows BLOCK only until that agent's
+own transcript records how its dialog ended. `SubagentStop` is the backstop
+for an agent that ends without such a record — interrupted, or killed with its
+dialog open — so its prompts are released rather than left blocking the row.
+`Notification` events of type `permission_prompt` are ignored: the
+`PermissionRequest` before them already reported the same dialog.
 
 The `PreToolUse` matcher restricts the hook to user-gating tools whose
 `tool_use` blocks aren't flushed to the JSONL transcript until the user

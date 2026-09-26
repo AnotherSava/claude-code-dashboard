@@ -5,13 +5,13 @@
 //! transcript question-detection. The `integrations/claude_hook.py` shim is a
 //! pure transport layer — it hands payloads to this module via `/api/event`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-use crate::adapters::AdapterOutput;
+use crate::adapters::{AdapterOutput, SubagentEffect};
 use crate::config::Config;
-use crate::state::{DialogRole, PendingDialogEntry, SetInput, Status};
+use crate::state::{DialogRole, PendingDialogEntry, SetInput, Status, SubagentPromptRequest};
 
 /// Built-in Claude Code tools that pause the model on a user decision. The
 /// model's `tool_use` block isn't flushed to the JSONL transcript until the
@@ -99,12 +99,43 @@ fn blocked_label_for(tool_name: &str) -> &'static str {
     }
 }
 
+/// The hook's `agent_id`, trimmed and non-empty: present only on an event a
+/// subagent raised, `None` on the main agent's own.
+fn subagent_id(payload: &Value) -> Option<&str> {
+    payload.get("agent_id").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty())
+}
+
+/// The hook's `agent_type`, trimmed and non-empty.
+fn subagent_type(payload: &Value) -> Option<&str> {
+    payload.get("agent_type").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty())
+}
+
+/// The tool a `PermissionRequest` gates, `"tool"` when the payload names none.
+fn permission_tool(payload: &Value) -> &str {
+    payload.get("tool_name").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()).unwrap_or("tool")
+}
+
+/// The background work a `Stop` reports still in flight: its `background_tasks`
+/// array when non-empty, `None` when the field is empty or absent. The one
+/// statement of "work in flight", read by [`classify_stop`] for `Waiting` and
+/// by [`dispatch`] for whether any subagent can still be prompting.
+fn background_tasks(payload: &Value) -> Option<&Vec<Value>> {
+    payload.get("background_tasks").and_then(|v| v.as_array()).filter(|tasks| !tasks.is_empty())
+}
+
+/// Where a session's subagents write their transcripts: beside the main
+/// transcript, in a directory named after it (`<id>.jsonl` → `<id>/subagents`).
+/// A workflow's agents sit further down, under `workflows/<run>/`.
+pub(crate) fn subagents_dir_for(transcript: &Path) -> PathBuf {
+    transcript.with_extension("").join("subagents")
+}
+
 /// Translate a Claude Code hook event + payload into an [`AdapterOutput`].
 ///
 /// Known events: `UserPromptSubmit`, `UserPromptExpansion`, `Stop`,
 /// `StopFailure`, `SessionStart`, `Notification`, `PreToolUse`,
 /// `PermissionRequest`, `Elicitation`, `ElicitationResult`, `PreCompact`,
-/// `SessionEnd`. Unknown events → [`AdapterOutput::Ignore`].
+/// `SubagentStop`, `SessionEnd`. Unknown events → [`AdapterOutput::Ignore`].
 /// `ElicitationResult` is the authoritative unblock for an `Elicitation` (user
 /// answered the MCP prompt → resume `Working`). `UserPromptExpansion` is the early signal
 /// a slash command fires before its context-gathering, so a skill launch shows
@@ -114,6 +145,13 @@ fn blocked_label_for(tool_name: &str) -> &'static str {
 /// lifecycle events leave.
 /// `PostToolUse` is intentionally ignored — once the user answers, the
 /// transcript watcher (and eventually `Stop`) carry the row out of `Blocked`.
+///
+/// A `PermissionRequest` carrying an `agent_id` is a subagent's dialog, not the
+/// main agent's: it opens a prompt over the row ([`SubagentEffect::PromptOpened`])
+/// that the agent's own transcript settles, and `SubagentStop` or a `Stop` with
+/// no background work in flight ends every prompt still open. A `Notification`
+/// of type `permission_prompt` is ignored, because `PermissionRequest` has
+/// already reported the same dialog.
 pub fn dispatch(event: &str, payload: &Value, cfg: &Config) -> AdapterOutput {
     let cwd = payload.get("cwd").and_then(|v| v.as_str());
     let projects_root = cfg.projects_root.as_deref();
@@ -129,6 +167,16 @@ pub fn dispatch(event: &str, payload: &Value, cfg: &Config) -> AdapterOutput {
     // transcript-path rotation also marks the same boundary.
     if event == "PreCompact" {
         return AdapterOutput::Boundary { id: chat_id };
+    }
+
+    // A subagent ended, normally or interrupted: none of its permission
+    // dialogs can still be on screen. Without an `agent_id` there is nothing
+    // to settle by.
+    if event == "SubagentStop" {
+        return match subagent_id(payload) {
+            Some(agent_id) => AdapterOutput::SubagentStopped { id: chat_id, agent_id: agent_id.to_string() },
+            None => AdapterOutput::Ignore,
+        };
     }
 
     // Only strip the marker for question detection when the canary is enabled;
@@ -170,6 +218,20 @@ pub fn dispatch(event: &str, payload: &Value, cfg: &Config) -> AdapterOutput {
         _ => None,
     };
 
+    let subagent = match (event, subagent_id(payload), label.as_deref()) {
+        ("PermissionRequest", Some(agent_id), Some(label)) => SubagentEffect::PromptOpened(SubagentPromptRequest {
+            agent_id: agent_id.to_string(),
+            session_id: payload.get("session_id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            agent_type: subagent_type(payload).map(str::to_string),
+            tool_name: permission_tool(payload).to_string(),
+            tool_input: payload.get("tool_input").cloned().unwrap_or(Value::Null),
+            label: label.to_string(),
+            subagents_dir: transcript_path.as_deref().map(subagents_dir_for),
+        }),
+        ("Stop", _, _) if background_tasks(payload).is_none() => SubagentEffect::AllEnded,
+        _ => SubagentEffect::Untouched,
+    };
+
     AdapterOutput::Set {
         input: SetInput {
             id: chat_id,
@@ -183,6 +245,7 @@ pub fn dispatch(event: &str, payload: &Value, cfg: &Config) -> AdapterOutput {
         },
         transcript_path,
         reason,
+        subagent,
     }
 }
 
@@ -326,11 +389,7 @@ fn classify_stop(payload: &Value, rules: QuestionRules, marker_template: &str) -
     // `shell` task is in flight. (An earlier "arm unless all-subagent" default
     // wrongly settled a running Workflow — typed neither shell nor subagent — to
     // Done after the window; see the printlab regression.)
-    let background_pending = payload
-        .get("background_tasks")
-        .and_then(|v| v.as_array())
-        .filter(|tasks| !tasks.is_empty());
-    if let Some(tasks) = background_pending {
+    if let Some(tasks) = background_tasks(payload) {
         // Tally by `type` so an unknown/new kind is named in the log, not bucketed
         // into an opaque "other" (which hid the Workflow case).
         let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
@@ -422,6 +481,14 @@ fn classify_detailed(
             if notif_type == "idle_prompt" {
                 return None;
             }
+            // `permission_prompt` is superseded by `PermissionRequest`, which
+            // always precedes it by at least 5.4s and names the tool. It carries
+            // no `agent_id` even when a subagent's dialog raised it, so applying
+            // it would relabel the row and could bring back a BLOCK a subagent
+            // prompt had already released.
+            if notif_type == "permission_prompt" {
+                return None;
+            }
             let label = notification_label(notif_type, message);
             let cleaned = clean_prompt(&label);
             if cleaned.is_empty() {
@@ -450,20 +517,20 @@ fn classify_detailed(
             Some(Classification::new(Status::Error, Some(kind.clone()), format!("turn failed on API error: {kind}")))
         }
         "PermissionRequest" => {
-            // A tool-permission dialog appeared — blocked on the user. Carries a
-            // real `tool_name`, unlike the `Notification` permission_prompt whose
-            // tool name is parsed out of a message string.
-            let tool = payload
-                .get("tool_name")
-                .and_then(|v| v.as_str())
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .unwrap_or("tool");
-            Some(Classification::new(
-                Status::Blocked,
-                Some(format!("needs approval: {}", tool)),
-                format!("tool-permission dialog for {tool}; blocked on user"),
-            ))
+            // A tool-permission dialog appeared — blocked on the user. A dialog
+            // for a user-gating tool keeps that tool's own label, the one its
+            // `PreToolUse` already set, rather than overwriting "has a question"
+            // with "needs approval: AskUserQuestion".
+            let tool = permission_tool(payload);
+            let label = if USER_GATING_TOOLS.contains(&tool) { blocked_label_for(tool).to_string() } else { format!("needs approval: {tool}") };
+            let reason = match subagent_id(payload) {
+                Some(agent_id) => {
+                    let agent = subagent_type(payload).map_or_else(|| agent_id.to_string(), |t| format!("{t} {agent_id}"));
+                    format!("tool-permission dialog for {tool} from subagent {agent}; BLOCK until that agent's transcript records the call's result")
+                }
+                None => format!("tool-permission dialog for {tool}; blocked on user"),
+            };
+            Some(Classification::new(Status::Blocked, Some(label), reason))
         }
         "Elicitation" => {
             // An MCP tool is requesting input — blocked on the user. The message
@@ -499,14 +566,6 @@ fn classify_detailed(
 
 fn notification_label(notif_type: &str, message: &str) -> String {
     match notif_type {
-        "permission_prompt" => {
-            let tool = if message.contains("use ") {
-                message.rsplit_once("use ").map(|(_, t)| t).unwrap_or("tool")
-            } else {
-                "tool"
-            };
-            format!("needs approval: {}", tool)
-        }
         "plan_approval" => "plan approval".into(),
         _ => message.to_string(),
     }
@@ -1254,14 +1313,17 @@ mod tests {
     // ----- classify: Notification -----
 
     #[test]
-    fn notification_permission_prompt_extracts_tool() {
+    fn notification_permission_prompt_is_ignored() {
+        // `PermissionRequest` reported the same dialog seconds earlier, with the
+        // tool named and the subagent identified; this echo carries neither.
         let p = json!({
             "notification_type": "permission_prompt",
             "message": "Claude needs your permission to use Bash"
         });
-        let (status, label) = classify("Notification", &p, NO_RULES).unwrap();
-        assert_eq!(status, Status::Blocked);
-        assert_eq!(label.as_deref(), Some("needs approval: Bash"));
+        assert!(classify("Notification", &p, NO_RULES).is_none());
+        let cfg = cfg_with(Some("d:/projects"), &[]);
+        let p = json!({ "cwd": "d:/projects/demo", "notification_type": "permission_prompt", "message": "Claude needs your permission to use Bash" });
+        assert!(matches!(dispatch("Notification", &p, &cfg), AdapterOutput::Ignore));
     }
 
     #[test]
@@ -1989,6 +2051,115 @@ mod tests {
                 assert_eq!(input.label.as_deref(), Some("needs approval: Bash"));
             }
             _ => panic!("expected Set"),
+        }
+    }
+
+    #[test]
+    fn subagent_permission_request_opens_a_prompt_for_its_agent() {
+        let cfg = cfg_with(Some("d:/projects"), &[]);
+        let input = json!({"command": "cargo test", "description": "run the suite"});
+        let transcript = Path::new("/tmp").join("s1.jsonl");
+        let p = json!({
+            "cwd": "d:/projects/demo", "tool_name": "Bash", "tool_input": input,
+            "agent_id": "a1b2", "agent_type": "code-reviewer", "transcript_path": transcript.to_str().unwrap(), "session_id": "s1"
+        });
+        match dispatch("PermissionRequest", &p, &cfg) {
+            AdapterOutput::Set { input: set, subagent: SubagentEffect::PromptOpened(prompt), reason, .. } => {
+                assert_eq!(set.status, Status::Blocked);
+                assert_eq!(prompt.agent_id, "a1b2");
+                assert_eq!(prompt.session_id, "s1", "a main Stop settles only its own session's prompts");
+                assert_eq!(prompt.agent_type.as_deref(), Some("code-reviewer"));
+                assert_eq!(prompt.tool_name, "Bash");
+                assert_eq!(prompt.tool_input, input, "the exact input, for narrowing parallel calls");
+                assert_eq!(prompt.label, "needs approval: Bash");
+                assert_eq!(set.label.as_deref(), Some("needs approval: Bash"), "the row shows the prompt's label");
+                assert_eq!(prompt.subagents_dir, Some(Path::new("/tmp").join("s1").join("subagents")));
+                assert!(reason.contains("from subagent code-reviewer a1b2"), "{reason}");
+            }
+            other => panic!("expected a subagent prompt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn main_permission_request_opens_no_subagent_prompt() {
+        let cfg = cfg_with(Some("d:/projects"), &[]);
+        for p in [
+            json!({ "cwd": "d:/projects/demo", "tool_name": "Bash" }),
+            json!({ "cwd": "d:/projects/demo", "tool_name": "Bash", "agent_id": "" }),
+            json!({ "cwd": "d:/projects/demo", "tool_name": "Bash", "agent_id": "  " }),
+        ] {
+            match dispatch("PermissionRequest", &p, &cfg) {
+                AdapterOutput::Set { input, subagent: SubagentEffect::Untouched, .. } => assert_eq!(input.status, Status::Blocked),
+                other => panic!("the main agent's own dialog sets its status: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn subagents_dir_sits_beside_the_main_transcript() {
+        let base = Path::new("projects").join("-d-projects-demo");
+        assert_eq!(subagents_dir_for(&base.join("abc.jsonl")), base.join("abc").join("subagents"));
+    }
+
+    #[test]
+    fn permission_request_for_a_user_gating_tool_keeps_its_own_label() {
+        // `PreToolUse` already labelled these; the dialog that follows must not
+        // overwrite "has a question" with "needs approval: AskUserQuestion".
+        for (tool, label) in [("AskUserQuestion", "has a question"), ("ExitPlanMode", "plan approval")] {
+            let (status, got) = classify("PermissionRequest", &json!({"tool_name": tool}), NO_RULES).unwrap();
+            assert_eq!(status, Status::Blocked);
+            assert_eq!(got.as_deref(), Some(label), "{tool}");
+        }
+    }
+
+    #[test]
+    fn stop_without_background_work_ends_every_subagent_prompt() {
+        let cfg = cfg_with(Some("d:/projects"), &[]);
+        for p in [
+            json!({ "cwd": "d:/projects/demo", "last_assistant_message": "Done.", "background_tasks": [] }),
+            json!({ "cwd": "d:/projects/demo", "last_assistant_message": "Done." }),
+            json!({ "cwd": "d:/projects/demo", "last_assistant_message": "Should I deploy?", "background_tasks": [] }),
+        ] {
+            assert!(matches!(dispatch("Stop", &p, &cfg), AdapterOutput::Set { subagent: SubagentEffect::AllEnded, .. }), "{p}");
+        }
+    }
+
+    #[test]
+    fn stop_with_background_work_leaves_subagent_prompts_alone() {
+        let cfg = cfg_with(Some("d:/projects"), &[]);
+        let p = json!({ "cwd": "d:/projects/demo", "background_tasks": [{"id": "w1", "type": "workflow", "status": "running"}] });
+        match dispatch("Stop", &p, &cfg) {
+            AdapterOutput::Set { input, subagent: SubagentEffect::Untouched, .. } => assert_eq!(input.status, Status::Waiting),
+            other => panic!("expected an untouched Waiting set, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn subagent_stop_names_the_agent() {
+        let cfg = cfg_with(Some("d:/projects"), &[]);
+        let p = json!({ "cwd": "d:/projects/demo", "agent_id": "a1b2", "agent_type": "code-reviewer" });
+        match dispatch("SubagentStop", &p, &cfg) {
+            AdapterOutput::SubagentStopped { id, agent_id } => assert_eq!((id.as_str(), agent_id.as_str()), ("demo", "a1b2")),
+            other => panic!("expected SubagentStopped, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn subagent_stop_without_agent_id_is_ignored() {
+        let cfg = cfg_with(Some("d:/projects"), &[]);
+        assert!(matches!(dispatch("SubagentStop", &json!({ "cwd": "d:/projects/demo" }), &cfg), AdapterOutput::Ignore));
+    }
+
+    #[test]
+    fn subagent_permission_request_without_transcript_path_still_opens() {
+        let cfg = cfg_with(Some("d:/projects"), &[]);
+        let p = json!({ "cwd": "d:/projects/demo", "tool_name": "Bash", "agent_id": "a1b2" });
+        match dispatch("PermissionRequest", &p, &cfg) {
+            AdapterOutput::Set { subagent: SubagentEffect::PromptOpened(prompt), .. } => {
+                assert_eq!(prompt.subagents_dir, None);
+                assert_eq!(prompt.tool_input, Value::Null);
+            }
+            other => panic!("expected a subagent prompt, got {other:?}"),
         }
     }
 
