@@ -773,17 +773,19 @@ def pill_opacities(png: Path, pill: tuple[int, int, int] = BLOCK_PILL) -> list[f
 # A row publishes its project name, and outside compact mode it publishes the
 # session's real prompt as well, so a frame carrying a project that should not be
 # published puts both on the README and the docs site. The rule applies to every
-# figure; the list lives here because four scripts enforce it and a copy per
-# script is four lists to forget to update.
+# figure; the list lives here because every script that enforces it would
+# otherwise need a copy, and each copy is one more to forget to update.
 #
 # THE NAME IS "PUBLISHABLE" AND NOT "PUBLIC", because the two are not the same
-# question and the difference is one entry. Five of these were read off GitHub
-# rather than assumed, and are public repositories: agterm (umputun/agterm),
-# bga-assistant (AnotherSava/bga-assistant), claude
+# question and the difference is one entry. All but that entry were read off
+# GitHub rather than assumed, and are public repositories: agterm
+# (umputun/agterm), bga-assistant (AnotherSava/bga-assistant), claude
 # (AnotherSava/claude-code-common), tauri-dashboard
-# (AnotherSava/claude-code-dashboard) and achievement-overlay
-# (AnotherSava/achievement-overlay), that last one reaching a frame from the other
-# machine rather than this one. The sixth, what-is-next
+# (AnotherSava/claude-code-dashboard), achievement-overlay
+# (AnotherSava/achievement-overlay) — that one reaching a frame from the other
+# machine rather than this one — and crop-stage, chrome-assistant, travel-map and
+# toolbox, all four under AnotherSava and all four read off GitHub on 2026-09-26
+# because the hero fixture puts them in frame. The exception, what-is-next
 # (AnotherSava/what-is-next), is PRIVATE, and is here because its owner cleared it
 # for these frames on 2026-09-11 knowing that the frames carry its prompt text and
 # not only its name. Only the owner can give that clearance, so a future entry
@@ -800,7 +802,7 @@ def pill_opacities(png: Path, pill: tuple[int, int, int] = BLOCK_PILL) -> list[f
 #
 # It is a DEFAULT and not a policy: a checkout under a different directory name
 # derives a different row id, so every caller takes a `--publishable` override.
-PUBLISHABLE_PROJECTS = ("achievement-overlay", "agterm", "ai-dashboard", "bga-assistant", "claude", "tauri-dashboard", "what-is-next")
+PUBLISHABLE_PROJECTS = ("achievement-overlay", "agterm", "ai-dashboard", "bga-assistant", "chrome-assistant", "claude", "crop-stage", "tauri-dashboard", "toolbox", "travel-map", "what-is-next")
 
 
 def names_in_frame(row: dict) -> list[str]:
