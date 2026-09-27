@@ -11,4 +11,4 @@ The tray usage badge (submenu: None / 5h·7d × lights·number → `config.tray_
 
 2. **No live DPI re-render** — the badge pixel size is computed from the main window's `scale_factor()` only when `tray_badge::refresh` runs (usage poll, config change, tray menu select). A monitor move to a different DPI won't re-render until the next such event; there's no `WM_DPICHANGED` hook.
 
-`config.tray_badge` is reset by the deploy step that overwrites `config.json` (see [[project_config_wiped_on_deploy]]) — re-select the mode from the tray submenu after a deploy (or set it in `config/local.json`).
+`config.tray_badge` is reset by the deploy step that overwrites `config.json` (see [[project_config_wiped_on_deploy]]) — re-select the mode from the tray submenu after a deploy, or set it in the machine's per-machine config source, which differs between the Windows box and the Mac (see that memory). Both run `seven_day_number` since 2026-09-26.

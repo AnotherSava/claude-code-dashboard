@@ -10,7 +10,7 @@
 - [No redundant flags](feedback_no_redundant_flags.md) — don't add booleans when existing data values already distinguish all cases (exception: cross-layer info gap)
 - [Frontend reads backend state decisions](feedback_frontend_reads_state_decisions.md) — stamp Rust state-machine decisions (task boundaries) onto data fields; don't re-derive in TS, they drift
 - [Notification text mirrors primaryText](notification_text_mirrors_primary_text.md) — build_message_text must match frontend primaryText (label vs original_prompt by status); drifted once → stale Blocked label on done ping
-- [Config wiped on deploy](project_config_wiped_on_deploy.md) — deploy overwrites config.json; persist runtime state in its own app-data JSON file
+- [Config wiped on deploy](project_config_wiped_on_deploy.md) — deploy rewrites config.json from local.template.json (Win) / local.json (Mac)
 - [Validate detection against history](feedback_validate_detection_against_history.md) — test is_a_question changes vs prompt_history.json; prefer phrase-matching over broad structural rules
 - [App.svelte multi-window finally-block trap](feedback_app_svelte_multi_window_routing.md) — finally{showWindow} runs even for non-main labels; guard with !historyMode && !aboutMode or hidden secondaries auto-reveal
 - [User docs stay high-level](feedback_user_docs_high_level.md) — high-level intros, no UI jargon, omit edge cases; users skim for the gist
