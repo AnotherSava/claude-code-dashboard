@@ -1,6 +1,7 @@
 use axum::{
     extract::State,
     http::{HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
@@ -108,11 +109,11 @@ enum WindowRequest {
 /// reaching this could pop the widget open or bring a conversation on screen.
 /// That is nuisance rather than exfiltration — the attacker cannot read the
 /// result — but the stricter check costs one line, and "changes what is on the
-/// user's screen" is a fair place to draw it. The hook routes keep the looser
-/// gate because their `TAURI_DASHBOARD_URL` host alias is a real setup.
+/// user's screen" is a fair place to draw it. The hook route keeps the looser
+/// gate because its `TAURI_DASHBOARD_URL` host alias is a real setup.
 async fn post_window(State(app): State<AppHandle>, headers: HeaderMap, Json(req): Json<WindowRequest>) -> (StatusCode, Json<serde_json::Value>) {
-    if origin_blocked(&headers) || !host_is_loopback(&headers) {
-        return (StatusCode::FORBIDDEN, Json(serde_json::json!({"ok": false, "reason": "csrf"})));
+    if let Some(detail) = csrf_refusal(&headers, true) {
+        return csrf_refused(detail);
     }
     let acted = match &req {
         WindowRequest::Show { label } => {
@@ -308,48 +309,72 @@ fn drift_action(present: bool, seen: bool, is_handback: bool) -> (DriftAction, &
     }
 }
 
-/// CSRF guard for every route on this server: block browser-originated requests.
-/// urllib / curl don't send `Origin`; browser XHRs do. `"null"` is allowed
-/// (`file://` / `data:`). The server is loopback-only and unauthenticated, so a
-/// page the user happens to have open is the whole threat model.
+/// Browser guard for every route on this server: refuse any request carrying an
+/// `Origin` header, whatever its value. A browser attaches one to every request
+/// whose method is not `GET` or `HEAD`, and to every cross-origin request made in
+/// CORS mode; the hook, curl, urllib and PowerShell's web cmdlets send none. The
+/// server is loopback-only and unauthenticated, so a page the user happens to
+/// have open is the whole threat model.
 ///
-/// **This is CSRF only, and does not close DNS rebinding.** An attacker page
-/// whose domain is rebound to `127.0.0.1` becomes same-origin with this server,
-/// so the browser sends no `Origin` at all and the request is allowed. That was
-/// close to worthless when the only route was a write; `GET /api/agents` makes it
-/// a read of every project name, status and label. Closing it means also
-/// requiring a loopback `Host`, which is deliberately *not* done here: the hook's
-/// target is overridable via `TAURI_DASHBOARD_URL`, so a host alias that resolves
-/// to loopback is a supported setup that such a check would break. Recorded
-/// rather than papered over — the gap is a known, accepted one.
+/// **`Origin: null` is refused with the rest.** A page sends it whenever it
+/// chooses — from a sandboxed iframe, or on a `POST` made with
+/// `mode: "same-origin"` under `referrerPolicy: "no-referrer"` (Fetch, "append a
+/// request `Origin` header") — so exempting it for the `file://` and `data:`
+/// documents that also send it exempts the rebound page described below, and
+/// nothing that calls this server is such a document.
 ///
-/// **Reassessed for `POST /api/message`, and priced differently there.** That
-/// gap was accepted while every route on this server wrote a status or read a
-/// roster. The message route starts a turn inside a live agent *on another
-/// machine*, so the same rebound page would become a way to prompt a remote
-/// agent — a different order of consequence. It therefore adds
-/// [`host_is_loopback`] on top of this check. The hook routes keep the accepted
-/// gap, because the `TAURI_DASHBOARD_URL` alias they support is real and the
-/// stake there is unchanged.
-///
-/// Extracted rather than copied into the other handlers: the guard is
-/// per-handler (there is no tower layer on this router), so every new route is
-/// unprotected until it repeats the check, and two copies of the rule would be
-/// two places to forget when it changes.
+/// **What it closes.** Cross-site writes, which axum's `Json` content-type check
+/// and the CORS preflight this server never answers also stop, and DNS rebinding
+/// on every `POST`: a page whose domain is rebound to `127.0.0.1` becomes
+/// same-origin with this server, and its `POST` still carries its `Origin`.
+/// **What it does not close** is rebinding on a `GET`, since a same-origin `GET`
+/// carries no `Origin`. The only `GET` route, the roster, carries every project
+/// name, status and label — prompt text included — so it also requires a
+/// loopback `Host` through [`csrf_refusal`].
 fn origin_blocked(headers: &HeaderMap) -> bool {
-    match headers.get("origin") {
-        None => false,
-        Some(origin) => !matches!(origin.to_str(), Ok("null")),
+    headers.contains_key(axum::http::header::ORIGIN)
+}
+
+/// Why this server refuses a request as browser-originated or rebound, worded so
+/// the caller knows what to change; `None` admits it. Every route applies the
+/// `Origin` rule. Routes that start a turn on another machine, change what is on
+/// the user's screen, or answer a `GET` (the roster, which the `Origin` rule
+/// cannot protect) also pass `require_loopback_host`, a second gate that does not
+/// depend on what the browser attaches. The cost there is that a
+/// `TAURI_DASHBOARD_URL` naming the server by a non-loopback alias reaches the
+/// hook route and no other. The hook route cannot take the gate, since that
+/// alias is a supported setup for it and the `Origin` rule already covers a
+/// `POST`.
+///
+/// Every handler calls this first rather than repeating the checks: the guard
+/// is per-handler (there is no tower layer on this router), so a new route is
+/// unprotected until it makes this call, and one function is one place to
+/// change the rule.
+fn csrf_refusal(headers: &HeaderMap, require_loopback_host: bool) -> Option<&'static str> {
+    if origin_blocked(headers) {
+        Some("a request carrying an Origin header is taken for a browser's and refused, whatever the value; send none, as curl, urllib and the hook do")
+    } else if require_loopback_host && !host_is_loopback(headers) {
+        Some("this route answers only a caller that names it by a loopback address or localhost in Host")
+    } else {
+        None
     }
 }
 
-/// Whether the request addressed us by a loopback name — the second gate on the
-/// message route, and the half that closes DNS rebinding for it.
+/// The `403` body for a [`csrf_refusal`], in the shape the window route's other
+/// answers already take. The message route carries the same detail inside its
+/// receipt instead.
+fn csrf_refused(detail: &'static str) -> (StatusCode, Json<serde_json::Value>) {
+    (StatusCode::FORBIDDEN, Json(serde_json::json!({"ok": false, "reason": "csrf", "detail": detail})))
+}
+
+/// Whether the request addressed us by a loopback name — the second gate the
+/// message, window and roster routes carry through [`csrf_refusal`], closing DNS
+/// rebinding there without depending on the browser attaching an `Origin`.
 ///
 /// A rebound page reaches this server with the attacker's own hostname in
 /// `Host`, because that is the name the browser resolved; a genuine local caller
 /// has no reason to use anything but loopback. `localhost` is accepted because
-/// the default hook URL and every hand-typed `curl` use it. A missing `Host`
+/// it is a loopback name a local caller may type. A missing `Host`
 /// is rejected: HTTP/1.1 requires it, so its absence is not a client we support.
 fn host_is_loopback(headers: &HeaderMap) -> bool {
     let Some(host) = headers.get("host").and_then(|v| v.to_str().ok()) else {
@@ -704,15 +729,15 @@ fn agent_roster(
 async fn get_agents(
     State(app): State<AppHandle>,
     headers: HeaderMap,
-) -> Result<Json<AgentsResponse>, StatusCode> {
-    if origin_blocked(&headers) {
-        return Err(StatusCode::FORBIDDEN);
+) -> Result<Json<AgentsResponse>, Response> {
+    if let Some(detail) = csrf_refusal(&headers, true) {
+        return Err(csrf_refused(detail).into_response());
     }
     let Some(state) = app.try_state::<AppState>() else {
-        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        return Err(StatusCode::INTERNAL_SERVER_ERROR.into_response());
     };
     let Some(cfg_state) = app.try_state::<ConfigState>() else {
-        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        return Err(StatusCode::INTERNAL_SERVER_ERROR.into_response());
     };
     let cfg = cfg_state.snapshot();
     let now = now_ms();
@@ -785,9 +810,8 @@ async fn post_message(State(app): State<AppHandle>, headers: HeaderMap, Json(req
         log_send(&r, from_agent, &req.target, device, req.text.len());
         (status, Json(r))
     };
-    // CSRF, then the stricter rebinding check this route alone carries.
-    if origin_blocked(&headers) || !host_is_loopback(&headers) {
-        return refused("csrf", "this route answers only a loopback caller addressing it by a loopback name".into(), StatusCode::FORBIDDEN, None);
+    if let Some(detail) = csrf_refusal(&headers, true) {
+        return refused("csrf", detail.into(), StatusCode::FORBIDDEN, None);
     }
     if req.text.trim().is_empty() {
         return refused("empty_text", "there is nothing to relay".into(), StatusCode::BAD_REQUEST, None);
@@ -1104,16 +1128,16 @@ async fn post_event(
     State(app): State<AppHandle>,
     headers: HeaderMap,
     Json(req): Json<EventRequest>,
-) -> (StatusCode, Json<EventResponse>) {
-    if origin_blocked(&headers) {
-        return (StatusCode::FORBIDDEN, Json(EventResponse::default()));
+) -> Response {
+    if let Some(detail) = csrf_refusal(&headers, false) {
+        return csrf_refused(detail).into_response();
     }
 
     let Some(state) = app.try_state::<AppState>() else {
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(EventResponse::default()));
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(EventResponse::default())).into_response();
     };
     let Some(cfg_state) = app.try_state::<ConfigState>() else {
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(EventResponse::default()));
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(EventResponse::default())).into_response();
     };
     let cfg = cfg_state.snapshot();
     let mut resp = EventResponse::default();
@@ -1332,7 +1356,7 @@ async fn post_event(
                     ending = %session_id,
                     "event -> clear"
                 );
-                return (StatusCode::OK, Json(resp));
+                return (StatusCode::OK, Json(resp)).into_response();
             }
             if let Some(registry) = app.try_state::<ChatIdRegistry>() {
                 registry.disown(&id);
@@ -1400,7 +1424,7 @@ async fn post_event(
             );
         }
     }
-    (StatusCode::OK, Json(resp))
+    (StatusCode::OK, Json(resp)).into_response()
 }
 
 #[cfg(test)]
@@ -1796,11 +1820,13 @@ mod tests {
     }
 
     #[test]
-    fn origin_blocked_allows_the_null_origin() {
-        // file:// and data: documents send "null"; the guard has always let them by.
+    fn origin_blocked_refuses_the_null_origin() {
+        // A rebound page sends "null" on demand (a same-origin-mode POST under
+        // no-referrer), so admitting it would admit the attacker; no caller of this
+        // server is a file:// or data: document that needs it.
         let mut headers = HeaderMap::new();
         headers.insert("origin", "null".parse().unwrap());
-        assert!(!origin_blocked(&headers));
+        assert!(origin_blocked(&headers));
     }
 
 
@@ -1937,20 +1963,31 @@ mod tests {
         h
     }
 
-    /// The CSRF check the message handler repeats: there is no tower layer on
-    /// this router, so a route that forgets it is simply unprotected.
+    /// Any `Origin` is refused, a loopback one included — a caller that sets the
+    /// header by hand is told to drop it rather than which value would pass.
     #[test]
-    fn a_browser_origin_is_blocked_on_the_message_route() {
-        assert!(origin_blocked(&headers(&[("origin", "https://evil.example")])));
-        assert!(!origin_blocked(&headers(&[("origin", "null")])), "file:// and data: pages");
-        assert!(!origin_blocked(&HeaderMap::new()), "curl and the hook send no Origin");
+    fn any_origin_is_refused_and_the_refusal_says_to_send_none() {
+        for origin in ["https://evil.example", "null", "http://127.0.0.1:9077"] {
+            for require_loopback_host in [false, true] {
+                let detail = csrf_refusal(&headers(&[("origin", origin), ("host", "127.0.0.1:9077")]), require_loopback_host);
+                assert!(detail.is_some_and(|d| d.contains("Origin") && d.contains("send none")), "{origin}");
+            }
+        }
     }
 
-    /// The extra gate this route alone carries. A page rebound to loopback sends
-    /// no `Origin` — same-origin — so the CSRF check waves it through; it still
-    /// carries the attacker's own hostname in `Host`, which is what this
-    /// catches. The accepted rebinding gap stays accepted for the hook routes,
-    /// where the stake is a status write, not a turn started on another machine.
+    /// A caller with no `Origin` passes the hook route whatever `Host` it used,
+    /// since `TAURI_DASHBOARD_URL` may alias the server; the stricter routes also
+    /// want a loopback name there and say so.
+    #[test]
+    fn the_host_gate_applies_only_where_it_is_asked_for() {
+        assert_eq!(csrf_refusal(&headers(&[("host", "dashboard.internal:9077")]), false), None);
+        assert_eq!(csrf_refusal(&headers(&[("host", "127.0.0.1:9077")]), true), None);
+        assert!(csrf_refusal(&headers(&[("host", "evil.example:9077")]), true).is_some_and(|d| d.contains("Host")));
+    }
+
+    /// The second gate the message, window and roster routes carry. A rebound page
+    /// carries the attacker's own hostname in `Host`, which is what this catches
+    /// whether or not the browser also attached an `Origin`.
     #[test]
     fn a_rebound_hostname_is_refused_while_loopback_names_pass() {
         for host in ["127.0.0.1:9077", "localhost:9077", "localhost", "[::1]:9077", "127.0.0.1", "127.0.0.2:9077"] {

@@ -64,8 +64,8 @@ function Invoke-DashboardWindow {
     $port = Get-DashboardPort
     $json = $Body | ConvertTo-Json -Compress
     try {
-        # No Origin header: the CSRF guard refuses every value except a literal
-        # `null`, and sending a plausible-looking one is a 403.
+        # No Origin header: the CSRF guard refuses any value, `null` and a
+        # loopback origin included, with a 403.
         $r = Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:$port/api/window" `
             -ContentType 'application/json' -Body $json -TimeoutSec 10
     } catch {

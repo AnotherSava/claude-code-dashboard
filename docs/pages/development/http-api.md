@@ -11,7 +11,7 @@ A second, separate listener serves the [multi-device sync](#sync-api) API when e
 
 ## Endpoint
 
-`POST /api/event` with `Content-Type: application/json`. Returns `204 No Content` on success, `403` if the `Origin` header is a real web origin (blocks browser XHR), `400` on malformed JSON.
+`POST /api/event` with `Content-Type: application/json`. Returns `200` with a JSON body on success — `{}`, or `additional_context` on a `SessionStart` while the adherence canary is on. The body is checked first: `415` without that content type, `400` for malformed JSON, `422` for JSON not in the envelope's shape. Then `403` if the request carries an `Origin` header of any value (browsers add one; the hook and curl do not). A `403` body says what to change: `{"ok": false, "reason": "csrf", "detail": "…"}`.
 
 ## Envelope
 
@@ -49,7 +49,7 @@ Writing a new adapter is a ~100 LOC pure Rust function: `src-tauri/src/adapters/
 
 Two arrays, because there are two sources and they can say different amounts. `agents` is the dashboard's own tracking — a session it has classified from the hook stream, so it can say what that session is *doing*. `registry_only` is Claude Code's own list of live sessions, proof that a session exists at a project with no status behind it: read off disk on every request for this machine, and carried on the sync push for every peer. A project present in both arrays *for the same device* appears only in `agents`.
 
-Read-only: it mutates nothing, emits no event, writes no `decision` line, and takes no query parameters. Same loopback bind and same `Origin` guard as `POST /api/event` — `403` for a real browser origin, `500` if the app's state isn't up yet. Like `server_port` itself, the route is wired once at startup, so a new build needs an app restart before it answers.
+Read-only: it mutates nothing, emits no event, writes no `decision` line, and takes no query parameters. Same loopback bind and `Origin` guard as `POST /api/event`, plus the loopback-`Host` gate of the [message route](#the-extra-gate-on-this-route), because a page whose DNS is rebound to `127.0.0.1` sends no `Origin` on a `GET`. Address it as a loopback IP or `localhost`: a `TAURI_DASHBOARD_URL` alias with any other host name reaches the hook route and not this one. `403` for either refusal, `500` if the app's state isn't up yet. Like `server_port` itself, the route is wired once at startup, so a new build needs an app restart before it answers.
 
 ```json
 {
@@ -265,7 +265,7 @@ Two refusals about the *remote* side are the sender's own and are made with cert
 
 ### The extra gate on this route
 
-The [`Origin` check](#endpoint) shared by the hook routes is CSRF only; a page whose domain is rebound to `127.0.0.1` becomes same-origin and sends no `Origin` at all. That gap is accepted for a status write and a roster read. It is not acceptable for a route that starts a turn inside a live agent on another machine, so this one **also requires a loopback `Host`** — `127.0.0.1`, `::1` or `localhost`. A rebound page carries the attacker's own hostname there. The hook routes keep the accepted gap, because the `TAURI_DASHBOARD_URL` host alias they support is a real setup and their stake is unchanged.
+The [`Origin` check](#endpoint) every route shares also stops DNS rebinding on a `POST`: a page whose domain is rebound to `127.0.0.1` becomes same-origin, but a browser still attaches its `Origin` to the `POST`. A route that starts a turn inside a live agent on another machine should not rest on what the browser attaches, so this one **also requires a loopback `Host`** — a loopback address or `localhost`. A rebound page carries the attacker's own hostname there. The [roster](#agent-roster) takes the same check, since a same-origin `GET` carries no `Origin` for the other check to catch. The hook route does not, because the `TAURI_DASHBOARD_URL` host alias it supports is a real setup and the `Origin` check already covers its `POST`.
 
 ### Idempotency
 
