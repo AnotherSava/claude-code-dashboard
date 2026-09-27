@@ -23,6 +23,11 @@ this to a workflow would not strengthen the gate, it would break it.
 The reference list is read out of the source rather than restated here, so a new
 `skill_script("...")` call is covered the day it is written and this file cannot
 drift into asserting a set the libs no longer use.
+
+It checks paths only. The PowerShell captures also depend on the *names* in the
+skill library they dot-source, and a renamed function passes a path check; the
+skill's own `check-capture-scripts.ps1` resolves those, run beside this one by the
+commit gate on Windows.
 """
 
 import re

@@ -78,6 +78,19 @@ npm run build
 echo "==> python docs/screenshots/check-skill-scripts.py"
 python docs/screenshots/check-skill-scripts.py
 
+# The same exception, one level deeper. The Windows captures dot-source the
+# skill's capture library and call its functions, parameters and [WinCapture]
+# members by name, so a rename there passes the path check above and fails at
+# the call — after the capture has moved the pointer. The skill ships the checker
+# that resolves those names; it loads that Windows-only library to do so, so on
+# macOS the gate says it did not run rather than passing.
+case "$OSTYPE" in
+  msys*|cygwin*)
+    echo "==> pwsh check-capture-scripts.ps1"
+    pwsh -NoProfile -NonInteractive -File ~/.claude/skills/docs-relevance/scripts/check-capture-scripts.ps1 ;;
+  *) echo "==> check-capture-scripts.ps1: NOT COVERED on $OSTYPE — the Windows capture scripts' names are checked on Windows only" ;;
+esac
+
 echo "==> python docs/screenshots/check-figures.py"
 python docs/screenshots/check-figures.py
 
