@@ -17,4 +17,6 @@ Two harness fixes made on the Windows side are worth checking on the Mac. The ca
 
 assert_percent_unit is already deleted from work-intensity-macos.py, so nothing in the script refuses the run.
 
+UPDATE 2026-09-28: this is the first macOS capture since v12 (3904afa) moved the raw copy into `lib/dashboard.py`'s `_keep_raw`, called at the top of `add_hairline`, and that path has never run — it was written and reviewed on Windows. After the committed shot, confirm `docs/screenshots/raw/work-intensity-macos.png` exists, is the frame's size less 2 × the hairline width each way, and equals the frame cropped by that width on every side (it is the sRGB, halo-trimmed capture `hairline.py` was handed). A `--probe` run must write no raw at all. Commit the raw with the frame.
+
 Related: [[rework-the-docs-screenshots-the-windows-half-is-done-the]].
