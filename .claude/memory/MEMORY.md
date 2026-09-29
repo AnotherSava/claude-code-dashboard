@@ -64,3 +64,5 @@
 - [Check npm -v, not the packageManager field](node_toolchain_pin_ahead_of_node.md) — the pin needs Node >=24.15.0, and a Node upgrade silently resets corepack so the field stays right while the shim is gone
 - [A migration filed two open memos as done](done_memo_that_is_not_done.md) — v1 asserts presence, not location; both reopened 2026-09-18, and a misfiled memo is invisible rather than wrong-looking
 - [Memo backlog audited 2026-09-20](memo_backlog_audit_2026_09_20.md) — a memo can be done and left open (its body says so); the rest verified genuinely open, don't re-sweep
+- [Telegram bot identity](telegram_bot_identity.md) — pings go through the dedicated notifications bot (token in Doppler claude-code-dashboard/dev); Mac has no Telegram configured; never print config.json notifications
+- [Typed prompts are invisible to the watcher](transcript_string_content_invisible.md) — string `content` fails log_watcher's Vec wire type, so infer_state skips typed prompts; pre-existing, not fixed
