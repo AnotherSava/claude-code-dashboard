@@ -14,10 +14,12 @@ use crate::config::Config;
 use crate::state::{DialogRole, PendingDialogEntry, SetInput, Status, SubagentPromptRequest};
 
 /// Built-in Claude Code tools that pause the model on a user decision. The
-/// model's `tool_use` block isn't flushed to the JSONL transcript until the
-/// user responds, so the watcher cannot see these calls in flight — the
-/// PreToolUse hook is the only timely signal.
-const USER_GATING_TOOLS: &[&str] = &["AskUserQuestion", "ExitPlanMode"];
+/// call's `tool_use` block reaches the JSONL transcript while the dialog is
+/// still on screen, but nothing in it says the call is waiting on the user, so
+/// the PreToolUse hook is what marks the row BLOCK. The transcript watcher
+/// shares this list to read an unanswered call as no evidence of activity:
+/// counting it as a tool call would flip a question still on screen to WORK.
+pub(crate) const USER_GATING_TOOLS: &[&str] = &["AskUserQuestion", "ExitPlanMode"];
 
 /// Claude Code injects synthetic prompts (e.g. background-task completion
 /// notices) as `<task-notification>` blocks. They are not real user input and
@@ -458,7 +460,7 @@ fn classify_detailed(
             Some(Classification::new(
                 Status::Blocked,
                 Some(blocked_label_for(tool_name).into()),
-                format!("{tool_name} tool gated the turn on the user (buffered until answered)"),
+                format!("{tool_name} tool gated the turn on the user"),
             ))
         }
         "Notification" | "SessionStart" => {

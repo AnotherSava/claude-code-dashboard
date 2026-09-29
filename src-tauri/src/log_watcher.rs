@@ -1,3 +1,4 @@
+use crate::adapters::claude::USER_GATING_TOOLS;
 use crate::commands::{emit_sessions_updated, now_ms};
 use crate::config::ConfigState;
 use crate::prompt_history::PromptHistoryStore;
@@ -27,7 +28,7 @@ pub struct InferredState {
     pub model: Option<String>,
     pub input_tokens: Option<u64>,
     /// The newest state-bearing entry is an Esc-cancel interrupt marker — the
-    /// turn ended with no hook. Drives a `Working`→`Idle` demotion.
+    /// turn ended with no hook. Drives the revert to the pre-prompt status.
     pub ended: bool,
 }
 
@@ -36,6 +37,10 @@ pub struct InferredState {
 pub fn infer_state(lines: &[&str]) -> Option<InferredState> {
     let mut result = InferredState::default();
     let mut saw_conversational = false;
+    // Only the newest state-bearing main-session entry decides the state. It
+    // can decide on no state at all (a cancel marker, an unanswered question),
+    // which must still stop an older tool call from resolving to Working.
+    let mut state_decided = false;
 
     for line in lines.iter().rev() {
         let entry: TranscriptEntry = match serde_json::from_str(line) {
@@ -90,35 +95,44 @@ pub fn infer_state(lines: &[&str]) -> Option<InferredState> {
         // background work from flipping a `Waiting` row (set at `Stop` time from
         // the hook's `background_tasks`) back to `Working`. Model/tokens are
         // already main-session-only above.
-        if result.state.is_none() && !entry.is_sidechain {
-            let has_tool_use = content.iter().any(|b| b.block_type == "tool_use");
-            let has_tool_result = content.iter().any(|b| b.block_type == "tool_result");
-            let has_text = content.iter().any(|b| {
-                b.block_type == "text"
-                    && b.text.as_deref().map(|t| !t.trim().is_empty()).unwrap_or(false)
-            });
-            if has_tool_use || has_tool_result {
+        let has_tool_use = content.iter().any(|b| b.block_type == "tool_use");
+        let has_tool_result = content.iter().any(|b| b.block_type == "tool_result");
+        let has_text = content.iter().any(|b| {
+            b.block_type == "text"
+                && b.text.as_deref().map(|t| !t.trim().is_empty()).unwrap_or(false)
+        });
+        if !state_decided && !entry.is_sidechain && (has_tool_use || has_tool_result || has_text) {
+            state_decided = true;
+            let awaits_user = has_tool_use
+                && !has_tool_result
+                && content
+                    .iter()
+                    .filter(|b| b.block_type == "tool_use")
+                    .all(|b| b.name.as_deref().is_some_and(|n| USER_GATING_TOOLS.contains(&n)));
+            if awaits_user {
+                // A question or plan approval with no result written yet is
+                // still on screen: PreToolUse marked the row BLOCK, and the
+                // answer arrives as the `tool_result` that promotes it.
+            } else if has_tool_use || has_tool_result {
                 result.state = Some(Status::Working);
-            } else if entry.entry_type == "user" && has_text {
+            } else if entry.entry_type == "user" {
                 // An interrupt marker is the newest user entry only when the
                 // turn was just cancelled (a fresh prompt afterwards would be
-                // newer). Flag the end and stop here so an older entry can't
-                // re-resolve the state to Working.
+                // newer).
                 if content.iter().any(|b| {
                     b.block_type == "text"
                         && b.text.as_deref().map(|t| t.trim().starts_with(INTERRUPT_MARKER_PREFIX)).unwrap_or(false)
                 }) {
                     result.ended = true;
-                    result.state = Some(Status::Idle); // sentinel: stop resolution; apply_watcher_update ignores non-Working
                 } else {
                     result.state = Some(Status::Working);
                 }
-            } else if entry.entry_type == "assistant" && has_text {
+            } else {
                 result.state = Some(Status::Done);
             }
         }
 
-        if result.state.is_some() && result.model.is_some() && result.input_tokens.is_some() {
+        if state_decided && result.model.is_some() && result.input_tokens.is_some() {
             break;
         }
     }
@@ -216,8 +230,9 @@ pub fn apply_watcher_update(
 ) -> bool {
     let mut changed = false;
     // The watcher is a promote *to* `Working` only: `infer_state` resolves the
-    // transcript to `Working` when the main turn resumed (a tool call or a fresh
-    // user prompt after a too-early `Stop`), and this carries the row back. It
+    // transcript to `Working` when the main turn resumed (a tool call other than
+    // an unanswered question, a tool result, or a fresh user prompt — e.g. the
+    // user answered an `AskUserQuestion`), and this carries the row back. It
     // never demotes — `Done`/`Idle`/`Blocked`/`Error` come from lifecycle hooks,
     // and `Waiting` from the adapter's `Stop`-time `background_tasks`
     // classification, so the watcher leaves them alone. (The arm still accepts
@@ -1019,6 +1034,47 @@ mod tests {
     fn tool_use_after_text_is_working() {
         let lines = [user_text("do X"), assistant_text("ok"), assistant_tool_use()];
         assert_eq!(infer_state(&refs(&lines)).unwrap().state, Some(Status::Working));
+    }
+
+    // -------- user-gating calls (AskUserQuestion / ExitPlanMode) --------
+    // Claude Code writes the call's `tool_use` line while the dialog is still on
+    // screen, and PreToolUse has already marked the row BLOCK. Only the answer's
+    // `tool_result` may carry the row back to Working.
+
+    fn assistant_calls(names: &[&str]) -> String {
+        let blocks: Vec<_> = names.iter().map(|n| json!({ "type": "tool_use", "name": n })).collect();
+        json!({ "type": "assistant", "message": { "role": "assistant", "content": blocks } }).to_string()
+    }
+
+    #[test]
+    fn unanswered_gating_call_decides_no_state() {
+        for &tool in USER_GATING_TOOLS {
+            let lines = [user_text("do X"), assistant_tool_use(), user_tool_result(), assistant_text("one question first"), assistant_calls(&[tool])];
+            let r = infer_state(&refs(&lines)).unwrap();
+            assert_eq!(r.state, None, "an unanswered {tool} must not resolve to the older tool call's Working, nor the text's Done");
+            assert!(!r.ended);
+        }
+    }
+
+    #[test]
+    fn answered_gating_call_is_working() {
+        let lines = [assistant_calls(&["AskUserQuestion"]), user_tool_result()];
+        assert_eq!(infer_state(&refs(&lines)).unwrap().state, Some(Status::Working));
+    }
+
+    #[test]
+    fn gating_call_beside_another_tool_is_working() {
+        let lines = [assistant_calls(&["AskUserQuestion", "Read"])];
+        assert_eq!(infer_state(&refs(&lines)).unwrap().state, Some(Status::Working));
+    }
+
+    #[test]
+    fn unanswered_gating_call_leaves_a_blocked_row_blocked() {
+        let lines = [assistant_tool_use(), user_tool_result(), assistant_calls(&["AskUserQuestion"])];
+        let mut s = make_session(Status::Blocked);
+        let changed = apply_watcher_update(&mut s, &infer_state(&refs(&lines)).unwrap(), 1000);
+        assert!(!changed);
+        assert_eq!(s.status, Status::Blocked);
     }
 
     #[test]

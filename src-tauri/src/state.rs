@@ -1029,26 +1029,35 @@ impl AppState {
     /// produced nothing, so the row should look as if the prompt never landed:
     /// a reply aborted mid-question reverts to `Blocked`, so the user's real
     /// answer is an approval-cycle reply (no task boundary) instead of a fresh
-    /// task that clobbers `original_prompt`. No-op unless still `Working`, so a
-    /// turn that already moved on is left alone. Mirrors `apply_set`'s
-    /// Working→non-Working accounting (banks the elapsed run, resets the timer).
+    /// task that clobbers `original_prompt`. A turn cancelled while `Blocked`
+    /// is reverted the same way: Esc on an `AskUserQuestion`, a plan approval
+    /// or a permission dialog writes the marker with no hook, and the dialog it
+    /// closes is the only thing holding the row BLOCK — a `Stop`'s `Blocked`
+    /// ends its turn, so no marker can follow it before the next prompt moves
+    /// the row to `Working`. No-op for any other status, so a turn that already
+    /// settled is left alone. Mirrors `apply_set`'s Working→non-Working
+    /// accounting (banks the elapsed run, resets the timer); a `Blocked` row's
+    /// run was banked when it left `Working`.
     ///
     /// The Esc is the main agent's, so under a pending subagent prompt it
     /// reverts the base and the row stays BLOCK (see [`with_base`]).
     ///
     /// Returns the base status it reverted to and whether a subagent prompt was
     /// overlaying the row (both for the decision log), or `None` when it was a
-    /// no-op because the main agent had already left `Working`.
+    /// no-op because the main agent's turn had already settled.
     pub fn revert_cancelled_turn(&self, id: &str, now_ms: i64) -> Option<(Status, bool)> {
         let mut sessions = self.sessions.lock().unwrap();
         let s = sessions.iter_mut().find(|s| s.id == id)?;
         let gated = s.subagent_gate.is_some();
         with_base(s, |s| {
-            if s.status != Status::Working {
-                return None;
+            match s.status {
+                Status::Working => {
+                    let delta = (now_ms - s.state_entered_at).max(0) as u64;
+                    s.working_accumulated_ms = s.working_accumulated_ms.saturating_add(delta);
+                }
+                Status::Blocked => {}
+                _ => return None,
             }
-            let delta = (now_ms - s.state_entered_at).max(0) as u64;
-            s.working_accumulated_ms = s.working_accumulated_ms.saturating_add(delta);
             s.status = s.status_before_working;
             s.state_entered_at = now_ms;
             s.updated = now_ms;
@@ -1652,11 +1661,32 @@ mod tests {
     }
 
     #[test]
-    fn revert_cancelled_turn_is_noop_when_not_working() {
+    fn revert_cancelled_turn_leaves_a_settled_turn_alone() {
+        for settled in [Status::Done, Status::Idle, Status::Waiting, Status::Error] {
+            let state = AppState::new();
+            state.apply_set(set("a", Status::Working, "fix foo.py"), 0, NO_CONTINUATIONS, None);
+            state.apply_set(set("a", settled, "fix foo.py"), 10_000, NO_CONTINUATIONS, None);
+            assert_eq!(state.revert_cancelled_turn("a", 20_000), None, "{settled:?}");
+            let s = get(&state, "a");
+            assert_eq!((s.status, s.state_entered_at), (settled, 10_000), "{settled:?}");
+        }
+    }
+
+    #[test]
+    fn revert_cancelled_turn_reverts_a_turn_cancelled_on_a_dialog() {
+        // Esc on an AskUserQuestion (or a permission dialog) writes the interrupt
+        // marker with no hook, while PreToolUse has the row on BLOCK. The dialog
+        // is gone, so the row goes back to where the prompt found it.
         let state = AppState::new();
-        state.apply_set(set("a", Status::Blocked, "run bash?"), 0, NO_CONTINUATIONS, None);
-        assert_eq!(state.revert_cancelled_turn("a", 20_000), None);
-        assert_eq!(get(&state, "a").status, Status::Blocked);
+        state.apply_set(set("a", Status::Working, "first task"), 0, NO_CONTINUATIONS, None);
+        state.apply_set(set_no_label("a", Status::Done), 1_000, NO_CONTINUATIONS, None);
+        state.apply_set(set("a", Status::Working, "second task"), 2_000, NO_CONTINUATIONS, None);
+        state.apply_set(set("a", Status::Blocked, "has a question"), 5_000, NO_CONTINUATIONS, None);
+
+        assert_eq!(state.revert_cancelled_turn("a", 8_000), Some((Status::Done, false)));
+        let s = get(&state, "a");
+        assert_eq!((s.status, s.state_entered_at, s.updated), (Status::Done, 8_000, 8_000));
+        assert_eq!(s.working_accumulated_ms, 3_000, "the run was banked on entering Blocked; the dialog's wait is not work");
     }
 
     #[test]
@@ -2776,7 +2806,6 @@ mod tests {
         assert_eq!((s.status, s.state_entered_at, s.label.as_str()), (Status::Blocked, 3_000, "needs approval: Bash"), "the BLOCK stands");
         assert_eq!(gate_of(&state, "a").unwrap().base.status, Status::Blocked, "the main agent is back on its question");
         assert_eq!(gate_of(&state, "a").unwrap().base.state_entered_at, 4_000);
-        assert_eq!(state.revert_cancelled_turn("a", 5_000), None, "the base already left Working");
     }
 
     #[test]

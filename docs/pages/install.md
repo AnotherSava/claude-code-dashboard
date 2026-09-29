@@ -80,7 +80,7 @@ For reference, the copied snippet has this shape (your copy substitutes the real
 
 The app-data folder is `%APPDATA%\com.anothersava.claude-code-dashboard\` on Windows and `~/Library/Application Support/com.anothersava.claude-code-dashboard/` on macOS. The instructions panel's **Hook script** line links straight to it.
 
-The `PreToolUse` matcher restricts the hook to user-gating tools (`AskUserQuestion`, `ExitPlanMode`). Claude Code buffers their `tool_use` blocks until the user answers, so without this hook the dashboard can't detect those calls in flight. The matcher also avoids per-Bash/Read/Grep fork overhead an unfiltered `PreToolUse` would incur.
+The `PreToolUse` matcher restricts the hook to user-gating tools (`AskUserQuestion`, `ExitPlanMode`). Nothing in the transcript says such a call is waiting on your answer, so without this hook the dashboard can't show it as blocked. The matcher also avoids per-Bash/Read/Grep fork overhead an unfiltered `PreToolUse` would incur.
 
 ## Optional tweaks
 

@@ -39,11 +39,10 @@ dialog open — so its prompts are released rather than left blocking the row.
 `Notification` events of type `permission_prompt` are ignored: the
 `PermissionRequest` before them already reported the same dialog.
 
-The `PreToolUse` matcher restricts the hook to user-gating tools whose
-`tool_use` blocks aren't flushed to the JSONL transcript until the user
-responds — without this hook, the dashboard cannot detect those calls in
-flight. The matcher avoids the per-Bash/Read/Grep fork overhead of an
-unfiltered hook.
+The `PreToolUse` matcher restricts the hook to user-gating tools. The JSONL
+transcript records such a call but nothing marks it as waiting on the user,
+so this hook is the only signal that the dialog is on screen. The matcher
+avoids the per-Bash/Read/Grep fork overhead of an unfiltered hook.
 
 `UserPromptExpansion` fires the instant a slash command is invoked — seconds
 before `UserPromptSubmit`, which Claude Code only emits after the command's

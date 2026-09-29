@@ -42,7 +42,7 @@ The adapter recognizes the events below. Anything else returns `Ignore` and the 
 | `UserPromptSubmit`    | `working`                                                                           | Label is the cleaned prompt; blank prompt → label `None`.      |
 | `UserPromptExpansion` | `working` for a slash command (`expansion_type` is `slash_command`); other expansions ignored | Label is the cleaned prompt. Fires before a skill's `!` context-gathering, so a skill launch shows `working` without waiting for the later `UserPromptSubmit`, which owns the dialog entry. |
 | `Notification`        | `blocked` (default); `idle_prompt` and `permission_prompt` are ignored outright     | See the notification-type table below.                         |
-| `PreToolUse`          | `blocked` for `AskUserQuestion` / `ExitPlanMode` only; other tools ignored         | Label: `"has a question"` for `AskUserQuestion`, `"plan approval"` for `ExitPlanMode`. The matcher in `~/.claude/settings.json` should restrict the hook to these two tools (see [Installation → Wire the Claude Code hook](../install#2-wire-the-claude-code-hook)) — Claude Code buffers the `tool_use` block until the user answers, so the JSONL transcript can't carry the signal in flight. |
+| `PreToolUse`          | `blocked` for `AskUserQuestion` / `ExitPlanMode` only; other tools ignored         | Label: `"has a question"` for `AskUserQuestion`, `"plan approval"` for `ExitPlanMode`. The matcher in `~/.claude/settings.json` should restrict the hook to these two tools (see [Installation → Wire the Claude Code hook](../install#2-wire-the-claude-code-hook)) — the JSONL transcript records the call's `tool_use` block but nothing marks it as waiting on the user, so this hook is the only signal that the dialog is on screen. |
 | `PermissionRequest`   | `blocked`                                                                           | Label: `"needs approval: <tool>"` from `payload.tool_name` (`"tool"` when absent), except that `AskUserQuestion` / `ExitPlanMode` keep the label their `PreToolUse` set. Without an `agent_id` it is the main agent's dialog and sets the row's status. With one, a subagent raised it: it opens a prompt over the row instead — see [Subagent permission prompts](#subagent-permission-prompts). |
 | `Elicitation`         | `blocked`                                                                           | An MCP tool asked for input. Label is the request's message (first 60 characters), else `"needs your input"`. |
 | `ElicitationResult`   | `working`                                                                           | The user answered the MCP prompt. No label of its own, so the task label stays. |
@@ -54,7 +54,7 @@ The adapter recognizes the events below. Anything else returns `Ignore` and the 
 
 `SessionStart` and `Notification` share a code path because Claude Code occasionally emits notifications under either name; the dispatcher merges them.
 
-`PostToolUse` is intentionally ignored. Once the user answers an `AskUserQuestion` / `ExitPlanMode`, the next `UserPromptSubmit` or the transcript watcher carries the row out of `blocked`.
+`PostToolUse` is intentionally ignored. Once the user answers an `AskUserQuestion` / `ExitPlanMode`, the transcript watcher carries the row out of `blocked` when the answer's `tool_result` lands, or the next `UserPromptSubmit` does. The call's own `tool_use` line is written while the dialog is still on screen, so the watcher reads an unanswered one as no activity.
 
 ### Notification subtypes
 
