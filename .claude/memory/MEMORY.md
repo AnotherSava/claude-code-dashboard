@@ -58,7 +58,7 @@
 - [Notification engine never fired](notification_engine_never_fired.md) — zero fires ever; windows are compiled defaults, not tuned, and blocked's effective backstop is ~5.4min not 2min
 - [Attention visit detection design](attention_visit_detection_design.md) — polling a level can't catch a short visit; chosen fix is an fsevent watch on agterm's window snapshot + a gated 1s poll, no agterm changes; upstream asks withdrawn 2026-09-02
 - [Windows Terminal attention signals](windows_terminal_attention_signals.md) — this machine's WT setup; tabs host WSL tmux clients, so all-`PowerShell` tabs mean check tmux set-titles first
-- [CLAUDE.md is one 75k-char line](claude_md_single_line_merge.md) — cross-machine edits always conflict; never resolve markers, stash + ff + re-apply edits onto the pulled text
+- [CLAUDE.md is one 140k-char line](claude_md_single_line_merge.md) — cross-machine edits always conflict; never resolve markers, stash + ff + re-apply edits onto the pulled text
 - [docs/_site floods content search](docs_site_floods_content_search.md) — exclude it from every grep over docs/; one compressed line per page dumps ~30KB, and the build is stale by construction
 - [Verify a relayed message's target](verify_peer_message_delivery.md) — diagnose relays on the RECEIVER: `peer_write` logs a pid to map via `~/.claude/sessions/<pid>.json`, `peer_refused` carries the true reason the sender's receipt may have mislabelled
 - [Check npm -v, not the packageManager field](node_toolchain_pin_ahead_of_node.md) — the pin needs Node >=24.15.0, and a Node upgrade silently resets corepack so the field stays right while the shim is gone

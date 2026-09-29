@@ -1,11 +1,11 @@
 ---
 name: claude_md_single_line_merge
-description: CLAUDE.md's module map is one ~75k-char line, so edits from both machines always conflict; never resolve the markers — re-apply the edits onto the pulled text
+description: CLAUDE.md's module map is one ~140k-char line, so edits from both machines always conflict; never resolve the markers — re-apply the edits onto the pulled text
 metadata:
   type: project
 ---
 
-The "Key module map" paragraph in `CLAUDE.md` is a **single line of ~75,000 characters**. Git diffs by line, so two edits to entirely unrelated sentences are the same hunk and conflict every time. Since this repo is worked from both a Windows and a macOS machine and nearly every feature updates that paragraph, a conflicting `git pull` on `CLAUDE.md` is the normal case, not an incident.
+The "Key module map" paragraph in `CLAUDE.md` is a **single line of ~140,000 characters** (measured 2026-09-28). Its size alone now trips Claude Code's instruction-file budget warning, which is informational only — see the global learning `claude-code-instruction-file-size.md`. Git diffs by line, so two edits to entirely unrelated sentences are the same hunk and conflict every time. Since this repo is worked from both a Windows and a macOS machine and nearly every feature updates that paragraph, a conflicting `git pull` on `CLAUDE.md` is the normal case, not an incident.
 
 **Why:** On 2026-08-30 a local edit (recording the Windows relay leg as verified) collided with an incoming commit that had inserted new roster and reply-path text elsewhere in the same line. The conflict markers wrapped the whole 75k-character line twice — nothing hand-resolvable. Both sides' changes were small and disjoint; only the line granularity made them collide.
 
