@@ -186,8 +186,9 @@ def main() -> int:
             dash.shot(dash.APP, out, title=WINDOW_TITLE, settle_ms=1200, hairline=True)
             # Second pass, as the hero does: a session can change state or a peer
             # can go silent inside the second the shutter takes. This one cannot
-            # un-write the file, so it refuses loudly instead — restore the frame
-            # with git and stage it again.
+            # un-write the files, so it refuses loudly instead — restore the frame
+            # and its raw under docs/screenshots/raw/ with git (deleting the raw
+            # if git does not hold one yet) and stage it again.
             if not args.force:
                 assert_frame_worthy("after the shot", public)
     except dash.CaptureError as e:

@@ -243,41 +243,44 @@ def capture_window(win: dict, out: Path, trim: bool = True) -> Path:
             "System Settings > Privacy & Security > Screen Recording, then run it again."
         )
 
-    keep_raw(out)
     if trim:
         subprocess.run([sys.executable, str(LIB / "trim_halo.py"), str(out)], check=True, timeout=120)
     to_srgb(out)
     return out
 
 
-def keep_raw(out: Path) -> Path | None:
-    """Put the untouched capture in `tmp/raw/` before anything rewrites it.
+def _keep_raw(path: Path) -> None:
+    """Commit a frame's capture as it stands just before the frame step, at `docs/screenshots/raw/<name>`.
 
-    Every step after this one — the halo trim, the sRGB conversion, the hairline —
-    edits the file in place, so without this the capture is destroyed by its own
-    post-processing and the only way to try a different treatment is to take the
-    shot again. That is a bad trade whatever it costs, and here it costs a great
-    deal: the window has to be on screen, which it is not when a full-screen app
-    is in front, and several of these frames need session states that can only be
-    staged by hand. Tuning a border is post-processing and should never have
-    needed the app running at all.
+    `hairline.py` edits the file in place, so without this the capture is
+    destroyed by its own framing and the only way to try a different edge is to
+    take the shot again. That costs a great deal here: the window has to be on
+    screen, which it is not when a full-screen app is in front, and several of
+    these frames need session states that can only be staged by hand. The border
+    was once reworked three times, and the run that finally settled it replayed a
+    raw left over from an unrelated probe, because by then the window was
+    unreachable. Committed, the raw is there on either machine and after a
+    re-shoot, since git keeps the one before.
 
-    It really was the difference between doing the work and not: the border was
-    reworked three times, and the run that finally settled it replayed a raw left
-    over from an unrelated probe, because by then the window was unreachable.
+    It is the file `hairline.py` is handed — after the halo trim and the sRGB
+    conversion — so a copy taken straight off `screencapture` would not
+    reproduce the frame: re-framing it would first need both of those replayed.
 
-    `tmp/` is scratch and gitignored, so this commits nothing and is safe to
-    delete. Failures are warned about rather than raised — a missing archive
-    copy must not lose a capture that succeeded.
+    Only a committed frame keeps one. A probe goes to `tmp/`, and its raw would
+    be a stray file under `docs/`.
+
+    A failed copy raises rather than warns. The frame has not been drawn yet, so
+    the capture is still at `path`, unframed, and stopping loses nothing, while
+    carrying on would commit a frame nothing can re-frame.
     """
+    if path.resolve().parent != SHOTS:
+        return
+    raw = SHOTS / "raw" / path.name
     try:
-        raw = REPO / "tmp" / "raw" / f"{out.stem}.raw.png"
-        raw.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy(out, raw)
-        return raw
+        raw.parent.mkdir(exist_ok=True)
+        shutil.copy(path, raw)
     except OSError as e:
-        print(f"WARNING: could not archive the raw capture of {out.name} ({e}); post-processing it will need a re-shoot.", file=sys.stderr)
-        return None
+        raise CaptureError(f"Could not keep the raw of {path.name} at {raw.relative_to(REPO)} ({e}), so it was not framed. The capture is at {path}, as it stood before the frame step.") from e
 
 
 SRGB_PROFILE = Path("/System/Library/ColorSync/Profiles/sRGB Profile.icc")
@@ -347,6 +350,7 @@ def add_hairline(path: Path) -> None:
     # strokes a frame and when it decides the frame already has an edge, so without
     # this a false positive from its gate ships an unbordered frame and reports
     # success. This function is only called when a border is wanted.
+    _keep_raw(path)
     r = subprocess.run([sys.executable, str(skill_script("hairline.py")), "--require", str(path)], capture_output=True, timeout=300)
     sys.stdout.write(r.stdout.decode("utf-8", "replace"))
     if r.returncode != 0:

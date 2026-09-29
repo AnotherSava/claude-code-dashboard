@@ -103,15 +103,13 @@ finished row is that row's current label rather than the sentence in the picture
 THE GUARD RUNS TWICE, before the window is raised and again after the shutter,
 because a real session can change state in the second in between, and the second
 pass is what turns that into a refusal rather than a committed frame nobody
-re-examines. That second pass runs after the PNG has been written, so a refusal
-there is about a file that already exists on disk. Once the figure is committed,
-restore it with `git checkout` rather than committing the new one; until then —
-and `docs/screenshots/hero-macos.png` has never been captured, so the first run
-is this case — the leftover is an untracked PNG to delete, which the manifest
-gate `check-figures.py` rejects for as long as it sits there. Either way
-the `--probe` flag avoids the question entirely: it writes to `tmp/` and cannot
-touch the committed frame at all, which is what to use while the staging is
-still moving.
+re-examines. That second pass runs after two files have been written — the frame,
+and its raw under `docs/screenshots/raw/` — so a refusal there is about a capture
+already on disk, possibly one carrying a private project's name. Restore both
+with `git checkout` rather than committing either; a raw git does not hold yet is
+untracked, and is deleted instead. Either way the `--probe` flag avoids the
+question entirely: it writes to `tmp/` and cannot touch the committed frame or
+its raw at all, which is what to use while the staging is still moving.
 
 STAGING, every item the operator's and none of it the script's:
 

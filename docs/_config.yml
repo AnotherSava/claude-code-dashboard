@@ -33,3 +33,5 @@ exclude:
   - plans/
   - screenshots/*.py
   - screenshots/capture/
+  # The untouched captures the frames were made from: inputs to the frame step, not pages.
+  - screenshots/raw/
