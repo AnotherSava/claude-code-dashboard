@@ -62,7 +62,22 @@ echo "==> cargo check --all-targets (a warning fails the build)"
 RUSTFLAGS="-D warnings" cargo check --manifest-path src-tauri/Cargo.toml --all-targets
 
 echo "==> cargo test --lib"
-cargo test --manifest-path src-tauri/Cargo.toml --lib
+# Teed to a log because the failing test's NAME is the thing that keeps getting
+# lost. Three times now (2026-09-11, 09-13, 09-29) a single test failed inside
+# this script and never again, and all three times the name was destroyed by the
+# filter the caller piped this script's output through — an agent reading for
+# "All CI checks passed" keeps the summary line and drops the `test … FAILED`
+# line right above it, turning a failure that happened into an anonymous one.
+# A log the filter cannot reach is the only fix that does not depend on
+# remembering. `pipefail` from line 30 already covers the pipe, so the status
+# stays cargo's rather than tee's — and `mkdir -p` is not optional: `tmp/` is
+# gitignored, so it exists on no fresh clone, and without this the tee fails,
+# pipefail makes that the pipeline's status, and `set -e` aborts the gate right
+# after a green test run. That turns a passing suite into a red gate whose
+# failure carries no test name — precisely the anonymous failure this block
+# exists to prevent, manufactured by the block itself.
+mkdir -p tmp
+cargo test --manifest-path src-tauri/Cargo.toml --lib 2>&1 | tee tmp/cargo-test.log
 
 echo "==> npm run build"
 npm run build
