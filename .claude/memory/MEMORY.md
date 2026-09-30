@@ -55,7 +55,7 @@
 - [Homebrew tap distribution](homebrew_tap_distribution.md) — macOS also ships via AnotherSava/homebrew-tap; cask strips quarantine on purpose, zap path UNTESTED and can disable sleep, never `brew audit --new`
 - [agterm status co-existence](agterm_status_coexistence.md) — dashboard owns status via the OSC title (glyph can't express WAIT/ERROR); agterm is still *read* for per-session attention, never written; agterm-side mechanics in learnings/agterm.md
 - [Notification delivery channel](notification_delivery_channel.md) — write OSC 777 to the session tty (focus-gated, free); NOT agtermctl notify (re-raises the pill) or tauri-plugin-notification (desktop stub, can't dismiss)
-- [Notification engine never fired](notification_engine_never_fired.md) — zero fires ever; windows are compiled defaults, not tuned, and blocked's effective backstop is ~5.4min not 2min
+- [Notification windows uncalibrated](notification_windows_uncalibrated.md) — first ping ever fired 2026-09-29; windows are compiled defaults, and blocked's effective backstop is ~5.4min not 2min
 - [Attention visit detection design](attention_visit_detection_design.md) — polling a level can't catch a short visit; chosen fix is an fsevent watch on agterm's window snapshot + a gated 1s poll, no agterm changes; upstream asks withdrawn 2026-09-02
 - [Windows Terminal attention signals](windows_terminal_attention_signals.md) — this machine's WT setup; tabs host WSL tmux clients, so all-`PowerShell` tabs mean check tmux set-titles first
 - [CLAUDE.md is one 140k-char line](claude_md_single_line_merge.md) — cross-machine edits always conflict; never resolve markers, stash + ff + re-apply edits onto the pulled text

@@ -21,4 +21,4 @@ The notification decision engine (`notifications.rs`) has always had a delivery 
 - In `NotificationManager::spawn`, `reset_tracker` and `last_usage_updated` are channel-*independent* (they observe the usage poller) and must not be split per channel; everything else in that block must.
 - Unverified and gating any desktop-banner path: whether an `ActivationPolicy::Accessory`, ad-hoc-signed bundle can post macOS notifications at all, and whether authorization survives an ad-hoc rebuild (the cdhash changes per build).
 
-Related: [[agterm-status-coexistence]], [[notification-engine-never-fired]], [[macos-signing-strategy]].
+Related: [[agterm-status-coexistence]], [[notification-windows-uncalibrated]], [[macos-signing-strategy]].
