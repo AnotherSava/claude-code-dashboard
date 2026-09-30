@@ -963,6 +963,27 @@ async fn post_message(State(app): State<AppHandle>, headers: HeaderMap, Json(req
         );
     };
 
+    // Both wire fields below read this one binding, because they are two
+    // renderings of the same fact — the sender's name in the body and the
+    // address a reply goes to — and a caller that prefixed its own device name
+    // would otherwise contradict itself across them: the body said
+    // `agent "CHROME/what-is-next" on device "CHROME"` while the address said
+    // `CHROME/CHROME/what-is-next`, and a reader had no way to tell which half
+    // was wrong. Normalizing once here is also why nothing downstream needs to
+    // know the raw form existed.
+    // The refusals above this line keep the raw value in their log lines: at
+    // that point the device name is not yet known, so the raw form is the only
+    // thing the caller has actually said.
+    let raw_from_agent = from_agent;
+    let from_agent = peer_message::bare_project_id(this_device, from_agent);
+    if from_agent != raw_from_agent {
+        tracing::warn!(
+            chat_id = %from_agent,
+            raw_from_agent,
+            "from_agent carried this device's own name; the reply address would have been unroutable, so the prefix was dropped"
+        );
+    }
+
     // Minted here because this is the only place that holds *both* halves
     // exactly — this machine's own `device_name` and the caller's own id. An
     // unidentified caller gets `None` rather than a plausible address: the

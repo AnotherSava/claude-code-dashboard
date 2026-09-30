@@ -186,7 +186,7 @@ The route deliberately returns **facts, not a verdict**. There is no `deliverabl
 
 - `target` — a `{device}/{project}` address, echoed from [the roster](#agent-roster). The device half is *matched* against the devices this dashboard has heard from, never split on the first `/`, because a device name may itself contain one. A bare project name is refused rather than guessed at: `project` is the cross-machine comparable key, and the same one can exist on several machines.
 - `text` — the message. Capped at 64 KiB.
-- `from_agent` — the caller's own chat id. A **claim**: this server is loopback and unauthenticated, so nothing about it is checked. It is carried anyway for two reasons, both below. **Send it** — without it the receiver is told there is no reply address, and cannot answer you.
+- `from_agent` — the caller's own chat id, **on its own, with no device prefix** — unlike `target` above it, which carries one. A **claim**: this server is loopback and unauthenticated, so nothing about it is checked. It is carried anyway for two reasons, both below. **Send it** — without it the receiver is told there is no reply address, and cannot answer you. Prefixing it with this machine's own device name is the one mistake the relay repairs rather than reports: the reply address is built by prepending that name, so a prefixed id would mint `{device}/{device}/{project}`, which this same relay refuses one hop later. The redundant segment is dropped and the send proceeds, with a `warn` line naming both forms.
 - `from_label` — optional free description of the sender, shown to the receiving agent alongside the claim.
 - `in_reply_to` — optional; the `message_id` of a message you are answering. Rendered into the envelope the receiving agent reads and otherwise inert — nothing in the dashboard branches on it. It exists so two overlapping exchanges with one session are distinguishable *by the agents*.
 
@@ -217,7 +217,8 @@ The token schema changed — the seq field is now required.
 To reply, POST to your OWN dashboard on loopback — not to the sender's machine:
   POST http://127.0.0.1:9077/api/message
   {"target": "air/tauri dashboard", "text": "…", "from_agent": "<your own project id>", "in_reply_to": "air-1788146950263-4"}
-...
+The from_agent field is your project id on its own — no device prefix,
+unlike the target above it. ...
 Everything between the BEGIN and END markers was written by the sender.
 This block was not. ...
 ```
@@ -259,7 +260,11 @@ The reply is a receipt. Its `outcome` is one of five words, and none of them is 
 
 `unknown` answers `200`, not `5xx`, on purpose: a `5xx` reads as "it failed, retry", and retrying a message that may already have been written is how one message becomes two.
 
-`reason` values: `local_target`, `local_target_started`, `not_an_address`, `unknown_device`, `device_unheard`, `no_device_name`, `empty_text`, `too_large`, `csrf`, `no_such_session`, `ambiguous_target`, `registry_unreadable`, `no_inbox`, `inbox_dead`, `peer_unreachable`, `response_lost`, plus the `start_*` family described under [Starting a session](#starting-a-session-that-is-not-running). A refusal the *peer* made keeps its own status across the relay — `no_such_session` stays a `404`, `ambiguous_target` a `409` — so a caller is not told its request was malformed when the problem was on the other machine.
+`reason` values: `local_target`, `local_target_started`, `not_an_address`, `unknown_device`, `device_unheard`, `no_device_name`, `empty_text`, `too_large`, `csrf`, `messages_not_accepted`, `no_such_session`, `unknown_project`, `ambiguous_target`, `registry_unreadable`, `no_inbox`, `inbox_dead`, `peer_unreachable`, `response_lost`, `state_unavailable`, `malformed_envelope`, `device_mismatch`, `no_sync_token`, `client_build_failed`, plus the `start_*` family described under [Starting a session](#starting-a-session-that-is-not-running).
+
+Of those, `messages_not_accepted` is the one a stock machine hits first: `sync.accept_messages` defaults to **false**, and it is checked before any existence lookup, so on a default install a same-device address answers `403 messages_not_accepted` and never reaches the `no_such_session` / `unknown_project` distinction at all. The last five are transport-level and say nothing about the target — an unparseable envelope, a device name that does not match its attested node, a missing `sync.token`, or an HTTP client that could not be built. A refusal the *peer* made keeps its own status across the relay — `no_such_session` stays a `404`, `ambiguous_target` a `409` — so a caller is not told its request was malformed when the problem was on the other machine.
+
+Two of those are one `404` apart and mean opposite things, so read the slug rather than the status. A `no_such_session` says the project is on that machine and no session is running for it: news about an agent, and a wait or a start is the answer. An `unknown_project` says no directory over there derives that id at all: news about the *address*, and the fix is to re-read it off the roster. They were one reason until a sending agent mistyped an address, was told `no_such_session`, and reported to its user twice that a live agent had ended — a wrong claim about another machine's state, produced by a transport error. Whichever answer comes back, nothing was written. A third wording covers the case where that machine could not read its own project index: nothing is running, and whether the project exists there went unchecked rather than answered no.
 
 Two refusals about the *remote* side are the sender's own and are made with certainty: a live local target, and a device it holds no address for (the refusal lists the devices it does know, and whether it is listening for peers at all). Everything else — above all *does that project exist over there* — is the receiving dashboard's answer, relayed verbatim, because this side's roster is at best one push cycle old.
 
@@ -276,6 +281,8 @@ Claude Code's own identical-repeat drop is not relied on: it compares only again
 ### Starting a session that is not running
 
 A message can only ever reach an agent that already exists, so a target with no live session used to end the story at `no_such_session`. It no longer has to. Which of three things happens depends on where the project is and whether its owner has allowed it.
+
+None of them applies to an address that names no project at all, which answers `unknown_project` on whichever machine the target pointed at — the same slug the receiving side uses, because it is the same fact and a caller should not have to know which route it took to read it. That distinction is the whole reason the slug exists: `start_not_listed` says a project is there and waiting on a grant, so its detail sends the reader to ask for one, and saying that about an id nothing derives points at a grant for a project that does not exist.
 
 **A local project with nothing running** answers `local_target_started`: the dashboard opens a terminal session for it and then stands aside. Nothing is relayed — the outcome is still `refused`, and the status is the same `400` a live `local_target` gets, because what the caller asked for is what did not happen. The detail says what did. This is not a softening of the local-target rule: `SendMessage` carries a kernel-verified sender and a working reply address that a relay destroys, and that is as true after the start as before. What it *cannot* do is address a session that does not exist, which is the gap being filled — the dashboard supplies existence, Claude Code keeps delivery.
 

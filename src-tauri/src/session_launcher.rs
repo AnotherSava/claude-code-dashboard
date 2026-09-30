@@ -89,6 +89,15 @@ pub enum StartRefusal {
     /// so the session exists in agterm's model and its command never runs — no
     /// pty, no `claude`, no registry record, and nothing a poll could wait for.
     NotRealized,
+    /// Nothing on this machine derives that project id, so there is no session
+    /// to message and nothing to start — the address names nothing here.
+    ///
+    /// Split out of [`Self::NotListed`], which is *true* of this case and is the
+    /// wrong thing to say about it: its detail sends the caller to ask an owner
+    /// to list a project that does not exist. Reported by a sibling session that
+    /// probed both cases through the same-device route and got one answer,
+    /// byte-identical apart from the echoed target.
+    NoSuchProject,
 }
 
 impl StartRefusal {
@@ -102,6 +111,12 @@ impl StartRefusal {
             Self::AlreadyStarting => "start_already_running",
             Self::NoLauncher => "start_no_launcher",
             Self::NotRealized => "start_not_realized",
+            // Deliberately outside the `start_*` family, and sharing the slug
+            // the receiving route answers with: "nothing here derives that id"
+            // is one fact about a machine, not a sub-reason a start was
+            // declined, and a caller must not have to know which route it hit
+            // to read the same answer.
+            Self::NoSuchProject => "unknown_project",
         }
     }
 
@@ -116,6 +131,7 @@ impl StartRefusal {
             Self::AlreadyStarting => "a session for that project is already being started",
             Self::NoLauncher => "this machine has no terminal this dashboard can start a session in",
             Self::NotRealized => "the terminal created a session but never gave it a surface, most likely because this machine's display is asleep, so no agent was started",
+            Self::NoSuchProject => "no existing directory on this machine derives that project id, so this is an address that names nothing here rather than a session that ended or a project awaiting a grant",
         }
     }
 }
@@ -204,10 +220,66 @@ pub struct StartCandidate {
 /// can answer, and the answer still has to pass every check in
 /// [`check_startable`] afterwards.
 pub fn candidates_for(project: &str, projects_root: Option<&str>) -> Vec<StartCandidate> {
-    let Some(config) = claude_config_file().and_then(|p| std::fs::read_to_string(p).ok()).and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()) else {
+    let Some(config) = claude_project_index() else {
         return Vec::new();
     };
     candidates_in(&config, project, projects_root)
+}
+
+/// Claude Code's `~/.claude.json`, parsed, or `None` when it could not be read.
+///
+/// Its own function because every caller needs the same bytes and they need the
+/// failure differently: [`candidates_for`] has nothing to suggest either way,
+/// [`check_startable`] treats an unreadable index as an untrusted directory —
+/// the conservative direction — and [`project_knowledge`] must not report it as
+/// an absent project at all.
+fn claude_project_index() -> Option<serde_json::Value> {
+    claude_config_file().and_then(|p| std::fs::read_to_string(p).ok()).and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+}
+
+/// Whether this machine holds any directory that derives a project id.
+///
+/// This is the fact that separates *a session that has ended* from *an address
+/// that never named anything here*, and the relay returned one refusal for both
+/// until it had this: a sender reading `no_such_session` after mistyping an
+/// address concluded a live agent had gone away, and told its user so twice.
+///
+/// `Unreadable` is a third answer for the same reason
+/// [`crate::session_registry::InboxLookup::Unreadable`] is one: not having
+/// looked is not a finding, and collapsing it into `Unknown` would turn our own
+/// failure to read a file into a claim about the caller's address.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ProjectKnowledge {
+    /// At least one directory here derives that id, so the project exists on
+    /// this machine and the absence is only of a *running* session.
+    Known,
+    /// The index was read and nothing in it derives that id.
+    Unknown,
+    /// The index could not be read, so this machine cannot say either way.
+    Unreadable,
+}
+
+/// Ask [`ProjectKnowledge`] about one project id.
+///
+/// Deliberately **not** `!candidates_for(..).is_empty()`: that reads an
+/// unreadable index as an empty one, which is the single answer this
+/// distinction exists to avoid.
+pub fn project_knowledge(project: &str, projects_root: Option<&str>) -> ProjectKnowledge {
+    knowledge_in(claude_project_index().as_ref(), project, projects_root)
+}
+
+/// Pure half of [`project_knowledge`], mirroring [`candidates_in`], so all three
+/// answers are reachable without a Claude Code install.
+///
+/// `Unreadable` is the reason this is split out rather than inlined: it is the
+/// answer that must never silently become `Unknown`, and while the index read sat
+/// inside the caller no test could produce it at all — the only lever was the
+/// process's own `HOME`, which is global mutable state a parallel test run shares.
+fn knowledge_in(index: Option<&serde_json::Value>, project: &str, projects_root: Option<&str>) -> ProjectKnowledge {
+    let Some(config) = index else {
+        return ProjectKnowledge::Unreadable;
+    };
+    if candidates_in(config, project, projects_root).is_empty() { ProjectKnowledge::Unknown } else { ProjectKnowledge::Known }
 }
 
 /// Pure half of [`candidates_for`], so the filtering is testable without a
@@ -238,14 +310,26 @@ fn candidates_in(config: &serde_json::Value, project: &str, projects_root: Optio
 /// Split from [`launch`] so the whole policy is testable without spawning
 /// anything, and so a refusal costs no process.
 pub fn check_startable(project: &str, auto_start: &BTreeMap<String, String>, projects_root: Option<&str>) -> Result<PathBuf, StartRefusal> {
-    let dir = listed_dir(project, auto_start, projects_root)?;
+    let dir = match listed_dir(project, auto_start, projects_root) {
+        Ok(dir) => dir,
+        // Asked about an id nothing here derives, "its owner has not listed it
+        // as startable" is true and useless: it points at a grant for a project
+        // that does not exist. The existence question is only asked once
+        // `listed_dir` has already said no, so the documented ordering — a
+        // listing answer before anything else — is unchanged, and a `PathMismatch`
+        // keeps its own reason because there the entry does exist.
+        //
+        // An index we could not read leaves `NotListed` standing, for the reason
+        // it leaves `no_such_session` standing on the receiving route: our own
+        // failure to read a file must not become a claim about the caller's
+        // address.
+        Err(StartRefusal::NotListed) if project_knowledge(project, projects_root) == ProjectKnowledge::Unknown => return Err(StartRefusal::NoSuchProject),
+        Err(refusal) => return Err(refusal),
+    };
     if !dir.is_dir() {
         return Err(StartRefusal::NoSuchDirectory);
     }
-    let config = claude_config_file()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
-    match config {
+    match claude_project_index() {
         Some(config) if trusted_in(&config, &dir) => Ok(dir),
         // An unreadable config file is treated the same as an untrusted
         // directory. It is the conservative direction and the honest one: we
@@ -523,6 +607,39 @@ mod tests {
         assert_eq!(listed_dir("transcripts", &BTreeMap::new(), None), Err(StartRefusal::NotListed));
     }
 
+    /// The listing question is answered without consulting the project index, so
+    /// the documented ordering holds and [`check_startable`] is the only thing
+    /// that can upgrade a `NotListed` to a `NoSuchProject`.
+    #[test]
+    fn listed_dir_answers_only_about_the_listing() {
+        let cfg = listing(&[("transcripts", "/Users/me/Projects/transcripts")]);
+        assert_eq!(
+            listed_dir("zz-derives-nowhere-4f2a", &cfg, None),
+            Err(StartRefusal::NotListed),
+            "an id nothing derives is still only unlisted as far as this function can see"
+        );
+    }
+
+    /// A caller must not have to know which route it hit to read the same fact,
+    /// so the same-device refusal carries the slug the receiving route answers
+    /// with rather than a second name for one thing.
+    #[test]
+    fn nothing_derives_it_is_one_slug_across_both_routes() {
+        assert_eq!(StartRefusal::NoSuchProject.slug(), "unknown_project");
+        assert_ne!(StartRefusal::NoSuchProject.slug(), StartRefusal::NotListed.slug());
+    }
+
+    /// The detail is the half that misled: `NotListed` sends the reader to ask an
+    /// owner for a grant, which is the wrong instruction for a project that does
+    /// not exist, so this one must not repeat it.
+    #[test]
+    fn the_no_such_project_detail_does_not_ask_for_a_grant() {
+        let detail = StartRefusal::NoSuchProject.detail();
+        assert!(!detail.contains("listed as startable"), "must not point at a grant: {detail}");
+        assert!(detail.contains("names nothing here"), "must name the real fact: {detail}");
+        assert!(StartRefusal::NotListed.detail().contains("has not listed it"), "the grant wording belongs to the refusal that means it");
+    }
+
     #[test]
     fn a_listed_project_resolves_to_its_directory() {
         let cfg = listing(&[("transcripts", "/Users/me/Projects/transcripts")]);
@@ -622,10 +739,35 @@ mod tests {
             StartRefusal::AlreadyStarting,
             StartRefusal::NoLauncher,
             StartRefusal::NotRealized,
+            StartRefusal::NoSuchProject,
         ];
+        // The list above is hand-written, so this match is what stops it going
+        // stale: a new variant fails to compile here, which puts the author in
+        // front of the list. Added because the list DID go stale — `NoSuchProject`
+        // was introduced and this test kept passing without it, still claiming to
+        // cover "every refusal".
+        fn _every_variant_is_listed(r: StartRefusal) {
+            match r {
+                StartRefusal::NotListed
+                | StartRefusal::PathMismatch
+                | StartRefusal::NoSuchDirectory
+                | StartRefusal::UntrustedDirectory
+                | StartRefusal::AlreadyStarting
+                | StartRefusal::NoLauncher
+                | StartRefusal::NotRealized
+                | StartRefusal::NoSuchProject => {}
+            }
+        }
         let slugs: std::collections::BTreeSet<&str> = all.iter().map(|r| r.slug()).collect();
         assert_eq!(slugs.len(), all.len());
-        assert!(all.iter().all(|r| r.slug().starts_with("start_")), "the prefix is what makes the whole feature greppable in widget.jsonl");
+        // The `start_` prefix belongs to the refusals that are *about a start*,
+        // which is what it makes greppable. `NoSuchProject` is deliberately
+        // outside that family: it reports a fact about the machine — nothing here
+        // derives that id — which the receiving route answers with the same slug,
+        // so a caller reads one answer without knowing which route it hit.
+        let (fact, starts): (Vec<&StartRefusal>, Vec<&StartRefusal>) = all.iter().partition(|r| matches!(**r, StartRefusal::NoSuchProject));
+        assert!(starts.iter().all(|r| r.slug().starts_with("start_")), "the prefix is what makes the whole feature greppable in widget.jsonl");
+        assert_eq!(fact.iter().map(|r| r.slug()).collect::<Vec<_>>(), vec!["unknown_project"], "the one non-start refusal, named for the fact rather than the attempt");
         assert!(all.iter().all(|r| !r.detail().is_empty()));
 
         // …and each must have a real arm in the canonical status map. Falling
@@ -667,6 +809,15 @@ mod tests {
             here_s.clone(): {"hasTrustDialogAccepted": false},
             sibling_s.clone(): {"hasTrustDialogAccepted": true},
             "/no/such/directory/anywhere": {"hasTrustDialogAccepted": true},
+            // Deliberately a path whose BASENAME is the id under test, so this
+            // entry survives the id filter and is dropped only by the `is_dir`
+            // check. The entry above it does not: `/no/such/directory/anywhere`
+            // derives `anywhere`, so querying `no-such-directory-anywhere`
+            // matches nothing and passes for a reason that has nothing to do with
+            // the directory being gone — which is what made the assertion below
+            // vacuous until a review disabled the `is_dir` filter and found the
+            // test still green.
+            "/no/such/directory/zzz-gone-4f2a": {"hasTrustDialogAccepted": true},
         }});
 
         let found = candidates_in(&config, "nested", None);
@@ -675,8 +826,20 @@ mod tests {
         let untrusted = candidates_in(&config, &leaf, None);
         assert_eq!(untrusted, vec![StartCandidate { dir: here_s, trusted: false }], "an untrusted folder is offered, not hidden — the user is looking for it");
 
-        assert!(candidates_in(&config, "no-such-directory-anywhere", None).is_empty(), "a directory that is gone is not a candidate even though the index still lists it");
+        assert!(candidates_in(&config, "zzz-gone-4f2a", None).is_empty(), "a directory that is gone is not a candidate even though the index still lists it — this id DOES derive from a listed path, so only the is_dir filter can reject it");
+        assert!(candidates_in(&config, "no-such-directory-anywhere", None).is_empty(), "and an id no listed path derives matches nothing, for the other reason");
         assert!(candidates_in(&serde_json::json!({}), "nested", None).is_empty(), "no index, no suggestions");
+
+        // The three answers the two relay routes now refuse by. `Unreadable` is
+        // the one that matters most and the one an inlined index read made
+        // untestable: it must not read as `Unknown`, because that would turn our
+        // own failure to read a file into a claim about the caller's address.
+        assert_eq!(knowledge_in(Some(&config), "nested", None), ProjectKnowledge::Known, "a directory that derives the id is positive knowledge");
+        assert_eq!(knowledge_in(Some(&config), "zzz-gone-4f2a", None), ProjectKnowledge::Unknown, "listed but gone from disk is not a project that exists here — which is why the refusal detail must not claim the machine never ran Claude Code there");
+        assert_eq!(knowledge_in(Some(&config), "zz-derives-nowhere-4f2a", None), ProjectKnowledge::Unknown, "an id nothing derives, read from a readable index");
+        assert_eq!(knowledge_in(Some(&serde_json::json!({})), "nested", None), ProjectKnowledge::Unknown, "an index with no projects map was still read");
+        assert_eq!(knowledge_in(None, "nested", None), ProjectKnowledge::Unreadable, "an index we could not read is not an absent project");
+        assert_ne!(knowledge_in(None, "nested", None), knowledge_in(Some(&serde_json::json!({})), "nested", None), "not having looked must stay distinguishable from having looked and found nothing");
 
         let _ = std::fs::remove_dir_all(&here);
     }

@@ -804,7 +804,42 @@ async fn post_message(
             );
             return (StatusCode::OK, Json(r));
         }
-        InboxLookup::NotFound => return refuse("no_such_session", StatusCode::NOT_FOUND, Some("no live interactive session on this machine derives that project id".into())),
+        // Nothing is running for that id — and *why* is two different answers a
+        // sender cannot tell apart from one slug. A session that ended is news
+        // about an agent; an id nothing here ever derived is news about the
+        // address, and reporting the first for the second is how a transport
+        // error became a confident wrong claim that a live agent had gone away.
+        // The distinguishing fact is already on this machine, in the same index
+        // `start_not_listed` offers directories from.
+        //
+        // Answered to every peer, attested or not. What the two slugs disclose
+        // is one bit — whether any project here derives that id — which is the
+        // same kind of fact the existing `no_such_session`-versus-`written`
+        // difference already tells anyone who can reach this route. The
+        // *directory list* stays behind attestation, because naming this
+        // machine's layout is a real disclosure and a yes/no is not.
+        InboxLookup::NotFound => {
+            return match crate::session_launcher::project_knowledge(&env.target_project, cfg.projects_root.as_deref()) {
+                crate::session_launcher::ProjectKnowledge::Unknown => refuse(
+                    "unknown_project",
+                    StatusCode::NOT_FOUND,
+                    Some("no existing directory on this machine derives that project id, so this is an address that names nothing here rather than a session that ended".into()),
+                ),
+                // The weaker claim, and the honest one when our own index could
+                // not be read: nothing is running, and whether the project even
+                // exists here went unchecked rather than answered no.
+                crate::session_launcher::ProjectKnowledge::Unreadable => refuse(
+                    "no_such_session",
+                    StatusCode::NOT_FOUND,
+                    Some("no live interactive session on this machine derives that project id; whether any directory here derives it is unknown, as the project index could not be read".into()),
+                ),
+                crate::session_launcher::ProjectKnowledge::Known => refuse(
+                    "no_such_session",
+                    StatusCode::NOT_FOUND,
+                    Some("no live interactive session on this machine derives that project id, though this machine does hold a directory that would — the session is not running".into()),
+                ),
+            };
+        }
         InboxLookup::Unreadable => return refuse("registry_unreadable", StatusCode::SERVICE_UNAVAILABLE, Some("this machine's session registry could not be read".into())),
         InboxLookup::NoInbox => {
             let r = receipt(Outcome::Unreachable).because("no_inbox").detailed("the session is live but publishes no messaging socket");
@@ -907,7 +942,11 @@ pub fn receipt_status(receipt: &Receipt) -> StatusCode {
         Outcome::Written | Outcome::Duplicate | Outcome::Unknown => StatusCode::OK,
         Outcome::Unreachable => StatusCode::BAD_GATEWAY,
         Outcome::Refused => match receipt.reason.as_deref() {
-            Some("no_such_session") => StatusCode::NOT_FOUND,
+            // Both are 404 and that is not a collapse of the distinction: the
+            // slug carries which absence it is, and a caller reading the status
+            // alone learns the one thing both have in common — nothing here
+            // answers to that address.
+            Some("no_such_session") | Some("unknown_project") => StatusCode::NOT_FOUND,
             Some("ambiguous_target") => StatusCode::CONFLICT,
             Some("too_large") => StatusCode::PAYLOAD_TOO_LARGE,
             Some("registry_unreadable") | Some("no_sync_token") => StatusCode::SERVICE_UNAVAILABLE,
@@ -2229,6 +2268,19 @@ mod tests {
         assert_eq!(refused("too_large"), StatusCode::PAYLOAD_TOO_LARGE);
         assert_eq!(refused("registry_unreadable"), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(refused("local_target"), StatusCode::BAD_REQUEST, "an unmapped reason stays a plain client error");
+    }
+
+    /// A mistyped address and a session that ended must not arrive as the same
+    /// refusal: they share a status, because both mean nothing here answers to
+    /// that address, and they differ in the slug, which is the half that says
+    /// whether to fix the address or to accept that an agent has gone. Reported
+    /// by a sibling session that spent four sends on the first while being told
+    /// the second, and told its own user twice that a live agent had ended.
+    #[test]
+    fn an_unroutable_address_is_not_reported_as_a_session_that_ended() {
+        let refused = |reason: &str| receipt_status(&Receipt::new(Outcome::Refused, "air-1-0", "chrome/p", Some("chrome")).because(reason));
+        assert_eq!(refused("unknown_project"), StatusCode::NOT_FOUND);
+        assert_eq!(refused("unknown_project"), refused("no_such_session"), "the status carries only what they share");
     }
 
     /// Every auto-start refusal needs its own arm. Falling through to the `_`

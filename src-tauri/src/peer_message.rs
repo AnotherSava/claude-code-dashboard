@@ -360,6 +360,38 @@ pub fn from_id(device: &str, agent: &str) -> String {
     format!("did:{}", id.trim_end_matches('-'))
 }
 
+/// Take a caller's own `from_agent` down to the bare project id the relay
+/// documents, dropping a device prefix it should never have carried.
+///
+/// A caller POSTing to `/api/message` supplies its own id, and the routing block
+/// asks for a project id in the same JSON line as a device-prefixed `target`,
+/// the two keys about forty characters apart — so an agent that reads them as one
+/// form sends `CHROME/what-is-next`. The relay then prepends its own device name and mints
+/// `CHROME/CHROME/what-is-next` as the reply address: a string the same relay
+/// refuses one hop later, and refuses with a reason that reads as *the session
+/// has ended*. Observed on 2026-09-03, where it cost the sender four attempts
+/// and two wrong reports to its user that a live agent had gone away.
+///
+/// The removed segment is not a guess — it is exactly the string the caller is
+/// about to have prepended, so taking it off yields the id it meant. Repeats go
+/// too, each being the same mistake applied twice. Comparison is
+/// case-insensitive for the reason [`crate::tailnet::attest`] compares that way:
+/// a machine answers to its own name in any case, while an *address* match stays
+/// exact. A prefix that consumes the whole value leaves nothing to address and
+/// is returned untouched, so the caller's own "no id" rule decides it rather
+/// than this function inventing one.
+pub fn bare_project_id<'a>(this_device: &str, from_agent: &'a str) -> &'a str {
+    let device = this_device.trim();
+    if device.is_empty() {
+        return from_agent;
+    }
+    let mut id = from_agent;
+    while id.len() > device.len() && id.as_bytes()[device.len()] == b'/' && id[..device.len()].eq_ignore_ascii_case(device) {
+        id = &id[device.len() + 1..];
+    }
+    if id.is_empty() { from_agent } else { id }
+}
+
 /// Lowercase, `[a-z0-9-]` only, no runs and no edge hyphens — the character set
 /// the address validator accepts, reached without a regex.
 fn sanitize_id_part(raw: &str) -> String {
@@ -546,8 +578,10 @@ pub fn build_content(r: &Relayed) -> String {
             "To reply, POST to your OWN dashboard on loopback — not to the sender's machine:\n  \
              POST http://127.0.0.1:{port}/api/message\n  \
              {{\"target\": \"{to}\", \"text\": \"…\", \"from_agent\": \"<your own project id>\", \"in_reply_to\": \"{message_id}\"}}\n\
-             Your reply arrives there as a message exactly like this one, which is\n\
-             the only way an answer gets back. Nothing polls for it."
+             The from_agent field is your project id on its own — no device prefix,\n\
+             unlike the target above it. Your reply arrives there as a message\n\
+             exactly like this one, which is the only way an answer gets back.\n\
+             Nothing polls for it."
         ),
         None => format!(
             "There is NO reply address for this message: the sender did not identify\n\
@@ -1122,6 +1156,92 @@ mod tests {
         assert!(content.contains("NO reply address"));
         assert!(!content.contains("\"target\""), "no address may be printed: {content}");
         assert!(content.contains("air-1-0"), "the id is still quotable");
+    }
+
+    /// The 2026-09-03 failure, as a test: the caller prefixed its own device
+    /// name, so the minted address was `CHROME/CHROME/what-is-next` and the
+    /// relay refused it one hop later as a session that did not exist.
+    #[test]
+    fn a_device_prefixed_from_agent_is_taken_back_down_to_the_project_id() {
+        assert_eq!(bare_project_id("CHROME", "CHROME/what-is-next"), "what-is-next");
+        assert_eq!(format!("CHROME/{}", bare_project_id("CHROME", "CHROME/what-is-next")), "CHROME/what-is-next");
+    }
+
+    /// A device answers to its own name in any case, and the mistake is the same
+    /// mistake whichever case the caller typed.
+    #[test]
+    fn the_device_prefix_is_matched_case_insensitively() {
+        assert_eq!(bare_project_id("CHROME", "chrome/printlab"), "printlab");
+        assert_eq!(bare_project_id("air", "AIR/tauri-dashboard"), "tauri-dashboard");
+    }
+
+    /// The common case must be untouched. The slash-bearing case is not a
+    /// *derived* id — `derive_chat_id` maps `/` to a space, so a subproject under
+    /// a `projects_root` is `bga assistant` and no id this dashboard produces
+    /// contains a slash at all. It is what a caller reading its own cwd plausibly
+    /// types, and `from_agent` is unchecked free text, so it is a reachable input
+    /// that must come back byte-identical: only *this* device's prefix is
+    /// redundant, and a future edit tempted to strip more generally would break
+    /// here.
+    #[test]
+    fn a_bare_project_id_survives_including_a_slash_bearing_one() {
+        assert_eq!(bare_project_id("CHROME", "what-is-next"), "what-is-next");
+        assert_eq!(bare_project_id("CHROME", "bga/assistant"), "bga/assistant");
+        assert_eq!(bare_project_id("CHROME", "unknown"), "unknown");
+    }
+
+    /// Another machine's name is not ours to strip: only the segment this relay
+    /// is about to prepend is redundant, and `AIR/x` sent from CHROME is a
+    /// different error that must not be silently rewritten into `x`.
+    #[test]
+    fn another_devices_prefix_is_left_alone() {
+        assert_eq!(bare_project_id("CHROME", "AIR/printlab"), "AIR/printlab");
+    }
+
+    /// A prefix that consumes the whole value leaves nothing to address, so the
+    /// value is handed back for the caller's own "no id" rule to judge rather
+    /// than becoming an empty half of an address.
+    #[test]
+    fn a_prefix_with_no_project_after_it_is_not_turned_into_an_empty_id() {
+        assert_eq!(bare_project_id("CHROME", "CHROME/"), "CHROME/");
+        assert_eq!(bare_project_id("CHROME", "CHROME"), "CHROME");
+        assert_eq!(bare_project_id("", "CHROME/x"), "CHROME/x");
+    }
+
+    /// Repeats are the same mistake applied twice and go the same way, so the
+    /// address is routable however many times the caller doubled it.
+    #[test]
+    fn a_repeated_prefix_is_removed_entirely() {
+        assert_eq!(bare_project_id("CHROME", "CHROME/CHROME/what-is-next"), "what-is-next");
+    }
+
+    /// The function indexes and slices a `&str` by a byte offset taken from a
+    /// *different* string, which panics on a non-char-boundary. It is safe only
+    /// because the byte at that offset is checked against `b'/'` first, and a
+    /// byte equal to an ASCII character can never be a UTF-8 continuation byte —
+    /// so a match proves the offset is a boundary. That argument is worth a test
+    /// rather than a comment, since the next edit to the loop could break it.
+    #[test]
+    fn a_multibyte_id_is_sliced_on_a_character_boundary() {
+        assert_eq!(bare_project_id("AIR", "AIR/naïve-café"), "naïve-café");
+        assert_eq!(bare_project_id("AIR", "naïve-café"), "naïve-café");
+        // Device name longer than the id, and a multi-byte id shorter than the
+        // device: the length guard is what stops the index going out of bounds.
+        assert_eq!(bare_project_id("a-very-long-device-name", "é"), "é");
+        // A device name that is itself multi-byte, matched exactly.
+        assert_eq!(bare_project_id("café", "café/roaster"), "roaster");
+        // Multi-byte where the device's byte length lands mid-character in the
+        // id: no `/` there, so the loop must decline rather than slice.
+        assert_eq!(bare_project_id("AI", "éx/thing"), "éx/thing");
+    }
+
+    /// The field the caller gets wrong is named in the block that asks for it,
+    /// beside the one whose form differs — the reader who confuses them is by
+    /// construction the one who could not tell them apart.
+    #[test]
+    fn the_routing_block_says_the_from_agent_carries_no_device_prefix() {
+        let content = build_content(&relayed("ops", "hi", Some("chrome/p")));
+        assert!(content.contains("no device prefix"), "the block must name the form it wants: {content}");
     }
 
     #[test]
