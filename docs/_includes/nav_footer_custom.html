@@ -12,7 +12,7 @@
   <span class="os-pick-label">Screenshots</span>
   <span class="os-seg" role="group" aria-label="Screenshot platform">
     {%- for p in site.data.platforms %}
-    <button type="button" class="os-btn os-seg-btn" data-set-os="{{ p.key }}" aria-pressed="false">{{ p.name }}</button>
+    <button type="button" class="os-seg-item os-seg-btn" data-set-os="{{ p.key }}" aria-pressed="false">{{ p.name }}</button>
     {%- endfor %}
   </span>
 </div>

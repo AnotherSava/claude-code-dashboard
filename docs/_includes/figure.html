@@ -79,7 +79,6 @@
 <div class="{{ wrap }}"{% if missing != '' %} data-missing="{{ missing }}"{% endif %}>
 {%- for key in shown -%}
   {%- assign p = site.data.platforms | where: 'key', key | first -%}
-  {%- assign other = site.data.platforms | where_exp: 'q', 'q.key != key' | first -%}
   {%- assign alt_key = 'alt_' | append: key -%}
   {%- assign cap_key = 'caption_' | append: key -%}
   {%- assign alt = include[alt_key] -%}
@@ -89,12 +88,23 @@
       <span class="os-cap-row">
         {%- if only -%}
         {% include os_chip.html os=only %}
+        {%- elsif shown.size > 1 -%}
+        {%- comment -%}
+          Both platforms in the one fixed order, whichever frame is showing, so
+          the segments stay put under the pointer when a click swaps the frame.
+        {%- endcomment -%}
+        <span class="os-seg" role="group" aria-label="Screenshot platform">
+          {%- for q in site.data.platforms -%}
+          {%- if q.key == key %}
+          <span class="os-seg-item os-badge" tabindex="-1">{{ q.name }}</span>
+          {%- else %}
+          <button type="button" class="os-seg-item os-seg-btn os-swap" data-set-os="{{ q.key }}" aria-label="Show the {{ q.name }} screenshot">{{ q.name }}</button>
+          {%- endif -%}
+          {%- endfor %}
+        </span>
         {%- else -%}
         <span class="os-badge" tabindex="-1">{{ p.name }}</span>
         {%- endif -%}
-        {%- if shown.size > 1 %}
-        <button type="button" class="os-btn os-swap" data-set-os="{{ other.key }}" data-figure="{{ include.id }}" aria-label="Show the {{ other.name }} screenshot">{{ other.name }}</button>
-        {%- endif %}
         {%- if include[cap_key] %}
         <span class="os-cap-text">{{ include[cap_key] }}</span>
         {%- endif %}

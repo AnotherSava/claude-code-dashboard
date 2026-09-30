@@ -26,6 +26,12 @@ html[data-os="macos"]   .os-figure-paired .os-frame[data-frame-os="windows"] {
   // Both variants are on the page, so a control offering to show one of
   // them is printing a lie next to the picture it names.
   .os-swap, .os-pick { display: none !important; }
+  .os-seg .os-badge {
+    border-color: $grey-lt-100 !important;
+    border-radius: 4px !important;
+    background-color: $grey-lt-100 !important;
+    color: $grey-dk-100 !important;
+  }
 }
 
 .os-cap { display: block; margin-bottom: 0.4rem; }
@@ -51,7 +57,7 @@ html[data-os="macos"]   .os-figure-paired .os-frame[data-frame-os="windows"] {
   line-height: 1.6;
   white-space: nowrap;
 }
-.os-badge:focus { outline: 2px solid $link-color; outline-offset: 1px; }
+.os-badge:focus-visible { outline: 2px solid $link-color; outline-offset: 1px; }
 
 // Scope: this feature exists on one platform. A label, never a control — the
 // presence of a control is what tells a reader two platforms are in play.
@@ -68,34 +74,40 @@ html[data-os="macos"]   .os-figure-paired .os-frame[data-frame-os="windows"] {
 }
 .os-cap-row .os-chip { margin-bottom: 0; }
 
-// Action: show the other platform. No resting underline — the outline says it
-// is a control, and the underline arrives on hover the way a link's does.
-.os-btn {
+// The platform toggle: both platforms as touching segments in one fixed order,
+// so a click never moves the segment under the pointer. The chosen one takes the
+// link colour; an unchosen one previews it at a quarter strength on hover. No
+// underline at any point -- the border and the fill already say it is a control.
+.os-seg { display: inline-flex; }
+.os-seg-item {
   padding: 0 0.45rem;
   border: 1px solid $border-color;
-  border-radius: 4px;
+  border-radius: 0;
   background: none;
-  color: $link-color;
+  color: $grey-dk-100;
   font: inherit;
   font-size: 0.75rem;
   line-height: 1.6;
   white-space: nowrap;
-  cursor: pointer;
   text-decoration: none;
 }
-.os-btn:hover { text-decoration: underline; }
-.os-btn:focus-visible { outline: 2px solid $link-color; outline-offset: 1px; }
+.os-seg-item + .os-seg-item { margin-left: -1px; }
+.os-seg-item:first-child { border-radius: 4px 0 0 4px; }
+.os-seg-item:last-child { border-radius: 0 4px 4px 0; }
+.os-seg-btn { cursor: pointer; }
+.os-seg-btn:hover { background-color: rgba($link-color, 0.25); }
+.os-seg-btn:focus-visible { outline: 2px solid $link-color; outline-offset: 1px; position: relative; }
 
-// In the sidebar there is no picture to be the badge, so the active segment
-// takes the badge's look. Driven from data-os, not from aria-pressed, so it is
-// correct at first paint; aria-pressed follows a tick later, for announcement.
+// Chosen: in a figure, the frame's own segment; in the sidebar, the stored
+// platform. Driven from data-os, not from aria-pressed, so it is correct at
+// first paint; aria-pressed follows a tick later, for announcement.
+html.js[data-os] .os-seg .os-badge,
 html[data-os="windows"] .os-pick .os-seg-btn[data-set-os="windows"],
 html[data-os="macos"]   .os-pick .os-seg-btn[data-set-os="macos"] {
-  border-color: $grey-lt-200;
-  background-color: $grey-lt-100;
-  color: $grey-dk-100;
-  cursor: default;
-  text-decoration: none;
+  position: relative;
+  border-color: $link-color;
+  background-color: $link-color;
+  color: $white;
 }
 
 .os-cap-text { color: $grey-dk-100; font-size: 0.75rem; }
@@ -120,7 +132,6 @@ html[data-os="macos"]   .os-pick .os-seg-btn[data-set-os="macos"] {
 
 .os-pick { margin-top: 0.75rem; }
 .os-pick-label { display: block; margin-bottom: 0.25rem; font-size: 0.75rem; color: $grey-dk-100; }
-.os-seg { display: inline-flex; gap: 0.25rem; }
 
 // A control that cannot act does not render, and a control that would lie is
 // worse than absent. Both apply to the same two states: with no JS, and on a
@@ -130,3 +141,10 @@ html[data-os="macos"]   .os-pick .os-seg-btn[data-set-os="macos"] {
 html:not(.js) .os-pick { display: none; }
 html:not(.js) .os-swap,
 html:not([data-os]) .os-swap { display: none; }
+// With its other segment gone, a figure's own segment is a plain badge again.
+html:not(.js) .os-seg .os-badge,
+html:not([data-os]) .os-seg .os-badge {
+  border-color: $grey-lt-100;
+  border-radius: 4px;
+  background-color: $grey-lt-100;
+}
