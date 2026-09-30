@@ -30,13 +30,14 @@
 //! clock, and no status — so reading the glyph back is not inference from a
 //! proxy; it is this dashboard reading its own last published record from the one
 //! place that outlives the process. It carries a second fact for free: titles are
-//! written from `commands::display_snapshot`, i.e. *after* `apply_read_as_idle`,
-//! so `🟢` means finished-and-unread while `⚪` means finished-and-read. That is
-//! why nothing here restores `attended_at` — which is `#[serde(skip)]` by
-//! deliberate design, this machine's observation of this keyboard — and nothing
-//! needs to: the attention flip was already applied when the title was written,
-//! so a read row comes back `Idle` and an unread one comes back `Done`, still
-//! asking. A tab with no title we recognize is **skipped**, never guessed at, and
+//! written from `commands::display_snapshot`, i.e. *after* `stamp_read`,
+//! so `🟢` means finished-and-unread, `⚪` finished-and-read and `⚫` clean. That
+//! is why nothing here persists `attended_at` — which is `#[serde(skip)]` by
+//! deliberate design, this machine's observation of this keyboard: the glyph the
+//! title is holding already answers it, so a `⚪` row comes back `Done` with its
+//! `read` flag set and a `🟢` one comes back `Done`, still asking, while a `⚫`
+//! one comes back not at all. A tab with no title we recognize is **skipped**,
+//! never guessed at, and
 //! that same rule is what stops a removed row from being resurrected — the blank
 //! `terminal_title::sync` writes on removal is exactly a title we do not
 //! recognize.
@@ -45,7 +46,7 @@
 //! and [`restored_status`] is where that is decided. They assert a turn is in
 //! flight *right now*, and the glyph's staleness is the dashboard's downtime,
 //! which is unbounded. So they alone are checked against the registry's coarse
-//! reading and degrade to `Idle` without it. That is not a nicety: a phantom
+//! reading and degrade to `Done` without it. That is not a nicety: a phantom
 //! `Working` row holds off macOS sleep through `lid_awake` (a system-wide switch
 //! that also suppresses thermal-emergency sleep), reads blue forever on this
 //! screen and on the peer's, and a phantom `Waiting` can never be settled because
@@ -138,6 +139,11 @@ pub struct Restorable {
     /// its current directory's derivation.
     pub id: String,
     pub status: Status,
+    /// Whether the tab said the user had already read this finished row (⚪
+    /// rather than 🟢). Restored because the tab is the only place it survives a
+    /// restart — `attended_at` is never persisted — and dropping it would make
+    /// every read row come back demanding attention after each deploy.
+    pub read: bool,
     /// When that status began, from the registry's own `statusUpdatedAt`.
     pub state_entered_at: i64,
     /// The owning process, or `None` where the registry collapsed more than one
@@ -168,16 +174,22 @@ pub fn gap_exists(live: &[LiveSession], rows: &[String], anchored: &dyn Fn(&str)
 /// on this dashboard and on every synced peer, and a `Waiting` restored without
 /// `waiting_backstop_armed` (which no longer exists after a restart) can never be
 /// settled by its backstop. So they survive only where the registry independently
-/// reports a turn running, and otherwise degrade to `Idle` — which asserts the one
-/// thing still known to be true, that the session is alive.
+/// reports a turn running, and otherwise degrade.
 ///
-/// The degrade is deliberately not to `Done`: that would claim a finished turn
-/// the user has not seen, raising an attention flag out of an absence of
-/// evidence. Every source in this module is a positive observation.
-pub fn restored_status(from_title: Status, activity: Activity) -> Status {
+/// The degrade is to `Done`, the evidence-free sink, which claims nothing beyond
+/// "a turn ended here" — whether the user has read it is carried separately by
+/// `read`, which a degraded row leaves `false`. `Idle` would be the opposite: a
+/// confirmed claim that there is nothing to come back to, which no stale glyph
+/// can support.
+///
+/// `None` means restore nothing. A CLEAN tab is the one reading that produces
+/// it: the row it describes has nothing in it worth putting back on the widget,
+/// and recreating it would undo the hiding it was given in the first place.
+pub fn restored_status(from_title: Status, activity: Activity) -> Option<Status> {
     match from_title {
-        Status::Working | Status::Waiting if activity != Activity::Busy => Status::Idle,
-        s => s,
+        Status::Idle => None,
+        Status::Working | Status::Waiting if activity != Activity::Busy => Some(Status::Done),
+        s => Some(s),
     }
 }
 
@@ -218,10 +230,12 @@ pub fn plan(
         if rows.iter().any(|r| *r == id) {
             continue;
         }
-        let Some(from_title) = title_status(&s.chat_id, tabs, derive) else { continue };
+        let Some((from_title, read)) = title_status(&s.chat_id, tabs, derive) else { continue };
+        let Some(status) = restored_status(from_title, s.activity) else { continue };
         out.push(Restorable {
             id,
-            status: restored_status(from_title, s.activity),
+            status,
+            read,
             // The registry stamps `statusUpdatedAt` when a turn settles, which is
             // the instant the status began. `now` would be a fabricated age, and
             // age is load-bearing in three places at once: the widget's elapsed
@@ -237,18 +251,25 @@ pub fn plan(
     out
 }
 
-/// The status the tabs showing `chat_id` agree on, or `None`.
-fn title_status(chat_id: &str, tabs: &[TerminalSession], derive: &dyn Fn(&str) -> String) -> Option<Status> {
-    let mut found: Option<Status> = None;
+/// The status the tabs showing `chat_id` agree on, and whether they agree it was
+/// read; `None` when they disagree or none of them answers.
+///
+/// Both halves must match for a reading to stand. A split that shows `🟢 dash`
+/// beside `⚪ dash` is two tabs disagreeing about whether the row has been seen,
+/// and the safe reading of a disagreement is neither — refusing leaves the row
+/// out of the restore entirely, where taking the read one would hide work.
+fn title_status(chat_id: &str, tabs: &[TerminalSession], derive: &dyn Fn(&str) -> String) -> Option<(Status, bool)> {
+    let mut found: Option<(Status, bool)> = None;
     for tab in tabs {
         let Some(cwd) = tab.cwd.as_deref() else { continue };
         if derive(cwd) != chat_id {
             continue;
         }
         let Some(reading) = tab.title.as_deref().and_then(crate::terminal_title::parse_title) else { continue };
+        let seen = (reading.status, reading.read);
         match found {
-            Some(prev) if prev != reading.status => return None,
-            _ => found = Some(reading.status),
+            Some(prev) if prev != seen => return None,
+            _ => found = Some(seen),
         }
     }
     found
@@ -369,7 +390,7 @@ fn tick(app: &AppHandle, adapter: &dyn crate::terminals::TerminalAdapter) -> Pas
         // to it exactly as it does on the hook path.
         let persisted = history.as_ref().and_then(|h| h.get(&r.id));
         let dialog_entries = persisted.as_ref().map_or(0, |p| p.dialog.len());
-        if !state.restore_row(input, r.state_entered_at, now, persisted) {
+        if !state.restore_row(input, r.read, r.state_entered_at, now, persisted) {
             continue; // a hook event created it between the snapshot and here
         }
         if let Some(pid) = r.pid {
@@ -509,32 +530,53 @@ mod tests {
         // The glyph is as stale as the downtime, which is unbounded. A phantom
         // `Working` row holds off system sleep via `lid_awake` and reads blue
         // forever here and on every synced peer.
-        assert_eq!(restored_status(Status::Working, Activity::Busy), Status::Working);
-        assert_eq!(restored_status(Status::Working, Activity::Idle), Status::Idle);
-        assert_eq!(restored_status(Status::Working, Activity::Unknown), Status::Idle);
-        assert_eq!(restored_status(Status::Waiting, Activity::Busy), Status::Waiting);
-        assert_eq!(restored_status(Status::Waiting, Activity::Idle), Status::Idle);
+        assert_eq!(restored_status(Status::Working, Activity::Busy), Some(Status::Working));
+        assert_eq!(restored_status(Status::Working, Activity::Idle), Some(Status::Done), "a stale WORK degrades to the neutral sink, never to a clean claim");
+        assert_eq!(restored_status(Status::Working, Activity::Unknown), Some(Status::Done));
+        assert_eq!(restored_status(Status::Waiting, Activity::Busy), Some(Status::Waiting));
+        assert_eq!(restored_status(Status::Waiting, Activity::Idle), Some(Status::Done));
     }
 
     #[test]
     fn a_settled_status_is_taken_from_the_tab_whatever_the_registry_says() {
         // `Activity` is idle/busy only and is deliberately never mapped onto a
         // `Status`: it cannot express any of these, so it gets no vote on them.
-        for status in [Status::Idle, Status::Blocked, Status::Done, Status::Error] {
+        for status in [Status::Blocked, Status::Done, Status::Error] {
             for activity in [Activity::Idle, Activity::Busy, Activity::Unknown] {
-                assert_eq!(restored_status(status, activity), status, "{status:?} / {activity:?}");
+                assert_eq!(restored_status(status, activity), Some(status), "{status:?} / {activity:?}");
             }
         }
     }
 
     #[test]
+    fn a_clean_tab_restores_nothing() {
+        // A CLEAN row holds nothing to come back to, and the widget hides it on a
+        // delay for exactly that reason. Recreating it on the next start would
+        // undo that, and would also re-assert a clean claim nobody re-checked.
+        for activity in [Activity::Idle, Activity::Busy, Activity::Unknown] {
+            assert_eq!(restored_status(Status::Idle, activity), None, "{activity:?}");
+        }
+        assert!(planned(&[live("scratch", Activity::Idle, Some(10), 1)], &[tab("/p/scratch", Some("⚫ scratch"))], &[]).is_empty());
+    }
+
+    #[test]
     fn a_read_finished_row_comes_back_read_and_an_unread_one_comes_back_asking() {
-        // The round-trip that makes `attended_at` not need restoring: titles are
-        // written after `apply_read_as_idle`, so the flip is already in the glyph.
+        // The round-trip that makes `attended_at` not need persisting: titles are
+        // written from `display_snapshot`, i.e. after `stamp_read`, so which of
+        // the two glyphs the tab is holding already answers it.
         let out = planned(&[live("agterm", Activity::Idle, Some(10), 1)], &[tab("/p/agterm", Some("🟢 agterm"))], &[]);
-        assert_eq!(out[0].status, Status::Done, "unread");
+        assert_eq!((out[0].status, out[0].read), (Status::Done, false), "unread");
         let out = planned(&[live("printlab", Activity::Idle, Some(10), 1)], &[tab("/p/printlab", Some("⚪ printlab"))], &[]);
-        assert_eq!(out[0].status, Status::Idle, "read before the restart");
+        assert_eq!((out[0].status, out[0].read), (Status::Done, true), "read before the restart");
+    }
+
+    #[test]
+    fn two_tabs_disagreeing_about_read_restore_nothing() {
+        // A split showing one session twice can disagree about the read half just
+        // as it can about the status. Taking the read one would hide work, so a
+        // disagreement is refused exactly as a status disagreement is.
+        let split = |a, b| planned(&[live("dash", Activity::Idle, Some(10), 1)], &[tab("/p/dash", Some(a)), tab("/p/dash", Some(b))], &[]);
+        assert!(split("🟢 dash", "⚪ dash").is_empty());
     }
 
     #[test]

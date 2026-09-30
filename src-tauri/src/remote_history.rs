@@ -101,7 +101,7 @@ mod tests {
     use crate::state::{DialogRole, Status};
 
     fn entry(text: &str, timestamp: i64) -> DialogEntry {
-        DialogEntry { role: DialogRole::User, text: text.into(), timestamp, status: Status::Working, task_start: false }
+        DialogEntry { role: DialogRole::User, text: text.into(), timestamp, status: Status::Working, task_start: false, boundary: None }
     }
 
     fn session(id: &str, dialog: Vec<DialogEntry>) -> AgentSession {
@@ -125,6 +125,7 @@ mod tests {
             instruction_drift: false,
             canary: crate::state::Canary::Off,
             attended_at: None,
+            read: false,
             name_shared_by: None,
             subagent_gate: None,
             terminal_stale_at: None,

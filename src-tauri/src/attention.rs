@@ -10,7 +10,7 @@
 //! `notifications::fire_reason`'s AFK window cannot express this, at any value.
 //!
 //! The verdict lives on [`crate::state::AgentSession::attention`] and is turned
-//! into the row's displayed status by `commands::apply_read_as_idle`. This module
+//! onto the row as `read` by `commands::display_snapshot`. This module
 //! is the *sensor*: every way the app learns the user looked at something. All of
 //! them are **positive observations** — nothing here ever infers attention from an
 //! absence, so a failure leaves a row *showing* rather than hiding it, and the

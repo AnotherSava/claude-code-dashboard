@@ -144,7 +144,7 @@ pub struct Config {
     /// Track which finished sessions the user has actually looked at, so a row
     /// that finished and hasn't been read stands apart from one already read.
     /// Read by `commands::resolved_snapshot` (which stamps the verdict), by
-    /// `commands::display_snapshot` (which turns it into the row's status), by
+    /// `commands::display_snapshot` (which stamps it onto the row as `read`), by
     /// `notifications::reconcile` (which takes it as a verdict rather than a
     /// status — see there for why) and by `attention` itself, which observes what
     /// counts as looking: opening a row's history window, *leaving* that session's
@@ -159,6 +159,22 @@ pub struct Config {
     /// the user types in a different session entirely. Off makes every row render
     /// as it did before the feature existed.
     pub attention_tracking: bool,
+    /// How long a CLEAN row stays on the widget before it drops out of view, in
+    /// milliseconds. `null` or `0` keeps every clean row on screen.
+    ///
+    /// A CLEAN row is one with nothing to come back to — the context was wiped
+    /// by `/clear`, or the session has only serviced a peer pull since. There is
+    /// nothing on it to read, so leaving it on the widget crowds out the rows
+    /// that do want something. The delay is not a rate limit: it exists so a row
+    /// you have just cleared does not vanish while you are still looking at it.
+    ///
+    /// Hiding is a *display* decision and nothing more. The row stays in
+    /// `AppState`, keeps syncing, keeps its terminal title, and still answers on
+    /// `/api/agents` — a peer looking for somewhere to send a message must still
+    /// find it, or it would conclude the project was gone and start a second
+    /// session in the same directory.
+    #[serde(default = "default_clean_hide_after_ms")]
+    pub clean_hide_after_ms: Option<i64>,
     /// Give a live session its row back after the dashboard restarts, instead of
     /// leaving it invisible until it next acts — which a session parked on a
     /// question cannot do, because it is waiting for the user.
@@ -623,6 +639,13 @@ impl Default for UsageColors {
     }
 }
 
+/// Thirty minutes. Long enough that a row cleared and then returned to is still
+/// where you left it, short enough that a day's worth of wrapped-up sessions
+/// does not fill the widget.
+fn default_clean_hide_after_ms() -> Option<i64> {
+    Some(30 * 60 * 1000)
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -668,6 +691,7 @@ impl Default for Config {
             detect_cancelled_turns: true,
             reap_exited_sessions: true,
             attention_tracking: true,
+            clean_hide_after_ms: default_clean_hide_after_ms(),
             restore_sessions: true,
             waiting_settle_ms: Some(600_000),
             sync: SyncConfig::default(),

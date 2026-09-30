@@ -5,7 +5,7 @@ use crate::custom_names::CustomNamesStore;
 use crate::log_watcher::WatcherRegistry;
 use crate::prompt_history::PromptHistoryStore;
 use crate::setup;
-use crate::state::{AgentSession, AppState, Attention, Canary, Status};
+use crate::state::{AgentSession, AppState, Attention, BoundaryKind, Canary};
 use crate::telegram::TelegramNotifier;
 use crate::usage_limits::{UsageLimits, UsageLimitsState};
 use serde::Serialize;
@@ -132,7 +132,7 @@ fn name_counts(sessions: &[AgentSession], per_row: &HashMap<String, usize>) -> H
 }
 
 /// The snapshot everything the *user* looks at is built from: [`resolved_snapshot`]
-/// plus [`apply_read_as_idle`].
+/// plus [`stamp_read`].
 ///
 /// The split is the point. `resolved_snapshot` answers "what is each agent doing",
 /// which is what `/api/agents` and the sync push report; this answers "what should
@@ -146,33 +146,34 @@ pub(crate) fn display_snapshot(app: &AppHandle) -> Vec<AgentSession> {
 fn display_snapshot_versioned(app: &AppHandle) -> (u64, Vec<AgentSession>) {
     let (seq, mut sessions) = resolved_snapshot_versioned(app);
     if app.try_state::<ConfigState>().is_some_and(|c| c.config.lock().unwrap().attention_tracking) {
-        apply_read_as_idle(&mut sessions);
+        stamp_read(&mut sessions);
     }
     (seq, sessions)
 }
 
-/// Show a finished local row the user has already read as `Idle`.
+/// Mark the finished local rows the user has already looked at.
 ///
-/// `Done` in this dashboard means "finished, **and you haven't looked**" — once
-/// you have, the row is just a live session sitting there, which is what `Idle`
-/// already means. Folding read/unread into the status vocabulary rather than
-/// adding a badge beside it is why there is no second signal on the row: the
-/// widget's pill and `terminal_title`'s ⚪-vs-🟢 both fall out of the status.
+/// This used to rewrite `status` to `Idle` instead, which worked while `Done`
+/// meant finished-*and-unread*. It does not now: `Done` covers both halves and
+/// `Idle` is a confirmed claim that there is nothing to come back to, so writing
+/// it here would say a row was wrapped up because somebody glanced at it.
 ///
-/// Derived at display time rather than written into `AppState`, which buys three
+/// Stamped at display time rather than stored in `AppState`, which buys three
 /// things. A machine reading `/api/agents` or a sync push still learns what the
-/// *agent* did, not whether a human at this keyboard has looked at their screen.
-/// `state_entered_at` is untouched, so the row keeps counting from when the agent
-/// finished instead of restarting from when it was read. And the late-flush case
-/// needs no machinery: `Stop` settles a row `Done` before Claude Code writes the
-/// final reply, so a read landing in that gap is undone for free the moment the
-/// text arrives and moves `content_at` past the stamp — the row simply reads
-/// `Done` again at the next emit.
-pub(crate) fn apply_read_as_idle(sessions: &mut [AgentSession]) {
-    for s in sessions.iter_mut().filter(|s| s.origin.is_none() && s.status == Status::Done) {
-        if s.attention() == Attention::Seen {
-            s.status = Status::Idle;
-        }
+/// *agent* did, never whether a human at this keyboard has looked at their
+/// screen. `state_entered_at` is untouched, so the row keeps counting from when
+/// the agent finished instead of restarting from when it was read. And the
+/// late-flush case needs no machinery: `Stop` settles a row `Done` before Claude
+/// Code writes the final reply, so a read landing in that gap is undone for free
+/// the moment the text arrives and moves `content_at` past the stamp.
+///
+/// Remote rows are skipped rather than answered `false`, which is the same
+/// thing here and means something different: this device does not observe
+/// attention for another machine's sessions, so it has nothing to say either
+/// way.
+pub(crate) fn stamp_read(sessions: &mut [AgentSession]) {
+    for s in sessions.iter_mut().filter(|s| s.origin.is_none()) {
+        s.read = s.attention() == Attention::Seen;
     }
 }
 
@@ -1012,11 +1013,18 @@ pub fn set_chat_name(chat_id: String, name: String, app: AppHandle) {
 /// row's last-seen `updated` to close the reap-vs-restart race; the Clear branch
 /// passes `None` (it is reacting to an authoritative event). Returns whether a
 /// row was actually removed.
-pub fn remove_session(app: &AppHandle, id: &str, expect_updated: Option<i64>, now: i64) -> bool {
+///
+/// `kind` tags the separator this appends, and the two callers disagree about
+/// it on purpose: only a `SessionEnd` whose reason is `clear` wiped the context,
+/// so only that one passes [`BoundaryKind::Clear`]. A reaped session and an
+/// ordinary exit pass [`BoundaryKind::Ended`] — their transcripts are still on
+/// disk, and `--continue` brings the conversation back, so the row that returns
+/// must not claim there is nothing to come back to.
+pub fn remove_session(app: &AppHandle, id: &str, expect_updated: Option<i64>, kind: BoundaryKind, now: i64) -> bool {
     let Some(state) = app.try_state::<AppState>() else {
         return false;
     };
-    let Some(removed) = state.take_session(id, expect_updated, now) else {
+    let Some(removed) = state.take_session(id, expect_updated, kind, now) else {
         return false;
     };
     // Persist the final dialog (now ending in a separator) so the next
@@ -1274,7 +1282,7 @@ pub fn get_persisted_dialog(id: String, app: AppHandle) -> Vec<crate::state::Dia
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::{DialogEntry, DialogRole};
+    use crate::state::{DialogEntry, DialogRole, Status};
 
     /// `name_counts` keyed by the row id, which is what the caller then reads
     /// through each row's label — the shape the assertions care about.
@@ -1361,25 +1369,34 @@ mod tests {
     }
 
     #[test]
-    fn a_finished_row_reads_done_until_it_is_read_then_idle() {
-        // The whole model in one test: DONE means "finished, and you haven't
-        // looked". There is no second badge because there is nothing left to say.
+    fn a_finished_row_reads_unread_until_it_is_read() {
+        // Read-ness is a flag now, not a status. DONE covers both halves, so the
+        // row's `status` must not move when the user looks at it.
         let mut rows = vec![row("a", Status::Done, 1_000, None)];
-        apply_read_as_idle(&mut rows);
-        assert_eq!(rows[0].status, Status::Done, "unread");
+        stamp_read(&mut rows);
+        assert_eq!((rows[0].status, rows[0].read), (Status::Done, false), "unread");
 
         let mut rows = vec![row("a", Status::Done, 1_000, Some(2_000))];
-        apply_read_as_idle(&mut rows);
-        assert_eq!(rows[0].status, Status::Idle, "read");
+        stamp_read(&mut rows);
+        assert_eq!((rows[0].status, rows[0].read), (Status::Done, true), "read, and still DONE");
+    }
+
+    #[test]
+    fn reading_a_row_never_makes_it_clean() {
+        // The trap this whole redefinition exists to avoid. `Idle` asserts there
+        // is nothing to come back to; glancing at a finished row establishes
+        // nothing of the sort, and the old code wrote exactly that.
+        let mut rows = vec![row("a", Status::Done, 1_000, Some(2_000))];
+        stamp_read(&mut rows);
+        assert_ne!(rows[0].status, Status::Idle, "a read row is read, not wrapped up");
     }
 
     #[test]
     fn reading_a_row_does_not_restart_its_timer() {
         // `state_entered_at` is untouched, so the row keeps counting from when the
-        // agent finished rather than from when it was read — the only one of
-        // IDLE's several origins whose elapsed number is worth reading.
+        // agent finished rather than from when it was read.
         let mut rows = vec![row("a", Status::Done, 1_000, Some(9_000))];
-        apply_read_as_idle(&mut rows);
+        stamp_read(&mut rows);
         assert_eq!(rows[0].state_entered_at, 1_000);
     }
 
@@ -1387,25 +1404,37 @@ mod tests {
     fn a_late_assistant_flush_undoes_the_read_with_no_extra_machinery() {
         // `Stop` settles the row Done *before* Claude Code writes the final reply.
         // A read landing in that gap must not swallow the answer — and doesn't,
-        // because the flip is derived from `content_at` at every emit rather than
+        // because the stamp is derived from `content_at` at every emit rather than
         // written into `AppState`.
         let mut r = row("a", Status::Done, 1_000, Some(2_000));
-        r.dialog.push(DialogEntry { role: DialogRole::Assistant, text: "the answer".into(), timestamp: 3_000, status: Status::Done, task_start: false });
+        r.dialog.push(DialogEntry { role: DialogRole::Assistant, text: "the answer".into(), timestamp: 3_000, status: Status::Done, task_start: false, boundary: None });
         let mut rows = vec![r];
-        apply_read_as_idle(&mut rows);
-        assert_eq!(rows[0].status, Status::Done, "the reply arrived after the read");
+        stamp_read(&mut rows);
+        assert!(!rows[0].read, "the reply arrived after the read");
     }
 
     #[test]
-    fn only_finished_local_rows_are_flipped() {
+    fn only_finished_local_rows_are_stamped_read() {
         // A remote row's attention is not this device's to judge, and no other
-        // status means "finished" — flipping one would be inventing a transition.
+        // status means "finished" — stamping one would be inventing a verdict.
         let mut remote = row("a", Status::Done, 1_000, Some(2_000));
         remote.origin = Some("chrome".into());
         let mut rows = vec![remote, row("b", Status::Blocked, 1_000, Some(2_000)), row("c", Status::Working, 1_000, Some(2_000))];
-        apply_read_as_idle(&mut rows);
-        assert_eq!(rows[0].status, Status::Done, "remote");
-        assert_eq!(rows[1].status, Status::Blocked);
-        assert_eq!(rows[2].status, Status::Working);
+        stamp_read(&mut rows);
+        assert!(!rows[0].read, "remote");
+        assert!(!rows[1].read);
+        assert!(!rows[2].read);
     }
+
+    #[test]
+    fn the_read_flag_never_reaches_the_roster() {
+        // `resolved_snapshot` is what `/api/agents` serves and what the sync
+        // pusher mirrors. Whether a human here looked at a screen is this
+        // machine's business, so only the display path may stamp it.
+        let mut rows = vec![row("a", Status::Done, 1_000, Some(2_000))];
+        assert!(!rows[0].read, "raw AppState carries no verdict");
+        stamp_read(&mut rows);
+        assert!(rows[0].read, "and the display path is what supplies one");
+    }
+
 }

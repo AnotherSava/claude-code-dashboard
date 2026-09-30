@@ -1128,6 +1128,7 @@ mod tests {
             instruction_drift: false,
             canary: crate::state::Canary::Off,
             attended_at: None,
+            read: false,
             name_shared_by: None,
             subagent_gate: None,
             terminal_stale_at: None,

@@ -568,13 +568,15 @@ pub async fn reconcile(
     // A finished row the user has demonstrably read has nothing left to announce,
     // so it neither fires nor keeps a ping.
     //
-    // Judged here rather than by rewriting the row's `status` to `Idle`, which is
-    // what `commands::apply_read_as_idle` does for the widget and the tab titles.
-    // That flip is right for a *display*, where `Idle` is just a quieter pill, and
-    // wrong here: `idle` is a user-settable rule key (`status_key`, and
-    // `settings.md` documents it), so a configured `states.idle` would fire
-    // *because* the row was read, turning the suppression into its opposite.
-    // Nothing about the row is restated; only this decision is taken.
+    // Judged here rather than read off the row. `commands::stamp_read` stamps
+    // the same verdict for the widget and the tab titles, but only onto the
+    // display copy — this reconciler reads the raw `AppState` snapshot, where
+    // the flag is always `false`, so it has to compute the verdict itself.
+    // Keeping it a verdict rather than a status is the other half: `done` and
+    // `idle` are both user-settable rule keys (`status_key`, and `settings.md`
+    // documents them), so folding read-ness into either would let a configured
+    // rule fire *because* the row was read, turning the suppression into its
+    // opposite. Nothing about the row is restated; only this decision is taken.
     //
     // "Read" is stricter here than on the display, and deliberately. It also
     // requires the final text to have arrived (`content_at` past
@@ -1153,6 +1155,7 @@ mod tests {
             instruction_drift: false,
             canary: crate::state::Canary::Off,
             attended_at: None,
+            read: false,
             name_shared_by: None,
             subagent_gate: None,
             terminal_stale_at: None,
@@ -1169,6 +1172,7 @@ mod tests {
             timestamp: state_entered_at,
             status,
             task_start: false,
+            boundary: None,
         });
         s
     }
@@ -1525,7 +1529,7 @@ mod tests {
     /// against the newest assistant entry, not against the status change.
     fn read_done(id: &str, flushed_at: i64, read_at: i64) -> AgentSession {
         let mut s = session(id, Status::Done, 0);
-        s.dialog.push(DialogEntry { role: DialogRole::Assistant, text: String::new(), timestamp: flushed_at, status: Status::Done, task_start: false });
+        s.dialog.push(DialogEntry { role: DialogRole::Assistant, text: String::new(), timestamp: flushed_at, status: Status::Done, task_start: false, boundary: None });
         s.attended_at = Some(read_at);
         s
     }
@@ -1574,7 +1578,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_read_row_is_not_restated_as_idle_so_an_idle_rule_cannot_fire_for_it() {
-        // The reason this is a verdict rather than `apply_read_as_idle`'s status
+        // The reason this is a verdict rather than the display path's `read`
         // rewrite. `idle` is a documented, user-settable rule key, so flipping a
         // read row's status here would let a configured `states.idle` fire
         // *because* the user read it — the opposite of what the feature promises.

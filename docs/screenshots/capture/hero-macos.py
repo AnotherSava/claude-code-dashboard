@@ -47,15 +47,16 @@ about it looks wrong.
 THE GUARD READS A DIFFERENT SNAPSHOT THAN THE FRAME PHOTOGRAPHS, and on this
 platform the gap between them is routine rather than a corner case. The roster
 at `/api/agents` is served from `commands::resolved_snapshot`; the widget
-draws `display_snapshot`, which is that plus `apply_read_as_idle`. So a DONE row
-the user has already looked at still reads `done` to the guard and draws as IDLE
-in the picture. No HTTP question can tell the two apart, deliberately:
+draws `display_snapshot`, which is that plus `commands::stamp_read`. So a DONE
+row the user has already looked at still reads `done` to the guard and draws as
+a muted DONE in the picture. No HTTP question can tell the two apart, deliberately:
 the `attended_at` stamp is this machine's observation of its own keyboard and
 never goes on the wire. The sensor setting it here is agterm
 (`terminals::agterm`), whose primary signal is *departure* — selecting another
 session means you left the one before it — so staging a session to DONE and then
-switching tabs is all it takes to mark it read. If the captured frame shows IDLE
-where the guard said DONE, make that session emit something fresh: a new
+switching tabs is all it takes to mark it read. If the captured frame shows a
+muted DONE where a bright one was wanted, make that session emit something
+fresh: a new
 assistant line moves the row's `content_at` past the stamp, and it asks to be
 read again.
 

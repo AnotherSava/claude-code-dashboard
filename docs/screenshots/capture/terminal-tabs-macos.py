@@ -17,8 +17,9 @@ photograph a sidebar the user never had:
     and anything else refuses the capture. It defaults to `dash.PUBLISHABLE_PROJECTS`,
     the names checked against GitHub as public repositories, which holds no
     workspace names at all, so this figure normally has to pass the flag.
-  * A spread of glyphs — the committed frame carries four of the six (⚪ idle,
-    🔵 working, 🟢 done, ✋ blocked; the other two are ⏳ waiting and 🔴 error) —
+  * A spread of glyphs — the committed frame carries four of the seven (⚪ done
+    and read, 🔵 working, 🟢 done and unread, ✋ blocked; the other three are
+    ⏳ waiting, 🔴 error and ⚫ clean) —
     and the two sessions past `terminal_title_context_percent` that put a ` [N%]`
     on a row, which is the count promised by both `screenshots.json` and the alt
     text in `docs/pages/features.md`. The percentage comes from the transcript
@@ -100,7 +101,12 @@ SNAPSHOT_VERSION = 1       # the only layout this script knows how to read
 # The map `status_glyph` writes, from `src-tauri/src/terminal_title.rs`, whose
 # inverse `parse_title` lives beside it so the two halves cannot drift. A leading
 # token that is not one of these is a title this dashboard did not write.
-GLYPHS = {"⚪": "idle", "🔵": "working", "⏳": "waiting", "✋": "blocked", "🟢": "done", "🔴": "error"}
+#
+# Seven entries for six statuses: the glyph names a status *and*, for a finished
+# session, whether the user has read it, so 🟢 and ⚪ are both `Done` and are
+# named apart here. The spread check counts them as two, which is what it is for
+# — they are two glyphs in the frame.
+GLYPHS = {"⚫": "clean", "🔵": "working", "⏳": "waiting", "✋": "blocked", "🟢": "done unread", "⚪": "done read", "🔴": "error"}
 CONTEXT_SUFFIX = re.compile(r"\[(\d+)%\]")
 
 COMMITTED_PT = (277, 404)  # the frame being replaced, in logical points
@@ -206,7 +212,7 @@ def rendered(tree: dict) -> tuple[list[dict], list[tuple[str, dict]]]:
 
 
 def read_title(label: str) -> tuple[str | None, str]:
-    """Split a sidebar label into the status its glyph names and the rest of it.
+    """Split a sidebar label into the reading its glyph names and the rest of it.
 
     The rule is `parse_title` in `src-tauri/src/terminal_title.rs`. An
     unrecognized leading token yields no status rather than a guess: a title this

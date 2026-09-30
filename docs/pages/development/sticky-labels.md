@@ -24,7 +24,7 @@ Both fields exist because Claude Code emits a flurry of events during a single u
 
 `label` is set by the per-client adapter on every event. The Claude adapter's full list of `(event, status, label)` mappings — including how box-drawing chrome gets stripped from messages and how the 60-character truncation works — lives in [Classification](classification#event--status).
 
-One detail relevant to the state machine: when the adapter emits `None` for the label, the state layer keeps the **prior** `label` value rather than blanking it (`src-tauri/src/label_policy.rs:49`). This is how `Stop` and `Notification` events that carry no label of their own (just a status change) leave the previous text in place.
+One detail relevant to the state machine: when the adapter emits `None` for the label, the state layer keeps the **prior** `label` value rather than blanking it (`src-tauri/src/label_policy.rs`). This is how `Stop` and `Notification` events that carry no label of their own (just a status change) leave the previous text in place.
 
 ## How `original_prompt` is set
 
@@ -34,13 +34,13 @@ The state layer (`src-tauri/src/state.rs::apply_set` via `src-tauri/src/label_po
 |---                |---                                |---         |---                                                                           |
 | no                | —                                 | `working`  | set to incoming `label`                                                      |
 | no                | —                                 | anything   | leave `None`                                                                 |
-| yes               | `done` / `idle` / `working`       | `working`  | **re-capture** to incoming `label` (a new task is starting); also reset `working_accumulated_ms = 0` and `state_entered_at = now` — *unless the incoming `label` is a [continuation prompt](#continuation-prompts), in which case the boundary is suppressed and the row is treated as if it were an approval cycle* |
+| yes               | `done` / `idle` / `working` / `waiting` | `working`  | **re-capture** to incoming `label` (a new task is starting); also reset `working_accumulated_ms = 0` and `state_entered_at = now` — *unless the incoming `label` is a [continuation prompt](#continuation-prompts), in which case the boundary is suppressed and the row is treated as if it were an approval cycle* |
 | yes               | `blocked`                        | `working`  | leave pinned (approval cycle: agent asked, user answered)                    |
 | yes               | any other                         | any        | leave pinned                                                                 |
 
 The third row is the **task boundary**: a transition into `working` from any status *except* `blocked` counts as a new task.
 
-- `done` / `idle` → `working` is the natural case: the agent has finished (or is freshly seeded) and the user is starting something new.
+- `done` / `idle` / `waiting` → `working` is the natural case: the last turn ended, the row is clean after a `/clear` or a fresh start, or background work was still finishing — and the user is starting something new either way.
 - `working` → `working` covers the **cancellation case**: the user hit `Esc` mid-task and submitted a fresh prompt before the agent could emit a `Stop`. Without this rule the row would still display the cancelled prompt, which is misleading.
 - `blocked` → `working` is the only transition into `working` that's **not** a boundary. It's the canonical approval cycle (agent asks → user answers → agent resumes), so typing `y` doesn't clobber the original prompt.
 
@@ -52,7 +52,7 @@ When a session is re-created from `prompt_history.json` — after an app restart
 
 ### Cancelled turns revert to the prior status
 
-A turn cancelled with Esc fires no lifecycle hook. The transcript watcher (the `[Request interrupted by user]` marker) calls `state::revert_cancelled_turn`, which settles the row back to `AgentSession::status_before_working` — the status captured on the last non-`working` → `working` transition — rather than blanket `Idle`. The cancelled prompt produced nothing, so the row should look as if it never landed: a reply aborted mid-question reverts to `Blocked`, and the user's real answer is then a `blocked → working` approval-cycle reply (no task boundary), so `original_prompt` survives. Gated by `detect_cancelled_turns`.
+A turn cancelled with Esc fires no lifecycle hook. The transcript watcher (the `[Request interrupted by user]` marker) calls `state::revert_cancelled_turn`, which settles the row back to `AgentSession::status_before_working` — the status captured on the last non-`working` → `working` transition, and `done` for a first turn that had no earlier status to go back to. The cancelled prompt produced nothing, so the row should look as if it never landed: a reply aborted mid-question reverts to `Blocked`, and the user's real answer is then a `blocked → working` approval-cycle reply (no task boundary), so `original_prompt` survives. Gated by `detect_cancelled_turns`.
 
 ### Continuation prompts
 
@@ -66,17 +66,17 @@ To avoid that, `apply_set` checks the incoming `label` against `Config::continua
 
 Match is **exact** after trim, not substring or starts-with — `"go"` matches `"go"` and `"Go"` and `" go "`, but not `"go ahead"` or `"google something"`. If you want phrases like `"go ahead"` to count, add them to the list verbatim.
 
-This rule only fires on what would otherwise be a task boundary (transitions into `working` from `done` / `idle` / `working`). On a `blocked → working` transition the row is already in an approval cycle, so the rule is a no-op there.
+This rule only fires on what would otherwise be a task boundary (transitions into `working` from `done` / `idle` / `working` / `waiting`). On a `blocked → working` transition the row is already in an approval cycle, so the rule is a no-op there.
 
 ## What the widget actually shows
 
-The frontend's `displayLabel` (`src/lib/types.ts:58-61`) chooses between the two fields based on the row's current status:
+The frontend's `displayLabel` (`src/lib/types.ts`) chooses between the two fields based on the row's current status:
 
 | Status                      | Widget shows                                          |
 |---                          |---                                                    |
 | `blocked`                  | `label` — the agent's question or permission request  |
 | `error`                     | `label` — the error message                           |
-| `working` / `done` / `idle` | `original_prompt` if set, else `label`                |
+| everything else             | `original_prompt` if set, else `label`                |
 
 The principle: when the agent is **blocked**, surface what's blocking it (the transient `label`). When the agent is **acting on or finished with a task**, surface the task itself (`original_prompt`).
 
@@ -86,7 +86,7 @@ A typical task with one approval cycle and a clarifying question, then a brand-n
 
 | Step | Hook fires                       | Status     | `label`                          | `original_prompt`                                | Widget shows                  |
 |---   |---                               |---         |---                               |---                                               |---                            |
-| 1    | UserPromptSubmit "fix foo.py"    | `working`  | `"fix foo.py"`                   | `"fix foo.py"` *(idle → working: captured)*      | `"fix foo.py"`                |
+| 1    | UserPromptSubmit "fix foo.py"    | `working`  | `"fix foo.py"`                   | `"fix foo.py"` *(new row: captured)*                       | `"fix foo.py"`                |
 | 2    | PermissionRequest                | `blocked` | `"needs approval: Bash"`         | `"fix foo.py"` *(pinned)*                        | `"needs approval: Bash"`      |
 | 3    | UserPromptSubmit "y"             | `working`  | `"y"`                            | `"fix foo.py"` *(blocked → working: pinned)*    | `"fix foo.py"`                |
 | 4    | Stop with question               | `blocked` | `"has a question"`               | `"fix foo.py"` *(pinned)*                        | `"has a question"`            |

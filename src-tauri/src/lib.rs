@@ -686,8 +686,8 @@ fn seed_dev_sessions(app: &tauri::AppHandle) {
                 original_prompt: Some("Refactor the move validator".into()),
                 task_started_at: now - 10 * min,
                 dialog: vec![
-                    DialogEntry { role: DialogRole::User, text: "Refactor the move validator".into(), timestamp: now - 10 * min, status: Status::Working, task_start: true },
-                    DialogEntry { role: DialogRole::Assistant, text: "Done — extracted the rules table.".into(), timestamp: now - 2 * min, status: Status::Done, task_start: false },
+                    DialogEntry { role: DialogRole::User, text: "Refactor the move validator".into(), timestamp: now - 10 * min, status: Status::Working, task_start: true, boundary: None },
+                    DialogEntry { role: DialogRole::Assistant, text: "Done — extracted the rules table.".into(), timestamp: now - 2 * min, status: Status::Done, task_start: false, boundary: None },
                 ],
                 source: "claude-code".into(),
                 model: Some("claude-sonnet-4-6".into()),
@@ -701,6 +701,7 @@ fn seed_dev_sessions(app: &tauri::AppHandle) {
                 instruction_drift: false,
                 canary: crate::state::Canary::Off,
                 attended_at: None,
+                read: false,
                 name_shared_by: None,
                 subagent_gate: None,
                 terminal_stale_at: None,

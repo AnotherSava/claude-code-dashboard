@@ -23,6 +23,29 @@ display name). The log is append-only and forward-looking — it explains state
 changes that happened *after* the build that introduced decision logging, so a
 just-deployed dashboard has a sparse log until events flow.
 
+## What the chips mean
+
+The chips this script prints are the dashboard's own. Two of them carry
+meanings worth having in hand before reading a trail:
+
+- **DONE** — a turn ended here. It covers every finished session, and it is
+  also where every *absence* of evidence lands: a stale WORK glyph restored
+  from a tab after a restart, an Esc-cancelled first turn, a WAIT the backstop
+  timed out, a row created because a subagent asked for permission. So DONE
+  answers "the agent finished" and "nothing here says otherwise" alike, and a
+  DONE nobody expected is usually one of those landings rather than a `Stop`.
+- **IDLE** — CLEAN: a confirmed claim that there is nothing left in the session
+  to come back to. Exactly two things set it, both a `SessionStart`: a `source`
+  of `clear` or `startup`, and a `resume` whose restored dialog ends at a
+  `/clear` boundary. No degrade path may, so IDLE never means "we don't know".
+  A CLEAN row also drops off the widget once it has sat there for
+  `clean_hide_after_ms`, so an agent listed here as IDLE may not be on screen.
+
+Whether the user has *read* a finished session is a separate flag on the row,
+not part of its status: both halves show DONE, in a brighter and a dimmer
+shade. The dashboard logs `attention_seen` each time it observes a session
+being looked at, with a `source` naming how.
+
 ## Decision vocabulary
 
 Each decision line carries `"decision":"<code>"`, the resolved agent (`chat_id`
@@ -35,7 +58,11 @@ or `id`), and a `reason`:
   the subagent on a `PermissionRequest` (and `PreToolUse`) a subagent raised, and
   is `None` on the main agent's. It proves nothing on other events: a subagent's
   `Notification`, `Elicitation`/`ElicitationResult` and `PreCompact` carry no
-  `agent_id` either, so they read exactly like the main agent's own.
+  `agent_id` either, so they read exactly like the main agent's own. A
+  `SessionStart` is classified from its `source` alone, so the `resume` case
+  logs `Done` even where the row lands on IDLE: whether the resumed dialog ends
+  at a `/clear` is read from the persisted history afterwards, and only the
+  `apply_set` line that follows carries the status the row actually took.
 - `resume_working` — the transcript watcher saw new activity (a tool call or
   user turn) after a pause and promoted the row back to Working. This is the
   path that clears a stale BLOCK once the user answers an `AskUserQuestion`.
@@ -65,7 +92,10 @@ or `id`), and a `reason`:
   task to Done once it sat unchanged past the window (`waited_ms`,
   `window_ms`): a task the user killed ends silently, so no later `Stop` comes.
 - `restore_row` — after a dashboard restart, a live session with no row got one
-  back, its `status` read from the tab title the dashboard last wrote.
+  back, its `status` read from the tab title the dashboard last wrote. A WORK
+  or WAIT glyph is only as fresh as the downtime, so it is kept only where the
+  session registry independently reports a turn running and degrades to DONE
+  otherwise; a CLEAN tab restores no row at all.
 - `reap_exited` — the liveness reaper removed the row because its owning Claude
   process exited without a `SessionEnd` (e.g. you typed `exit` / closed the
   terminal). Carries the dead `pid` and the `prior_status` the row last held.
@@ -75,7 +105,10 @@ or `id`), and a `reason`:
 Historical, only in logs written by older builds: `enter_waiting` (WAIT now
 comes from `classify` of a `Stop`), and `correct_to_blocked` /
 `correct_to_done` (the watcher's re-judging of a too-early `Stop`, removed
-once `Stop` carried its final message).
+once `Stop` carried its final message). The log is append-only, so it also
+holds lines from builds where `Idle` was the catch-all for anything
+unestablished: an old IDLE in a trail is not the CLEAN claim above, and only
+lines after the deploy that changed it can be read that way.
 
 ## Workflow
 

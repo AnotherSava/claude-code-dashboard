@@ -463,15 +463,45 @@ fn classify_detailed(
                 format!("{tool_name} tool gated the turn on the user"),
             ))
         }
-        "Notification" | "SessionStart" => {
+        // `SessionStart` is the one event that can vouch for a CLEAN row, and it
+        // does so from its `source` — the authoritative statement of what
+        // happened to the context, which arrives on every session start and,
+        // until now, was read nowhere outside the canary.
+        //
+        // Only `clear` and `startup` are self-sufficient: both mean the model is
+        // holding nothing. `resume` is the interesting one and cannot be
+        // answered here — whether the conversation being resumed ended at a
+        // `/clear` is a fact about the *persisted dialog*, which the adapter
+        // never sees, so it classifies `Done` and `http_server` upgrades it
+        // through `resume_is_clean`. `compact` and `fork` both carry the parent
+        // context forward and are never clean. An absent `source` is an absence
+        // of evidence, which lands on `Done` like every other one.
+        "SessionStart" => {
+            let source = payload.get("source").and_then(|v| v.as_str()).unwrap_or("");
+            let (status, why) = match source {
+                "clear" => (Status::Idle, "context wiped by /clear"),
+                "startup" => (Status::Idle, "fresh session, nothing in it"),
+                "resume" => (Status::Done, "resumed context; clean only if it ended at a /clear"),
+                "compact" => (Status::Done, "compacted context continues"),
+                "fork" => (Status::Done, "forked session carries its parent's context"),
+                _ => (Status::Done, "no source field; nothing established"),
+            };
+            Some(Classification::new(status, None, format!("SessionStart source={source:?} → {why}")))
+        }
+        "Notification" => {
             let notif_type = payload
                 .get("notification_type")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             let message = payload.get("message").and_then(|v| v.as_str()).unwrap_or("");
 
+            // An empty notification says nothing about the session, so it moves
+            // nothing — the same answer its `idle_prompt` and `permission_prompt`
+            // neighbours give. It used to answer `Idle`, which was harmless while
+            // `Idle` was the evidence-free sink and is a false claim now that it
+            // means "nothing to come back to".
             if notif_type.is_empty() && message.trim().is_empty() {
-                return Some(Classification::new(Status::Idle, None, format!("{event} with no notification payload → idle")));
+                return None;
             }
             // `idle_prompt` (Claude sitting at the idle input prompt ~60s after a
             // turn) is ignored: `Stop` already settled the row authoritatively
@@ -1397,10 +1427,30 @@ mod tests {
     // ----- classify: SessionStart -----
 
     #[test]
-    fn session_start_with_no_fields_is_idle() {
-        let (status, label) = classify("SessionStart", &json!({}), NO_RULES).unwrap();
-        assert_eq!(status, Status::Idle);
-        assert_eq!(label, None);
+    fn session_start_is_clean_only_where_the_source_says_the_context_is_empty() {
+        // `clear` and `startup` are the two sources that vouch for themselves.
+        // The rest carry a conversation forward, and an absent `source` carries
+        // no evidence at all — both land on the neutral sink rather than
+        // claiming there is nothing to come back to.
+        for source in ["clear", "startup"] {
+            let (status, label) = classify("SessionStart", &json!({"source": source}), NO_RULES).unwrap();
+            assert_eq!(status, Status::Idle, "{source}");
+            assert_eq!(label, None);
+        }
+        for source in ["resume", "compact", "fork", "something-new"] {
+            let (status, _) = classify("SessionStart", &json!({"source": source}), NO_RULES).unwrap();
+            assert_eq!(status, Status::Done, "{source}");
+        }
+        let (status, _) = classify("SessionStart", &json!({}), NO_RULES).unwrap();
+        assert_eq!(status, Status::Done, "no source field is an absence of evidence");
+    }
+
+    #[test]
+    fn an_empty_notification_moves_nothing() {
+        // It says nothing about the session, so it must not be an answer. While
+        // `Idle` was the evidence-free sink this was harmless; it would now
+        // stamp "nothing to come back to" onto whatever row it landed on.
+        assert!(classify("Notification", &json!({}), NO_RULES).is_none());
     }
 
     // ----- classify: unknown -----

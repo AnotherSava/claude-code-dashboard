@@ -21,7 +21,7 @@ use crate::prompt_history::PromptHistoryStore;
 use crate::session_launcher;
 use crate::start_approval;
 use crate::session_registry::{Activity, LiveSession, SessionRegistry};
-use crate::state::{AgentSession, AppState, SettleScope, Status};
+use crate::state::{AgentSession, AppState, BoundaryKind, SettleScope, Status};
 use crate::sync::SyncListening;
 
 pub async fn run(app: AppHandle, port: u16) {
@@ -243,7 +243,11 @@ struct EventResponse {
 /// marker the model is already emitting is unknowable, so return `None` rather
 /// than mint a conflict — the row reads `Off` until its next fresh start.
 fn session_start_nonce(ns: &NonceStore, chat_id: &str, source: &str, now_ms: i64) -> Option<String> {
-    if matches!(source, "resume" | "compact") {
+    // `fork` belongs with the other two and was missing: a `--fork-session`
+    // start carries its parent's context *and* the marker instruction already in
+    // it, so minting a fresh nonce there strands the row Pending on a marker the
+    // model will never emit — the exact failure the paragraph above describes.
+    if matches!(source, "resume" | "compact" | "fork") {
         ns.get(chat_id).map(|(nonce, _seen)| nonce)
     } else {
         Some(ns.mint(chat_id, now_ms))
@@ -721,6 +725,24 @@ fn agent_roster(
 }
 
 /// Read-only roster of every session this dashboard tracks, local and synced.
+/// Whether a `SessionStart` that resumed a conversation may claim
+/// [`Status::Idle`] — the one CLEAN verdict `adapters::claude` cannot reach,
+/// because it is a fact about the persisted dialog rather than about the event.
+///
+/// A resumed session is clean exactly when the conversation it resumed ended at
+/// a `/clear`. That is narrower than "ended at a boundary" on purpose: every
+/// removal appends a separator, so the weaker test reads true after a
+/// compaction, after an ordinary exit, and after the liveness reaper — and
+/// sessions here are started with `--continue`, which would make nearly every
+/// row on the machine claim to be clean at start-up.
+///
+/// Scoped to `resume` alone. `clear` and `startup` are already answered by the
+/// adapter from evidence that needs no history, and letting this widen to them
+/// would make a `/clear` on a row with no persisted dialog fail to be clean.
+fn resume_is_clean(event: &str, source: Option<&str>, dialog: Option<&[crate::state::DialogEntry]>) -> bool {
+    event == "SessionStart" && source == Some("resume") && dialog.is_some_and(crate::state::ends_with_clear_boundary)
+}
+
 /// Mutates nothing — no `apply_set`, no emit, no `SyncDirty` poke, no store
 /// write — which is also why it writes no `decision` line: every one of those
 /// tags marks a state change and the `investigate` skill replays them to
@@ -1236,6 +1258,14 @@ async fn post_event(
             }
             let history = app.try_state::<PromptHistoryStore>();
             let restored = history.as_ref().and_then(|h| h.get(&chat_id));
+            // The half of the CLEAN rule the adapter cannot answer. A `resume`
+            // is how this machine starts every session (`claude --continue`), so
+            // whether it is clean turns entirely on where the previous one
+            // stopped — and only the persisted dialog knows that.
+            let mut input = input;
+            if resume_is_clean(&req.event, req.payload.get("source").and_then(|v| v.as_str()), restored.as_ref().map(|r| r.dialog.as_slice())) {
+                input.status = Status::Idle;
+            }
             let now = now_ms();
             let watcher = app.try_state::<WatcherRegistry>();
             // A subagent's permission dialog overlays the row instead of setting
@@ -1398,7 +1428,17 @@ async fn post_event(
             // restore it and land the upcoming UserPromptSubmit after the
             // boundary. `None` = remove unconditionally (this is the
             // authoritative end signal, not a speculative reap).
-            crate::commands::remove_session(&app, &id, None, now_ms());
+            //
+            // The adapter answers `Clear` for every `SessionEnd` reason, so the
+            // reason is read here and nowhere else decides it. It settles two
+            // separate things, and conflating them is what made the boundary
+            // marker useless as evidence: whether the nonce is forgotten, and
+            // what kind of separator the dialog ends with. Only `/clear` wipes
+            // the context; an exit, a logout or a Ctrl-D leaves a transcript
+            // `--continue` will bring straight back.
+            let wiped = req.payload.get("reason").and_then(|v| v.as_str()) == Some("clear");
+            let kind = if wiped { BoundaryKind::Clear } else { BoundaryKind::Ended };
+            crate::commands::remove_session(&app, &id, None, kind, now_ms());
             // Drop the session's canary nonce only on a `/clear`, which wipes the
             // model's context (and its marker instruction); the next
             // SessionStart:clear then mints a fresh one. A plain exit/logout keeps
@@ -1406,7 +1446,7 @@ async fn post_event(
             // marker) intact, and `session_start_nonce` reuses it so a resumed
             // session stays confirmed instead of falsely rotating to a marker the
             // model isn't emitting.
-            if req.payload.get("reason").and_then(|v| v.as_str()) == Some("clear") {
+            if wiped {
                 if let Some(ns) = app.try_state::<crate::nonce_store::NonceStore>() {
                     ns.forget(&id);
                 }
@@ -1473,6 +1513,7 @@ mod tests {
             instruction_drift: false,
             canary: crate::state::Canary::Off,
             attended_at: None,
+            read: false,
             name_shared_by: None,
             subagent_gate: None,
             terminal_stale_at: None,
@@ -1850,6 +1891,47 @@ mod tests {
         assert!(origin_blocked(&headers));
     }
 
+
+    #[test]
+    fn a_resume_is_clean_only_where_the_conversation_ended_at_a_clear() {
+        use crate::state::{BoundaryKind, DialogEntry, DialogRole};
+        let sep = |kind| vec![DialogEntry { role: DialogRole::Separator, text: String::new(), timestamp: 10, status: Status::Done, task_start: false, boundary: kind }];
+
+        assert!(resume_is_clean("SessionStart", Some("resume"), Some(&sep(Some(BoundaryKind::Clear)))));
+
+        // The three boundaries that are not a wipe. A compaction continues the
+        // conversation, and an exit or a reap leaves the transcript on disk for
+        // the `--continue` that starts every session on this machine — so each
+        // of these resumes something the user may well want back.
+        assert!(!resume_is_clean("SessionStart", Some("resume"), Some(&sep(Some(BoundaryKind::Compact)))));
+        assert!(!resume_is_clean("SessionStart", Some("resume"), Some(&sep(Some(BoundaryKind::Ended)))));
+        assert!(!resume_is_clean("SessionStart", Some("resume"), Some(&sep(None))), "an older build's untagged separator");
+
+        // No history at all, and a conversation still mid-flight.
+        assert!(!resume_is_clean("SessionStart", Some("resume"), None));
+        assert!(!resume_is_clean("SessionStart", Some("resume"), Some(&[])));
+
+        // Scoped to `resume`. The adapter already answers the other sources from
+        // evidence that needs no history, and widening here would make a
+        // `/clear` on a row with no persisted dialog fail to be clean.
+        for source in ["clear", "startup", "compact", "fork"] {
+            assert!(!resume_is_clean("SessionStart", Some(source), Some(&sep(Some(BoundaryKind::Clear)))), "{source}");
+        }
+        assert!(!resume_is_clean("UserPromptSubmit", Some("resume"), Some(&sep(Some(BoundaryKind::Clear)))), "only a session start resumes anything");
+    }
+
+    #[test]
+    fn a_forked_session_reuses_its_parents_nonce() {
+        // A `--fork-session` start carries its parent's context *and* the marker
+        // instruction already in it, so minting a fresh nonce strands the row
+        // Pending on a marker the model will never emit.
+        let ns = NonceStore::default();
+        let minted = session_start_nonce(&ns, "a", "startup", 1_000).expect("minted");
+        for source in ["resume", "compact", "fork"] {
+            assert_eq!(session_start_nonce(&ns, "a", source, 2_000).as_deref(), Some(minted.as_str()), "{source}");
+        }
+        assert_ne!(session_start_nonce(&ns, "a", "clear", 3_000).as_deref(), Some(minted.as_str()), "a wipe rotates");
+    }
 
     #[test]
     fn clear_permitted_when_the_owning_session_ends_it() {

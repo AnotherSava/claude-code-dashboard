@@ -1,5 +1,5 @@
 {
-  "about": "The hero figure's rows, replayed by lib/dashboard.py fixture-up. Local rows go through the dashboard's own /api/event, so the production classifier and state machine build them; rows with a device are pushed to its sync listener as that peer. The projects are the author's public repositories and every string is written for the frame. age_min is how long each row has been in its state when the shutter fires: local rows are replayed that many minutes early, and a pushed row carries it in its own timestamps. The two blocked rows are two minutes apart, 75 whole pulses of the BLOCK pill's 1.6s animation, so both pills are bright at once.",
+  "about": "The hero figure's rows, replayed by lib/dashboard.py fixture-up. Local rows go through the dashboard's own /api/event, so the production classifier and state machine build them; rows with a device are pushed to its sync listener as that peer. The projects are the author's public repositories and every string is written for the frame. age_min is how long each row has been in its state when the shutter fires: local rows are replayed that many minutes early, and a pushed row carries it in its own timestamps. The two blocked rows are two minutes apart, 75 whole pulses of the BLOCK pill's 1.6s animation, so both pills are bright at once. The clean row is staged through a real /clear pair, SessionEnd{reason:clear} then SessionStart{source:clear}, because that is the evidence CLEAN is settable on; it carries no input_tokens because a cleared session holds no context, and the widget draws its last prompt muted.",
   "config": { "compact_mode": false },
   "model": "claude-opus-5-5",
   "rows": [
@@ -16,11 +16,11 @@
       "project": "crop-stage",
       "expect": "idle",
       "age_min": 4,
-      "input_tokens": 58000,
       "events": [
         ["UserPromptSubmit", { "prompt": "remember the last crop ratio between sessions" }],
         ["Stop", { "last_assistant_message": "The last crop ratio is now saved and restored on the next launch.", "background_tasks": [] }],
-        ["SessionStart", { "source": "resume" }]
+        ["SessionEnd", { "reason": "clear" }],
+        ["SessionStart", { "source": "clear" }]
       ]
     },
     {

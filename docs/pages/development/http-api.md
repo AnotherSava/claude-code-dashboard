@@ -113,7 +113,8 @@ Read-only: it mutates nothing, emits no event, writes no `decision` line, and ta
 - `project` — the same id with the device prefix stripped (identical to `id` for a local row). Chat ids are derived from the cwd with backslashes normalized and the projects root removed, so one project yields the same string on macOS and on Windows — this is the field to compare across machines.
 - `device` / `local` — which machine the session runs on, and the authoritative local test. Kept separate because `device` can be `null` for an unnamed local box.
 - `display_name` — omitted rather than `null` when unset, so a caller falls back to `id` exactly as the app does.
-- `status` — `idle` / `working` / `waiting` / `blocked` / `error` / `done`, the same values [Classification](classification) assigns.
+- `status` — `idle` / `working` / `waiting` / `blocked` / `error` / `done`, the same values [Classification](classification) assigns. Two of them carry more than their names suggest. **`done`** means a turn ended here and is also where every absence of evidence lands, which makes it the ordinary resting state of a session that has finished something. **`idle`** means *clean*: a confirmed claim that there is nothing left in the session to come back to, written only on positive evidence — a `/clear`, a fresh start, or a resumed conversation that had ended at one.
+- **The roster never says whether a human has read a row.** That verdict comes from watching this machine's own keyboard and terminal, and it stays here: a peer asking what an agent is doing is not told whether somebody is sitting in front of it. So a finished session reads `done` on the wire whether or not its user has looked at the answer.
 - `label` — the "what is it doing" line the dashboard row itself shows.
 - `status_age_ms` — time in the current status. All three arrays are always present and never `null`.
 
@@ -132,7 +133,7 @@ The `registry_only` entries carry a deliberately smaller vocabulary:
 
 Every time in this body is an **age**, never a timestamp: a remote row's stamps come off the sender's clock, so an absolute time would need clock agreement the two machines don't have, while every question a caller actually has is "how old is this".
 
-A peer pushes on every state change (coalesced 300 ms) and at worst every 30 s as a heartbeat; the receiver drops a device that has been silent past a 90 s TTL, checked on that same 30 s tick — so the drop lands 90–120 s after the last push. In between, that device's rows sit in the roster with their last-pushed status **frozen**. A peer that closed its lid keeps reading `working`, and a bare `idle` is indistinguishable from a dead machine's last words.
+A peer pushes on every state change (coalesced 300 ms) and at worst every 30 s as a heartbeat; the receiver drops a device that has been silent past a 90 s TTL, checked on that same 30 s tick — so the drop lands 90–120 s after the last push. In between, that device's rows sit in the roster with their last-pushed status **frozen**. A peer that closed its lid keeps reading `working`, and a bare `done` is indistinguishable from a dead machine's last words.
 
 `last_seen_age_ms` is the number to judge on. It is measured on the receiver's clock at both ends, so it carries no skew — unlike `status_age_ms`, which for a remote row is the sender's arithmetic and is only clamped at zero. A few seconds means the row was pushed on a live connection; anything past ~35 s means at least one heartbeat went missing. It is omitted for local rows, where a `0` would claim freshness on a channel that doesn't exist.
 

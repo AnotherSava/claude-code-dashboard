@@ -36,12 +36,14 @@ This derivation runs per event, but the result is only the **first-seen anchor**
 
 The adapter recognizes the events below. Anything else returns `Ignore` and the widget state is untouched.
 
+Two statuses are easy to confuse. **`done`** means a turn ended here, and it is also where every absence of evidence lands: a payload that establishes nothing settles `done` rather than claiming more. **`idle`** means *clean* — a confirmed claim that there is nothing in the session to come back to — and only positive evidence may write it, never a fallback. Whether the user has already *read* a finished row is a separate `read` flag stamped at display time, not a status.
+
 | Event                 | Status produced                                                                     | Notes                                                          |
 |---                    |---                                                                                  |---                                                             |
-| `SessionStart`        | `idle` (no fields) — otherwise treated like `Notification`                          | Used to seed an empty row before any user activity.            |
+| `SessionStart`        | `idle` when `source` is `clear` or `startup`, else `done`                           | The one event that can vouch for a clean row — see [Session starts](#session-starts). |
 | `UserPromptSubmit`    | `working`                                                                           | Label is the cleaned prompt; blank prompt → label `None`.      |
 | `UserPromptExpansion` | `working` for a slash command (`expansion_type` is `slash_command`); other expansions ignored | Label is the cleaned prompt. Fires before a skill's `!` context-gathering, so a skill launch shows `working` without waiting for the later `UserPromptSubmit`, which owns the dialog entry. |
-| `Notification`        | `blocked` (default); `idle_prompt` and `permission_prompt` are ignored outright     | See the notification-type table below.                         |
+| `Notification`        | `blocked` (default); `idle_prompt`, `permission_prompt` and an empty payload are ignored outright | See the notification-type table below.       |
 | `PreToolUse`          | `blocked` for `AskUserQuestion` / `ExitPlanMode` only; other tools ignored         | Label: `"has a question"` for `AskUserQuestion`, `"plan approval"` for `ExitPlanMode`. The matcher in `~/.claude/settings.json` should restrict the hook to these two tools (see [Installation → Wire the Claude Code hook](../install#2-wire-the-claude-code-hook)) — the JSONL transcript records the call's `tool_use` block but nothing marks it as waiting on the user, so this hook is the only signal that the dialog is on screen. |
 | `PermissionRequest`   | `blocked`                                                                           | Label: `"needs approval: <tool>"` from `payload.tool_name` (`"tool"` when absent), except that `AskUserQuestion` / `ExitPlanMode` keep the label their `PreToolUse` set. Without an `agent_id` it is the main agent's dialog and sets the row's status. With one, a subagent raised it: it opens a prompt over the row instead — see [Subagent permission prompts](#subagent-permission-prompts). |
 | `Elicitation`         | `blocked`                                                                           | An MCP tool asked for input. Label is the request's message (first 60 characters), else `"needs your input"`. |
@@ -52,9 +54,24 @@ The adapter recognizes the events below. Anything else returns `Ignore` and the 
 | `SubagentStop`        | emits `SubagentStopped` for the payload's `agent_id`; ignored without one            | No status of its own. Releases every open prompt from that agent. |
 | `SessionEnd`          | emits `Clear` (removes the row, unless a live sibling owns it)                       | Bypasses status classification entirely.                       |
 
-`SessionStart` and `Notification` share a code path because Claude Code occasionally emits notifications under either name; the dispatcher merges them.
-
 `PostToolUse` is intentionally ignored. Once the user answers an `AskUserQuestion` / `ExitPlanMode`, the transcript watcher carries the row out of `blocked` when the answer's `tool_result` lands, or the next `UserPromptSubmit` does. The call's own `tool_use` line is written while the dialog is still on screen, so the watcher reads an unanswered one as no activity.
+
+### Session starts
+
+The one event that can declare a row clean is `SessionStart`, and it does so from `payload.source` — Claude Code's own statement of what happened to the context, which arrives on every session start:
+
+| `source`  | Status | Reading                                                              |
+|---        |---     |---                                                                   |
+| `clear`   | `idle` | `/clear` wiped the context; the model holds nothing.                 |
+| `startup` | `idle` | A fresh session, nothing in it.                                      |
+| `resume`  | `done` | Clean only if the resumed conversation ended at a `/clear` — see below. |
+| `compact` | `done` | The conversation continues under a summary.                          |
+| `fork`    | `done` | A fork carries its parent's context forward.                         |
+| absent    | `done` | Nothing established.                                                 |
+
+Whether a `resume` is clean is a fact about the **persisted dialog**, which the adapter never sees, so the adapter settles `done` and `http_server::resume_is_clean` upgrades it: the row goes `idle` only when the restored dialog's last entry is a separator tagged `BoundaryKind::Clear`. That tag is why the three kinds of boundary are distinguished at all — `state::append_boundary` runs for `/clear`, for every other `SessionEnd` reason, for `PreCompact` and for the liveness reaper, and `BoundaryKind` (`clear` / `compact` / `ended`) is what tells them apart afterwards. The weaker "ended at a boundary" test would read true after a compaction, an ordinary exit and a reap alike, and sessions here start with `claude --continue`, so nearly every row on the machine would claim to be clean at start-up.
+
+The upgrade is scoped to `resume` alone. Both `clear` and `startup` are already answered from evidence that needs no history, and widening it would make a `/clear` on a row with no persisted dialog fail to be clean.
 
 ### Notification subtypes
 
@@ -66,11 +83,13 @@ The adapter recognizes the events below. Anything else returns `Ignore` and the 
 | `plan_approval`      | `blocked`                                                   | `"plan approval"` (fixed)                            |
 | `idle_prompt`        | none — the event is ignored                                  | none                                                 |
 | anything else        | `blocked`                                                   | cleaned `payload.message`, truncated to 60 chars     |
-| empty type, empty message | `idle`                                                  | `None`                                               |
+| empty type, empty message | none — the event is ignored                             | none                                                 |
 
 The 60-char truncation counts **characters, not bytes**, so multi-byte glyphs (emoji, CJK) are never split mid-codepoint.
 
 `idle_prompt` produces no classification at all: `Stop` has already settled the row from its own payload, so re-deriving a verdict here would be redundant, and the event is a flaky fixed timer besides. See [question detection](#question-detection).
+
+A notification with neither a type nor a message says nothing about the session, so it moves nothing either. Answering `idle` there would be a claim that the session has been wrapped up, on a payload that establishes nothing at all.
 
 `permission_prompt` is ignored because it repeats a dialog `PermissionRequest` reported seconds earlier, with the tool named in a field rather than in message text. It carries no `agent_id` even when a subagent's dialog raised it, so applying it would relabel the row, and after a subagent prompt had been released it would bring the BLOCK back.
 

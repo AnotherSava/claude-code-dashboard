@@ -279,7 +279,9 @@
       {#if session.origin}
         <span class="device" title="Session on {session.origin}">{session.origin}</span>
       {/if}
-      <span class="pill state-{session.status}" class:pulse={shouldPulse}>{stateLabel[session.status]}</span>
+      <span class="pill-col">
+        <span class="pill state-{session.status}" class:read={session.read} class:pulse={shouldPulse}>{stateLabel[session.status]}</span>
+      </span>
       {#if !config.compact_mode}
         <span class="time">{time}</span>
       {/if}
@@ -433,6 +435,19 @@
     line-height: 1.3;
     cursor: default;
   }
+  /* The pill gets a column of its own, centred, so every row's pill sits on the
+     same vertical line. The two numeric columns after it are fixed for the same
+     reason and are what actually caused the drift: while they were `min-width`,
+     a four-digit token count or a three-digit hour count grew its own column
+     and pushed that row's pill leftwards, so the pills stopped forming a line
+     exactly on the busiest and longest-running rows. `ch` is exact for both,
+     being monospace with tabular figures. */
+  .pill-col {
+    display: flex;
+    justify-content: center;
+    width: 48px;
+    flex: none;
+  }
   .pill {
     font-size: 9px;
     font-weight: 700;
@@ -464,6 +479,18 @@
     background: #047857;
     color: #a7f3d0;
   }
+  /* Finished and already looked at. The word stays DONE — the row finished
+     either way, and only how loudly it says so changes.
+     Exactly `.state-idle` inverted: the same two greys, swapped. That pairs the
+     widget's two quiet states without letting them be confused, since one is
+     dark-on-light and the other light-on-dark, and it keeps both clear of the
+     saturated fills that mean a row wants something. Applies to DONE alone —
+     `read` is meaningless on every other status and the Rust side never stamps
+     it there. */
+  .state-done.read {
+    background: #a1a1aa;
+    color: #2f2f33;
+  }
   .state-error {
     background: #b91c1c;
     color: #fecaca;
@@ -474,16 +501,16 @@
     font-family: ui-monospace, Consolas, monospace;
     font-variant-numeric: tabular-nums;
     text-align: right;
-    flex-shrink: 0;
-    min-width: 36px;
+    flex: none;
+    width: 6ch;
   }
   .tokens {
     font-size: 12px;
     font-weight: 600;
     font-family: ui-monospace, Consolas, monospace;
     font-variant-numeric: tabular-nums;
-    flex-shrink: 0;
-    min-width: 32px;
+    flex: none;
+    width: calc(5ch + 1px);
     text-align: right;
   }
   .tokens .k {

@@ -9,10 +9,33 @@
   }
 
   let { sessions, config, now }: Props = $props()
+
+  // A CLEAN row has nothing in it to come back to, so after a while it stops
+  // earning its place on the widget. The delay is not a rate limit: it is there
+  // so a row you have just cleared does not disappear while you are still
+  // looking at it.
+  //
+  // The filter lives here rather than in Rust for two reasons. It needs a
+  // ticking clock to make a row leave on time, and `now` already ticks here —
+  // a backend filter would only drop the row at the next emit, which for an
+  // idle machine may be never. And the backend's display snapshot is also what
+  // writes the terminal titles, so hiding a row there would blank the tab of
+  // every clean session.
+  //
+  // Local rows only. For a synced row `state_entered_at` is the sender's clock,
+  // and that machine's own widget is where the decision belongs.
+  let visible = $derived.by(() => {
+    const window = config.clean_hide_after_ms
+    if (!window || window <= 0) return sessions
+    return sessions.filter((s) => !(s.origin == null && s.status === 'idle' && now - s.state_entered_at >= window))
+  })
+  let hidden = $derived(sessions.length - visible.length)
 </script>
 
-{#if sessions.length === 0}
-  <div class="empty">No active agents</div>
+{#if visible.length === 0}
+  <!-- Say what the filter hid, never that nothing happened: with every row
+       clean, "No active agents" would claim the opposite of the truth. -->
+  <div class="empty">{hidden > 0 ? `${hidden} clean ${hidden === 1 ? 'session' : 'sessions'}, nothing waiting` : 'No active agents'}</div>
 {:else}
   <div class="list">
     <!-- Inner wrapper shrink-wraps the rows so its measured height is the true
@@ -20,7 +43,7 @@
          stretched by flex. App.svelte's auto-resize measures this element; a
          single rect read is race-free where summing .list children was not. -->
     <div class="list-inner">
-      {#each sessions as session (session.id)}
+      {#each visible as session (session.id)}
         <SessionItem {session} {config} {now} />
       {/each}
     </div>

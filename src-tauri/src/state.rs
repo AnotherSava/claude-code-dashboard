@@ -7,7 +7,19 @@ use std::sync::Mutex;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Status {
-    #[default]
+    /// CLEAN: a confirmed claim that there is nothing here to come back to.
+    ///
+    /// **Settable only on positive evidence**, and that prohibition is the whole
+    /// point of the variant. The three sources are a `SessionStart` whose
+    /// `source` is `clear` or `startup`, a `resume` whose restored dialog ends in
+    /// a [`BoundaryKind::Clear`] separator, and a relay turn that a pure peer
+    /// pull declared value-free. Nothing else may write it — above all not a
+    /// degrade path, which is what five of them used to do back when this variant
+    /// was also the "we know nothing" sink.
+    ///
+    /// An absence of evidence lands on [`Status::Done`] instead. Reaching for
+    /// `Idle` there claims the user has nothing to return to, which hides real
+    /// work — the one forbidden direction in this state machine.
     Idle,
     Working,
     /// Held active by background work after the main turn already settled —
@@ -19,6 +31,22 @@ pub enum Status {
     /// Blocked on the user: a question, a tool-permission prompt, or an MCP
     /// elicitation. Rendered amber as "BLOCK". (Formerly `Blocked`.)
     Blocked,
+    /// "A turn ended here." Both the settled end of a turn and the neutral
+    /// landing place for every absence of evidence.
+    ///
+    /// It carries no claim about whether the user has *seen* the result — that
+    /// is [`Attention`], stamped onto the row as `AgentSession::read` by
+    /// `commands::display_snapshot` and by nothing else. Status used to carry it
+    /// (`Done` meant finished-and-unread, and a display-time rewrite turned a
+    /// read row into `Idle`), which is why `Idle` ended up meaning three
+    /// unrelated things at once.
+    ///
+    /// Being the evidence-free sink is the other half, and it is why every
+    /// degrade path points here: a stale `Working` restored from a tab, an
+    /// Esc-cancelled first turn, a `Waiting` the backstop timed out, a row
+    /// invented because a subagent asked for permission. None of those know the
+    /// user has nothing to come back to, and [`Status::Idle`] would assert it.
+    #[default]
     Done,
     Error,
 }
@@ -42,12 +70,17 @@ impl Status {
 /// Whether a finished row is still waiting to be looked at — the "I haven't read
 /// this one yet" axis, orthogonal to [`Status`].
 ///
-/// **Internal, and deliberately never serialized.** It is a verdict computed on
-/// demand by [`AgentSession::attention`], read by `commands::apply_read_as_idle`
-/// (which turns it into the row's displayed status) and by
-/// `attention::should_poll`. The frontend is never told it separately: `Done`
-/// already means "finished, and you haven't looked", so a field carrying the same
-/// fact beside the status would be a duplicate state signal.
+/// **The verdict itself is never serialized.** It is computed on demand by
+/// [`AgentSession::attention`] and read in two places: `attention::should_poll`,
+/// which uses it to decide whether asking the terminal anything is worth the
+/// cost, and `commands::display_snapshot`, which flattens it into
+/// [`AgentSession::read`] on the way to the frontend and the tab titles.
+///
+/// That flattening is the only way the distinction reaches a reader, because
+/// `status` no longer carries it. It used to: `Done` meant finished-*and-unread*
+/// and a display-time rewrite turned a read row into `Idle`. That overloading is
+/// what left `Idle` meaning three unrelated things, and undoing it is what freed
+/// `Idle` to mean CLEAN.
 ///
 /// This exists because nothing else in the process can answer it. `idle.rs`
 /// reports input across the whole desktop, not per session, so a `Done` row the
@@ -97,6 +130,31 @@ pub enum DialogRole {
     Separator,
 }
 
+/// What produced a [`DialogRole::Separator`] — the fact that makes a trailing
+/// separator usable as evidence rather than as a four-way ambiguity.
+///
+/// `append_boundary` is shared by `take_session` (which runs for **every**
+/// `SessionEnd` reason and for the liveness reaper) and by
+/// `mark_session_boundary` (`PreCompact`), so until this existed the marker for
+/// "the user wiped the context" was byte-identical to the marker for "the agent
+/// exited with its conversation intact on disk" and for "the conversation was
+/// compacted and continues". Only [`BoundaryKind::Clear`] licenses
+/// [`Status::Idle`] on the following `resume`; everything else is a conversation
+/// somebody may want back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BoundaryKind {
+    /// `/clear` — `SessionEnd` with `reason == "clear"`. The context is gone.
+    Clear,
+    /// `PreCompact`. The conversation continues under a summary, so its value
+    /// survives even though the boundary looks the same.
+    Compact,
+    /// The session ended some other way — a plain exit, Ctrl-D, a closed
+    /// terminal, or the liveness reaper stepping in. The transcript is still on
+    /// disk and `--continue` will bring it back.
+    Ended,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DialogEntry {
     pub role: DialogRole,
@@ -111,6 +169,15 @@ pub struct DialogEntry {
     /// as `false` (those pre-flag entries simply aren't highlighted).
     #[serde(default)]
     pub task_start: bool,
+    /// For a [`DialogRole::Separator`], what produced it; `None` on every other
+    /// role and on separators persisted before this field existed.
+    ///
+    /// `#[serde(default)]` so an old `prompt_history.json` loads, and the `None`
+    /// it yields is the safe reading: an untagged separator does not license
+    /// [`Status::Idle`], so a dialog written by an older build is treated as a
+    /// conversation somebody may want back rather than as a confirmed clear.
+    #[serde(default)]
+    pub boundary: Option<BoundaryKind>,
 }
 
 /// Built by the adapter, converted to a full [`DialogEntry`] by `apply_set`
@@ -245,10 +312,10 @@ pub struct AgentSession {
     /// this row written by a user action rather than by the agent.
     ///
     /// Compared against [`AgentSession::content_at`] by [`AgentSession::attention`],
-    /// which `commands::apply_read_as_idle` turns into the row's *displayed*
-    /// status. The frontend is never told the verdict separately — `Done` already
-    /// means "finished, and you haven't looked", so a second field saying the same
-    /// thing would be a duplicate state signal.
+    /// which `commands::display_snapshot` flattens onto the row as
+    /// [`AgentSession::read`]. That flag is the only way the verdict reaches a
+    /// reader, and it exists because `status` stopped carrying it: `Done` now
+    /// covers read and unread alike.
     ///
     /// Internal bookkeeping — never serialized to the frontend, to sync, or to
     /// disk (mirrors `status_before_working`). Keeping it off the wire is
@@ -256,6 +323,30 @@ pub struct AgentSession {
     /// remote row's timestamps are the sender's clock.
     #[serde(skip)]
     pub attended_at: Option<i64>,
+    /// Whether this finished row has been looked at — the [`Attention::Seen`]
+    /// verdict, flattened for the frontend and the tab title.
+    ///
+    /// Always `false` in `AppState`. Stamped by `commands::display_snapshot` and
+    /// by nothing else, which is the same split the old status rewrite used to
+    /// occupy and for the same reason: `resolved_snapshot` is what `/api/agents`
+    /// serves and what the sync pusher's raw snapshot mirrors, and a peer asking
+    /// what this machine's agents are doing must not be told whether a human
+    /// here has looked at their screen.
+    ///
+    /// It exists as a field because `status` no longer carries it. `Done` used
+    /// to mean finished-*and-unread*, so a second field would have been a
+    /// duplicate state signal; now that `Done` covers both and `Idle` means
+    /// clean, this is the only place the distinction lives. The frontend renders
+    /// it as a paler green pill, `terminal_title::status_glyph` as ⚪ instead of
+    /// 🟢, and `session_restore` reads that glyph back — which is why nothing
+    /// persists `attended_at` and nothing needs to.
+    ///
+    /// Threaded from the stamp rather than recomputed downstream: the stamp is
+    /// gated on `config.attention_tracking`, and a second caller computing
+    /// `attention()` for itself would ignore that gate and disagree with the
+    /// widget.
+    #[serde(default)]
+    pub read: bool,
     /// How many things on this machine answer to this row's *name*. `1` is the
     /// ordinary case; anything above it means several terminal tabs carry the same
     /// caption, which is what the row's warning marker reports.
@@ -608,7 +699,7 @@ pub struct AppState {
 /// whether one was added — skipped when the dialog is empty or already ends with
 /// a separator. Shared by [`AppState::mark_session_boundary`] and
 /// [`AppState::take_session`] so the boundary rule lives in exactly one place.
-fn append_boundary(session: &mut AgentSession, now_ms: i64) -> bool {
+fn append_boundary(session: &mut AgentSession, kind: BoundaryKind, now_ms: i64) -> bool {
     if session.dialog.is_empty() {
         return false;
     }
@@ -619,11 +710,24 @@ fn append_boundary(session: &mut AgentSession, now_ms: i64) -> bool {
         role: DialogRole::Separator,
         text: String::new(),
         timestamp: now_ms,
-        status: Status::Idle,
+        status: Status::Done,
         task_start: false,
+        boundary: Some(kind),
     });
     session.updated = now_ms;
     true
+}
+
+/// Whether a restored conversation ends at a `/clear` — the only boundary that
+/// licenses [`Status::Idle`] on the `SessionStart` that follows it.
+///
+/// This is deliberately not "ends with a separator". That weaker test reads
+/// `true` after a compaction and after every ordinary exit, and since sessions
+/// here are started with `--continue`, it would declare nearly every session on
+/// the machine clean at start-up. An untagged separator from an older build
+/// answers `false` for the same reason.
+pub(crate) fn ends_with_clear_boundary(dialog: &[DialogEntry]) -> bool {
+    dialog.last().is_some_and(|e| e.role == DialogRole::Separator && e.boundary == Some(BoundaryKind::Clear))
 }
 
 impl AppState {
@@ -786,6 +890,7 @@ impl AppState {
                 if let Some(pending) = dialog_entry {
                     let task_start = pending.role == DialogRole::User && task_boundary;
                     existing.dialog.push(DialogEntry {
+                        boundary: None,
                         role: pending.role,
                         text: pending.text,
                         timestamp: now_ms,
@@ -833,14 +938,25 @@ impl AppState {
     /// notifier's time-in-state — needs to be told. `updated` stays `now_ms`,
     /// since that is a fact about this process's bookkeeping.
     ///
+    /// `read` restores the one fact that lives nowhere but the tab. `attended_at`
+    /// is `#[serde(skip)]` and never persisted, so a ⚪ glyph is the only surviving
+    /// record that the user already looked at this row. It is stamped to the
+    /// row's own `content_at` rather than to `now_ms`: the claim being restored is
+    /// "seen as of everything this row had produced when its tab was last
+    /// written", and `now_ms` would additionally vouch for anything that arrives
+    /// between here and the next emit.
+    ///
     /// Returns whether a row was created.
-    pub fn restore_row(&self, input: SetInput, state_entered_at: i64, now_ms: i64, restored: Option<PersistedSession>) -> bool {
+    pub fn restore_row(&self, input: SetInput, read: bool, state_entered_at: i64, now_ms: i64, restored: Option<PersistedSession>) -> bool {
         let mut sessions = self.sessions.lock().unwrap();
         if sessions.iter().any(|s| s.id == input.id) {
             return false;
         }
         let (label, event_prompt) = crate::label_policy::select(None, &input, false);
-        let (session, _) = new_session(input, label, event_prompt, None, state_entered_at, now_ms, restored);
+        let (mut session, _) = new_session(input, label, event_prompt, None, state_entered_at, now_ms, restored);
+        if read {
+            session.attended_at = Some(session.content_at());
+        }
         sessions.push(session);
         true
     }
@@ -879,11 +995,16 @@ impl AppState {
         }
         let (label, event_prompt) = crate::label_policy::select(None, &input, false);
         let (mut session, seeded) = new_session(input, label, event_prompt, None, now_ms, now_ms, restored);
-        let base = BaseState { status: Status::Idle, label: String::new(), waiting_backstop_armed: false, state_entered_at: now_ms };
+        // `Done`, not `Idle`. All this row's existence proves is that some main
+        // agent launched a subagent that asked for permission — nothing about
+        // whether the user has anything to come back to, so the neutral sink is
+        // the only honest base. `settle_subagent_prompts` writes this back
+        // verbatim when the dialog releases, so it is what the row then shows.
+        let base = BaseState { status: Status::Done, label: String::new(), waiting_backstop_armed: false, state_entered_at: now_ms };
         session.subagent_gate = Some(SubagentGate { base, blocked_since: now_ms, pending: vec![entry] });
         show_gate(&mut session);
         sessions.push(session);
-        OpenOutcome { request, pending: 1, base_status: Status::Idle, dialog_changed: seeded }
+        OpenOutcome { request, pending: 1, base_status: Status::Done, dialog_changed: seeded }
     }
 
     /// Settle the open subagent prompts `scope` covers on row `id`.
@@ -947,24 +1068,28 @@ fn new_session(
     restored: Option<PersistedSession>,
 ) -> (AgentSession, bool) {
     let r = restored.unwrap_or_default();
-    // A restored dialog ending in a separator means the conversation was
-    // cleared or compacted — the boundary marker is the last thing on the
-    // row, so no task is in flight. Don't resurrect the pre-boundary
-    // task's prompt/timer onto the fresh row (that's what made a `/clear`
-    // recreate the row as Idle still showing the previous task). Keep the
-    // dialog for history continuity but start the row's active-task state
-    // clean. An incoming `event_prompt` (a Working prompt arriving with
-    // this same event) still takes precedence and starts a real task.
-    let cleared = r.dialog.last().is_some_and(|e| e.role == DialogRole::Separator);
-    let restored_prompt = if cleared { None } else { r.original_prompt };
-    let restored_task_started_at = if cleared { 0 } else { r.task_started_at };
+    // A restored dialog ending in a separator means a boundary of some kind was
+    // the last thing on the row, so no task is in flight. Don't resurrect the
+    // pre-boundary task's prompt/timer onto the fresh row. Keep the dialog for
+    // history continuity but start the row's active-task state clean. An
+    // incoming `event_prompt` (a Working prompt arriving with this same event)
+    // still takes precedence and starts a real task.
+    //
+    // Any boundary suppresses the prompt, because none of them leaves a task
+    // running. Whether the row is also CLEAN is a narrower question answered by
+    // `ends_with_clear_boundary` on the `SessionStart` path — only a `/clear`
+    // counts there, while a compaction or an ordinary exit leaves a
+    // conversation somebody may want back.
+    let ended_at_boundary = r.dialog.last().is_some_and(|e| e.role == DialogRole::Separator);
+    let restored_prompt = if ended_at_boundary { None } else { r.original_prompt };
+    let restored_task_started_at = if ended_at_boundary { 0 } else { r.task_started_at };
     let original_prompt = event_prompt.or(restored_prompt);
     let task_started_at = if original_prompt.is_some() && restored_task_started_at == 0 { now_ms } else { restored_task_started_at };
     let mut dialog = r.dialog;
 
     let has_new_entry = if let Some(pending) = dialog_entry {
         let task_start = pending.role == DialogRole::User;
-        dialog.push(DialogEntry { role: pending.role, text: pending.text, timestamp: now_ms, status: input.status, task_start });
+        dialog.push(DialogEntry { role: pending.role, text: pending.text, timestamp: now_ms, status: input.status, task_start, boundary: None });
         true
     } else {
         false
@@ -974,7 +1099,11 @@ fn new_session(
     let session = AgentSession {
         id: input.id,
         status: input.status,
-        status_before_working: Status::Idle,
+        // `Done`, not `Idle`: this is where an Esc-cancelled *first* turn lands,
+        // and a row whose only turn was abandoned has not been established as
+        // having nothing to come back to — the cancelled turn may well have
+        // edited files.
+        status_before_working: Status::Done,
         label,
         original_prompt,
         task_started_at,
@@ -992,6 +1121,7 @@ fn new_session(
         terminal_stale_at: None,
         canary: Canary::Off,
         attended_at: None,
+        read: false,
         name_shared_by: None,
         subagent_gate: None,
     };
@@ -1007,7 +1137,7 @@ impl AppState {
     /// avoid deleting a row that received a new event between observation and
     /// removal. The check, boundary append, and removal all happen under one
     /// lock, so it is atomic against a concurrent hook event.
-    pub fn take_session(&self, id: &str, expect_updated: Option<i64>, now_ms: i64) -> Option<AgentSession> {
+    pub fn take_session(&self, id: &str, expect_updated: Option<i64>, kind: BoundaryKind, now_ms: i64) -> Option<AgentSession> {
         let mut sessions = self.sessions.lock().unwrap();
         let pos = sessions.iter().position(|s| s.id == id)?;
         if let Some(expected) = expect_updated {
@@ -1015,7 +1145,7 @@ impl AppState {
                 return None;
             }
         }
-        append_boundary(&mut sessions[pos], now_ms);
+        append_boundary(&mut sessions[pos], kind, now_ms);
         Some(sessions.remove(pos))
     }
 
@@ -1058,7 +1188,19 @@ impl AppState {
                 Status::Blocked => {}
                 _ => return None,
             }
-            s.status = s.status_before_working;
+            // A cancelled turn can restore any prior resting state except
+            // CLEAN, and that exception is the whole reason this is not a plain
+            // assignment. The row a user types into next is very often one they
+            // just cleared, so `status_before_working` is `Idle` in the common
+            // case — and by the time Esc is pressed the turn may have edited
+            // files, which is exactly when a row must not claim there is
+            // nothing to come back to. Restoring the *previous* state is right
+            // for `Blocked`, where an aborted reply leaves the question
+            // standing; for `Idle` the turn itself is the counter-evidence.
+            s.status = match s.status_before_working {
+                Status::Idle => Status::Done,
+                prior => prior,
+            };
             s.state_entered_at = now_ms;
             s.updated = now_ms;
             Some((s.status, gated))
@@ -1222,10 +1364,15 @@ impl AppState {
         changed
     }
 
-    /// Mark a session-boundary in the in-memory dialog. Called on the
-    /// authoritative boundary signals — `SessionEnd` (before `/clear` removes
-    /// the row) and `PreCompact` (context compaction) — to append a history
-    /// separator without resurrecting the prior task onto the next turn.
+    /// Mark a compaction boundary in the in-memory dialog — a history separator
+    /// without ending the session, so the prior task is not resurrected onto the
+    /// next turn. `PreCompact` is its only caller; the `/clear` half of the pair
+    /// goes through [`AppState::take_session`], which appends its own separator
+    /// on the way out and tags it [`BoundaryKind::Clear`].
+    ///
+    /// The kind matters here rather than being cosmetic: a compaction leaves a
+    /// conversation the user still wants, so this boundary must never license
+    /// the `Idle` a `/clear` does.
     pub fn mark_session_boundary(&self, id: &str, now_ms: i64) -> bool {
         let mut sessions = self.sessions.lock().unwrap();
         let Some(session) = sessions.iter_mut().find(|s| s.id == id) else {
@@ -1239,7 +1386,7 @@ impl AppState {
         // spurious high-context alert. `None` = unknown until the watcher
         // repopulates it from the first post-compact turn.
         let tokens_cleared = session.input_tokens.take().is_some();
-        let separator_added = append_boundary(session, now_ms);
+        let separator_added = append_boundary(session, BoundaryKind::Compact, now_ms);
         if tokens_cleared && !separator_added {
             session.updated = now_ms;
         }
@@ -1261,7 +1408,7 @@ impl AppState {
         let incoming: Vec<DialogEntry> = entries
             .iter()
             .filter(|(role, _)| matches!(role, DialogRole::User | DialogRole::Assistant))
-            .map(|(role, text)| DialogEntry { role: *role, text: text.clone(), timestamp: now_ms, status: session.status, task_start: false })
+            .map(|(role, text)| DialogEntry { role: *role, text: text.clone(), timestamp: now_ms, status: session.status, task_start: false, boundary: None })
             .collect();
         let changed = merge_dialog_entries(&mut session.dialog, &incoming);
         if changed {
@@ -1412,7 +1559,7 @@ mod tests {
         // state is not re-announced. A `state_entered_at` of `now` defeats all
         // four at once.
         let state = AppState::new();
-        assert!(state.restore_row(set_no_label("dash", Status::Blocked), 1_000, 900_000, None));
+        assert!(state.restore_row(set_no_label("dash", Status::Blocked), false, 1_000, 900_000, None));
         let s = get(&state, "dash");
         assert_eq!(s.state_entered_at, 1_000, "the status began long before we started");
         assert_eq!(s.updated, 900_000, "but the row was written just now");
@@ -1427,7 +1574,7 @@ mod tests {
         // a genuinely Working session back to whatever its tab said.
         let state = AppState::new();
         state.apply_set(set("dash", Status::Working, "live prompt"), 500_000, NO_CONTINUATIONS, None);
-        assert!(!state.restore_row(set_no_label("dash", Status::Blocked), 1_000, 900_000, None), "no row was created");
+        assert!(!state.restore_row(set_no_label("dash", Status::Blocked), false, 1_000, 900_000, None), "no row was created");
         let s = get(&state, "dash");
         assert_eq!(s.status, Status::Working, "the live status survives");
         assert_eq!(s.label, "live prompt");
@@ -1471,11 +1618,11 @@ mod tests {
     fn restore_row_seeds_the_persisted_conversation() {
         let state = AppState::new();
         let persisted = PersistedSession {
-            dialog: vec![DialogEntry { role: DialogRole::User, text: "do the thing".into(), timestamp: 10, status: Status::Working, task_start: true }],
+            dialog: vec![DialogEntry { role: DialogRole::User, text: "do the thing".into(), timestamp: 10, status: Status::Working, task_start: true, boundary: None }],
             original_prompt: Some("do the thing".into()),
             task_started_at: 10,
         };
-        assert!(state.restore_row(set_no_label("dash", Status::Done), 1_000, 900_000, Some(persisted)));
+        assert!(state.restore_row(set_no_label("dash", Status::Done), false, 1_000, 900_000, Some(persisted)));
         let s = get(&state, "dash");
         assert_eq!(s.dialog.len(), 1);
         assert_eq!(s.original_prompt.as_deref(), Some("do the thing"));
@@ -1490,13 +1637,13 @@ mod tests {
         let state = AppState::new();
         let persisted = PersistedSession {
             dialog: vec![
-                DialogEntry { role: DialogRole::User, text: "old task".into(), timestamp: 10, status: Status::Working, task_start: true },
-                DialogEntry { role: DialogRole::Separator, text: String::new(), timestamp: 20, status: Status::Idle, task_start: false },
+                DialogEntry { role: DialogRole::User, text: "old task".into(), timestamp: 10, status: Status::Working, task_start: true, boundary: None },
+                DialogEntry { role: DialogRole::Separator, text: String::new(), timestamp: 20, status: Status::Idle, task_start: false, boundary: None },
             ],
             original_prompt: Some("old task".into()),
             task_started_at: 10,
         };
-        assert!(state.restore_row(set_no_label("dash", Status::Idle), 1_000, 900_000, Some(persisted)));
+        assert!(state.restore_row(set_no_label("dash", Status::Idle), false, 1_000, 900_000, Some(persisted)));
         let s = get(&state, "dash");
         assert_eq!(s.dialog.len(), 2, "history kept");
         assert_eq!(s.original_prompt, None, "but no task is in flight");
@@ -1607,10 +1754,11 @@ mod tests {
 
     #[test]
     fn attention_never_reaches_the_wire_in_any_form() {
-        // Neither the raw observation nor a verdict field: `status` carries the
-        // whole thing (`commands::apply_read_as_idle`), and a second field saying
-        // the same would be a duplicate state signal. What *does* go out is
-        // `status: "done"` — a peer asking what this machine's agents are doing
+        // The observation never leaves this machine, and neither does the
+        // verdict derived from it. `read` is a field now, so this asserts its
+        // *value* rather than the absence of a key: the sync pusher serializes
+        // a raw `AppState` row, where it must still be `false` however long ago
+        // the user looked. A peer asking what this machine's agents are doing
         // must not be told whether a human here has looked at their screen.
         let state = AppState::new();
         state.apply_set(set_no_label("a", Status::Done), 0, NO_CONTINUATIONS, None);
@@ -1618,19 +1766,80 @@ mod tests {
         let json = serde_json::to_value(get(&state, "a")).expect("serialize");
         assert!(json.get("attended_at").is_none(), "the observation stays on this machine");
         assert!(json.get("attention").is_none(), "and so does the verdict");
+        assert_eq!(json.get("read").and_then(|v| v.as_bool()), Some(false), "the flag is on the wire but never true off the display path");
         assert_eq!(json.get("status").and_then(|v| v.as_str()), Some("done"), "the wire reports what the agent did");
     }
 
     #[test]
-    fn revert_cancelled_turn_banks_elapsed_and_falls_back_to_idle() {
+    fn nothing_evidence_free_can_produce_a_clean_row() {
+        // The invariant the whole redefinition rests on. `Idle` asserts there is
+        // nothing to come back to; every path below knows strictly less than
+        // that, so each must land on the neutral sink instead. This is written
+        // as a sweep rather than a grep because the ways in are functions, not
+        // literals — five of them used to reach for `Idle` and every one of them
+        // would have shipped a row claiming to be wrapped up.
+        assert_eq!(Status::default(), Status::Done, "a value nobody chose is not a claim");
+
+        let state = AppState::new();
+
+        // The path the first cut of this got wrong, and the commonest one: a
+        // row created CLEAN by `/clear`, typed into, then Esc-cancelled. The
+        // prior resting state really was `Idle`, and restoring it verbatim
+        // would let a cancel write a clean claim over a turn that may have
+        // edited files.
+        state.apply_set(set_no_label("clean", Status::Idle), 1_000, NO_CONTINUATIONS, None);
+        state.apply_set(set("clean", Status::Working, "edit the thing"), 2_000, NO_CONTINUATIONS, None);
+        assert_eq!(get(&state, "clean").status_before_working, Status::Idle, "the capture is faithful");
+        assert_eq!(state.revert_cancelled_turn("clean", 3_000).expect("reverted").0, Status::Done, "but the revert refuses to restore CLEAN");
+
+        // A row invented because a subagent asked for permission.
+        let o = state.open_subagent_prompt(set("a", Status::Blocked, "needs approval: Bash"), prompt_from("agent-1", "Bash"), 1_000, None);
+        assert_ne!(o.base_status, Status::Idle);
+
+        // A first turn cancelled with Esc, which has no prior state to return to.
+        state.apply_set(set("b", Status::Working, "do a thing"), 1_000, NO_CONTINUATIONS, None);
+        assert_ne!(state.revert_cancelled_turn("b", 2_000).expect("reverted").0, Status::Idle);
+
+        // A WAIT the backstop gave up on.
+        state.apply_set(set("c", Status::Waiting, "bg work"), 1_000, NO_CONTINUATIONS, None);
+        let updated = get(&state, "c").updated;
+        assert!(state.settle_stale_waiting("c", updated, 9_000));
+        assert_ne!(get(&state, "c").status, Status::Idle);
+
+        // A row deserialized off the sync wire, where `status_before_working` is
+        // filled by `Default` and reaches `revert_cancelled_turn` on the peer.
+        let wire = serde_json::to_string(&get(&state, "c")).expect("serialize");
+        let back: AgentSession = serde_json::from_str(&wire).expect("deserialize");
+        assert_ne!(back.status_before_working, Status::Idle);
+    }
+
+    #[test]
+    fn only_a_clear_boundary_licenses_a_clean_resume() {
+        // Every removal appends a separator, so "ends with a separator" is true
+        // after a compaction and after every ordinary exit too — and sessions
+        // here start with `--continue`. Reading the weaker test would declare
+        // nearly every row on the machine clean at start-up.
+        let sep = |kind| vec![DialogEntry { role: DialogRole::Separator, text: String::new(), timestamp: 10, status: Status::Done, task_start: false, boundary: kind }];
+        assert!(ends_with_clear_boundary(&sep(Some(BoundaryKind::Clear))));
+        assert!(!ends_with_clear_boundary(&sep(Some(BoundaryKind::Compact))));
+        assert!(!ends_with_clear_boundary(&sep(Some(BoundaryKind::Ended))));
+        assert!(!ends_with_clear_boundary(&sep(None)), "an untagged separator from an older build is not evidence");
+        assert!(!ends_with_clear_boundary(&[]));
+        assert!(!ends_with_clear_boundary(&[user_entry("still talking", 20)]));
+    }
+
+    #[test]
+    fn revert_cancelled_turn_banks_elapsed_and_falls_back_to_done() {
         // A fresh session's first turn has no prior status, so a cancel reverts
-        // to Idle (status_before_working defaults to Idle).
+        // to `Done` — the neutral sink `status_before_working` defaults to. Not
+        // `Idle`: the cancelled turn may well have edited files, and a row that
+        // has done work is the last thing that should read as wrapped up.
         let state = AppState::new();
         state.apply_set(set("a", Status::Working, "fix foo.py"), 0, NO_CONTINUATIONS, None);
 
-        assert_eq!(state.revert_cancelled_turn("a", 20_000), Some((Status::Idle, false)));
+        assert_eq!(state.revert_cancelled_turn("a", 20_000), Some((Status::Done, false)));
         let s = get(&state, "a");
-        assert_eq!(s.status, Status::Idle);
+        assert_eq!(s.status, Status::Done);
         assert_eq!(s.working_accumulated_ms, 20_000, "elapsed run banked");
         assert_eq!(s.state_entered_at, 20_000);
         assert_eq!(s.updated, 20_000);
@@ -1906,7 +2115,7 @@ mod tests {
         let state = AppState::new();
         state.apply_set(set("a", Status::Working, "task"), 0, NO_CONTINUATIONS, None);
         state.apply_set(set("b", Status::Working, "other"), 0, NO_CONTINUATIONS, None);
-        let removed = state.take_session("a", None, 0);
+        let removed = state.take_session("a", None, BoundaryKind::Clear, 0);
         assert!(removed.is_some(), "the removed session is returned");
         assert_eq!(removed.unwrap().id, "a");
         let ids: Vec<String> = state.snapshot().into_iter().map(|s| s.id).collect();
@@ -1920,9 +2129,9 @@ mod tests {
         let state = AppState::new();
         state.apply_set(set("a", Status::Working, "task"), 0, NO_CONTINUATIONS, None);
         let updated = get(&state, "a").updated;
-        assert!(state.take_session("a", Some(updated + 1), 0).is_none(), "stale expectation aborts");
+        assert!(state.take_session("a", Some(updated + 1), BoundaryKind::Clear, 0).is_none(), "stale expectation aborts");
         assert_eq!(state.snapshot().len(), 1, "row survives a mismatched expectation");
-        assert!(state.take_session("a", Some(updated), 0).is_some(), "matching expectation removes");
+        assert!(state.take_session("a", Some(updated), BoundaryKind::Clear, 0).is_some(), "matching expectation removes");
         assert!(state.snapshot().is_empty());
     }
 
@@ -1934,7 +2143,7 @@ mod tests {
         let mut input = set("a", Status::Working, "task");
         input.dialog_entry = Some(PendingDialogEntry { role: DialogRole::User, text: "task".into() });
         state.apply_set(input, 0, NO_CONTINUATIONS, None);
-        let removed = state.take_session("a", None, 100).expect("removed");
+        let removed = state.take_session("a", None, BoundaryKind::Clear, 100).expect("removed");
         assert_eq!(removed.dialog.last().map(|e| e.role), Some(DialogRole::Separator));
     }
 
@@ -2208,8 +2417,8 @@ mod tests {
         let state = AppState::new();
         let restored = PersistedSession {
             dialog: vec![
-                DialogEntry { role: DialogRole::User, text: "old task".into(), timestamp: 100, status: Status::Working, task_start: true },
-                DialogEntry { role: DialogRole::Assistant, text: "Done.".into(), timestamp: 200, status: Status::Done, task_start: false },
+                DialogEntry { role: DialogRole::User, text: "old task".into(), timestamp: 100, status: Status::Working, task_start: true, boundary: None },
+                DialogEntry { role: DialogRole::Assistant, text: "Done.".into(), timestamp: 200, status: Status::Done, task_start: false, boundary: None },
             ],
             original_prompt: Some("old task".into()),
             task_started_at: 100,
@@ -2230,9 +2439,9 @@ mod tests {
         let state = AppState::new();
         let restored = PersistedSession {
             dialog: vec![
-                DialogEntry { role: DialogRole::User, text: "old task".into(), timestamp: 100, status: Status::Working, task_start: true },
-                DialogEntry { role: DialogRole::Assistant, text: "Done.".into(), timestamp: 200, status: Status::Done, task_start: false },
-                DialogEntry { role: DialogRole::Separator, text: String::new(), timestamp: 300, status: Status::Idle, task_start: false },
+                DialogEntry { role: DialogRole::User, text: "old task".into(), timestamp: 100, status: Status::Working, task_start: true, boundary: None },
+                DialogEntry { role: DialogRole::Assistant, text: "Done.".into(), timestamp: 200, status: Status::Done, task_start: false, boundary: None },
+                DialogEntry { role: DialogRole::Separator, text: String::new(), timestamp: 300, status: Status::Idle, task_start: false, boundary: None },
             ],
             original_prompt: Some("old task".into()),
             task_started_at: 100,
@@ -2252,8 +2461,8 @@ mod tests {
         let state = AppState::new();
         let restored = PersistedSession {
             dialog: vec![
-                DialogEntry { role: DialogRole::User, text: "old task".into(), timestamp: 100, status: Status::Working, task_start: true },
-                DialogEntry { role: DialogRole::Separator, text: String::new(), timestamp: 300, status: Status::Idle, task_start: false },
+                DialogEntry { role: DialogRole::User, text: "old task".into(), timestamp: 100, status: Status::Working, task_start: true, boundary: None },
+                DialogEntry { role: DialogRole::Separator, text: String::new(), timestamp: 300, status: Status::Idle, task_start: false, boundary: None },
             ],
             original_prompt: Some("old task".into()),
             task_started_at: 100,
@@ -2274,13 +2483,13 @@ mod tests {
     }
 
     fn user_entry(text: &str, ts: i64) -> DialogEntry {
-        DialogEntry { role: DialogRole::User, text: text.into(), timestamp: ts, status: Status::Working, task_start: true }
+        DialogEntry { role: DialogRole::User, text: text.into(), timestamp: ts, status: Status::Working, task_start: true, boundary: None }
     }
     fn assistant_entry(text: &str, ts: i64) -> DialogEntry {
-        DialogEntry { role: DialogRole::Assistant, text: text.into(), timestamp: ts, status: Status::Done, task_start: false }
+        DialogEntry { role: DialogRole::Assistant, text: text.into(), timestamp: ts, status: Status::Done, task_start: false, boundary: None }
     }
     fn separator_entry(ts: i64) -> DialogEntry {
-        DialogEntry { role: DialogRole::Separator, text: String::new(), timestamp: ts, status: Status::Idle, task_start: false }
+        DialogEntry { role: DialogRole::Separator, text: String::new(), timestamp: ts, status: Status::Idle, task_start: false, boundary: None }
     }
 
     fn seed(state: &AppState, dialog: Vec<DialogEntry>) {
@@ -2305,6 +2514,7 @@ mod tests {
             terminal_stale_at: None,
             canary: Canary::Off,
             attended_at: None,
+            read: false,
             name_shared_by: None,
             subagent_gate: None,
         });
@@ -2574,6 +2784,7 @@ mod tests {
             terminal_stale_at: None,
             canary: Canary::Off,
             attended_at: None,
+            read: false,
             name_shared_by: None,
             subagent_gate: None,
         }
@@ -2818,17 +3029,23 @@ mod tests {
     }
 
     #[test]
-    fn a_prompt_for_an_unknown_row_creates_it_blocked_over_idle() {
+    fn a_prompt_for_an_unknown_row_creates_it_blocked_over_done() {
+        // `Done`, the neutral sink — all this row's existence proves is that some
+        // main agent launched a subagent that asked for permission. `Idle` would
+        // claim the user has nothing to come back to, which nothing established.
         let state = AppState::new();
         let o = open(&state, "a", "agent-1", "Bash", 5_000);
-        assert_eq!((o.pending, o.base_status, o.dialog_changed), (1, Status::Idle, false));
+        assert_eq!((o.pending, o.base_status, o.dialog_changed), (1, Status::Done, false));
         let s = get(&state, "a");
         assert_eq!((s.status, s.label.as_str(), s.state_entered_at), (Status::Blocked, "needs approval: Bash", 5_000));
         assert_eq!(s.original_prompt, None, "a subagent's dialog is not a task");
 
+        // The base is written back verbatim, clock included — so what the row
+        // shows once the dialog releases is the same neutral `Done` it was
+        // invented with, on the prompt-open clock.
         state.settle_subagent_prompts("a", SettleScope::Session("sess"), 6_000).expect("settled");
         let s = get(&state, "a");
-        assert_eq!((s.status, s.label.as_str(), s.state_entered_at), (Status::Idle, "", 5_000));
+        assert_eq!((s.status, s.label.as_str(), s.state_entered_at), (Status::Done, "", 5_000));
 
         let restored = PersistedSession { dialog: vec![user_entry("old", 10)], original_prompt: None, task_started_at: 0 };
         let o = state.open_subagent_prompt(set("b", Status::Blocked, "needs approval: Bash"), prompt_from("agent-1", "Bash"), 7_000, Some(restored));
@@ -2873,7 +3090,7 @@ mod tests {
         let state = AppState::new();
         state.apply_set(set("a", Status::Working, "task"), 0, NO_CONTINUATIONS, None);
         let r = open(&state, "a", "agent-1", "Bash", 1_000).request;
-        assert!(state.take_session("a", None, 2_000).is_some());
+        assert!(state.take_session("a", None, BoundaryKind::Clear, 2_000).is_some());
         assert!(state.pending_subagent_prompts().is_empty());
 
         state.apply_set(set_no_label("a", Status::Idle), 3_000, NO_CONTINUATIONS, None);

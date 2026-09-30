@@ -89,6 +89,7 @@ mod tests {
             timestamp: 1000,
             status: Status::Working,
             task_start: true,
+            boundary: None,
         };
         {
             let mut data = store.data.lock().unwrap();

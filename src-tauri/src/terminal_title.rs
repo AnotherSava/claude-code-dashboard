@@ -552,10 +552,20 @@ pub(crate) fn live_session_count(app: &AppHandle, chat_id: &str) -> Option<usize
     )
 }
 
-fn status_glyph(status: Status) -> &'static str {
+/// The glyph a tab carries for a row.
+///
+/// Takes `read` as well as `status` because the tab is the **only durable copy**
+/// of read-ness: nothing persists `attended_at`, and `session_restore` recovers
+/// the distinction by reading this glyph back after a restart. `read` is
+/// meaningful for `Done` alone and ignored everywhere else, which
+/// `status_from_glyph` relies on to be total.
+fn status_glyph(status: Status, read: bool) -> &'static str {
     // Mirrors the status pill colors in SessionItem.svelte.
     match status {
-        Status::Idle => "⚪",
+        // CLEAN. Black rather than a grey, because no grey circle emoji exists —
+        // the set is red/orange/yellow/green/blue/purple/brown/black/white and
+        // nothing between the last two.
+        Status::Idle => "⚫",
         Status::Working => "🔵",
         // No light-blue *circle* emoji exists to mirror the dashboard pill, so
         // `Waiting` (main turn settled, background work still running) uses an
@@ -566,6 +576,10 @@ fn status_glyph(status: Status) -> &'static str {
         // `Blocked` (waiting on the user) uses a raised hand — its "stop, your
         // turn" semantics also separate it cleanly from `Error`'s red circle.
         Status::Blocked => "✋",
+        // The only status whose glyph splits, and the split is what a glance at
+        // the tab strip is for: 🟢 is finished and still wanting you, ⚪ is
+        // finished and already seen.
+        Status::Done if read => "⚪",
         Status::Done => "🟢",
         Status::Error => "🔴",
     }
@@ -575,6 +589,10 @@ fn status_glyph(status: Status) -> &'static str {
 pub struct TitleReading<'a> {
     /// The status its glyph names.
     pub status: Status,
+    /// Whether that glyph was the read variant. Only ever `true` for
+    /// [`Status::Done`]; `false` for every other status, which have one glyph
+    /// each and say nothing about attention.
+    pub read: bool,
     /// Everything after the glyph, suffixes included — deliberately not the bare
     /// name. `build_title` appends " [N%]" and " ⚠" today and will grow more, so
     /// a parser that stripped them would have to learn each one; [`names`] does
@@ -655,19 +673,26 @@ pub fn shared_label<'a>(a: &'a str, b: &str) -> Option<&'a str> {
 /// be the single worst thing this parser could do.
 pub fn parse_title(title: &str) -> Option<TitleReading<'_>> {
     let (head, rest) = title.trim().split_once(' ')?;
-    Some(TitleReading { status: status_from_glyph(head)?, rest: rest.trim() })
+    let (status, read) = status_from_glyph(head)?;
+    Some(TitleReading { status, read, rest: rest.trim() })
 }
 
 /// The inverse of [`status_glyph`]. Total over the glyphs that function emits
 /// and `None` everywhere else.
-fn status_from_glyph(glyph: &str) -> Option<Status> {
+///
+/// Returns the **pair**, not the status: ⚪ and 🟢 are both `Done` and differ only
+/// in whether the user has read the row, so a signature that dropped the second
+/// half would restore every read-finished tab as something else entirely. That
+/// is the whole reason this is not a one-line addition of a ⚫ arm.
+fn status_from_glyph(glyph: &str) -> Option<(Status, bool)> {
     Some(match glyph {
-        "⚪" => Status::Idle,
-        "🔵" => Status::Working,
-        "⏳" => Status::Waiting,
-        "✋" => Status::Blocked,
-        "🟢" => Status::Done,
-        "🔴" => Status::Error,
+        "⚫" => (Status::Idle, false),
+        "🔵" => (Status::Working, false),
+        "⏳" => (Status::Waiting, false),
+        "✋" => (Status::Blocked, false),
+        "🟢" => (Status::Done, false),
+        "⚪" => (Status::Done, true),
+        "🔴" => (Status::Error, false),
         _ => return None,
     })
 }
@@ -682,7 +707,7 @@ fn status_from_glyph(glyph: &str) -> Option<Status> {
 /// console-write side effects live in `push_title`.
 fn build_title(session: &AgentSession, context_threshold: f32, window_tokens: &HashMap<String, u64>) -> String {
     let name = session.display_name.as_deref().unwrap_or(&session.id);
-    let mut title = format!("{} {}", status_glyph(session.status), name);
+    let mut title = format!("{} {}", status_glyph(session.status, session.read), name);
     if context_threshold > 0.0 {
         if let Some(pct) = context_percent(session, window_tokens) {
             if pct >= context_threshold {
@@ -973,17 +998,34 @@ mod tests {
 
     #[test]
     fn status_glyph_covers_every_status() {
-        assert_eq!(status_glyph(Status::Working), "🔵");
+        assert_eq!(status_glyph(Status::Working, false), "🔵");
         // Waiting must stay distinct from Working — not the shared blue circle.
-        assert_eq!(status_glyph(Status::Waiting), "⏳");
-        assert_ne!(status_glyph(Status::Waiting), status_glyph(Status::Working));
+        assert_eq!(status_glyph(Status::Waiting, false), "⏳");
+        assert_ne!(status_glyph(Status::Waiting, false), status_glyph(Status::Working, false));
         // Blocked must stay distinct from Error — the orange/red circles read
         // too alike, so Blocked is a raised hand, not a circle.
-        assert_eq!(status_glyph(Status::Blocked), "✋");
-        assert_ne!(status_glyph(Status::Blocked), status_glyph(Status::Error));
-        assert_eq!(status_glyph(Status::Done), "🟢");
-        assert_eq!(status_glyph(Status::Error), "🔴");
-        assert_eq!(status_glyph(Status::Idle), "⚪");
+        assert_eq!(status_glyph(Status::Blocked, false), "✋");
+        assert_ne!(status_glyph(Status::Blocked, false), status_glyph(Status::Error, false));
+        assert_eq!(status_glyph(Status::Done, false), "🟢");
+        assert_eq!(status_glyph(Status::Done, true), "⚪");
+        assert_eq!(status_glyph(Status::Error, false), "🔴");
+        // CLEAN. No grey circle emoji exists, so the dim end of the scale is
+        // black; it must not collide with the white one ⚪ now means.
+        assert_eq!(status_glyph(Status::Idle, false), "⚫");
+        assert_ne!(status_glyph(Status::Idle, false), status_glyph(Status::Done, true));
+    }
+
+    /// `read` is meaningful for `Done` alone. Every other status has one glyph,
+    /// which is what lets `status_from_glyph` answer `false` for them without
+    /// losing information.
+    #[test]
+    fn read_only_changes_the_glyph_for_done() {
+        for status in ALL_STATUSES {
+            if status == Status::Done {
+                continue;
+            }
+            assert_eq!(status_glyph(status, false), status_glyph(status, true), "{status:?}");
+        }
     }
 
     /// The two halves of the map must not drift. `session_restore` reads a status
@@ -995,6 +1037,20 @@ mod tests {
     /// that state after the next restart. A hard-coded array would have passed.
     const ALL_STATUSES: [Status; 6] = [Status::Idle, Status::Working, Status::Waiting, Status::Blocked, Status::Done, Status::Error];
 
+    /// Every distinct thing a tab can say: one reading per status, plus the
+    /// read/unread split that `Done` alone carries. The distinctness assertion
+    /// lives here rather than on `ALL_STATUSES`, because ⚪ belongs to no status
+    /// on its own and a status-keyed set would never evaluate it.
+    const ALL_READINGS: [(Status, bool); 7] = [
+        (Status::Idle, false),
+        (Status::Working, false),
+        (Status::Waiting, false),
+        (Status::Blocked, false),
+        (Status::Done, false),
+        (Status::Done, true),
+        (Status::Error, false),
+    ];
+
     #[test]
     fn the_status_list_these_tests_use_is_every_status() {
         for status in ALL_STATUSES {
@@ -1003,15 +1059,20 @@ mod tests {
                 Status::Idle | Status::Working | Status::Waiting | Status::Blocked | Status::Done | Status::Error => {}
             }
         }
-        assert_eq!(ALL_STATUSES.iter().map(|s| status_glyph(*s)).collect::<std::collections::HashSet<_>>().len(), ALL_STATUSES.len(), "every glyph is distinct, so `parse_title` can invert the map");
     }
 
     #[test]
-    fn every_glyph_round_trips_back_to_its_own_status() {
-        for status in ALL_STATUSES {
-            let title = format!("{} dash", status_glyph(status));
+    fn every_reading_has_its_own_glyph() {
+        let glyphs: std::collections::HashSet<_> = ALL_READINGS.iter().map(|(s, r)| status_glyph(*s, *r)).collect();
+        assert_eq!(glyphs.len(), ALL_READINGS.len(), "every glyph is distinct, so `parse_title` can invert the map");
+    }
+
+    #[test]
+    fn every_glyph_round_trips_back_to_its_own_reading() {
+        for (status, read) in ALL_READINGS {
+            let title = format!("{} dash", status_glyph(status, read));
             let reading = parse_title(&title).expect("parses");
-            assert_eq!(reading.status, status, "{status:?}");
+            assert_eq!((reading.status, reading.read), (status, read), "{status:?} read={read}");
             assert!(reading.names("dash"));
         }
     }
@@ -1244,6 +1305,7 @@ mod tests {
             instruction_drift: false,
             canary: crate::state::Canary::Off,
             attended_at: None,
+            read: false,
             name_shared_by: None,
             subagent_gate: None,
             terminal_stale_at: None,

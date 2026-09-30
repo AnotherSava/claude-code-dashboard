@@ -55,6 +55,12 @@ export interface AgentSession {
   // the tab is not. The instant is here rather than a bool because the Telegram
   // alert waits it out; the badge only cares that it is set. Windows only.
   terminal_stale_at?: number | null
+  // Whether this finished row has already been looked at. DONE covers both
+  // halves now, so the pill reads the same either way and only its shade
+  // differs. Stamped by the Rust display path and by nothing else: it never
+  // crosses the sync wire or `/api/agents`, because whether a human at this
+  // keyboard has looked at a screen is not a peer's business.
+  read?: boolean
 }
 
 export interface UsageColors {
@@ -87,6 +93,12 @@ export interface Config {
   // collapse the usage bars down to their bare percentage. Toggled from the
   // tray's "Compact view" checkbox.
   compact_mode: boolean
+  // How long a CLEAN row stays on the widget before it drops out of view, in
+  // milliseconds; null or 0 keeps every clean row. Only the widget hides them —
+  // the row keeps syncing, keeps its terminal title, and still answers on
+  // /api/agents, where a peer looking for somewhere to send a message has to
+  // find it.
+  clean_hide_after_ms: number | null
 }
 
 export type UsageStatus = 'ok' | 'unavailable' | 'auth_expired' | 'network_error'

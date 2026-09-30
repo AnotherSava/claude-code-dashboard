@@ -31,7 +31,7 @@ use tauri::{AppHandle, Manager};
 use crate::commands::now_ms;
 use crate::config::ConfigState;
 use crate::liveness::{is_claude_image, process_images, AgentPids};
-use crate::state::AppState;
+use crate::state::{AppState, BoundaryKind};
 
 /// Poll cadence. Reaping a vanished session is a backstop, not latency-critical,
 /// so a slower 2s tick is fine.
@@ -125,7 +125,13 @@ pub fn spawn(app: AppHandle) {
                 if tracker.record_dead(&s.id, pid, s.updated) >= DEAD_STREAK_TO_REAP {
                     // `Some(s.updated)` makes remove_session abort if an event
                     // landed since this snapshot — closes the reap-vs-restart race.
-                    if crate::commands::remove_session(&app, &s.id, Some(s.updated), now_ms()) {
+                    //
+                    // `Ended`, never `Clear`: a reaped session exited without
+                    // announcing itself, so its transcript is intact on disk and
+                    // the `--continue` that brings it back brings the whole
+                    // conversation with it. Tagging this boundary `Clear` would
+                    // make every exited session come back claiming to be clean.
+                    if crate::commands::remove_session(&app, &s.id, Some(s.updated), BoundaryKind::Ended, now_ms()) {
                         tracing::debug!(
                             chat_id = %s.id,
                             decision = "reap_exited",

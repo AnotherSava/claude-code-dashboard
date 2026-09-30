@@ -1911,6 +1911,7 @@ mod tests {
             instruction_drift: false,
             canary: crate::state::Canary::Off,
             attended_at: None,
+            read: false,
             name_shared_by: None,
             subagent_gate: None,
             terminal_stale_at: None,
@@ -1918,7 +1919,7 @@ mod tests {
     }
 
     fn entry(role: DialogRole, text: &str, ts: i64) -> DialogEntry {
-        DialogEntry { role, text: text.into(), timestamp: ts, status: Status::Working, task_start: false }
+        DialogEntry { role, text: text.into(), timestamp: ts, status: Status::Working, task_start: false, boundary: None }
     }
     fn push_item(id: &str, dialog_tip: i64) -> SessionSync {
         SessionSync { session: session(id, Vec::new()), dialog_tip }
