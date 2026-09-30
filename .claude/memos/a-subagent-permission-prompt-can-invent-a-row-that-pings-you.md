@@ -20,6 +20,16 @@ TWO FIXES, neither obviously right, which is why this is parked rather than done
 - Mark the invented row. It is the one row in the system provably without a finished turn, so a flag set in `open_subagent_prompt`'s create branch could make `fire_reason` decline it. Costs a field for a rare case, which `feedback_no_redundant_flags` would push back on.
 - Widen `state_observed_here`. It exists to stop a restored row pinging on a state the previous process already announced; "a row this process invented rather than classified" is arguably the same idea. Cheaper, and it puts the decline where the other decline already lives.
 
+A THIRD FIX, and the better one (user, 2026-09-30): **when the work was initiated by another agent rather than by the user, show that agent's prompt** — on the row and in the ping — instead of nothing. That reframes the memo: the complaint is not really that a ping fires, it is that the ping is *empty*, `[project] done` with no text under it, because the row has no dialog of its own. A row that says what was being done is worth having whether or not it also fires.
+
+What is reachable, so this is not a wish:
+
+- **In memory already**, on `SubagentPromptRequest`: `agent_id`, `agent_type`, `tool_name`, `tool_input`, and the `label` the BLOCK showed ("needs approval: Bash"). Enough for a row that reads as something rather than nothing, with no new source.
+- **The subagent's own prompt** is in `agent-<agent_id>.jsonl`, under `<main transcript minus .jsonl>/subagents/`. `subagent_gate` already opens exactly that file on its tick to find the gated call's `tool_result`, so the task text is one read away in a path this code already walks — it is not currently extracted.
+- **For a relay-initiated turn** the text is already on the row, and too much of it: a relayed peer message becomes the row's whole `label` and `original_prompt`, envelope and all. That is [[a-relayed-peer-message-becomes-the-receiving-row-s-label-a]], and the two want solving together — one row has no text and the other has the wrong text, and both are "the initiator was an agent, so use what the agent supplied".
+
+Note this does not by itself stop the ping; it makes the ping worth reading. Whether an invented row should also be declined is still open above, and the answer may now be no.
+
 DO NOT fix it by sending the base back to `Idle`. That reopens the forbidden direction the whole redefinition closed — a row claiming there is nothing to come back to on no evidence — and `state.rs`'s `nothing_evidence_free_can_produce_a_clean_row` test asserts against exactly that, so it would fail loudly and correctly.
 
 Read `state.rs`'s `Status::Done` doc comment and `open_subagent_prompt`'s base-status comment before touching this; both explain why the base is what it is.
