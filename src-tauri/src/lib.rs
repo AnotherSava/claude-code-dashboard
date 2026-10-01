@@ -149,6 +149,7 @@ pub fn run() {
         .manage(terminal_title::TerminalTitles::new())
         .manage(session_registry::SessionRegistry::new())
         .manage(liveness::AgentPids::new())
+        .manage(commands::RowLocks::default())
         .manage(nonce_store::NonceStore::new())
         .manage(lid_awake::LidAwakeState::default())
         .manage(idle_awake::IdleAwakeState::default())

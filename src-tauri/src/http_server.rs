@@ -14,6 +14,7 @@ use crate::adapters::{self, AdapterOutput, SubagentEffect};
 use crate::chat_id_registry::ChatIdRegistry;
 use crate::commands::{emit_sessions_updated, now_ms, resolved_snapshot};
 use crate::config::ConfigState;
+use crate::liveness::RecordedPid;
 use crate::log_watcher::WatcherRegistry;
 use crate::nonce_store::NonceStore;
 use crate::peer_message::{self, Outcome, Receipt};
@@ -273,12 +274,36 @@ fn session_start_nonce(ns: &NonceStore, chat_id: &str, source: &str, now_ms: i64
 /// an authoritative end signal beats a guess. `/clear` still removes its own
 /// row — it fires `SessionEnd` under the *old* session_id, which is the one
 /// that claimed the row, and mints the new id only on the following
-/// `SessionStart`.
+/// `SessionStart`. When that `SessionStart` arrives first instead,
+/// [`clear_overtook_its_end`] does the removal and this refuses the late end.
 fn clear_permitted(owner: Option<&str>, ending: &str) -> bool {
     match owner {
         Some(owner) if !ending.is_empty() => owner == ending,
         _ => true,
     }
+}
+
+/// Whether a `SessionStart` is a `/clear` that reached this server ahead of its
+/// own `SessionEnd`. Both are async hooks, separate processes racing here, and
+/// the start wins often enough to matter. It claims the row for the new
+/// session_id, so `clear_permitted` refuses the late end as a sibling's, and the
+/// teardown the end would have done (a `Clear` separator, the stale context
+/// gauge, a drift flag) is done by nobody.
+///
+/// The test is that the row's owner is the session that recorded the row's pid
+/// and that pid is this event's: `/clear` keeps the process, so that is the
+/// session this one replaces, the same fact `clear_permitted` reads from the
+/// session_id. Pid equality alone is not enough — the hook reports no pid when
+/// its process walk fails, so a sibling sharing the cwd can own the row while
+/// the pid held for it is still this process's. A different pid, or an owner
+/// other than the recording session, is a sibling, whose row this must not
+/// reset. The pid is safe to use here, unlike on a `SessionEnd`, because a
+/// starting session's process is alive to be found. With no row left (the end
+/// got here first) nothing is recorded, so this answers `false` and the
+/// ordinary order runs. A hook that resolves no pid gets the old behaviour.
+fn clear_overtook_its_end(event: &str, source: Option<&str>, recorded: Option<&RecordedPid>, owner: Option<&str>, agent_pid: Option<u32>) -> bool {
+    let Some(recorded) = recorded else { return false };
+    event == "SessionStart" && source == Some("clear") && agent_pid == Some(recorded.pid) && owner.is_some() && recorded.session_id.as_deref() == owner
 }
 
 /// What the per-`Stop` canary check should do to the surfaced `instruction_drift`
@@ -1217,7 +1242,20 @@ async fn post_event(
     if let Some(detail) = csrf_refusal(&headers, false) {
         return csrf_refused(detail).into_response();
     }
+    // A spawned task runs to completion even when this future is dropped, which
+    // hyper does the moment the hook's 2s client timeout closes the socket. An
+    // event waiting on its row lock must not vanish that way: a lost
+    // `SessionStart` leaves a row with no pid, which the reaper never removes.
+    match tauri::async_runtime::spawn_blocking(move || apply_event(&app, req)).await {
+        Ok(response) => response,
+        Err(e) => {
+            tracing::error!(error = %e, "hook event handler failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(EventResponse::default())).into_response()
+        }
+    }
+}
 
+fn apply_event(app: &AppHandle, req: EventRequest) -> Response {
     let Some(state) = app.try_state::<AppState>() else {
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(EventResponse::default())).into_response();
     };
@@ -1253,8 +1291,42 @@ async fn post_event(
         }
     }
 
+    // Held to the end of the handler, so this event's writes across every
+    // per-row store land as a unit — see `RowLocks` for the `/clear` race.
+    let row_id = match &output {
+        AdapterOutput::Set { input, .. } => Some(input.id.as_str()),
+        AdapterOutput::Clear { id } | AdapterOutput::Boundary { id } | AdapterOutput::SubagentStopped { id, .. } => Some(id.as_str()),
+        AdapterOutput::Ignore => None,
+    };
+    let row_lock = match (row_id, app.try_state::<crate::commands::RowLocks>()) {
+        (Some(id), Some(locks)) => Some(locks.row(id)),
+        _ => None,
+    };
+    let _row_guard = row_lock.as_deref().map(crate::commands::RowLocks::hold);
+
     match output {
         AdapterOutput::Set { input, transcript_path, reason, subagent } => {
+            // Do the `/clear` teardown its `SessionEnd` will be refused for, ahead
+            // of everything this event records — its pid, console and ownership,
+            // which the removal would otherwise forget — and of its own
+            // `classify` line, so the log reads in the order end-first does.
+            let owner = app.try_state::<ChatIdRegistry>().and_then(|r| r.owner_of(&input.id));
+            let recorded = app.try_state::<crate::liveness::AgentPids>().and_then(|p| p.recorded(&input.id));
+            let source = req.payload.get("source").and_then(|v| v.as_str());
+            if clear_overtook_its_end(&req.event, source, recorded.as_ref(), owner.as_deref(), req.agent_pid) && crate::commands::remove_session(app, &input.id, None, BoundaryKind::Clear, now_ms()) {
+                if let (Some(registry), Some(ended)) = (app.try_state::<ChatIdRegistry>(), owner.as_deref()) {
+                    registry.supersede(ended);
+                }
+                tracing::debug!(
+                    client = %req.client,
+                    event = %req.event,
+                    chat_id = %input.id,
+                    decision = "session_clear",
+                    reason = "SessionStart:clear arrived before its SessionEnd; row removed on the end's behalf",
+                    ending = ?owner,
+                    "event -> clear"
+                );
+            }
             // Permanent decision record: why this row landed in this state. The
             // `decision` field makes it greppable (the `investigate` skill reads
             // these), and `reason` carries the matched question-rule + a text
@@ -1290,7 +1362,7 @@ async fn post_event(
             // same-cwd restart's new pid supersedes a now-dead one.
             if let Some(pid) = req.agent_pid {
                 if let Some(pids) = app.try_state::<crate::liveness::AgentPids>() {
-                    pids.set(&chat_id, pid);
+                    pids.set(&chat_id, pid, (!session_id.is_empty()).then_some(session_id));
                 }
             }
             // Claim the row for this session, so a `SessionEnd` from another
@@ -1431,6 +1503,21 @@ async fn post_event(
             }
         }
         AdapterOutput::Clear { id } => {
+            // The end of a `/clear` whose start got here first and already
+            // removed the row. Refusing it is right, but it is not a sibling's,
+            // and logging it as one would make every such race read as a fork.
+            if app.try_state::<ChatIdRegistry>().is_some_and(|r| r.take_superseded(session_id)) {
+                tracing::debug!(
+                    client = %req.client,
+                    event = %req.event,
+                    chat_id = %id,
+                    decision = "clear_superseded",
+                    reason = "end of a /clear whose SessionStart already removed the row",
+                    ending = %session_id,
+                    "event -> clear"
+                );
+                return (StatusCode::OK, Json(resp)).into_response();
+            }
             // Two Claude Code instances can hold one cwd — canonically a terminal
             // session forked into a background/desktop one (`--fork-session
             // --resume`) — and the chat_id is cwd-derived, so both address the
@@ -2036,6 +2123,39 @@ mod tests {
         // reported null and "unknown ownership" waved the removal past. The
         // session_id is in the payload either way.
         assert!(!clear_permitted(Some("add18820"), "83820-is-dying"));
+    }
+
+    fn recorded(pid: u32, session: &str) -> RecordedPid {
+        RecordedPid { pid, session_id: Some(session.to_string()) }
+    }
+
+    #[test]
+    fn a_clear_start_from_the_rows_own_process_does_the_late_ends_teardown() {
+        assert!(clear_overtook_its_end("SessionStart", Some("clear"), Some(&recorded(31644, "old")), Some("old"), Some(31644)));
+    }
+
+    #[test]
+    fn a_clear_start_leaves_alone_a_row_it_did_not_write() {
+        // A sibling instance sharing the cwd wrote it last, with its own pid.
+        assert!(!clear_overtook_its_end("SessionStart", Some("clear"), Some(&recorded(2208, "sib")), Some("sib"), Some(31644)));
+        // The sibling wrote last but its hook resolved no pid, so the pid held
+        // is still this process's: the owner is what tells them apart.
+        assert!(!clear_overtook_its_end("SessionStart", Some("clear"), Some(&recorded(31644, "old")), Some("sib"), Some(31644)));
+        // The end got here first and removed the row, taking its pid with it.
+        assert!(!clear_overtook_its_end("SessionStart", Some("clear"), None, None, Some(31644)));
+        // No pid resolved by this hook: nothing to compare.
+        assert!(!clear_overtook_its_end("SessionStart", Some("clear"), Some(&recorded(31644, "old")), Some("old"), None));
+        // A restored row's pid names no session, and nothing owns the row.
+        assert!(!clear_overtook_its_end("SessionStart", Some("clear"), Some(&RecordedPid { pid: 31644, session_id: None }), None, Some(31644)));
+    }
+
+    #[test]
+    fn only_a_clear_start_does_the_teardown() {
+        let own = recorded(31644, "old");
+        for source in [Some("startup"), Some("resume"), Some("compact"), Some("fork"), None] {
+            assert!(!clear_overtook_its_end("SessionStart", source, Some(&own), Some("old"), Some(31644)), "{source:?}");
+        }
+        assert!(!clear_overtook_its_end("UserPromptSubmit", Some("clear"), Some(&own), Some("old"), Some(31644)));
     }
 
     #[test]

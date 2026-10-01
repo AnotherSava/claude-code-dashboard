@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -18,6 +18,12 @@ pub struct ChatIdRegistry {
     /// In-memory only: a restart leaves ownership unknown, which the guard
     /// treats as "defer to the end signal", i.e. today's behavior.
     owners: Mutex<HashMap<String, String>>,
+    /// Sessions whose row a `/clear` `SessionStart` already tore down because it
+    /// reached the server before their `SessionEnd`. That end then arrives
+    /// from a session that no longer owns the row, and this is how the `Clear`
+    /// guard tells it from a sibling's. Taken on arrival; an end that never
+    /// arrives leaves one id behind, in memory only.
+    superseded: Mutex<HashSet<String>>,
 }
 
 impl ChatIdRegistry {
@@ -38,6 +44,7 @@ impl ChatIdRegistry {
             path,
             data: Mutex::new(data),
             owners: Mutex::new(HashMap::new()),
+            superseded: Mutex::new(HashSet::new()),
         }
     }
 
@@ -55,6 +62,19 @@ impl ChatIdRegistry {
     /// been written since startup.
     pub fn owner_of(&self, chat_id: &str) -> Option<String> {
         self.owners.lock().unwrap().get(chat_id).cloned()
+    }
+
+    /// Records that `session_id`'s row was torn down ahead of its `SessionEnd`.
+    pub fn supersede(&self, session_id: &str) {
+        if !session_id.is_empty() {
+            self.superseded.lock().unwrap().insert(session_id.to_string());
+        }
+    }
+
+    /// Whether `session_id`'s row was already torn down by a `/clear` start,
+    /// consuming the record.
+    pub fn take_superseded(&self, session_id: &str) -> bool {
+        self.superseded.lock().unwrap().remove(session_id)
     }
 
     /// Drops ownership of a row that is going away, so a later session reusing
@@ -159,6 +179,17 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&path);
         ChatIdRegistry::new(path)
+    }
+
+    #[test]
+    fn a_superseded_session_is_reported_once() {
+        let r = registry();
+        r.supersede("old");
+        r.supersede("");
+        assert!(!r.take_superseded("sibling"));
+        assert!(r.take_superseded("old"));
+        assert!(!r.take_superseded("old"), "consumed by the end it was kept for");
+        assert!(!r.take_superseded(""));
     }
 
     #[test]

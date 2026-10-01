@@ -400,7 +400,7 @@ fn tick(app: &AppHandle, adapter: &dyn crate::terminals::TerminalAdapter) -> Pas
             // stranded forever — and worse than the hook case, because a restored
             // row also has no owner in `ChatIdRegistry`, so nothing removes it.
             if let Some(pids) = app.try_state::<crate::liveness::AgentPids>() {
-                pids.set(&r.id, pid);
+                pids.set(&r.id, pid, None);
             }
             // And give `terminal_title` a console candidate, so the blank it
             // writes when a row goes away can still reach the tab. Its own

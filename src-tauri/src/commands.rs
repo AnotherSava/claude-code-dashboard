@@ -1002,21 +1002,65 @@ pub fn set_chat_name(chat_id: String, name: String, app: AppHandle) {
     emit_sessions_updated(&app);
 }
 
+/// One lock per row id, taken by every writer that sets up or tears down a
+/// row's per-session state as a unit: the hook handler for each event, and the
+/// liveness reaper around its removal.
+///
+/// A row's state is spread over several stores (`AppState`, `AgentPids`, the
+/// watcher, `NonceStore`, `ChatIdRegistry`), each with its own lock, so no single
+/// lock orders a teardown against a setup. `/clear` is where that bites: Claude
+/// Code fires `SessionEnd` and `SessionStart` as async hooks, two processes
+/// racing to this server, and the `SessionEnd` teardown runs a 12MB
+/// `prompt_history.json` write between dropping the row and forgetting its pid.
+/// A `SessionStart` landing in that write would recreate the row and record the
+/// pid, and the late forget would then delete it, leaving a row the reaper can
+/// never judge, which outlives its closed terminal indefinitely. Holding this lock for
+/// the whole of each handler makes each event's effects land as a unit. It does
+/// not order the two events: when `SessionStart` wins the race outright it does
+/// the teardown itself (`http_server::clear_overtook_its_end`) and
+/// `clear_permitted` then refuses the late end.
+///
+/// A blocking mutex, taken off the async runtime: the hook handler runs on the
+/// blocking pool so that waiting here cannot become a point where a dropped
+/// request cancels it. Never taken on the main thread or inside
+/// `emit_sessions_updated`, which blocks on the main thread; never held across
+/// two ids.
+/// Entries are not pruned — there is one per project ever tracked in this
+/// process.
+#[derive(Default)]
+pub struct RowLocks {
+    map: std::sync::Mutex<HashMap<String, std::sync::Arc<std::sync::Mutex<()>>>>,
+}
+
+impl RowLocks {
+    pub fn row(&self, id: &str) -> std::sync::Arc<std::sync::Mutex<()>> {
+        self.map.lock().unwrap().entry(id.to_string()).or_default().clone()
+    }
+
+    /// The guard tolerates poisoning: the lock guards no data, so a handler
+    /// that panicked leaves nothing inconsistent behind it, and refusing every
+    /// later event for that row would be the worse failure.
+    pub fn hold(row: &std::sync::Mutex<()>) -> std::sync::MutexGuard<'_, ()> {
+        row.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
 /// Remove a local session row exactly as a `SessionEnd` would — append a
 /// history separator, persist the final dialog, drop the in-memory row, stop its
 /// transcript watcher and owning-pid tracking, and emit. Shared by the
-/// `SessionEnd` Clear branch ([`crate::http_server`]) and the liveness reaper
-/// ([`crate::liveness_reaper`]) so the two removal paths can't drift apart.
+/// `SessionEnd` Clear branch and the `/clear` `SessionStart` that overtook its
+/// end ([`crate::http_server`]), and by the liveness reaper
+/// ([`crate::liveness_reaper`]), so the removal paths can't drift apart.
 ///
 /// `expect_updated`, when `Some`, makes the removal abort (returns `false`) if
 /// the row received a new event since it was observed — the reaper passes the
-/// row's last-seen `updated` to close the reap-vs-restart race; the Clear branch
-/// passes `None` (it is reacting to an authoritative event). Returns whether a
+/// row's last-seen `updated` to close the reap-vs-restart race; the two hook
+/// paths pass `None` (they are reacting to an authoritative event). Returns whether a
 /// row was actually removed.
 ///
-/// `kind` tags the separator this appends, and the two callers disagree about
-/// it on purpose: only a `SessionEnd` whose reason is `clear` wiped the context,
-/// so only that one passes [`BoundaryKind::Clear`]. A reaped session and an
+/// `kind` tags the separator this appends, and the callers disagree about it on
+/// purpose: only a `/clear` wiped the context, so only its `SessionEnd`, or the
+/// `SessionStart` that overtook it, passes [`BoundaryKind::Clear`]. A reaped session and an
 /// ordinary exit pass [`BoundaryKind::Ended`] — their transcripts are still on
 /// disk, and `--continue` brings the conversation back, so the row that returns
 /// must not claim there is nothing to come back to.
@@ -1283,6 +1327,31 @@ pub fn get_persisted_dialog(id: String, app: AppHandle) -> Vec<crate::state::Dia
 mod tests {
     use super::*;
     use crate::state::{DialogEntry, DialogRole, Status};
+
+    #[test]
+    fn row_lock_serializes_one_row_and_not_others() {
+        let locks = RowLocks::default();
+        let a = locks.row("a");
+        let held = RowLocks::hold(&a);
+        assert!(locks.row("a").try_lock().is_err(), "a second writer for the same row waits");
+        assert!(locks.row("b").try_lock().is_ok(), "a different row does not");
+        drop(held);
+        assert!(locks.row("a").try_lock().is_ok());
+    }
+
+    #[test]
+    fn row_lock_survives_a_panicking_holder() {
+        let locks = std::sync::Arc::new(RowLocks::default());
+        let l = locks.clone();
+        let _ = std::thread::spawn(move || {
+            let row = l.row("a");
+            let _g = RowLocks::hold(&row);
+            panic!("handler panicked");
+        })
+        .join();
+        let row = locks.row("a");
+        let _g = RowLocks::hold(&row); // would panic on a poisoned unwrap
+    }
 
     /// `name_counts` keyed by the row id, which is what the caller then reads
     /// through each row's label — the shape the assertions care about.

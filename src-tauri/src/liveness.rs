@@ -32,13 +32,27 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-/// Latest owning Claude pid per chat_id, as reported by the hook on each event.
+/// Latest owning Claude pid per chat_id, as reported by the hook on each event,
+/// with the `session_id` of the event that reported it.
 /// Overwrite semantics (not the intersection [`crate::terminal_title`] uses):
 /// each event carries the *current* pid, so a session restarted in the same cwd
 /// replaces a now-dead pid before the reaper can act on the stale one.
+///
+/// The session is kept because the pid is not written on every event — the hook
+/// reports none when its process walk fails — so the session that last wrote a
+/// row (`ChatIdRegistry::owner_of`) need not be the one whose pid is held here.
+/// A reader asking "is this pid the owner's?" has to compare both.
 #[derive(Default)]
 pub struct AgentPids {
-    map: Mutex<HashMap<String, u32>>,
+    map: Mutex<HashMap<String, RecordedPid>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecordedPid {
+    pub pid: u32,
+    /// `None` where the pid came from somewhere other than a hook event
+    /// (`session_restore`), which names no session.
+    pub session_id: Option<String>,
 }
 
 impl AgentPids {
@@ -46,12 +60,17 @@ impl AgentPids {
         Self::default()
     }
 
-    pub fn set(&self, chat_id: &str, pid: u32) {
-        self.map.lock().unwrap().insert(chat_id.to_string(), pid);
+    pub fn set(&self, chat_id: &str, pid: u32, session_id: Option<&str>) {
+        let recorded = RecordedPid { pid, session_id: session_id.map(str::to_string) };
+        self.map.lock().unwrap().insert(chat_id.to_string(), recorded);
     }
 
     pub fn get(&self, chat_id: &str) -> Option<u32> {
-        self.map.lock().unwrap().get(chat_id).copied()
+        self.map.lock().unwrap().get(chat_id).map(|r| r.pid)
+    }
+
+    pub fn recorded(&self, chat_id: &str) -> Option<RecordedPid> {
+        self.map.lock().unwrap().get(chat_id).cloned()
     }
 
     pub fn forget(&self, chat_id: &str) {
@@ -169,9 +188,9 @@ mod tests {
     #[test]
     fn agent_pids_keeps_only_the_latest() {
         let p = AgentPids::new();
-        p.set("a", 100);
+        p.set("a", 100, Some("s1"));
         assert_eq!(p.get("a"), Some(100));
-        p.set("a", 200); // a same-cwd restart reports the new pid
+        p.set("a", 200, Some("s2")); // a same-cwd restart reports the new pid
         assert_eq!(p.get("a"), Some(200));
         p.forget("a");
         assert_eq!(p.get("a"), None);

@@ -123,6 +123,11 @@ pub fn spawn(app: AppHandle) {
                     continue;
                 }
                 if tracker.record_dead(&s.id, pid, s.updated) >= DEAD_STREAK_TO_REAP {
+                    // A hook event for this row either finishes before the
+                    // removal (moving `updated`, so it aborts) or waits for it,
+                    // so its fresh pid is never forgotten by this teardown.
+                    let row_lock = app.try_state::<crate::commands::RowLocks>().map(|locks| locks.row(&s.id));
+                    let _row_guard = row_lock.as_deref().map(crate::commands::RowLocks::hold);
                     // `Some(s.updated)` makes remove_session abort if an event
                     // landed since this snapshot — closes the reap-vs-restart race.
                     //
