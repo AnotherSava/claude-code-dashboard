@@ -16,3 +16,11 @@ No config edit needed: read the token straight from the app-data `config.json` a
 Verify landing via `remote_history/<DEVICE>.json` and `remote_usage/<DEVICE>.json`, plus the `dialog range pulled` / `usage range pulled` lines in `widget.jsonl`. A tip equal to what's held must produce **no** request. Clean up by deleting both files and restarting, or the fake device lingers as a row.
 
 Verify UI rows via `PrintWindow` with `PW_RENDERFULLCONTENT` (flag 3) on the process `MainWindowHandle` — works when the widget is occluded (e.g. fullscreen video), unlike `CopyFromScreen`. Related: [[debug-synthetic-hook-events]].
+
+## To check what a *sent envelope* carries, serve `/api/sync/message` and read the JSON
+
+`build_content` runs on the **receiving** dashboard, so a new `MessageEnvelope` field cannot be verified by relaying to a real peer and asking what it saw: a peer on a build that predates the field ignores it silently and renders a header without it, which is indistinguishable from a sender that stamped nothing. Measured 2026-09-30 while adding `from_task` — the live peer answered "absent", correctly, and that answer said nothing about the sender.
+
+So add `POST /api/sync/message` to the stub, store the parsed envelope and print the fields. That is the authoritative view of what this machine emitted, taken before any renderer touches it. Announce the stub first (the push above) so the device is known and the hop resolves to it; pair it with a synthetic `UserPromptSubmit` ([[debug-synthetic-hook-events]]) when the field is stamped off a live row, since a row restored after a restart has no `original_prompt` and correctly stamps nothing.
+
+Two cleanup notes the pull-only flow does not hit: the device entry outlives the sessions, so a roster read filtered to rows shows it gone while `peer_relay.py` still fans out to it until the 90–120s TTL reap; and `peer_relay.py` sends to *every* known device, so a leftover stub gets a copy of whatever is sent next. Complements [[verify-peer-message-delivery]], which covers the opposite question — where a message *went*.

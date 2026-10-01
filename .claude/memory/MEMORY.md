@@ -20,7 +20,7 @@
 - [Console-title checks: no-screen verification](debug_console_titles_tool_consoles.md) — confirm a write via the widget.jsonl "terminal title written" log line; general Bash-vs-PowerShell trap is now a global learning
 - [Terminal title follow-ups](terminal_title_followups.md) — deferred: yes-button via WriteConsoleInputW, Claude OSC title clobbering options
 - [Synthetic hook events for e2e tests](debug_synthetic_hook_events.md) — pipe fake-cwd payloads through claude_hook.py; SessionEnd cleans up; check widget.jsonl
-- [Sync e2e via fake peer](debug_sync_fake_peer.md) — don't run two app instances (shared %APPDATA%); Python peer on :9080 + temp sync block in config/local.json; PrintWindow flag 3 for occluded-widget screenshots
+- [Sync e2e via fake peer](debug_sync_fake_peer.md) — don't run two app instances (shared %APPDATA%); Python peer that pushes AND serves, no config edit; serve /api/sync/message to read a sent envelope
 - [Terminal-reading e2e](debug_terminal_reading_e2e.md) — bind synthetic Working session to real console pids (GetConsoleProcessList in PowerShell tool), POST direct to /api/event, end turn, bg-watch widget.jsonl
 - [Real-device sync pair](sync_device_pair.md) — Tailscale MagicDNS peers `chrome`/`air` on :9078 (not mDNS `.local`), token in each config/local.json; pingable-but-port-timeout Mac = asleep, not firewalled
 - [Remote store device keying](remote_store_device_keying.md) — keyed by inner `device` field; merge don't rename; one bad enum value kills a file
