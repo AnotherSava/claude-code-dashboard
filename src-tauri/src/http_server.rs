@@ -797,6 +797,11 @@ struct MessageRequest {
     /// its own admission bucket on the receiver.
     #[serde(default)]
     from_agent: Option<String>,
+    /// The caller's own one-line account of **why it is writing**, in its own
+    /// words. Deliberately a separate field from the envelope's `from_task`,
+    /// which is what this dashboard has on record for the row the caller named:
+    /// the two are different facts of different strengths, and one field holding
+    /// either would need a flag to say which it currently held.
     #[serde(default)]
     from_label: Option<String>,
     /// Set when this send answers a message that arrived here, echoing the
@@ -804,6 +809,37 @@ struct MessageRequest {
     /// dashboard branches on it.
     #[serde(default)]
     in_reply_to: Option<String>,
+}
+
+/// The task this dashboard has on record for the row the caller named.
+///
+/// **This corroborates a claim; it does not observe the sender.** `from_agent`
+/// is chosen by the caller — the route is loopback and unauthenticated — so the
+/// row looked up here is the one the caller *named*, which is its own row only
+/// as far as that name is right. A caller that misnames itself gets another
+/// row's task, which is why neither this function's result nor the envelope line
+/// built from it is ever worded as something the dashboard saw. What makes the
+/// value worth sending anyway is that the alternative is nothing: the receiving
+/// row otherwise has no text of its own at all.
+///
+/// Attesting the loopback caller's process would turn the claimed half into an
+/// observed one, and is the subject of its own memo; nothing here changes shape
+/// when it arrives.
+///
+/// `None` wherever there is no answer — an unidentified caller, a name no local
+/// row carries, a row that has no prompt recorded yet — never a substitute.
+/// Remote rows are skipped: a row this device merely syncs is some other
+/// machine's, so its prompt is not ours to report as a local sender's.
+fn sender_task(rows: &[AgentSession], from_agent: &str) -> Option<String> {
+    if from_agent == "unknown" {
+        return None;
+    }
+    rows.iter()
+        .find(|s| s.origin.is_none() && s.id == from_agent)
+        .and_then(|s| s.original_prompt.as_deref())
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(str::to_string)
 }
 
 /// Relay one message to an agent on another machine.
@@ -851,7 +887,12 @@ async fn post_message(State(app): State<AppHandle>, headers: HeaderMap, Json(req
     // Local ids come from both session sources, so a session the hook stream has
     // not heard from this run is still recognized as local rather than being
     // relayed to a machine it is not on.
-    let mut local_ids: Vec<String> = resolved_snapshot(&app).into_iter().filter(|s| s.origin.is_none()).map(|s| s.id).collect();
+    //
+    // The rows are kept rather than reduced to ids on the spot, because
+    // `sender_task` needs one of them further down and a second snapshot would
+    // be a second answer to the same question.
+    let rows = resolved_snapshot(&app);
+    let mut local_ids: Vec<String> = rows.iter().filter(|s| s.origin.is_none()).map(|s| s.id.clone()).collect();
     if let Some(registry) = app.try_state::<SessionRegistry>() {
         if let Some(live) = registry.live_sessions(cfg.projects_root.as_deref(), now) {
             local_ids.extend(live.into_iter().map(|s| s.chat_id));
@@ -1019,6 +1060,7 @@ async fn post_message(State(app): State<AppHandle>, headers: HeaderMap, Json(req
         target_project: project,
         from_agent: from_agent.to_string(),
         from_label: req.from_label.clone(),
+        from_task: sender_task(&rows, from_agent),
         text: req.text.clone(),
         reply_to,
         in_reply_to: req.in_reply_to.clone(),
@@ -1522,6 +1564,43 @@ mod tests {
 
     fn devices(entries: &[(&str, i64)]) -> BTreeMap<String, i64> {
         entries.iter().map(|(d, seen)| (d.to_string(), *seen)).collect()
+    }
+
+    fn with_prompt(id: &str, origin: Option<&str>, prompt: Option<&str>) -> AgentSession {
+        AgentSession { original_prompt: prompt.map(str::to_string), ..session(id, Status::Working, origin, 0) }
+    }
+
+    #[test]
+    fn the_named_rows_task_is_what_gets_stamped() {
+        let rows = [with_prompt("transcripts", None, Some("tidy the importer")), with_prompt("what-is-next", None, Some("re-shoot the macOS figures"))];
+        assert_eq!(sender_task(&rows, "what-is-next").as_deref(), Some("re-shoot the macOS figures"));
+    }
+
+    /// Every way of having no answer gives `None`, never a substitute. A caller
+    /// that did not identify itself, named a row this device does not hold, or
+    /// names one that has recorded no prompt yet gets the task omitted — the
+    /// envelope then says nothing about it, which is the truth.
+    #[test]
+    fn nothing_is_stamped_where_there_is_no_answer() {
+        let rows = [with_prompt("transcripts", None, Some("tidy the importer")), with_prompt("blank", None, None), with_prompt("spaces", None, Some("   "))];
+        assert_eq!(sender_task(&rows, "unknown"), None, "an unidentified caller claimed no row to read");
+        assert_eq!(sender_task(&rows, "no-such-row"), None, "a name no local row carries is not a reason to pick another");
+        assert_eq!(sender_task(&rows, "blank"), None, "a row with no prompt recorded has no task to report");
+        assert_eq!(sender_task(&rows, "spaces"), None, "a whitespace-only prompt is no prompt");
+        assert_eq!(sender_task(&[], "transcripts"), None);
+    }
+
+    /// A remote row is some other machine's, so its prompt is not this device's
+    /// to report as a local sender's task. Keyed on `origin.is_none()` — the
+    /// authoritative local test the roster uses — rather than on the id, which
+    /// a peer running the same project shares.
+    #[test]
+    fn a_remote_row_is_never_read_as_the_senders_task() {
+        let rows = [with_prompt("what-is-next", Some("chrome"), Some("something on the other box"))];
+        assert_eq!(sender_task(&rows, "what-is-next"), None);
+
+        let both = [with_prompt("what-is-next", Some("chrome"), Some("the peer's task")), with_prompt("what-is-next", None, Some("this machine's task"))];
+        assert_eq!(sender_task(&both, "what-is-next").as_deref(), Some("this machine's task"), "the local row answers even where a same-named remote one is listed first");
     }
 
     #[test]

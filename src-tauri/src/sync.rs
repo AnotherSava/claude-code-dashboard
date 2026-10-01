@@ -211,8 +211,28 @@ pub struct MessageEnvelope {
     /// bucket on the receiver (see `peer_message::from_id`).
     #[serde(default)]
     pub from_agent: String,
+    /// The sender's own one-line account of why it is writing, in its own words.
     #[serde(default)]
     pub from_label: Option<String>,
+    /// What the **sending dashboard** has on record as the current task of the
+    /// row `from_agent` names, stamped by `http_server::sender_task`.
+    ///
+    /// A separate field from `from_label` rather than a fallback inside it,
+    /// because the two are different facts with different authors: one is the
+    /// sender's account of its intent, the other a dashboard's record of a task.
+    /// Collapsing them would need a flag saying which meaning the field
+    /// currently held, which is the signal that it is holding two.
+    ///
+    /// Not an observation of the sender. `from_agent` is a claim on an
+    /// unauthenticated loopback route, so this is the task of the row the sender
+    /// *named*; `sender_task`'s own docs carry the consequence. The envelope
+    /// line built from it says whose record it is for that reason.
+    ///
+    /// `serde(default)` like every field here, so a peer built before this
+    /// existed still parses an envelope carrying it, and one built after still
+    /// parses an envelope without it.
+    #[serde(default)]
+    pub from_task: Option<String>,
     #[serde(default)]
     pub text: String,
     /// The exact `{device}/{project}` address a reply goes to, minted by the
@@ -862,6 +882,7 @@ async fn post_message(
         origin_device: &env.origin_device,
         from_agent: &env.from_agent,
         from_label: env.from_label.as_deref(),
+        from_task: env.from_task.as_deref(),
         text: &env.text,
         reply_to: env.reply_to.as_deref(),
         message_id: &env.message_id,
@@ -2230,7 +2251,20 @@ mod tests {
         let env: MessageEnvelope = serde_json::from_str(body).expect("older envelope should parse");
         assert_eq!(env.from_agent, "");
         assert_eq!(env.from_label, None);
+        assert_eq!(env.from_task, None, "a peer predating from_task sends none, and the envelope must read that as absent rather than fail");
         assert_eq!(env.text, "hi");
+    }
+
+    /// The other direction of the same skew, which is the one that actually
+    /// ships first: this device stamps `from_task` and the peer receiving it may
+    /// be the older build. An unknown field must be ignored, not rejected —
+    /// serde's default for a struct, asserted because the whole route would
+    /// break on the day one machine updates ahead of the other.
+    #[test]
+    fn a_message_envelope_carrying_from_task_parses_on_a_peer_that_ignores_it() {
+        let body = r#"{"origin_device":"air","message_id":"air-1-0","target_project":"transcripts","from_agent":"what-is-next","from_task":"re-shoot the macOS figures","text":"hi"}"#;
+        let env: MessageEnvelope = serde_json::from_str(body).expect("newer envelope should parse");
+        assert_eq!(env.from_task.as_deref(), Some("re-shoot the macOS figures"));
     }
 
     /// The distinction the whole receipt vocabulary turns on: a refused
