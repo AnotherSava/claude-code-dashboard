@@ -11,9 +11,12 @@ pub enum Status {
     ///
     /// **Settable only on positive evidence**, and that prohibition is the whole
     /// point of the variant. The three sources are a `SessionStart` whose
-    /// `source` is `clear` or `startup`, a `resume` whose restored dialog ends in
-    /// a [`BoundaryKind::Clear`] separator, and a relay turn that a pure peer
-    /// pull declared value-free. Nothing else may write it — above all not a
+    /// `source` is `clear` or `startup` (`adapters::claude`), a `resume` whose
+    /// restored dialog ends in a [`BoundaryKind::Clear`] separator
+    /// (`http_server::resume_is_clean`), and a relayed peer pull that reported
+    /// leaving nothing behind, on a row that was already clean when the request
+    /// arrived (`http_server::pull_declared_clean`). Nothing else may write it —
+    /// above all not a
     /// degrade path, which is what five of them used to do back when this variant
     /// was also the "we know nothing" sink.
     ///
@@ -323,6 +326,40 @@ pub struct AgentSession {
     /// remote row's timestamps are the sender's clock.
     #[serde(skip)]
     pub attended_at: Option<i64>,
+    /// Whether the turn currently in flight was begun by a relayed peer message
+    /// rather than by something a human typed — captured by `apply_set` on the
+    /// same non-`Working` → `Working` transition that captures
+    /// `status_before_working`, from `SetInput::turn_from_relay`.
+    ///
+    /// Both facts are about *this turn*, and both are written by one line of one
+    /// function at one instant, so they cannot come to disagree about which turn
+    /// they describe. That is the whole reason this is captured at the transition
+    /// rather than stamped when the frame is written into the session's inbox:
+    /// across 115 measured `peer_write`s, 16 produced no arriving prompt at all
+    /// and 4 arrived in one burst 3.8 to 8.1 hours later, so a stamp left waiting
+    /// for "the next turn" to collect it would be collected by a turn that had
+    /// nothing to do with it — a human-typed one, hours later.
+    ///
+    /// Internal bookkeeping — never serialized to the frontend, to sync, or to
+    /// disk (mirrors `status_before_working`), so a restart loses it and the row
+    /// falls back to not-relayed, which is the direction that declines to make a
+    /// CLEAN claim rather than inventing one.
+    #[serde(skip)]
+    pub turn_from_relay: bool,
+    /// When a `/pull` run told this dashboard it left nothing worth coming back
+    /// to (`POST /api/session-clean`), as wall-clock ms — `None` whenever no such
+    /// claim is outstanding.
+    ///
+    /// A *claim*, not a verdict: it says only what the skill observed about its
+    /// own run, and `http_server::pull_declared_clean` decides whether it may
+    /// become [`Status::Idle`]. It is recorded mid-turn, because `/pull` posts
+    /// from inside the turn it is reporting on, and consumed at that turn's
+    /// `Stop`; `apply_set` drops it on every entry into `Working`, so a claim no
+    /// `Stop` ever came for cannot be redeemed by a later turn. That is the
+    /// revocation rule the design asked for, and it falls out of the ordering
+    /// rather than needing a timer.
+    #[serde(skip)]
+    pub clean_claim_at: Option<i64>,
     /// Whether this finished row has been looked at — the [`Attention::Seen`]
     /// verdict, flattened for the frontend and the tab title.
     ///
@@ -337,9 +374,10 @@ pub struct AgentSession {
     /// to mean finished-*and-unread*, so a second field would have been a
     /// duplicate state signal; now that `Done` covers both and `Idle` means
     /// clean, this is the only place the distinction lives. The frontend renders
-    /// it as a paler green pill, `terminal_title::status_glyph` as ⚪ instead of
-    /// 🟢, and `session_restore` reads that glyph back — which is why nothing
-    /// persists `attended_at` and nothing needs to.
+    /// it as the inverse of the CLEAN pill — grey text on a dark fill becomes dark
+    /// text on a grey fill — `terminal_title::status_glyph` as ⚪ instead of 🟢,
+    /// and `session_restore` reads that glyph back, which is why nothing persists
+    /// `attended_at` and nothing needs to.
     ///
     /// Threaded from the stamp rather than recomputed downstream: the stamp is
     /// gated on `config.attention_tracking`, and a second caller computing
@@ -596,6 +634,19 @@ impl AgentSession {
     }
 }
 
+/// What a row knows that bears on whether a `/pull` run may leave it CLEAN.
+/// Read as a set by [`AppState::clean_claim_facts`] and judged by the pure
+/// `http_server::pull_declared_clean`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CleanClaimFacts {
+    /// A `/pull` run has posted `POST /api/session-clean` during this turn.
+    pub claimed: bool,
+    /// This turn was begun by a relayed peer message.
+    pub turn_from_relay: bool,
+    /// What the row was immediately before this turn began.
+    pub status_before_working: Status,
+}
+
 #[derive(Clone, Debug)]
 pub struct SetInput {
     pub id: String,
@@ -609,6 +660,25 @@ pub struct SetInput {
     /// silently-killable (`shell`) background task holds the WAIT, arming the
     /// `waiting_settle` backstop. `false` for every other event/status.
     pub waiting_backstop_armed: bool,
+    /// Who began the turn this event belongs to — `Some(true)` when a relayed
+    /// peer message did, `Some(false)` when a human typed it, and `None` from
+    /// every event that says nothing either way.
+    ///
+    /// Set to `Some` by the `UserPromptSubmit` adapter alone, which is the only
+    /// event that *is* a prompt arriving. The three-state form is what keeps the
+    /// question separate from the status: `log_watcher`'s promote also sets
+    /// `Working`, and reading relay-ness off the status would let a promotion
+    /// mid-turn silently rewrite who started it.
+    ///
+    /// `apply_set` acts on `Some` regardless of the transition, unlike
+    /// `status_before_working`, which is captured only on a real entry into
+    /// `Working`. The two differ because they answer different questions: that
+    /// field is where an Esc-cancel reverts to, so it must survive a
+    /// `Working` → `Working` prompt, while this one is about the turn now in
+    /// flight and has to follow every prompt. Conflating them left a claim from an
+    /// unsettled turn redeemable by the next one — caught by
+    /// `a_new_turn_revokes_an_unredeemed_clean_claim`.
+    pub turn_from_relay: Option<bool>,
 }
 
 /// True when `label` (after trim, case-insensitive) matches one of the
@@ -838,6 +908,24 @@ impl AppState {
                     existing.status_before_working = prior;
                 }
 
+                // A prompt arriving is what records who began the turn, and what
+                // revokes any clean claim still outstanding. Keyed on the event
+                // being a prompt (`Some`) rather than on the transition, because a
+                // second prompt before any `Stop` is `Working` → `Working`: gating
+                // this on the transition above left the first turn's claim and its
+                // relay flag in place for the next turn to redeem.
+                //
+                // `/pull` posts from inside the turn it reports on, so a claim
+                // still here when another prompt lands is one whose `Stop` never
+                // came — the turn went on to do other work, or was cancelled.
+                // Either way it no longer describes anything about to end, which
+                // is the revocation rule falling out of the ordering rather than
+                // needing a timer.
+                if let Some(relay) = input.turn_from_relay {
+                    existing.turn_from_relay = relay;
+                    existing.clean_claim_at = None;
+                }
+
                 let (new_label, new_original_prompt) =
                     crate::label_policy::select(Some(&*existing), &input, task_boundary);
 
@@ -974,7 +1062,8 @@ impl AppState {
     /// On an existing row the first prompt captures the base; later ones join
     /// without re-capturing it, which is what lets two agents' prompts settle in
     /// either order. A row this creates has nothing of the main agent's to
-    /// capture, so its base is an `Idle` stamped now.
+    /// capture, so its base is a `Done` stamped now — the neutral sink, for the
+    /// reason the branch that writes it gives.
     pub fn open_subagent_prompt(&self, input: SetInput, prompt: SubagentPromptRequest, now_ms: i64, restored: Option<PersistedSession>) -> OpenOutcome {
         let mut sessions = self.sessions.lock().unwrap();
         // Relaxed for the reason `snapshot_versioned` gives: the ordering is the mutex's.
@@ -1121,6 +1210,12 @@ fn new_session(
         terminal_stale_at: None,
         canary: Canary::Off,
         attended_at: None,
+        // Carried where the event that creates the row is itself a prompt. The
+        // row is still refused a CLEAN settle, because `status_before_working`
+        // on a row this process has never seen before cannot say it was clean —
+        // but the fact that is knowable is recorded rather than flattened.
+        turn_from_relay: input.turn_from_relay.unwrap_or(false),
+        clean_claim_at: None,
         read: false,
         name_shared_by: None,
         subagent_gate: None,
@@ -1204,6 +1299,40 @@ impl AppState {
             s.state_entered_at = now_ms;
             s.updated = now_ms;
             Some((s.status, gated))
+        })
+    }
+
+    /// Record that a `/pull` run reported leaving nothing worth coming back to.
+    ///
+    /// Stores only the claim — whether it may become [`Status::Idle`] is
+    /// `http_server::pull_declared_clean`'s to decide at the turn's `Stop`, from
+    /// this plus the two facts `apply_set` captured about the turn. Returns
+    /// `false` when no such row exists, which is the honest answer to a claim for
+    /// a session this dashboard is not tracking.
+    ///
+    /// Deliberately **not** routed through `apply_set`: nothing about the row's
+    /// status changes here, so going through the transition machinery would reset
+    /// `state_entered_at` and bank working time for a bookkeeping write. It does
+    /// not bump `updated` either, for the reason `mark_attended` does not — a
+    /// claim is not activity, and `updated` is the compare-and-swap guard the
+    /// reaper and the WAIT backstop abort on.
+    pub fn record_clean_claim(&self, id: &str, now_ms: i64) -> bool {
+        let mut sessions = self.sessions.lock().unwrap();
+        let Some(s) = sessions.iter_mut().find(|s| s.id == id) else { return false };
+        s.clean_claim_at = Some(now_ms);
+        true
+    }
+
+    /// The three facts `pull_declared_clean` needs about a row, read under one
+    /// lock so they cannot be sampled at different instants.
+    pub fn clean_claim_facts(&self, id: &str) -> Option<CleanClaimFacts> {
+        let sessions = self.sessions.lock().unwrap();
+        sessions.iter().find(|s| s.id == id).map(|s| CleanClaimFacts {
+            claimed: s.clean_claim_at.is_some(),
+            turn_from_relay: s.turn_from_relay,
+            // The main agent's own status, so a subagent prompt overlaying the
+            // row cannot make its pre-turn state unreadable.
+            status_before_working: s.status_before_working,
         })
     }
 
@@ -1524,6 +1653,7 @@ mod tests {
             input_tokens: None,
             dialog_entry: None,
             waiting_backstop_armed: false,
+            turn_from_relay: None,
         }
     }
 
@@ -1537,6 +1667,7 @@ mod tests {
             input_tokens: None,
             dialog_entry: None,
             waiting_backstop_armed: false,
+            turn_from_relay: None,
         }
     }
 
@@ -2161,6 +2292,7 @@ mod tests {
                 input_tokens: Some(50_000),
                 dialog_entry: None,
                 waiting_backstop_armed: false,
+                turn_from_relay: None,
             },
             1000,
             NO_CONTINUATIONS,
@@ -2337,6 +2469,7 @@ mod tests {
                 text: label.to_string(),
             }),
             waiting_backstop_armed: false,
+            turn_from_relay: None,
         }
     }
 
@@ -2353,6 +2486,7 @@ mod tests {
                 text: agent_text.to_string(),
             }),
             waiting_backstop_armed: false,
+            turn_from_relay: None,
         }
     }
 
@@ -2514,6 +2648,8 @@ mod tests {
             terminal_stale_at: None,
             canary: Canary::Off,
             attended_at: None,
+            turn_from_relay: false,
+            clean_claim_at: None,
             read: false,
             name_shared_by: None,
             subagent_gate: None,
@@ -2784,6 +2920,8 @@ mod tests {
             terminal_stale_at: None,
             canary: Canary::Off,
             attended_at: None,
+            turn_from_relay: false,
+            clean_claim_at: None,
             read: false,
             name_shared_by: None,
             subagent_gate: None,

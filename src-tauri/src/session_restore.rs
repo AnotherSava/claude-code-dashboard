@@ -383,6 +383,7 @@ fn tick(app: &AppHandle, adapter: &dyn crate::terminals::TerminalAdapter) -> Pas
             input_tokens: None,
             dialog_entry: None,
             waiting_backstop_armed: false,
+            turn_from_relay: None,
         };
         // Whatever was persisted for this row: its dialog, its originating prompt
         // and its task clock. Nothing here is a guess — it is what the row held

@@ -35,9 +35,12 @@ meanings worth having in hand before reading a trail:
   answers "the agent finished" and "nothing here says otherwise" alike, and a
   DONE nobody expected is usually one of those landings rather than a `Stop`.
 - **IDLE** — CLEAN: a confirmed claim that there is nothing left in the session
-  to come back to. Exactly two things set it, both a `SessionStart`: a `source`
-  of `clear` or `startup`, and a `resume` whose restored dialog ends at a
-  `/clear` boundary. No degrade path may, so IDLE never means "we don't know".
+  to come back to. Three things set it. Two are a `SessionStart`: a `source` of
+  `clear` or `startup`, and a `resume` whose restored dialog ends at a `/clear`
+  boundary. The third is a `Stop` on a turn a peer started to ask this session to
+  pull, where the pull reported leaving nothing and the row was clean before the
+  request — see `pull_claim` / `pull_clean` below. No degrade path may set it, so
+  IDLE never means "we don't know".
   A CLEAN row also drops off the widget once it has sat there for
   `clean_hide_after_ms`, so an agent listed here as IDLE may not be on screen.
 
@@ -86,6 +89,22 @@ or `id`), and a `reason`:
   `no_tool_use`). The prompt stays open and the status does not move. Only
   `no_transcript_path` is final; after the other two the tick keeps looking and
   can still settle the prompt `via=tool_result`.
+- `pull_claim` — a `/pull` run reported leaving nothing worth coming back to.
+  `outcome` is `recorded`, `no_row` (no row here for that session), or
+  `not_owner` (a live sibling in the same directory holds the row, so this
+  instance may not speak for it). Moves nothing on its own; a `recorded` claim is
+  what the turn's `Stop` then weighs.
+- `pull_clean` — the `Stop` that weighed such a claim. With no `outcome` it
+  settled the row CLEAN instead of DONE. With one it refused, and the `outcome`
+  names which of the three facts failed:
+  - `still_outstanding` — the turn settled BLOCK or WAIT, so something is open.
+    The canonical case is a `/pull` nested inside `/commit`, where the commit
+    plan's own approval question lands in the same turn.
+  - `not_relayed` — a human typed the prompt that began the turn.
+  - `not_clean_before` — the session had work parked in it when the request
+    arrived.
+  A `recorded` `pull_claim` with no `pull_clean` at all means a later prompt
+  revoked the claim before any `Stop` came.
 - `session_clear` / `compact_boundary` — session removed / context-compaction
   separator inserted.
 - `settle_waiting` — the backstop settled a WAIT held by a background shell

@@ -5,7 +5,7 @@ parent: Development
 nav_order: 4
 ---
 
-The widget listens on `http://127.0.0.1:9077` (default) for lifecycle events from external agents. One write endpoint, one envelope shape, adapter-dispatched on the server side — plus a read-only [agent roster](#agent-roster) an agent can query to see what is running, here and on the user's other machines, and a [message relay](#cross-machine-messaging) for reaching one of those agents on another machine.
+The widget listens on `http://127.0.0.1:9077` (default) for lifecycle events from external agents. One write endpoint, one envelope shape, adapter-dispatched on the server side — plus a read-only [agent roster](#agent-roster) an agent can query to see what is running, here and on the user's other machines, a [message relay](#cross-machine-messaging) for reaching one of those agents on another machine, and [a route a local skill posts to](#post-apisession-clean) to report that its run left nothing to come back to.
 
 A second, separate listener serves the [multi-device sync](#sync-api) API when enabled — the hook API below stays loopback-only and unauthenticated regardless.
 
@@ -321,6 +321,27 @@ The `start_*` refusals, all of them certain and none of them retryable by the ca
 | `start_not_ready` | `502` | a session was launched and had not registered in time; nothing was written, and whether it comes up is not observable from here. The outcome is `unreachable` rather than `refused` — we tried and found nothing listening yet — so it maps to `502` here even though the peer deliberately answered `200`, keeping the sender from reading it as a lost hop |
 
 **Attested is not enough to start something.** Reading a peer's rows tolerates the case where an unbound device name happens to equal its Tailscale node name — the sender picks that name, so it chooses both sides of the comparison, which is fair corroboration for attribution and useless as a gate. Causing a process to exist, recording a standing permission, and disclosing directories all require an explicit `sync.peer_identity` entry the *receiver* wrote down.
+
+## `POST /api/session-clean`
+
+A `/pull` run reports that it left nothing worth coming back to, so a session that was clean before a peer asked it to pull can go back to clean. The skill's step 10 is the only caller; `docs/pages/development/classification.md` has the rule that weighs it.
+
+```json
+{ "session_id": "<claude session id>", "cwd": "/Users/you/Projects/transcripts" }
+```
+
+The `session_id` is required — a `cwd` alone cannot separate two sessions open on one repo, which is the same case the relay refuses as `ambiguous_target`, and crediting the wrong one would hide a sibling's unfinished work. It names the row through `ChatIdRegistry::anchored`, falling back to deriving one from `cwd`; the anchored lookup inserts nothing, so a claim never mints an identity.
+
+Carries the loopback `Host` gate on top of the `Origin` check, like the roster and the message route: the caller is a script on this machine with no host alias to support.
+
+| Status | Body | Meaning |
+|---     |---   |---      |
+| `200`  | `{"recorded": true, …}` | a claim is on the row; whether it settles CLEAN is decided at this turn's `Stop` |
+| `400`  | `{"recorded": false, …}` | no `session_id` |
+| `404`  | `{"recorded": false, …}` | no row here for that session |
+| `409`  | `{"recorded": false, …}` | another session owns that row — a cwd-derived row can have two resident instances, and only the one that last wrote it may speak for it (the `clear_permitted` rule, refusing only where the owner is known and differs) |
+
+Nothing reads the body in production — the poster closes the response unread and exits 0 whatever happens, because silence has to mean *not clean* on this side. It says why rather than just whether for whoever reaches the route with `curl`.
 
 ## Sync API
 

@@ -1427,6 +1427,7 @@ mod tests {
                 input_tokens: None,
                 dialog_entry: None,
                 waiting_backstop_armed: false,
+                turn_from_relay: None,
             },
             state_entered_at,
             &[],

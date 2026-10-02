@@ -125,6 +125,8 @@ mod tests {
             instruction_drift: false,
             canary: crate::state::Canary::Off,
             attended_at: None,
+            turn_from_relay: false,
+            clean_claim_at: None,
             read: false,
             name_shared_by: None,
             subagent_gate: None,

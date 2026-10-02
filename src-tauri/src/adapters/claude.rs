@@ -185,7 +185,7 @@ pub fn dispatch(event: &str, payload: &Value, cfg: &Config) -> AdapterOutput {
     // an empty template makes `strip_response_marker` a plain trim, so a user who
     // never turned the feature on never has an incidental hex comment altered.
     let marker_template = if cfg.instruction_canary_enabled { CANARY_MARKER } else { "" };
-    let Some(Classification { status, label, reason, waiting_backstop_armed }) = classify_detailed(event, payload, QuestionRules::from_config(cfg), marker_template) else {
+    let Some(Classification { status, label, reason, waiting_backstop_armed, turn_from_relay }) = classify_detailed(event, payload, QuestionRules::from_config(cfg), marker_template) else {
         return AdapterOutput::Ignore;
     };
 
@@ -244,6 +244,7 @@ pub fn dispatch(event: &str, payload: &Value, cfg: &Config) -> AdapterOutput {
             input_tokens: None,
             dialog_entry,
             waiting_backstop_armed,
+            turn_from_relay,
         },
         transcript_path,
         reason,
@@ -306,17 +307,28 @@ struct Classification {
     /// `waiting_settle` time-backstop must cover. A subagent-only WAIT sets this
     /// `false` so the backstop leaves the row to the subagent's completion turn.
     waiting_backstop_armed: bool,
+    /// Who began the turn — `Some` only on `UserPromptSubmit`, the one event that
+    /// is a prompt arriving, and `None` from every other event because they say
+    /// nothing about it. See `state::SetInput::turn_from_relay`.
+    turn_from_relay: Option<bool>,
 }
 
 impl Classification {
     fn new(status: Status, label: Option<String>, reason: impl Into<String>) -> Self {
-        Self { status, label, reason: reason.into(), waiting_backstop_armed: false }
+        Self { status, label, reason: reason.into(), waiting_backstop_armed: false, turn_from_relay: None }
+    }
+
+    /// Record who began this turn: `true` for a relayed peer message, `false`
+    /// for a prompt a human typed. Only `UserPromptSubmit` may answer.
+    fn begun_by(mut self, relayed: bool) -> Self {
+        self.turn_from_relay = Some(relayed);
+        self
     }
 
     /// A `Waiting` classification carrying whether the time-backstop should arm
     /// (a `shell` background task is in flight vs. subagents only).
     fn waiting(backstop_armed: bool, reason: impl Into<String>) -> Self {
-        Self { status: Status::Waiting, label: None, reason: reason.into(), waiting_backstop_armed: backstop_armed }
+        Self { status: Status::Waiting, label: None, reason: reason.into(), waiting_backstop_armed: backstop_armed, turn_from_relay: None }
     }
 }
 
@@ -426,11 +438,22 @@ fn classify_detailed(
             // as a prompt to wake the agent — it resumes the *existing* task, so
             // classify it like an empty/continuation prompt (no label → no task
             // boundary, `original_prompt` preserved) rather than a fresh task.
-            if prompt.trim().is_empty() || is_system_injected(prompt.trim()) {
-                Some(Classification::new(Status::Working, None, "user submitted a prompt (empty/continuation)"))
+            // Whether a peer began this turn is read off the prompt itself, from
+            // the preamble this dashboard mints in `peer_message::build_content`.
+            // The alternative — stamping the row when the frame is written into
+            // the inbox — was measured and rejected: of 115 `peer_write`s, 16
+            // produced no arriving prompt at all and 4 arrived in one burst 3.8
+            // to 8.1 hours later, so a stamp waiting to be consumed by "the next
+            // turn" dangles and is then collected by whatever turn comes next,
+            // including one a human typed. The prompt carries the fact with no
+            // such gap.
+            let relayed = crate::peer_message::is_relayed_prompt(prompt);
+            let classification = if prompt.trim().is_empty() || is_system_injected(prompt.trim()) {
+                Classification::new(Status::Working, None, "user submitted a prompt (empty/continuation)")
             } else {
-                Some(Classification::new(Status::Working, Some(clean_prompt(prompt)), "user submitted a prompt"))
-            }
+                Classification::new(Status::Working, Some(clean_prompt(prompt)), "user submitted a prompt")
+            };
+            Some(classification.begun_by(relayed))
         }
         "UserPromptExpansion" => {
             // Fires the instant a slash command is invoked — seconds before
@@ -1263,6 +1286,40 @@ mod tests {
         let (status, label) = classify("Stop", &p, NO_RULES).unwrap();
         assert_eq!(status, Status::Waiting);
         assert_eq!(label, None);
+    }
+
+    #[test]
+    fn only_a_prompt_answers_who_began_the_turn() {
+        let begun_by = |event: &str, payload: &Value| {
+            classify_detailed(event, payload, NO_RULES, "").map(|c| c.turn_from_relay)
+        };
+        let envelope = crate::peer_message::build_content(&crate::peer_message::Relayed {
+            origin_device: "desktop",
+            from_agent: "claude",
+            from_label: None,
+            from_task: None,
+            text: "please pull",
+            reply_to: None,
+            message_id: "m1",
+            in_reply_to: None,
+            reply_port: 9077,
+            attestation: crate::tailnet::Attestation::Claimed,
+            tailnet_user: None,
+        });
+
+        assert_eq!(begun_by("UserPromptSubmit", &json!({"prompt": envelope})), Some(Some(true)));
+        assert_eq!(begun_by("UserPromptSubmit", &json!({"prompt": "/pull"})), Some(Some(false)));
+        // An empty or auto-submitted prompt is still a prompt, and still answers:
+        // a `<task-notification>` resumes the turn a human or a peer started, and
+        // leaving it `None` would let the previous answer stand for a new turn.
+        assert_eq!(begun_by("UserPromptSubmit", &json!({"prompt": ""})), Some(Some(false)));
+
+        // Every other event says nothing, so `apply_set` leaves the row's answer
+        // alone rather than overwriting it mid-turn.
+        assert_eq!(begun_by("Stop", &json!({"last_assistant_message": "Done."})), Some(None));
+        // A typed `/pull`'s own early Working signal, which lands before the
+        // prompt does. It must not answer: the prompt that follows is what knows.
+        assert_eq!(begun_by("UserPromptExpansion", &json!({"expansion_type": "slash_command", "prompt": "/pull"})), Some(None));
     }
 
     #[test]

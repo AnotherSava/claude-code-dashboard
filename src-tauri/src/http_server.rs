@@ -41,11 +41,111 @@ pub async fn run(app: AppHandle, port: u16) {
         .route("/api/agents", get(get_agents))
         .route("/api/message", post(post_message))
         .route("/api/window", post(post_window))
+        .route("/api/session-clean", post(post_session_clean))
         .with_state(app);
 
     if let Err(e) = axum::serve(listener, router).await {
         tracing::error!(error = %e, "http serve ended");
     }
+}
+
+/// What a `/pull` run reports to `POST /api/session-clean`.
+#[derive(Deserialize)]
+struct SessionCleanRequest {
+    /// The Claude session the claim is about. Required: a `cwd` alone cannot
+    /// separate two sessions open on one repo, which is exactly the case the
+    /// relay already refuses as `ambiguous_target`, and crediting the wrong one
+    /// would hide a sibling's unfinished work.
+    #[serde(default)]
+    session_id: String,
+    /// Where that session is running, used only to derive the row id for a
+    /// session this dashboard has not anchored yet.
+    #[serde(default)]
+    cwd: Option<String>,
+}
+
+/// What it is told back. Nothing reads this in production — `session_clean.py`
+/// closes the response unread, by design — so it exists for a human holding
+/// `curl` and for the tests, which is why it says *why* rather than just whether.
+#[derive(Serialize, Default)]
+struct SessionCleanResponse {
+    recorded: bool,
+    reason: &'static str,
+}
+
+/// Record a `/pull` run's report that it left nothing worth coming back to.
+///
+/// Records a *claim* and settles nothing: `pull_declared_clean` weighs it at the
+/// turn's `Stop`, because `/pull` posts from inside the turn it is reporting on
+/// and that turn's own `Stop` would overwrite any status set here moments later.
+///
+/// Gated on a loopback `Host` as well as the `Origin` check (`csrf_refusal`'s
+/// `true`), like the roster and the message route and unlike `/api/event`: the
+/// caller is a script on this machine with no host alias to support, so there is
+/// nothing to lose by requiring it.
+async fn post_session_clean(State(app): State<AppHandle>, headers: HeaderMap, Json(req): Json<SessionCleanRequest>) -> Response {
+    if let Some(detail) = csrf_refusal(&headers, true) {
+        return csrf_refused(detail).into_response();
+    }
+    // Takes a row lock, so it goes the way every other row write goes — off the
+    // async workers, and surviving the caller hanging up.
+    match tauri::async_runtime::spawn_blocking(move || apply_session_clean(&app, req)).await {
+        Ok(response) => response,
+        Err(e) => {
+            tracing::error!(error = %e, "session-clean handler failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(SessionCleanResponse::default())).into_response()
+        }
+    }
+}
+
+fn apply_session_clean(app: &AppHandle, req: SessionCleanRequest) -> Response {
+    let answer = |status: StatusCode, recorded: bool, reason: &'static str| (status, Json(SessionCleanResponse { recorded, reason })).into_response();
+
+    if req.session_id.is_empty() {
+        return answer(StatusCode::BAD_REQUEST, false, "no session_id, and a cwd alone cannot say which session this is about");
+    }
+    let Some(state) = app.try_state::<AppState>() else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(SessionCleanResponse::default())).into_response();
+    };
+    let Some(cfg_state) = app.try_state::<ConfigState>() else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(SessionCleanResponse::default())).into_response();
+    };
+    let cfg = cfg_state.snapshot();
+
+    // `anchored`, never `resolve`: this is a read of an existing row's identity
+    // and must not mint an anchor. A session with no anchor yet has had no hook
+    // event, so it has no row for a claim to attach to either, and the `cwd`
+    // derivation below is what finds the row in the ordinary case where the
+    // anchor and the derivation agree.
+    let chat_id = app
+        .try_state::<ChatIdRegistry>()
+        .and_then(|r| r.anchored(&req.session_id))
+        .unwrap_or_else(|| adapters::claude::derive_chat_id(req.cwd.as_deref(), cfg.projects_root.as_deref()));
+
+    let row_lock = app.try_state::<crate::commands::RowLocks>().map(|locks| locks.row(&chat_id));
+    let _row_guard = row_lock.as_deref().map(crate::commands::RowLocks::hold);
+
+    // A chat_id is cwd-derived, so every instance in that directory addresses one
+    // row, and a `--fork-session --resume` migration routinely leaves two
+    // resident. Only the instance that last wrote the row may speak for it:
+    // otherwise a sibling's clean pull settles a row whose other session has work
+    // parked in it — `status_before_working` keeps its older `Idle` across a
+    // `Working` → `Working` prompt — and CLEAN then hides it, which is the
+    // hiding-unread-work direction. Same rule and same reasoning as
+    // `clear_permitted`: refused only where the owner is known and differs, so an
+    // unclaimed row (nothing since a restart) still accepts the claim.
+    let owner = app.try_state::<ChatIdRegistry>().and_then(|r| r.owner_of(&chat_id));
+    if !clear_permitted(owner.as_deref(), &req.session_id) {
+        tracing::info!(chat_id = %chat_id, decision = "pull_claim", outcome = "not_owner", "a pull reported a clean run for a row a live sibling holds");
+        return answer(StatusCode::CONFLICT, false, "another session owns that row, so this claim is not its to make");
+    }
+
+    if !state.record_clean_claim(&chat_id, now_ms()) {
+        tracing::info!(chat_id = %chat_id, decision = "pull_claim", outcome = "no_row", "a pull reported a clean run for a session this dashboard holds no row for");
+        return answer(StatusCode::NOT_FOUND, false, "no row here for that session");
+    }
+    tracing::info!(chat_id = %chat_id, decision = "pull_claim", outcome = "recorded", "a pull reported leaving nothing to come back to");
+    answer(StatusCode::OK, true, "recorded; whether it settles CLEAN is decided at this turn's Stop")
 }
 
 /// What `POST /api/window` is being asked to do.
@@ -768,6 +868,84 @@ fn resume_is_clean(event: &str, source: Option<&str>, dialog: Option<&[crate::st
     event == "SessionStart" && source == Some("resume") && dialog.is_some_and(crate::state::ends_with_clear_boundary)
 }
 
+/// Why a claim did not settle CLEAN, or `None` where it did.
+///
+/// A verdict rather than a bool because the three facts fail for different
+/// reasons and the log has to say which: a `pull_claim` with no `pull_clean` after
+/// it marks a refusal, but not what refused it, and reconstructing that from the
+/// neighbouring `classify` line is what diagnosing the first real claim cost.
+/// `None` where no claim was outstanding at all — the overwhelmingly common case,
+/// which logs nothing.
+#[derive(Debug, PartialEq, Eq)]
+enum CleanRefusal {
+    /// The turn settled as anything but `Done` — canonically BLOCK or WAIT, each
+    /// of which says something is still outstanding.
+    StillOutstanding(Status),
+    /// A human typed the prompt that began this turn.
+    NotRelayed,
+    /// The session had work parked in it when the request arrived.
+    NotCleanBefore(Status),
+}
+
+impl CleanRefusal {
+    fn slug(&self) -> &'static str {
+        match self {
+            Self::StillOutstanding(_) => "still_outstanding",
+            Self::NotRelayed => "not_relayed",
+            Self::NotCleanBefore(_) => "not_clean_before",
+        }
+    }
+}
+
+/// Whether a settling turn may claim [`Status::Idle`] because a peer asked this
+/// session to pull and the pull left nothing behind — the third CLEAN source
+/// named in `Status::Idle`'s own documentation.
+///
+/// Three independent facts have to agree, and each is owned by whoever can
+/// actually establish it:
+///
+/// 1. **The run left nothing to come back to** — `claimed`, which only the
+///    `/pull` skill knows, because only it saw whether anything conflicted and
+///    whether anything was left for the user. It posts that judgment; this
+///    dashboard never second-guesses it.
+/// 2. **A peer asked, rather than the human** — `turn_from_relay`, which only
+///    this dashboard knows, because it minted the preamble the arriving prompt
+///    carries. It is here because the user's rule is about servicing *someone
+///    else's* request: a session the human drove to a clean tree is finished
+///    work they may well want to see, and CLEAN hides a row.
+/// 3. **The session was already clean when the request arrived** —
+///    `status_before_working`, the user's own "if it was in clean state before
+///    this request". A pull that interrupts real work leaves that work sitting
+///    there, so the row is not clean however little the pull itself did.
+///
+/// # Why only `Done`
+///
+/// `Blocked` and `Waiting` are refused outright rather than being folded into the
+/// test. Both say something is still outstanding — a question on screen, work
+/// still running — and no claim about a pull can speak to either. (`/pull` step 10
+/// declines to signal where the *turn* goes on to ask the user anything, not
+/// merely where the pull itself did, so the two rules agree. This one does not
+/// rely on that: a refusal here is free, and the skill's discipline is not ours
+/// to depend on. The case that settled the wording — a `/pull` nested inside
+/// `/commit`, posting a claim 46 seconds before the commit plan's own approval
+/// question — was refused here first.)
+///
+/// `Idle` → `Idle` is not special-cased: a row already clean needs no upgrade,
+/// and the `Done` gate declines it for free.
+fn pull_declared_clean(settling: Status, facts: Option<crate::state::CleanClaimFacts>) -> Result<(), Option<CleanRefusal>> {
+    let Some(f) = facts.filter(|f| f.claimed) else { return Err(None) };
+    if settling != Status::Done {
+        return Err(Some(CleanRefusal::StillOutstanding(settling)));
+    }
+    if !f.turn_from_relay {
+        return Err(Some(CleanRefusal::NotRelayed));
+    }
+    if f.status_before_working != Status::Idle {
+        return Err(Some(CleanRefusal::NotCleanBefore(f.status_before_working)));
+    }
+    Ok(())
+}
+
 /// Mutates nothing — no `apply_set`, no emit, no `SyncDirty` poke, no store
 /// write — which is also why it writes no `decision` line: every one of those
 /// tags marks a state change and the `investigate` skill replays them to
@@ -1380,6 +1558,35 @@ fn apply_event(app: &AppHandle, req: EventRequest) -> Response {
             if resume_is_clean(&req.event, req.payload.get("source").and_then(|v| v.as_str()), restored.as_ref().map(|r| r.dialog.as_slice())) {
                 input.status = Status::Idle;
             }
+            // The other CLEAN source the adapter cannot answer: a peer asked this
+            // session to pull, the pull left nothing behind, and the session was
+            // already clean when the request arrived. Read before `apply_set`,
+            // because the transition this event is about to perform is what
+            // consumes the facts it turns on.
+            let clean_facts = state.clean_claim_facts(&chat_id);
+            match pull_declared_clean(input.status, clean_facts) {
+                Ok(()) => {
+                    input.status = Status::Idle;
+                    tracing::info!(
+                        chat_id = %chat_id,
+                        decision = "pull_clean",
+                        event = %req.event,
+                        reason = "a relayed peer pull reported leaving nothing to come back to, on a row that was clean before it",
+                        "settling CLEAN instead of done"
+                    );
+                }
+                // Only where a claim was actually outstanding. Every other turn
+                // takes this path too, and must say nothing.
+                Err(Some(refusal)) => tracing::info!(
+                    chat_id = %chat_id,
+                    decision = "pull_clean",
+                    event = %req.event,
+                    outcome = refusal.slug(),
+                    reason = ?refusal,
+                    "a pull's clean claim was refused"
+                ),
+                Err(None) => {}
+            }
             let now = now_ms();
             let watcher = app.try_state::<WatcherRegistry>();
             // A subagent's permission dialog overlays the row instead of setting
@@ -1642,6 +1849,8 @@ mod tests {
             instruction_drift: false,
             canary: crate::state::Canary::Off,
             attended_at: None,
+            turn_from_relay: false,
+            clean_claim_at: None,
             read: false,
             name_shared_by: None,
             subagent_gate: None,
@@ -2057,6 +2266,97 @@ mod tests {
         assert!(origin_blocked(&headers));
     }
 
+
+    #[test]
+    fn a_pull_settles_clean_only_when_all_three_facts_agree() {
+        use crate::state::CleanClaimFacts;
+        let facts = |claimed, relay, before| Some(CleanClaimFacts { claimed, turn_from_relay: relay, status_before_working: before });
+
+        assert_eq!(pull_declared_clean(Status::Done, facts(true, true, Status::Idle)), Ok(()));
+
+        // Each fact removed on its own, and the refusal names which one — the log
+        // has to distinguish them, so the test pins them apart rather than
+        // asserting a bare no.
+        assert_eq!(pull_declared_clean(Status::Done, facts(true, false, Status::Idle)), Err(Some(CleanRefusal::NotRelayed)));
+        assert_eq!(pull_declared_clean(Status::Done, facts(true, true, Status::Done)), Err(Some(CleanRefusal::NotCleanBefore(Status::Done))));
+        assert_eq!(pull_declared_clean(Status::Done, facts(true, true, Status::Blocked)), Err(Some(CleanRefusal::NotCleanBefore(Status::Blocked))));
+
+        // No claim outstanding is silence, not a refusal: every ordinary turn
+        // reaches this and must log nothing. Both shapes of it — the skill said
+        // nothing, and this dashboard holds no row at all.
+        assert_eq!(pull_declared_clean(Status::Done, facts(false, true, Status::Idle)), Err(None));
+        assert_eq!(pull_declared_clean(Status::Done, None), Err(None));
+
+        // Only a settling turn. BLOCK and WAIT each say something is still
+        // outstanding, and no claim about a pull speaks to either. Checked before
+        // the other two facts, so this is the reason reported for the nested
+        // `/commit` case that produced the first real claim.
+        for held in [Status::Blocked, Status::Waiting, Status::Working, Status::Error] {
+            assert_eq!(pull_declared_clean(held, facts(true, true, Status::Idle)), Err(Some(CleanRefusal::StillOutstanding(held))), "{held:?} has something outstanding");
+        }
+        // Already clean needs no upgrade, and the `Done` gate declines it free.
+        assert_eq!(pull_declared_clean(Status::Idle, facts(true, true, Status::Idle)), Err(Some(CleanRefusal::StillOutstanding(Status::Idle))));
+    }
+
+    #[test]
+    fn a_new_turn_revokes_an_unredeemed_clean_claim() {
+        // The revocation rule, driven through the real transitions rather than by
+        // presetting the fields: a claim recorded mid-turn, then a *second* turn
+        // opening before any `Stop` came for the first. Setting
+        // `clean_claim_at` by hand would prove nothing about `apply_set`, which is
+        // the only thing that clears it.
+        let state = AppState::default();
+        let prompt = |relay: bool| crate::state::SetInput {
+            id: "r".into(),
+            status: Status::Working,
+            label: Some("pull".into()),
+            source: None,
+            model: None,
+            input_tokens: None,
+            dialog_entry: None,
+            waiting_backstop_armed: false,
+            turn_from_relay: Some(relay),
+        };
+        // A `/clear`-style settle to CLEAN is not a prompt, so it says nothing
+        // about who begins the next turn.
+        let clean = crate::state::SetInput { status: Status::Idle, label: None, turn_from_relay: None, ..prompt(false) };
+
+        // A clean row, then a relayed turn opens on it and reports a clean run.
+        state.apply_set(clean, 1_000, &[], None);
+        state.apply_set(prompt(true), 2_000, &[], None);
+        assert!(state.record_clean_claim("r", 3_000));
+        let held = state.clean_claim_facts("r").unwrap();
+        assert_eq!(held, crate::state::CleanClaimFacts { claimed: true, turn_from_relay: true, status_before_working: Status::Idle });
+        assert_eq!(pull_declared_clean(Status::Done, Some(held)), Ok(()));
+
+        // No `Stop` arrives; the user types something instead. The claim was about
+        // a turn that never settled, so it must not be redeemable by this one.
+        state.apply_set(prompt(false), 4_000, &[], None);
+        let after = state.clean_claim_facts("r").unwrap();
+        assert!(!after.claimed, "a new turn drops the stale claim");
+        assert!(!after.turn_from_relay, "and records who began this turn instead");
+        // Silence, not a refusal: the claim is gone, so there is nothing to refuse.
+        assert_eq!(pull_declared_clean(Status::Done, Some(after)), Err(None));
+    }
+
+    #[test]
+    fn a_siblings_clean_claim_cannot_speak_for_a_shared_row() {
+        // One cwd-derived row, two resident instances — what a
+        // `--fork-session --resume` migration leaves. The guard is
+        // `clear_permitted`, reused rather than reimplemented, so this pins the
+        // reuse for *this* caller: a claim from the owner lands, one from the
+        // sibling does not, and an unclaimed row still accepts.
+        assert!(clear_permitted(Some("owner-sid"), "owner-sid"), "the instance that last wrote the row may speak for it");
+        assert!(!clear_permitted(Some("owner-sid"), "sibling-sid"), "a sibling's pull must not settle a row holding the owner's work");
+        assert!(clear_permitted(None, "owner-sid"), "nothing claimed since a restart: ownership unknown, so the claim stands");
+    }
+
+    #[test]
+    fn a_clean_claim_for_an_untracked_session_is_refused_not_invented() {
+        let state = AppState::default();
+        assert!(!state.record_clean_claim("nobody", 1_000), "no row, no claim");
+        assert!(state.clean_claim_facts("nobody").is_none());
+    }
 
     #[test]
     fn a_resume_is_clean_only_where_the_conversation_ended_at_a_clear() {
