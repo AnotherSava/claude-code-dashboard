@@ -95,11 +95,11 @@ THE PROMPT TEXT IS PUBLISHED TOO, and no list can vet prose. Outside compact
 view a row draws its task line, so the hero carries each session's real prompt
 into the README — the one figure that does. What the guard can check is names,
 so what it does with the prose is print it: every row's text is on stdout before
-the shutter and again after it. Read it. The roster's `label` is the exact string
-on screen only for the blocked and the error rows; for the others the widget
-draws `original_prompt ?? label` (`displayLabel`, `src/lib/types.ts`) and the
-roster carries no `original_prompt`, so what is printed for a working or a
-finished row is that row's current label rather than the sentence in the picture.
+the shutter and again after it. Read it. The roster's `label` is
+`AgentSession::primary_text`, the same text the row's task line draws, so what is
+printed is the sentence in the picture. The one exception is a row with no
+current text, which the widget fills with its most recent past task, drawn muted
+(`AgentSession::row_line`), while the roster prints an empty label for it.
 
 THE GUARD RUNS TWICE, before the window is raised and again after the shutter,
 because a real session can change state in the second in between, and the second

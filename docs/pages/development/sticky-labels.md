@@ -38,13 +38,17 @@ The state layer (`src-tauri/src/state.rs::apply_set` via `src-tauri/src/label_po
 | yes               | `blocked`                        | `working`  | leave pinned (approval cycle: agent asked, user answered)                    |
 | yes               | any other                         | any        | leave pinned                                                                 |
 
-The third row is the **task boundary**: a transition into `working` from any status *except* `blocked` counts as a new task.
+The third row is the **task boundary**: a transition into `working` from any status *except* `blocked` counts as a new task, unless the prompt names no task: a continuation prompt, a prompt Claude Code submitted on its own account, or one of the messages from other agents described after these cases.
 
 - `done` / `idle` / `waiting` → `working` is the natural case: the last turn ended, the row is clean after a `/clear` or a fresh start, or background work was still finishing — and the user is starting something new either way.
 - `working` → `working` covers the **cancellation case**: the user hit `Esc` mid-task and submitted a fresh prompt before the agent could emit a `Stop`. Without this rule the row would still display the cancelled prompt, which is misleading.
-- `blocked` → `working` is the only transition into `working` that's **not** a boundary. It's the canonical approval cycle (agent asks → user answers → agent resumes), so typing `y` doesn't clobber the original prompt.
+- `blocked` → `working` is **never** a boundary, whatever the prompt. It's the canonical approval cycle (agent asks → user answers → agent resumes), so typing `y` doesn't clobber the original prompt.
 
 If the new event has `label: None` on a task boundary, the prior `original_prompt` survives unchanged.
+
+Two kinds of prompt Claude Code submits on its own account are no task from anyone: a subagent handing its report back (`<agent-message from="…">` with `[Subagent hand-back]` on the next line) and a cross-session notice (`[Cross-session idle notice]`, `[Cross-session delivery notice]`). The adapter gives them no label (`peer_message::parse_harness_prompt`, logged in the `classify` line's `reason`), and `apply_set` does not count them as a boundary. The turn still shows `working` and the history still records the prompt, but the row keeps its task, label and working timer, and the entry is not marked as a task start.
+
+A message from another agent that arrives while the row's turn is still `working` or `waiting` is no boundary either: it is a reply to, or a follow-up on, the exchange already under way, so the person's task stays on the row. A relayed reply to a message this row's agent sent is no boundary on a `done` or `idle` row either, which is where it usually lands, since nothing polls for it and the asking turn has ended by then; the relay header's "This is a reply to your message" line is what marks it. Any other agent message arriving on a `done` or `idle` row starts a task like any prompt — a reply through Claude Code's own `SendMessage` included, because its envelope carries no reply mark.
 
 ### Restore from disk
 
@@ -62,7 +66,7 @@ To avoid that, `apply_set` checks the incoming `label` against `Config::continua
 
 - `original_prompt` stays pinned to the prior task.
 - `working_accumulated_ms` is preserved (the timer continues from where it left off).
-- `label` is still updated to the incoming text (e.g. `"go"`), but with `status = working` `displayLabel` falls back to `original_prompt` anyway, so the user keeps seeing the real task on screen.
+- `label` is still updated to the incoming text (e.g. `"go"`), but with `status = working` the row's text falls back to `original_prompt` anyway, so the user keeps seeing the real task on screen.
 
 Match is **exact** after trim, not substring or starts-with — `"go"` matches `"go"` and `"Go"` and `" go "`, but not `"go ahead"` or `"google something"`. If you want phrases like `"go ahead"` to count, add them to the list verbatim.
 
@@ -70,13 +74,17 @@ This rule only fires on what would otherwise be a task boundary (transitions int
 
 ## What the widget actually shows
 
-The frontend's `displayLabel` (`src/lib/types.ts`) chooses between the two fields based on the row's current status:
+`AgentSession::primary_text` (`src-tauri/src/state.rs`) chooses between the label and the task based on the row's current status. Telegram notifications show the same text. The row draws it through `AgentSession::row_line`, which the display snapshot stamps onto every row it sends the frontend. agwinterm's context line is written from the task alone (`AgentSession::shown_task`), never the label, since the tab title's glyph already says the row is asking:
 
 | Status                      | Widget shows                                          |
 |---                          |---                                                    |
 | `blocked`                  | `label` — the agent's question or permission request  |
 | `error`                     | `label` — the error message                           |
-| everything else             | `original_prompt` if set, else `label`                |
+| everything else             | the task if set, else `label`                         |
+
+The task is `original_prompt`, except where another agent's message began it. Claude Code delivers that message as an ordinary prompt, so `original_prompt` holds the whole envelope, and the row shows instead what `src-tauri/src/prompt_origin.rs` settled when the prompt arrived: the sending agent's own task (`delegated_task`), or, where that could not be resolved, the message's first line (`message_line`). Both move with `original_prompt` through `label_policy::select`, so they describe the task it holds; `original_prompt` keeps the envelope for the History window. The row's hover tooltip lists its past tasks by the same rule, from `AgentSession::task_lines` rather than the raw dialog entries. Any envelope that still reaches a display, in `label`, in a past dialog entry or in an older row's `original_prompt`, is shown as an excerpt of its message, never as the envelope.
+
+Where that text is empty, as on a row restored after `/clear` or a restart, `row_line` falls back to the most recent task in the row's history, and the row draws it muted so it reads as a past task.
 
 The principle: when the agent is **blocked**, surface what's blocking it (the transient `label`). When the agent is **acting on or finished with a task**, surface the task itself (`original_prompt`).
 

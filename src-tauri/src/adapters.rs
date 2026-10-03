@@ -10,6 +10,7 @@
 use std::path::PathBuf;
 
 use crate::config::Config;
+use crate::peer_message::AgentMessage;
 use crate::state::{SetInput, SubagentPromptRequest};
 
 pub mod claude;
@@ -32,6 +33,12 @@ pub enum AdapterOutput {
         /// main-agent status (see `AppState::open_subagent_prompt`); one that
         /// ends them all is applied after it.
         subagent: SubagentEffect,
+        /// The envelope of a prompt another agent wrote, read off the raw
+        /// prompt; `None` for one a person typed and for every other event. The
+        /// HTTP layer settles it into `input.delegated_task` before applying,
+        /// since that needs the session registry and the other rows, which an
+        /// adapter has no access to.
+        agent_message: Option<AgentMessage>,
     },
     /// A subagent ended (`SubagentStop`), so none of its permission prompts can
     /// still be on screen: settle every one it holds on row `id`.

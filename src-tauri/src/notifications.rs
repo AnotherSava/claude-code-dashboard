@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
@@ -86,26 +87,10 @@ pub fn status_key(s: Status) -> &'static str {
     }
 }
 
-/// The text the notification shows under the status line — mirroring the
-/// frontend's `primaryText` (`src/lib/types.ts`; keep the two in sync). For a
-/// row the user must act on (`blocked`/`error`) it's the current `label` (the
-/// question / approval request); otherwise it's the original task
-/// (`original_prompt`), falling back to `label`. Without this a `done` row that
-/// was previously `blocked` would carry its stale `Blocked` label (the
-/// `Stop`→Done event has no label, so `label_policy` preserves the old one), so
-/// the message read e.g. "done\nneeds approval: tool" while the dashboard row
-/// already showed the finished task.
-fn primary_text(session: &AgentSession) -> &str {
-    match session.status {
-        Status::Blocked | Status::Error => &session.label,
-        _ => session.original_prompt.as_deref().unwrap_or(&session.label),
-    }
-}
-
 pub fn build_message_text(session: &AgentSession) -> String {
     let status = status_key(session.status);
     let name = session.display_label();
-    let text = primary_text(session);
+    let text = session.primary_text();
     if text.trim().is_empty() {
         format!("[{}] {}", name, status)
     } else {
@@ -247,17 +232,22 @@ pub fn drift_reconcile<'a>(
 ///
 /// - `blocked` / `done`: the full final assistant turn (the multi-paragraph
 ///   answer or completion summary the user actually reads), taken from the last
-///   `Assistant` dialog entry. Falls back to `label` only when there is no
-///   assistant entry yet — a `PreToolUse` / permission `blocked` row, where
-///   `label` *is* the question. (A `Stop`→`Blocked` `label` is the fixed string
-///   `"has a question"`, so the dialog text is preferred over it.)
-/// - `error`: `label` (the short failure kind). A `StopFailure` turn emits no
-///   assistant text, so the last dialog entry is the *prior* successful turn —
-///   scaling off that would delay an actionable error ping by an irrelevant
-///   length, so `error` reads its own short label and stays snappy.
-fn read_burden_text(session: &AgentSession) -> &str {
+///   `Assistant` dialog entry. Falls back to the row's
+///   [`primary_text`](AgentSession::primary_text) — the text the ping itself
+///   carries — only when there is no assistant entry yet: a `PreToolUse` /
+///   permission `blocked` row, where that *is* the question, or a row an agent
+///   message began whose reply is not flushed yet, where it is the task
+///   `prompt_origin` settled rather than the message's whole envelope. (A
+///   `Stop`→`Blocked` `label` is the fixed string `"has a question"`, so the
+///   dialog text is preferred over it.)
+/// - `error`: `primary_text`, which for an error row is its `label` (the short
+///   failure kind). A `StopFailure` turn emits no assistant text, so the last
+///   dialog entry is the *prior* successful turn — scaling off that would delay
+///   an actionable error ping by an irrelevant length, so `error` reads its own
+///   short label and stays snappy.
+fn read_burden_text(session: &AgentSession) -> Cow<'_, str> {
     if session.status == Status::Error {
-        return &session.label;
+        return session.primary_text();
     }
     session
         .dialog
@@ -266,7 +256,8 @@ fn read_burden_text(session: &AgentSession) -> &str {
         .find(|e| e.role == DialogRole::Assistant)
         .map(|e| e.text.as_str())
         .filter(|t| !t.trim().is_empty())
-        .unwrap_or(&session.label)
+        .map(Cow::Borrowed)
+        .unwrap_or_else(|| session.primary_text())
 }
 
 /// Milliseconds to allow for *reading* `text` before a notification is due, at
@@ -627,7 +618,7 @@ pub async fn reconcile(
         let (reason, reading_ms) = if high_alert && rule_notifies(rule) {
             (Some("high_alert"), 0)
         } else {
-            let reading_ms = reading_time_ms(read_burden_text(s), reading_speed_cps, READING_CAP_MS);
+            let reading_ms = reading_time_ms(&read_burden_text(s), reading_speed_cps, READING_CAP_MS);
             (fire_reason(rule, time_in_state, idle_ms, reading_ms), reading_ms)
         };
         let Some(reason) = reason else { continue };
@@ -1156,9 +1147,13 @@ mod tests {
             canary: crate::state::Canary::Off,
             attended_at: None,
             turn_from_relay: false,
+            delegated_task: None,
+            message_line: None,
             clean_claim_at: None,
             read: false,
             name_shared_by: None,
+            row_line: None,
+            task_lines: Vec::new(),
             subagent_gate: None,
             terminal_stale_at: None,
         }
@@ -1430,6 +1425,18 @@ mod tests {
         let mut s = session_with_message("s", Status::Error, 0, &"x".repeat(5_000));
         s.label = "api error".into();
         assert_eq!(read_burden_text(&s), "api error");
+    }
+
+    /// A row an agent message began, settled before its reply is flushed: the
+    /// budget is the settled task the ping shows, not the envelope in `label`.
+    #[test]
+    fn read_burden_text_never_measures_an_envelope() {
+        let envelope = "<cross-session-message from=\"uds:/tmp/cc-socks/1.sock\" from-name=\"a\" from-mode=\"prompting\"> placeholder message </cross-session-message>";
+        let mut s = session("s", Status::Done, 0);
+        s.label = envelope.into();
+        s.original_prompt = Some(envelope.into());
+        s.delegated_task = Some("add a caption".into());
+        assert_eq!(read_burden_text(&s), "add a caption");
     }
 
     #[test]

@@ -220,6 +220,11 @@ pub fn dispatch(event: &str, payload: &Value, cfg: &Config) -> AdapterOutput {
         _ => None,
     };
 
+    // Read off the raw prompt the dialog entry keeps, so the envelope parses with
+    // its line structure intact; a prompt that becomes no entry (empty, or a
+    // `<task-notification>`) becomes no task either.
+    let agent_message = dialog_entry.as_ref().and_then(|e| crate::peer_message::parse_agent_message(&e.text));
+
     let subagent = match (event, subagent_id(payload), label.as_deref()) {
         ("PermissionRequest", Some(agent_id), Some(label)) => SubagentEffect::PromptOpened(SubagentPromptRequest {
             agent_id: agent_id.to_string(),
@@ -245,10 +250,14 @@ pub fn dispatch(event: &str, payload: &Value, cfg: &Config) -> AdapterOutput {
             dialog_entry,
             waiting_backstop_armed,
             turn_from_relay,
+            delegated_task: None,
+            message_line: None,
+            message_is_reply: None,
         },
         transcript_path,
         reason,
         subagent,
+        agent_message,
     }
 }
 
@@ -436,8 +445,9 @@ fn classify_detailed(
             let prompt = payload.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
             // A `<task-notification>` (background-task completion) is auto-submitted
             // as a prompt to wake the agent — it resumes the *existing* task, so
-            // classify it like an empty/continuation prompt (no label → no task
-            // boundary, `original_prompt` preserved) rather than a fresh task.
+            // classify it like an empty prompt (no label → no task boundary,
+            // `original_prompt` and the working timer preserved) rather than a
+            // fresh task.
             // Whether a peer began this turn is read off the prompt itself, from
             // the preamble this dashboard mints in `peer_message::build_content`.
             // The alternative — stamping the row when the frame is written into
@@ -448,8 +458,13 @@ fn classify_detailed(
             // including one a human typed. The prompt carries the fact with no
             // such gap.
             let relayed = crate::peer_message::is_relayed_prompt(prompt);
+            // A subagent's hand-back or a cross-session notice is no task from
+            // anyone either, and gets no label for the same reason; unlike a
+            // `<task-notification>` it keeps its dialog entry.
             let classification = if prompt.trim().is_empty() || is_system_injected(prompt.trim()) {
                 Classification::new(Status::Working, None, "user submitted a prompt (empty/continuation)")
+            } else if let Some(harness) = crate::peer_message::parse_harness_prompt(prompt) {
+                Classification::new(Status::Working, None, format!("harness submitted a {}: no task from anyone, the row keeps its task", harness.slug()))
             } else {
                 Classification::new(Status::Working, Some(clean_prompt(prompt)), "user submitted a prompt")
             };
@@ -627,8 +642,10 @@ fn notification_label(notif_type: &str, message: &str) -> String {
 }
 
 /// Normalize whitespace and strip Claude Code's terminal chrome (box-drawing,
-/// block elements, misc technical) so labels read cleanly in the widget.
-fn clean_prompt(text: &str) -> String {
+/// block elements, misc technical) so labels read cleanly in the widget. The one
+/// normaliser for row text: `prompt_origin` puts an agent message's line and a
+/// resolved task through it too, so they read the way a typed prompt does.
+pub(crate) fn clean_prompt(text: &str) -> String {
     let stripped: String = text
         .chars()
         .map(|c| match c {
@@ -1191,6 +1208,29 @@ mod tests {
         let (status, label) = classify("UserPromptSubmit", &p, NO_RULES).unwrap();
         assert_eq!(status, Status::Working);
         assert_eq!(label, None);
+    }
+
+    /// A subagent's hand-back and a cross-session notice run a turn but name no
+    /// task, and the history still records them.
+    #[test]
+    fn a_harness_prompt_is_working_without_a_label_and_keeps_its_dialog_entry() {
+        let cfg = cfg_with(Some("d:/projects"), &[]);
+        let hand_back = "<agent-message from=\"ab070651cd45c459e\">\n[Subagent hand-back] The text below is the final report.\n  done\n</agent-message>";
+        let notice = "[Cross-session idle notice] \"peer-2f\", which you asked to be notified about, is idle now.";
+        for prompt in [hand_back, notice] {
+            match dispatch("UserPromptSubmit", &json!({ "cwd": "d:/projects/demo", "prompt": prompt }), &cfg) {
+                AdapterOutput::Set { input, reason, agent_message, .. } => {
+                    assert_eq!((input.status, input.label), (Status::Working, None));
+                    assert_eq!(input.dialog_entry.map(|e| e.text).as_deref(), Some(prompt));
+                    assert_eq!(agent_message, None);
+                    assert!(reason.contains("keeps its task"), "{reason}");
+                }
+                other => panic!("expected Set, got {other:?}"),
+            }
+        }
+        let typed = format!("{hand_back}\nwhy did this become the task?");
+        let (_, label) = classify("UserPromptSubmit", &json!({ "prompt": typed }), NO_RULES).unwrap();
+        assert!(label.is_some(), "a person asking about a pasted report starts a task");
     }
 
     // ----- classify: Stop (from the `last_assistant_message` + `background_tasks` payload) -----
@@ -2122,6 +2162,22 @@ mod tests {
             dispatch("PreToolUse", &json!({}), &cfg),
             AdapterOutput::Ignore
         ));
+    }
+
+    /// The envelope is read off the raw prompt, with its lines, and only on the
+    /// event that is a prompt arriving.
+    #[test]
+    fn a_prompt_another_agent_wrote_carries_its_envelope_to_the_http_layer() {
+        let cfg = cfg_with(Some("d:/projects"), &[]);
+        let envelope = "<cross-session-message from=\"uds:/tmp/cc-socks/7.sock\" from-name=\"peer\" from-mode=\"prompting\">\nfirst line\nsecond line\n</cross-session-message>";
+        let message = |event: &str, prompt: &str| match dispatch(event, &json!({ "cwd": "d:/projects/demo", "prompt": prompt, "expansion_type": "slash_command" }), &cfg) {
+            AdapterOutput::Set { agent_message, input, .. } => (agent_message, input.delegated_task),
+            other => panic!("expected Set, got {other:?}"),
+        };
+        let expected = crate::peer_message::AgentMessage::Local { inbox: Some("/tmp/cc-socks/7.sock".into()), name: Some("peer".into()), body: "first line\nsecond line".into() };
+        assert_eq!(message("UserPromptSubmit", envelope), (Some(expected), None), "settling it is the HTTP layer's job");
+        assert_eq!(message("UserPromptSubmit", "fix the parser"), (None, None));
+        assert_eq!(message("UserPromptExpansion", envelope).0, None, "only the prompt that becomes the task");
     }
 
     #[test]

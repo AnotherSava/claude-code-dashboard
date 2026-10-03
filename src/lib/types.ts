@@ -18,9 +18,6 @@ export interface DialogEntry {
 export interface AgentSession {
   id: string
   status: Status
-  label: string
-  original_prompt: string | null
-  task_started_at: number
   dialog: DialogEntry[]
   source: string
   model: string | null
@@ -61,6 +58,27 @@ export interface AgentSession {
   // crosses the sync wire or `/api/agents`, because whether a human at this
   // keyboard has looked at a screen is not a peer's business.
   read?: boolean
+  // The text of the row's task line, decided by `AgentSession::row_line` in Rust
+  // so the row and a terminal's headline cannot disagree: 'current' is what the
+  // row is about now, 'past' the most recent task of a row with nothing current,
+  // drawn muted. null where the row has no text for that line. Stamped by the
+  // Rust display path, so every row the frontend receives carries it.
+  row_line?: RowLine | null
+  // The row's tasks as its hover tooltip lists them, oldest first, decided by
+  // `AgentSession::task_lines` in Rust: a task another agent began reads as the
+  // task line does, never as the envelope its dialog entry holds. Stamped by the
+  // Rust display path beside `row_line`.
+  task_lines?: TaskLine[]
+}
+
+export interface RowLine {
+  kind: 'current' | 'past'
+  text: string
+}
+
+export interface TaskLine {
+  at: number
+  text: string
 }
 
 export interface UsageColors {
@@ -163,11 +181,6 @@ export const stateLabel: Record<Status, string> = {
   blocked: 'BLOCK',
   done: 'DONE',
   error: 'ERROR',
-}
-
-export function displayLabel(session: AgentSession): string {
-  if (session.status === 'blocked' || session.status === 'error') return session.label
-  return session.original_prompt ?? session.label
 }
 
 export function displayTimeMs(session: AgentSession, now: number): number {

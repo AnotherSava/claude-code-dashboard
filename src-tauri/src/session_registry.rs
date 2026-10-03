@@ -64,7 +64,9 @@
 //! Both readings share one cache, so a roster request costs no extra directory
 //! read and no extra process-table snapshot, and a title and a roster served
 //! within one TTL cannot disagree about which processes exist. The cache holds
-//! the surviving *records*; `chat_id` is derived per query rather than baked in,
+//! the surviving *records* of every `kind` — a message's sender need not own a
+//! terminal — and each reading about terminals keeps only the interactive ones
+//! itself; `chat_id` is derived per query rather than baked in,
 //! which also means a `projects_root` change takes effect immediately instead of
 //! being masked for up to a TTL.
 //!
@@ -229,7 +231,7 @@ impl LiveSession {
     /// `anchored` is deliberately a read-only lookup that inserts nothing, so
     /// both callers stay read paths.
     pub fn row_id(&self, anchored: &dyn Fn(&str) -> Option<String>) -> String {
-        self.session_ids.iter().find_map(|sid| anchored(sid)).unwrap_or_else(|| self.chat_id.clone())
+        row_for(self.session_ids.iter().map(String::as_str), &self.chat_id, anchored)
     }
 
     /// Whether this dashboard has ever processed an event for one of the sessions
@@ -250,6 +252,23 @@ impl LiveSession {
     pub fn known_to(&self, anchored: &dyn Fn(&str) -> Option<String>) -> bool {
         self.session_ids.iter().any(|sid| anchored(sid).is_some())
     }
+}
+
+/// The row a set of sessions writes to: the anchored id where `ChatIdRegistry`
+/// has pinned one of them, else `derived`. The one rule behind
+/// [`LiveSession::row_id`] and [`record_row`].
+fn row_for<'a>(session_ids: impl IntoIterator<Item = &'a str>, derived: &str, anchored: &dyn Fn(&str) -> Option<String>) -> String {
+    session_ids.into_iter().find_map(anchored).unwrap_or_else(|| derived.to_string())
+}
+
+/// [`row_for`] for one record.
+fn record_row(r: &Record, anchored: &dyn Fn(&str) -> Option<String>, projects_root: Option<&str>) -> String {
+    row_for(r.session_id.as_deref(), &derive_chat_id(Some(&r.cwd), projects_root), anchored)
+}
+
+/// Whether a record is a session that owns a terminal.
+fn is_interactive(r: &Record) -> bool {
+    r.kind.as_deref() == Some("interactive")
 }
 
 /// What the registry can say about where to write a message for one row.
@@ -279,7 +298,7 @@ pub enum InboxLookup {
 
 /// Pure resolver behind [`SessionRegistry::inbox_for`].
 fn inbox_in(records: &[Record], chat_id: &str, projects_root: Option<&str>) -> InboxLookup {
-    let matches: Vec<&Record> = records.iter().filter(|r| derive_chat_id(Some(&r.cwd), projects_root) == chat_id).collect();
+    let matches: Vec<&Record> = records.iter().filter(|r| is_interactive(r) && derive_chat_id(Some(&r.cwd), projects_root) == chat_id).collect();
     match matches.as_slice() {
         [] => InboxLookup::NotFound,
         [only] => match only.messaging_socket_path.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
@@ -290,7 +309,9 @@ fn inbox_in(records: &[Record], chat_id: &str, projects_root: Option<&str>) -> I
     }
 }
 
-/// Managed state: the live interactive records as last read, and when.
+/// Managed state: the live records as last read, and when. Every kind is kept,
+/// because a message's sender need not own a terminal; each reading that is
+/// about terminals filters to [`is_interactive`] itself.
 #[derive(Default)]
 pub struct SessionRegistry {
     cached: Mutex<Option<(i64, Vec<Record>)>>,
@@ -341,7 +362,7 @@ impl SessionRegistry {
     #[cfg_attr(not(windows), allow(dead_code))]
     pub fn live_records(&self, now: i64) -> Option<Vec<(u32, String)>> {
         let mut cached = self.cached.lock().unwrap();
-        Self::refresh(&mut cached, now).map(|recs| recs.iter().map(|r| (r.pid, r.cwd.clone())).collect())
+        Self::refresh(&mut cached, now).map(|recs| recs.iter().filter(|r| is_interactive(r)).map(|r| (r.pid, r.cwd.clone())).collect())
     }
 
     /// Where a cross-machine message for `chat_id` must be written, or why it
@@ -361,6 +382,17 @@ impl SessionRegistry {
         match Self::refresh(&mut cached, now) {
             Some(recs) => inbox_in(recs, chat_id, projects_root),
             None => InboxLookup::Unreadable,
+        }
+    }
+
+    /// The live session that sent a `SendMessage`, named by the `from` inbox and
+    /// the `from-name` its envelope carries. Shares the 5 s cache with every other
+    /// reading. See [`sender_in`] for the order the two keys are tried in.
+    pub fn sender_of(&self, inbox: Option<&str>, name: Option<&str>, anchored: &dyn Fn(&str) -> Option<String>, projects_root: Option<&str>, now: i64) -> SenderLookup {
+        let mut cached = self.cached.lock().unwrap();
+        match Self::refresh(&mut cached, now) {
+            Some(recs) => sender_in(recs, inbox, name, anchored, projects_root),
+            None => SenderLookup::Unreadable,
         }
     }
 
@@ -385,7 +417,7 @@ impl SessionRegistry {
         let fresh = cached.as_ref().is_some_and(|(at, _)| now - at < CACHE_TTL_MS);
         if !fresh {
             let records = read_records()?;
-            *cached = Some((now, live_interactive(records, liveness::process_images())));
+            *cached = Some((now, live(records, liveness::process_images())));
         }
         cached.as_ref().map(|(_, recs)| recs.as_slice())
     }
@@ -424,17 +456,19 @@ fn read_records() -> Option<Vec<Record>> {
         .collect())
 }
 
-/// The records both readings are built from: interactive only, each pid
-/// confirmed to still be a live Claude Code process.
+/// The records every reading is built from: each pid confirmed to still be a
+/// live Claude Code process, of any `kind`. The readings about terminals — the
+/// title target, the roster, the inbox, the per-console list — keep only
+/// [`is_interactive`] records; the sender lookup keeps them all, since a
+/// background session sends messages as readily as one in a tab.
 ///
 /// `images` is the process-table snapshot (`None` when it could not be taken,
 /// which skips the liveness check rather than dropping every candidate — a
 /// missing snapshot is our failure, not evidence the sessions are dead).
 /// Pure so the rules are testable without a registry on disk.
-fn live_interactive(records: Vec<Record>, images: Option<HashMap<u32, String>>) -> Vec<Record> {
+fn live(records: Vec<Record>, images: Option<HashMap<u32, String>>) -> Vec<Record> {
     records
         .into_iter()
-        .filter(|r| r.kind.as_deref() == Some("interactive"))
         .filter(|r| match &images {
             Some(images) => images.get(&r.pid).is_some_and(|img| liveness::is_claude_image(img)),
             None => true,
@@ -448,7 +482,7 @@ fn live_interactive(records: Vec<Record>, images: Option<HashMap<u32, String>>) 
 /// wants.
 fn tab_pid_in(records: &[Record], chat_id: &str, projects_root: Option<&str>) -> Option<u32> {
     let mut found: Option<u32> = None;
-    for r in records {
+    for r in records.iter().filter(|r| is_interactive(r)) {
         if derive_chat_id(Some(&r.cwd), projects_root) != chat_id {
             continue;
         }
@@ -467,24 +501,78 @@ fn tab_pid_in(records: &[Record], chat_id: &str, projects_root: Option<&str>) ->
 /// so one unchanged registry serializes identically on every poll.
 fn live_rows(records: &[Record], projects_root: Option<&str>, now: i64) -> Vec<LiveSession> {
     let mut by_chat: BTreeMap<String, Vec<&Record>> = BTreeMap::new();
-    for r in records {
+    for r in records.iter().filter(|r| is_interactive(r)) {
         by_chat.entry(derive_chat_id(Some(&r.cwd), projects_root)).or_default().push(r);
     }
-    by_chat
-        .into_iter()
-        .filter_map(|(chat_id, recs)| {
-            let speaker = recs.iter().copied().max_by_key(|r| (r.status_updated_at.unwrap_or(i64::MIN), std::cmp::Reverse(r.pid)))?;
-            Some(LiveSession {
-                chat_id,
-                name: speaker.name.clone(),
-                activity: Activity::parse(speaker.status.as_deref()),
-                activity_age_ms: speaker.status_updated_at.map(|t| (now - t).max(0)),
-                sessions: recs.len(),
-                session_ids: recs.iter().filter_map(|r| r.session_id.clone()).collect(),
-                pid: speaker.pid,
-            })
-        })
-        .collect()
+    by_chat.into_iter().filter_map(|(chat_id, recs)| live_row(chat_id, &recs, now)).collect()
+}
+
+/// One [`LiveSession`] from the records sharing its `chat_id`, the freshest
+/// speaking for them; `None` for an empty set.
+fn live_row(chat_id: String, recs: &[&Record], now: i64) -> Option<LiveSession> {
+    let speaker = recs.iter().copied().max_by_key(|r| (r.status_updated_at.unwrap_or(i64::MIN), std::cmp::Reverse(r.pid)))?;
+    Some(LiveSession {
+        chat_id,
+        name: speaker.name.clone(),
+        activity: Activity::parse(speaker.status.as_deref()),
+        activity_age_ms: speaker.status_updated_at.map(|t| (now - t).max(0)),
+        sessions: recs.len(),
+        session_ids: recs.iter().filter_map(|r| r.session_id.clone()).collect(),
+        pid: speaker.pid,
+    })
+}
+
+/// Which live session sent a message, as far as the registry can say.
+///
+/// Four answers rather than an `Option`, for [`InboxLookup`]'s reason: the
+/// caller logs which wall it hit, and "the sender has gone" is a different
+/// finding from "two sessions share that name" and from "we could not look".
+#[derive(Debug, PartialEq, Eq)]
+pub enum SenderLookup {
+    /// Exactly one live session matches; the dashboard row it writes to, by the
+    /// rule [`LiveSession::row_id`] applies, so a sender that has `cd`-ed is
+    /// placed on the row it actually writes to.
+    Found(String),
+    /// The envelope named no inbox and several sessions carry its name. Refused,
+    /// never guessed: a guess would put another conversation's task on the row.
+    Ambiguous,
+    /// No live session publishes the envelope's inbox, or, for an envelope
+    /// naming no inbox, carries its name.
+    NotFound,
+    /// The registry directory could not be read at all.
+    Unreadable,
+}
+
+/// Pure resolver behind [`SessionRegistry::sender_of`]: by the inbox where the
+/// envelope names one, by the name only where it names none. Every live record is a
+/// candidate whatever its `kind`: a background session publishes an inbox and
+/// has a row, and filtering it out would leave its messages resolvable only by
+/// name, or not at all.
+///
+/// The inbox is compared verbatim, for the reason `messaging_socket_path` is
+/// stored verbatim: it is Claude Code's string, and its fallback shapes are
+/// exactly the ones a normalised comparison would get wrong. It is also the
+/// stronger key — one inbox per session by construction, where a name is only
+/// whatever the session was called, and two sessions in one project routinely
+/// derive the same one.
+///
+/// So an inbox no live record publishes is [`SenderLookup::NotFound`], and the
+/// name is not consulted: the inbox belonged to one process, which has gone, and
+/// any live session carrying the name is by construction a different one. On
+/// macOS a name is the bare project basename, which every later session in that
+/// project — and every project sharing the basename — takes again, so a name
+/// match there would report a namesake's task as the sender's.
+fn sender_in(records: &[Record], inbox: Option<&str>, name: Option<&str>, anchored: &dyn Fn(&str) -> Option<String>, projects_root: Option<&str>) -> SenderLookup {
+    let matches: Vec<&Record> = match (inbox, name) {
+        (Some(i), _) => records.iter().filter(|r| r.messaging_socket_path.as_deref() == Some(i)).collect(),
+        (None, Some(n)) => records.iter().filter(|r| r.name.as_deref() == Some(n)).collect(),
+        (None, None) => Vec::new(),
+    };
+    match matches.as_slice() {
+        [] => SenderLookup::NotFound,
+        [only] => SenderLookup::Found(record_row(only, anchored, projects_root)),
+        _ => SenderLookup::Ambiguous,
+    }
 }
 
 #[cfg(test)]
@@ -516,12 +604,12 @@ mod tests {
     /// The title reading end to end, mirroring `tab_pid`'s body without a
     /// registry on disk.
     fn tab(records: Vec<Record>, chat_id: &str, projects_root: Option<&str>, images: Option<HashMap<u32, String>>) -> Option<u32> {
-        tab_pid_in(&live_interactive(records, images), chat_id, projects_root)
+        tab_pid_in(&live(records, images), chat_id, projects_root)
     }
 
     /// The roster reading end to end, likewise.
     fn rows(records: Vec<Record>, projects_root: Option<&str>, images: Option<HashMap<u32, String>>, now: i64) -> Vec<LiveSession> {
-        live_rows(&live_interactive(records, images), projects_root, now)
+        live_rows(&live(records, images), projects_root, now)
     }
 
     #[test]
@@ -699,7 +787,7 @@ mod tests {
     }
 
     fn inbox(records: Vec<Record>, chat_id: &str, images: Option<HashMap<u32, String>>) -> InboxLookup {
-        inbox_in(&live_interactive(records, images), chat_id, Some("/Users/x/Projects"))
+        inbox_in(&live(records, images), chat_id, Some("/Users/x/Projects"))
     }
 
     /// The path is the record's own string, carried through untouched — never
@@ -792,7 +880,7 @@ mod tests {
     /// way.
     #[test]
     fn both_readings_agree_off_one_record_set() {
-        let live = live_interactive(
+        let live = live(
             vec![
                 rec(100, "/Users/x/Projects/landlord", Some("interactive")),
                 rec(200, "/Users/x/Projects/landlord", Some("interactive")),
@@ -805,5 +893,64 @@ mod tests {
         assert_eq!(tab_pid_in(&live, "landlord", root), None, "titling stays silent on ambiguity");
         let roster = live_rows(&live, root, 1_000);
         assert_eq!(roster.iter().map(|r| r.chat_id.as_str()).collect::<Vec<_>>(), vec!["landlord", "printlab"], "the roster reports both cwds, sorted");
+    }
+
+    // -------- sender_of --------
+
+    /// The Windows pipe shape exactly as a live record publishes it and as the
+    /// `from` attribute of a `SendMessage` envelope carries it after `uds:`.
+    const PIPE: &str = r"\\.\pipe\LOCAL\cc-msg-a4c1b938590ef77f87b579f87d833c4a";
+
+    fn sender(pid: u32, cwd: &str, sock: Option<&str>, name: &str, sid: &str) -> Record {
+        let mut r = with_inbox(pid, cwd, sock);
+        r.name = Some(name.to_string());
+        r.session_id = Some(sid.to_string());
+        r
+    }
+
+    /// Nothing anchored: every session sits on its cwd-derived row.
+    fn unanchored(_: &str) -> Option<String> {
+        None
+    }
+
+    #[test]
+    fn a_sender_is_found_by_its_inbox_verbatim() {
+        let recs = vec![sender(41948, r"D:\projects\tauri-dashboard", Some(PIPE), "tauri-dashboard-bf", "sid-a"), sender(9268, r"D:\projects\claude", Some(r"\\.\pipe\LOCAL\cc-msg-other"),"tauri-dashboard-bf", "sid-b")];
+        let found = sender_in(&recs, Some(PIPE), Some("tauri-dashboard-bf"), &unanchored, None);
+        assert_eq!(found, SenderLookup::Found("tauri-dashboard".into()), "the inbox decides even where the name is shared");
+        assert_eq!(sender_in(&recs, Some(&PIPE.to_uppercase()), None, &unanchored, None), SenderLookup::NotFound, "compared verbatim, never normalised");
+    }
+
+    #[test]
+    fn the_name_is_tried_only_when_the_envelope_names_no_inbox_and_a_shared_name_is_refused() {
+        let recs = vec![sender(1, "/p/a", Some("/tmp/cc-socks/1.sock"), "alpha", "s1"), sender(2, "/p/b", Some("/tmp/cc-socks/2.sock"), "twin", "s2"), sender(3, "/p/c", None, "twin", "s3")];
+        assert_eq!(sender_in(&recs, None, Some("alpha"), &unanchored, None), SenderLookup::Found("a".into()), "found by name");
+        assert_eq!(sender_in(&recs, Some("/tmp/cc-socks/gone.sock"), Some("alpha"), &unanchored, None), SenderLookup::NotFound, "an inbox no record publishes is a sender that has gone; a live namesake is another process");
+        assert_eq!(sender_in(&recs, None, Some("twin"), &unanchored, None), SenderLookup::Ambiguous);
+        assert_eq!(sender_in(&recs, None, Some("nobody"), &unanchored, None), SenderLookup::NotFound);
+        assert_eq!(sender_in(&recs, None, None, &unanchored, None), SenderLookup::NotFound, "an envelope naming neither finds nothing");
+    }
+
+    /// A message's sender need not own a terminal: a conversation moved into a
+    /// background session still publishes an inbox and writes a row. Read
+    /// through the same `live` + reading pair `sender_of` runs.
+    #[test]
+    fn a_background_session_is_found_as_a_sender() {
+        let mut bg = sender(4546, "/Users/x/Projects/printlab", Some("/tmp/cc-socks/4546.sock"), "printlab", "sid-bg");
+        bg.kind = Some("bg".into());
+        let recs = live(vec![bg], all_claude(&[4546]));
+        let found = sender_in(&recs, Some("/tmp/cc-socks/4546.sock"), None, &unanchored, Some("/Users/x/Projects"));
+        assert_eq!(found, SenderLookup::Found("printlab".into()));
+        assert_eq!(inbox_in(&recs, "printlab", Some("/Users/x/Projects")), InboxLookup::NotFound, "still not an address a message can be written to");
+    }
+
+    /// The row is the anchored one, so a sender that has `cd`-ed is placed on the
+    /// row it writes to rather than the one its directory derives.
+    #[test]
+    fn a_sender_is_placed_on_its_anchored_row() {
+        let recs = vec![sender(1, "/p/a", Some("/tmp/cc-socks/1.sock"), "a", "s1"), sender(2, "/p/a/sub", Some("/tmp/cc-socks/2.sock"), "a-sub", "s2")];
+        let anchored = |sid: &str| (sid == "s2").then(|| "a".to_string());
+        assert_eq!(sender_in(&recs, Some("/tmp/cc-socks/2.sock"), None, &anchored, Some("/p")), SenderLookup::Found("a".into()));
+        assert_eq!(sender_in(&recs, Some("/tmp/cc-socks/2.sock"), None, &unanchored, Some("/p")), SenderLookup::Found("a sub".into()), "unanchored, its directory decides");
     }
 }

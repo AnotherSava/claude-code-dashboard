@@ -1933,9 +1933,13 @@ mod tests {
             canary: crate::state::Canary::Off,
             attended_at: None,
             turn_from_relay: false,
+            delegated_task: None,
+            message_line: None,
             clean_claim_at: None,
             read: false,
             name_shared_by: None,
+            row_line: None,
+            task_lines: Vec::new(),
             subagent_gate: None,
             terminal_stale_at: None,
         }

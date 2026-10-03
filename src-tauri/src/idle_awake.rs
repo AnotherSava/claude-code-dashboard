@@ -411,6 +411,9 @@ mod tests {
                     dialog_entry: None,
                     waiting_backstop_armed: false,
                     turn_from_relay: None,
+                    delegated_task: None,
+                    message_line: None,
+                    message_is_reply: None,
                 },
                 *updated,
                 &[],
@@ -475,7 +478,7 @@ mod tests {
         // A subagent's permission dialog shows the row BLOCK, but the main
         // agent's workflow underneath is still running and must keep the hold.
         let state = AppState::new();
-        let working = SetInput { id: "x".into(), status: Status::Working, label: None, source: None, model: None, input_tokens: None, dialog_entry: None, waiting_backstop_armed: false, turn_from_relay: None };
+        let working = SetInput { delegated_task: None, message_line: None, message_is_reply: None, id: "x".into(), status: Status::Working, label: None, source: None, model: None, input_tokens: None, dialog_entry: None, waiting_backstop_armed: false, turn_from_relay: None };
         state.apply_set(working.clone(), 5, &[], None);
         let prompt = crate::state::SubagentPromptRequest { agent_id: "a1".into(), session_id: "sess".into(), agent_type: None, tool_name: "Bash".into(), tool_input: serde_json::Value::Null, label: "needs approval: Bash".into(), subagents_dir: None };
         state.open_subagent_prompt(working, prompt, 9, None);

@@ -748,7 +748,11 @@ fn agent_roster(
                 local: s.origin.is_none(),
                 display_name: s.display_name.clone(),
                 status: s.status,
-                label: s.label.clone(),
+                // The row's own text, read by the one function the widget row
+                // and the Telegram ping read, so a task
+                // another agent began reads here as the sender's task too, and
+                // no agent message's envelope is ever reported.
+                label: s.primary_text().into_owned(),
                 status_age_ms: age_since(s.state_entered_at),
                 last_seen_age_ms: seen,
             })
@@ -1033,16 +1037,22 @@ struct MessageRequest {
 /// row carries, a row that has no prompt recorded yet — never a substitute.
 /// Remote rows are skipped: a row this device merely syncs is some other
 /// machine's, so its prompt is not ours to report as a local sender's.
+///
+/// The row's task as a person gave it ([`AgentSession::person_task`]): where
+/// another agent began the sender's own task, the task behind that, so the
+/// receiver is told what a person asked for rather than handed an envelope to
+/// unwrap. Where that task was never resolved, `None` — the message line the
+/// row shows in its place is another agent's words, not a task, and sent on as
+/// one it would be reported as this sender's task by the receiving row.
 fn sender_task(rows: &[AgentSession], from_agent: &str) -> Option<String> {
     if from_agent == "unknown" {
         return None;
     }
     rows.iter()
         .find(|s| s.origin.is_none() && s.id == from_agent)
-        .and_then(|s| s.original_prompt.as_deref())
-        .map(str::trim)
+        .and_then(AgentSession::person_task)
+        .map(|p| p.trim().to_string())
         .filter(|p| !p.is_empty())
-        .map(str::to_string)
 }
 
 /// Relay one message to an agent on another machine.
@@ -1483,7 +1493,7 @@ fn apply_event(app: &AppHandle, req: EventRequest) -> Response {
     let _row_guard = row_lock.as_deref().map(crate::commands::RowLocks::hold);
 
     match output {
-        AdapterOutput::Set { input, transcript_path, reason, subagent } => {
+        AdapterOutput::Set { input, transcript_path, reason, subagent, agent_message } => {
             // Do the `/clear` teardown its `SessionEnd` will be refused for, ahead
             // of everything this event records — its pid, console and ownership,
             // which the removal would otherwise forget — and of its own
@@ -1555,6 +1565,28 @@ fn apply_event(app: &AppHandle, req: EventRequest) -> Response {
             // whether it is clean turns entirely on where the previous one
             // stopped — and only the persisted dialog knows that.
             let mut input = input;
+            // A prompt another agent wrote: settle what the row shows for it now,
+            // against the rows as they stand before this prompt lands, so the
+            // sender moving on later cannot change it. See `prompt_origin`.
+            let origin = agent_message.as_ref().map(|msg| {
+                let registry = app.try_state::<SessionRegistry>();
+                let chat_ids = app.try_state::<ChatIdRegistry>();
+                let rows = state.snapshot();
+                let live = crate::prompt_origin::Live {
+                    rows: &rows,
+                    registry: registry.as_deref(),
+                    anchored: &|sid| chat_ids.as_ref().and_then(|r| r.anchored(sid)),
+                    projects_root: cfg.projects_root.as_deref(),
+                    now: now_ms(),
+                };
+                (msg, crate::prompt_origin::for_arrival(msg, &live))
+            });
+            if let Some((msg, res)) = &origin {
+                input.delegated_task = res.delegated_task();
+                input.message_line = res.message_line();
+                input.message_is_reply = Some(msg.is_reply());
+            }
+            let arriving_prompt = origin.as_ref().and(input.label.clone());
             if resume_is_clean(&req.event, req.payload.get("source").and_then(|v| v.as_str()), restored.as_ref().map(|r| r.dialog.as_slice())) {
                 input.status = Status::Idle;
             }
@@ -1611,6 +1643,14 @@ fn apply_event(app: &AppHandle, req: EventRequest) -> Response {
                 }
                 SubagentEffect::AllEnded | SubagentEffect::Untouched => state.apply_set(input, now, &cfg.continuation_prompts, restored),
             };
+            // Logged once the prompt has landed, because only now is it known
+            // whether it became the row's task: off a task boundary
+            // `label_policy::select` keeps the previous task and its text, and
+            // the resolution goes unused.
+            if let Some((msg, res)) = &origin {
+                let adopted = crate::prompt_origin::adopted(state.sessions.lock().unwrap().iter().find(|s| s.id == chat_id), arriving_prompt.as_deref(), res);
+                crate::prompt_origin::log(&chat_id, msg, res, adopted);
+            }
             // A main turn that ended with no background work in flight leaves none
             // of its session's subagents able to still be prompting, so release
             // every prompt that session raised — after `apply_set`, so the release
@@ -1850,9 +1890,13 @@ mod tests {
             canary: crate::state::Canary::Off,
             attended_at: None,
             turn_from_relay: false,
+            delegated_task: None,
+            message_line: None,
             clean_claim_at: None,
             read: false,
             name_shared_by: None,
+            row_line: None,
+            task_lines: Vec::new(),
             subagent_gate: None,
             terminal_stale_at: None,
         }
@@ -1897,6 +1941,34 @@ mod tests {
 
         let both = [with_prompt("what-is-next", Some("chrome"), Some("the peer's task")), with_prompt("what-is-next", None, Some("this machine's task"))];
         assert_eq!(sender_task(&both, "what-is-next").as_deref(), Some("this machine's task"), "the local row answers even where a same-named remote one is listed first");
+    }
+
+    /// A sender whose own task another agent began reports the task behind it,
+    /// and never an envelope for the receiver to unwrap.
+    #[test]
+    fn a_delegated_sender_reports_the_task_behind_its_envelope() {
+        let envelope = "<cross-session-message from=\"uds:/tmp/cc-socks/1.sock\" from-name=\"a\" from-mode=\"prompting\"> placeholder message </cross-session-message>";
+        let delegated = AgentSession { delegated_task: Some("add a title-bar caption".into()), ..with_prompt("agwinterm", None, Some(envelope)) };
+        assert_eq!(sender_task(&[delegated], "agwinterm").as_deref(), Some("add a title-bar caption"));
+        assert_eq!(sender_task(&[with_prompt("agwinterm", None, Some(envelope))], "agwinterm"), None, "an unresolved message is no task, and the envelope is never sent on as one");
+        let line = AgentSession { message_line: Some("placeholder message".into()), ..with_prompt("agwinterm", None, Some(envelope)) };
+        assert_eq!(sender_task(&[line], "agwinterm"), None, "the message line standing in for it is not a task either");
+    }
+
+    /// The roster's label is the row's own text: a label an agent message set
+    /// is its envelope, with the sender's inbox address in it, and a task
+    /// another agent began reads as the sender's task, as it does on the widget.
+    #[test]
+    fn the_roster_reports_the_row_s_text_never_an_envelope() {
+        let envelope = "<cross-session-message from=\"uds:\\\\.\\pipe\\LOCAL\\cc-msg-a4c1\" from-name=\"a\" from-mode=\"prompting\"> add a caption </cross-session-message>";
+        let row = AgentSession { label: envelope.into(), ..session("agwinterm", Status::Working, None, 900) };
+        let roster = agent_roster(&[row], Some(&[]), &BTreeMap::new(), &BTreeMap::new(), &|_| None, &devices(&[]), Some("chrome"), false, 1_000);
+        assert_eq!(roster.agents[0].label, "add a caption");
+
+        let row = AgentSession { label: envelope.into(), original_prompt: Some(envelope.into()), delegated_task: Some("add a title-bar caption to agwinterm".into()), ..session("agwinterm", Status::Working, None, 900) };
+        let roster = agent_roster(&[row.clone()], Some(&[]), &BTreeMap::new(), &BTreeMap::new(), &|_| None, &devices(&[]), Some("chrome"), false, 1_000);
+        assert_eq!(roster.agents[0].label, "add a title-bar caption to agwinterm", "the sender's task, as the widget shows it");
+        assert_eq!(roster.agents[0].label, row.primary_text());
     }
 
     #[test]
@@ -2316,6 +2388,9 @@ mod tests {
             dialog_entry: None,
             waiting_backstop_armed: false,
             turn_from_relay: Some(relay),
+            delegated_task: None,
+            message_line: None,
+            message_is_reply: None,
         };
         // A `/clear`-style settle to CLEAN is not a prompt, so it says nothing
         // about who begins the next turn.

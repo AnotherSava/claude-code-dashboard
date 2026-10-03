@@ -1129,9 +1129,13 @@ mod tests {
             canary: crate::state::Canary::Off,
             attended_at: None,
             turn_from_relay: false,
+            delegated_task: None,
+            message_line: None,
             clean_claim_at: None,
             read: false,
             name_shared_by: None,
+            row_line: None,
+            task_lines: Vec::new(),
             subagent_gate: None,
             terminal_stale_at: None,
         }
@@ -1227,7 +1231,7 @@ mod tests {
         // The main agent was blocked on its own dialog when a subagent's opened;
         // the user approves the main one and the transcript shows it resumed.
         let state = AppState::new();
-        let blocked = crate::state::SetInput { id: "s".into(), status: Status::Blocked, label: Some("needs approval: Write".into()), source: None, model: None, input_tokens: None, dialog_entry: None, waiting_backstop_armed: false, turn_from_relay: None };
+        let blocked = crate::state::SetInput { delegated_task: None, message_line: None, message_is_reply: None, id: "s".into(), status: Status::Blocked, label: Some("needs approval: Write".into()), source: None, model: None, input_tokens: None, dialog_entry: None, waiting_backstop_armed: false, turn_from_relay: None };
         state.apply_set(blocked.clone(), 1_000, &[], None);
         let prompt = crate::state::SubagentPromptRequest { agent_id: "a1".into(), session_id: "sess".into(), agent_type: None, tool_name: "Bash".into(), tool_input: serde_json::Value::Null, label: "needs approval: Bash".into(), subagents_dir: None };
         state.open_subagent_prompt(blocked, prompt, 2_000, None);

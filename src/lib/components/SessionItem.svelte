@@ -58,7 +58,6 @@
 <script lang="ts">
   import type { AgentSession, Config } from '../types'
   import {
-    displayLabel,
     displayTimeMs,
     formatTime,
     formatTokens,
@@ -114,30 +113,13 @@
     else if (e.key === 'Escape') { e.preventDefault(); cancelEdit() }
   }
 
-  const label = $derived(displayLabel(session))
-  // When there's no active task to show (e.g. an idle row after `/clear`), fall
-  // back to the most recent task prompt so the history tooltip + click-to-open
-  // stay reachable. Rendered muted/italic via `isPastTask` so it reads clearly
-  // as a past task, not the current one.
-  const lastTask = $derived.by(() => {
-    const tasks = session.dialog.filter((e) => e.task_start)
-    if (tasks.length) return tasks[tasks.length - 1].text
-    // No flagged task starts — a dialog synced from a peer, persisted before
-    // backend task-start marking, or made of only continuations/approvals.
-    // Fall back to a user prompt so a row with restorable history never goes
-    // blank (the click target stays alive and history stays reachable).
-    // Prefer the most recent non-trivial prompt over single-token approvals
-    // like "y"/"ok" so the hint reads as a task, not a confirmation; fall back
-    // to any user prompt, then any non-separator entry.
-    const users = session.dialog.filter((e) => e.role === 'user' && e.text.trim() !== '')
-    const substantive = users.filter((e) => e.text.trim().length > 4)
-    if (substantive.length) return substantive[substantive.length - 1].text
-    if (users.length) return users[users.length - 1].text
-    const any = session.dialog.filter((e) => e.role !== 'separator' && e.text.trim() !== '')
-    return any.length ? any[any.length - 1].text : ''
-  })
-  const labelText = $derived(label || lastTask)
-  const isPastTask = $derived(!label && !!lastTask)
+  // The task line's text is decided in Rust (`AgentSession::row_line`), which a
+  // terminal's headline is written from too. A row with nothing current shows
+  // its most recent task instead, so the history tooltip and click-to-open stay
+  // reachable; that one is muted/italic via `isPastTask` so it reads as a past
+  // task, not the current one.
+  const labelText = $derived(session.row_line?.text ?? '')
+  const isPastTask = $derived(session.row_line?.kind === 'past')
   const time = $derived(formatTime(displayTimeMs(session, now)))
   const tokensText = $derived(
     session.input_tokens !== null ? formatTokens(session.input_tokens) : '',
@@ -219,16 +201,17 @@
   // which is what gives us the ability to exceed the dashboard window's
   // width. Format: each line is `HH:MM  prompt`, with long prompts wrapped to a
   // hanging-indented second column. Older prompts on top, current on the
-  // bottom, prefixed with an arrow marker.
+  // bottom, prefixed with an arrow marker. The tasks and their text come from
+  // Rust (`AgentSession::task_lines`), not from the dialog, whose entry for a
+  // task another agent began is the whole envelope.
   const titleText = $derived.by(() => {
-    const taskPrompts = session.dialog.filter((e) => e.task_start)
-    const visible = taskPrompts.slice(-(HISTORY_VISIBLE + 1))
-    const lines: string[] = visible.map((e, i) => {
+    const visible = (session.task_lines ?? []).slice(-(HISTORY_VISIBLE + 1))
+    const lines: string[] = visible.map((t, i) => {
       // Current task gets the ▸ centered in a marker measured to the exact width
       // of the gap (MARKER.gap) the other rows fill, so its prompt text lines up
       // with the rows above it regardless of the proportional triangle width.
       const marker = i === visible.length - 1 ? MARKER.current : MARKER.gap
-      return wrapWithHangingIndent(`${formatClock(e.timestamp)}${marker}`, e.text)
+      return wrapWithHangingIndent(`${formatClock(t.at)}${marker}`, t.text)
     })
     return lines.join('\n')
   })

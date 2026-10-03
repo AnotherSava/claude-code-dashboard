@@ -132,7 +132,8 @@ fn name_counts(sessions: &[AgentSession], per_row: &HashMap<String, usize>) -> H
 }
 
 /// The snapshot everything the *user* looks at is built from: [`resolved_snapshot`]
-/// plus [`stamp_read`].
+/// plus [`stamp_read`] and each row's [`AgentSession::row_line`] and
+/// [`AgentSession::task_lines`].
 ///
 /// The split is the point. `resolved_snapshot` answers "what is each agent doing",
 /// which is what `/api/agents` and the sync push report; this answers "what should
@@ -147,6 +148,10 @@ fn display_snapshot_versioned(app: &AppHandle) -> (u64, Vec<AgentSession>) {
     let (seq, mut sessions) = resolved_snapshot_versioned(app);
     if app.try_state::<ConfigState>().is_some_and(|c| c.config.lock().unwrap().attention_tracking) {
         stamp_read(&mut sessions);
+    }
+    for s in sessions.iter_mut() {
+        s.row_line = s.row_line();
+        s.task_lines = s.task_lines();
     }
     (seq, sessions)
 }
@@ -1096,6 +1101,12 @@ pub fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// This machine's own rows, without the ones synced from a peer: what every
+/// terminal-facing reader is handed, since a remote row has no console here.
+pub(crate) fn local_rows(sessions: &[AgentSession]) -> Vec<AgentSession> {
+    sessions.iter().filter(|s| s.origin.is_none()).cloned().collect()
+}
+
 pub fn emit_sessions_updated(app: &AppHandle) {
     // The ticket rides with the snapshot as far as the one publisher that has to
     // order itself against other emits — see `AppState::snapshot_versioned` and
@@ -1112,7 +1123,7 @@ pub fn emit_sessions_updated(app: &AppHandle) {
     // without a second state machine. Titles are a local-machine concern:
     // hand over only the local subset so remote rows can't even reach the
     // pid bookkeeping.
-    let local: Vec<AgentSession> = sessions.iter().filter(|s| s.origin.is_none()).cloned().collect();
+    let local = local_rows(&sessions);
     crate::terminal_title::sync(app, &local, seq);
     // Same chokepoint drives the lid-closed sleep veto: it must be armed while
     // an agent is busy *before* the lid shuts, since a lid close sleeps the Mac
@@ -1428,6 +1439,9 @@ mod tests {
                 dialog_entry: None,
                 waiting_backstop_armed: false,
                 turn_from_relay: None,
+                delegated_task: None,
+                message_line: None,
+                message_is_reply: None,
             },
             state_entered_at,
             &[],

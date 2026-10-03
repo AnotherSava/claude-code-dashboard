@@ -48,6 +48,8 @@ impl PromptHistoryStore {
             PersistedSession {
                 dialog: session.dialog.clone(),
                 original_prompt: session.original_prompt.clone(),
+                delegated_task: session.delegated_task.clone(),
+                message_line: session.message_line.clone(),
                 task_started_at: session.task_started_at,
             },
         );
@@ -98,6 +100,8 @@ mod tests {
                 PersistedSession {
                     dialog: vec![entry],
                     original_prompt: Some("fix foo".into()),
+                    delegated_task: None,
+                    message_line: None,
                     task_started_at: 1000,
                 },
             );

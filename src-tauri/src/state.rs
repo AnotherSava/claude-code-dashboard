@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -199,8 +200,36 @@ pub struct PersistedSession {
     pub dialog: Vec<DialogEntry>,
     #[serde(default)]
     pub original_prompt: Option<String>,
+    /// `AgentSession::delegated_task`, kept with the prompt it stands for.
+    #[serde(default)]
+    pub delegated_task: Option<String>,
+    /// `AgentSession::message_line`, likewise.
+    #[serde(default)]
+    pub message_line: Option<String>,
     #[serde(default)]
     pub task_started_at: i64,
+}
+
+/// The text of the widget row's task line, and which kind it is.
+///
+/// Two kinds because the row draws them differently: current text plainly, a
+/// past task muted and italic, so it does not read as what the agent is doing
+/// now. On the wire as `{"kind": "current" | "past", "text": …}`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "text", rename_all = "snake_case")]
+pub enum RowLine {
+    /// [`AgentSession::primary_text`]: what the row is about now.
+    Current(String),
+    /// The most recent task in the dialog, for a row with no current text.
+    Past(String),
+}
+
+/// One task in the widget row's hover tooltip: when it began and the text it
+/// shows as.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskLine {
+    pub at: i64,
+    pub text: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -218,6 +247,42 @@ pub struct AgentSession {
     pub status_before_working: Status,
     pub label: String,
     pub original_prompt: Option<String>,
+    /// When another agent began the row's task: that agent's own task, the one a
+    /// person gave it at the start of the chain, as resolved when the prompt
+    /// arrived. `None` for a task a person began, and for one whose sender's
+    /// task could not be resolved (see [`message_line`](Self::message_line)).
+    /// See `prompt_origin`.
+    ///
+    /// For a relayed message it is the sending dashboard's record of that task,
+    /// the envelope header's copy — reserved words `[redacted]`, quotes dropped,
+    /// cut to 200 characters.
+    ///
+    /// A field beside `original_prompt` rather than a rewrite of it, because the
+    /// two are different facts: `original_prompt` is what arrived (the whole
+    /// envelope, kept for the history), this is what to call it. It moves in
+    /// lockstep with `original_prompt` (`label_policy::select`), so it can never
+    /// describe a task the row has left.
+    ///
+    /// Settled once, when the prompt arrives, and never recomputed: the sender
+    /// moving on to other work does not change what this row was asked. Persisted
+    /// with the prompt and carried on the sync wire, `#[serde(default)]` on both,
+    /// so an older `prompt_history.json` loads and an older peer's push parses.
+    #[serde(default)]
+    pub delegated_task: Option<String>,
+    /// When another agent began the row's task and its own task could not be
+    /// resolved: the first line of the message, envelope stripped, which is the
+    /// next-truest account of what this session was asked. `None` otherwise;
+    /// never set together with [`delegated_task`](Self::delegated_task).
+    ///
+    /// Its own field because it is a different fact from a resolved task: a line
+    /// another agent wrote, not something a person asked for. Kept in
+    /// `delegated_task` it would be read back as one — by the next message this
+    /// row sends (`prompt_origin`'s chain, `http_server::sender_task`), which
+    /// would then report a message line, possibly the receiver's own message
+    /// echoed back, as this row's task. Moves, persists and syncs exactly as
+    /// `delegated_task` does.
+    #[serde(default)]
+    pub message_line: Option<String>,
     #[serde(default)]
     pub task_started_at: i64,
     #[serde(default)]
@@ -411,6 +476,27 @@ pub struct AgentSession {
     /// be about that machine's tabs anyway.
     #[serde(default)]
     pub name_shared_by: Option<usize>,
+    /// The text of the widget row's task line, the [`AgentSession::row_line`]
+    /// verdict. The frontend draws it rather than deciding it, so the row and
+    /// the terminal headline `terminal_title` writes from the same function
+    /// cannot disagree.
+    ///
+    /// Always `None` in `AppState`. Stamped by `commands::display_snapshot` for
+    /// every row, local and remote, where `None` then means the row has no text
+    /// for that line. Like [`AgentSession::read`] it is a display fact, so the
+    /// sync push and `/api/agents`, which read the unstamped rows, never carry it.
+    #[serde(default)]
+    pub row_line: Option<RowLine>,
+    /// The row's tasks as its hover tooltip lists them, oldest first, the
+    /// [`AgentSession::task_lines`] verdict. Decided here rather than read off
+    /// `dialog` by the frontend, because a task another agent began is its
+    /// whole envelope there, kept for the history window, and the tooltip sits
+    /// over the task line that shows the sender's task instead.
+    ///
+    /// Empty in `AppState` and stamped by `commands::display_snapshot` beside
+    /// [`row_line`](Self::row_line), for the same reasons.
+    #[serde(default)]
+    pub task_lines: Vec<TaskLine>,
     /// The subagent permission prompts open on this row, and the main agent's
     /// own state underneath them. `None` whenever no subagent is waiting on a
     /// dialog, which is nearly always.
@@ -592,6 +678,110 @@ impl AgentSession {
         self.display_name.as_deref().unwrap_or(&self.id)
     }
 
+    /// What the row is about right now. For a row the user must act on
+    /// (`blocked`/`error`) it is the current `label`, the question or approval
+    /// request; otherwise the original task, falling back to `label`. The
+    /// fallback order matters because `Stop`→`Done` carries no label, so
+    /// `label_policy` keeps the previous one, and a `done` row that was `blocked`
+    /// would otherwise still read "needs approval: tool".
+    ///
+    /// The task is [`shown_task`](Self::shown_task), so a task another agent
+    /// began reads as what that agent was asked to do; and every text goes through
+    /// `prompt_origin::shown`, so no agent message's envelope is ever what this
+    /// returns. The widget row and the Telegram ping both read it, which is what
+    /// keeps the two agreeing. A terminal's context line reads
+    /// [`shown_task`](Self::shown_task) alone, since the tab title's glyph
+    /// already says the row is asking.
+    pub fn primary_text(&self) -> Cow<'_, str> {
+        let label = || crate::prompt_origin::shown(&self.label);
+        let text = match self.status {
+            Status::Blocked | Status::Error => label(),
+            _ => self.shown_task().or_else(label),
+        };
+        text.unwrap_or_default()
+    }
+
+    /// The task a person gave this row's agent, where it is known:
+    /// `delegated_task`, or `original_prompt` when a person typed it. `None`
+    /// where the task is another agent's message whose sender's task was never
+    /// resolved — the [`message_line`](Self::message_line) standing in for it is
+    /// a line that agent wrote, not a task, so it is never reported as this
+    /// row's task to anyone else (`http_server::sender_task`,
+    /// `prompt_origin::sender_task`).
+    pub fn person_task(&self) -> Option<&str> {
+        self.delegated_task.as_deref().filter(|t| crate::peer_message::parse_harness_prompt(t).is_none()).or(self.original_prompt.as_deref().filter(|p| crate::peer_message::parse_agent_message(p).is_none() && crate::peer_message::parse_harness_prompt(p).is_none()))
+    }
+
+    /// The row's task fit to show: [`person_task`](Self::person_task), else the
+    /// [`message_line`](Self::message_line) standing in for it, else what
+    /// `prompt_origin::shown` makes of `original_prompt` — an envelope persisted
+    /// before `message_line` existed, or synced from a peer predating it, shows
+    /// an excerpt of its message there, never the envelope.
+    pub fn shown_task(&self) -> Option<Cow<'_, str>> {
+        self.person_task().map(Cow::Borrowed).or_else(|| self.message_line.as_deref().map(Cow::Borrowed)).or_else(|| self.original_prompt.as_deref().and_then(crate::prompt_origin::shown))
+    }
+
+    /// The text of the widget row's task line, the line under the name, which
+    /// `SessionItem.svelte` draws unless `compact_mode` hides it. `None` where the
+    /// row has no text for it.
+    ///
+    /// [`primary_text`](Self::primary_text) where it is not empty; otherwise the
+    /// most recent task in the dialog, so a row with history never goes blank and
+    /// its history stays one click away. The task is the last task-start entry;
+    /// failing that the last user prompt longer than four UTF-16 units, so an
+    /// approval like "ok" does not read as a task; then any user prompt; then any
+    /// non-separator entry. Prompts and entries that are blank are skipped.
+    ///
+    /// "Blank" and the four-unit count are measured after `str::trim`, which
+    /// strips Rust's `White_Space` set, so U+FEFF is text and U+0085 is not.
+    ///
+    /// Every entry is read as `prompt_origin::shown` gives it, so a past task
+    /// that was another agent's message shows as that message's first line — the
+    /// dialog keeps no record of whose task stood behind it, so the sender's own
+    /// task that `delegated_task` carries for the current one is not available
+    /// here.
+    pub fn row_line(&self) -> Option<RowLine> {
+        let primary = self.primary_text();
+        if !primary.is_empty() {
+            return Some(RowLine::Current(primary.into_owned()));
+        }
+        fn shown(e: &DialogEntry) -> Cow<'_, str> {
+            crate::prompt_origin::shown(&e.text).unwrap_or_default()
+        }
+        let past = match self.dialog.iter().rev().find(|e| e.task_start) {
+            Some(task) => Some(task),
+            None => {
+                let blank = |e: &&DialogEntry| shown(e).trim().is_empty();
+                let users = || self.dialog.iter().rev().filter(|e| e.role == DialogRole::User).filter(|e| !blank(e));
+                let substantive = users().find(|e| shown(e).trim().encode_utf16().count() > 4);
+                let any = || self.dialog.iter().rev().find(|e| e.role != DialogRole::Separator && !blank(e));
+                substantive.or_else(|| users().next()).or_else(any)
+            }
+        };
+        past.map(shown).filter(|t| !t.is_empty()).map(|t| RowLine::Past(t.into_owned()))
+    }
+
+    /// Every task-start entry in the dialog, oldest first, as the row's hover
+    /// tooltip lists them. A person's prompt is its text as typed, newlines and
+    /// all, since the tooltip has room to wrap it. Another agent's message reads
+    /// as `prompt_origin::shown` gives it, the first line of the message, and
+    /// the one that began the current task reads as the task line does
+    /// ([`shown_task`](Self::shown_task)), the sender's own task where it was
+    /// resolved. A message with no text to show is left out, as is a prompt
+    /// Claude Code submitted on its own account, which `shown` gives no text.
+    ///
+    /// The current task is the entry whose prompt `original_prompt` holds,
+    /// compared as `clean_prompt` stored it; an older message of identical text
+    /// would read the same either way.
+    pub fn task_lines(&self) -> Vec<TaskLine> {
+        let current = |e: &DialogEntry| self.original_prompt.as_deref() == Some(crate::adapters::claude::clean_prompt(&e.text).as_str());
+        let text = |e: &DialogEntry| match crate::peer_message::parse_agent_message(&e.text) {
+            Some(_) if current(e) => self.shown_task().map(Cow::into_owned),
+            _ => crate::prompt_origin::shown(&e.text).map(Cow::into_owned),
+        };
+        self.dialog.iter().filter(|e| e.task_start).filter_map(|e| text(e).filter(|t| !t.trim().is_empty()).map(|text| TaskLine { at: e.timestamp, text })).collect()
+    }
+
     /// The moment this row last produced something the user may not have seen:
     /// the later of the current state's start and the newest assistant text on
     /// the row.
@@ -679,6 +869,22 @@ pub struct SetInput {
     /// unsettled turn redeemable by the next one — caught by
     /// `a_new_turn_revokes_an_unredeemed_clean_claim`.
     pub turn_from_relay: Option<bool>,
+    /// For a prompt another agent wrote, its sender's own task where that was
+    /// resolved — settled by `http_server` through `prompt_origin::for_arrival`
+    /// before the event is applied. `None` for a prompt a person typed and for
+    /// every other event. Becomes `AgentSession::delegated_task` exactly when
+    /// `label` becomes `original_prompt` (`label_policy::select`).
+    pub delegated_task: Option<String>,
+    /// For a prompt another agent wrote whose sender's task was not resolved,
+    /// the message's first line; becomes `AgentSession::message_line` the same
+    /// way.
+    pub message_line: Option<String>,
+    /// For a prompt another agent wrote, whether it answers a message this
+    /// row's agent sent (`AgentMessage::is_reply`); `None` for a prompt a person
+    /// typed and for every other event. Set by `http_server` from the adapter's
+    /// own parse of the raw prompt, beside `delegated_task`, so `apply_set`
+    /// judges the exchange on that one reading rather than parsing `label` again.
+    pub message_is_reply: Option<bool>,
 }
 
 /// True when `label` (after trim, case-insensitive) matches one of the
@@ -893,7 +1099,21 @@ impl AppState {
                         .label
                         .as_deref()
                         .is_some_and(|l| is_continuation_prompt(l, continuation_prompts));
-                let task_boundary = raw_task_boundary && !is_continuation;
+                // A prompt that names no task — the adapter gives no label to an
+                // empty prompt, a `<task-notification>`, a subagent's hand-back or
+                // a cross-session notice — runs a turn of the task already there,
+                // so its timer and its dialog's task marks stay as they are. A
+                // prompt is what `turn_from_relay` being `Some` means.
+                let prompt_names_no_task = input.label.is_none() && input.turn_from_relay.is_some();
+                // Another agent's message belongs to the exchange already under
+                // way, not to a new task, when it arrives while this row's turn is
+                // still running, or when it is a reply to a message this row's
+                // agent sent — which usually lands after that turn ended, since
+                // nothing polls for it. Any other message on a finished row may
+                // start a task. Only the relay marks a reply, so a `SendMessage`
+                // reply on a finished row still starts one.
+                let message_in_exchange = input.message_is_reply.is_some_and(|reply| matches!(prior, Status::Working | Status::Waiting) || reply);
+                let task_boundary = raw_task_boundary && !is_continuation && !prompt_names_no_task && !message_in_exchange;
 
                 if prior == Status::Working && input.status != Status::Working {
                     let delta = (now_ms - existing.state_entered_at).max(0) as u64;
@@ -926,7 +1146,7 @@ impl AppState {
                     existing.clean_claim_at = None;
                 }
 
-                let (new_label, new_original_prompt) =
+                let crate::label_policy::Selected { label: new_label, original_prompt: new_original_prompt, delegated_task: new_delegated_task, message_line: new_message_line } =
                     crate::label_policy::select(Some(&*existing), &input, task_boundary);
 
                 if task_boundary {
@@ -946,6 +1166,8 @@ impl AppState {
                     gated,
                     task_boundary,
                     continuation_suppressed = is_continuation,
+                    no_task_prompt = prompt_names_no_task,
+                    message_in_exchange,
                     input_label = ?input.label,
                     prior_original_prompt = ?existing.original_prompt,
                     new_label = %new_label,
@@ -964,6 +1186,8 @@ impl AppState {
                 existing.waiting_backstop_armed = input.waiting_backstop_armed;
                 existing.label = new_label;
                 existing.original_prompt = new_original_prompt;
+                existing.delegated_task = new_delegated_task;
+                existing.message_line = new_message_line;
                 if let Some(src) = input.source {
                     existing.source = src;
                 }
@@ -990,18 +1214,18 @@ impl AppState {
                 false
             })
         } else {
-            let (label, event_prompt) = crate::label_policy::select(None, &input, false);
+            let selected = crate::label_policy::select(None, &input, false);
             tracing::debug!(
                 id = %input.id,
                 decision = "apply_set",
                 path = "new",
                 new_status = ?input.status,
                 input_label = ?input.label,
-                new_label = %label,
-                new_original_prompt = ?event_prompt,
+                new_label = %selected.label,
+                new_original_prompt = ?selected.original_prompt,
                 "apply_set"
             );
-            let (session, seeded) = new_session(input, label, event_prompt, dialog_entry, now_ms, now_ms, restored);
+            let (session, seeded) = new_session(input, selected, dialog_entry, now_ms, now_ms, restored);
             sessions.push(session);
             seeded
         }
@@ -1040,8 +1264,8 @@ impl AppState {
         if sessions.iter().any(|s| s.id == input.id) {
             return false;
         }
-        let (label, event_prompt) = crate::label_policy::select(None, &input, false);
-        let (mut session, _) = new_session(input, label, event_prompt, None, state_entered_at, now_ms, restored);
+        let selected = crate::label_policy::select(None, &input, false);
+        let (mut session, _) = new_session(input, selected, None, state_entered_at, now_ms, restored);
         if read {
             session.attended_at = Some(session.content_at());
         }
@@ -1082,8 +1306,8 @@ impl AppState {
             s.updated = now_ms;
             return OpenOutcome { request, pending, base_status, dialog_changed: false };
         }
-        let (label, event_prompt) = crate::label_policy::select(None, &input, false);
-        let (mut session, seeded) = new_session(input, label, event_prompt, None, now_ms, now_ms, restored);
+        let selected = crate::label_policy::select(None, &input, false);
+        let (mut session, seeded) = new_session(input, selected, None, now_ms, now_ms, restored);
         // `Done`, not `Idle`. All this row's existence proves is that some main
         // agent launched a subagent that asked for permission — nothing about
         // whether the user has anything to come back to, so the neutral sink is
@@ -1146,11 +1370,9 @@ impl AppState {
 /// the ones a second copy would forget. Returns the row and whether it carries
 /// any content (a pushed entry or a restored dialog), which is what `apply_set`
 /// reports as "the dialog changed".
-#[allow(clippy::too_many_arguments)]
 fn new_session(
     input: SetInput,
-    label: String,
-    event_prompt: Option<String>,
+    selected: crate::label_policy::Selected,
     dialog_entry: Option<PendingDialogEntry>,
     state_entered_at: i64,
     now_ms: i64,
@@ -1160,9 +1382,11 @@ fn new_session(
     // A restored dialog ending in a separator means a boundary of some kind was
     // the last thing on the row, so no task is in flight. Don't resurrect the
     // pre-boundary task's prompt/timer onto the fresh row. Keep the dialog for
-    // history continuity but start the row's active-task state clean. An
-    // incoming `event_prompt` (a Working prompt arriving with this same event)
-    // still takes precedence and starts a real task.
+    // history continuity but start the row's active-task state clean. A prompt
+    // the event itself carries (a Working prompt arriving with this same event)
+    // still takes precedence and starts a real task, and brings its own
+    // `delegated_task` and `message_line` with it rather than inheriting the
+    // restored ones.
     //
     // Any boundary suppresses the prompt, because none of them leaves a task
     // running. Whether the row is also CLEAN is a narrower question answered by
@@ -1170,14 +1394,19 @@ fn new_session(
     // counts there, while a compaction or an ordinary exit leaves a
     // conversation somebody may want back.
     let ended_at_boundary = r.dialog.last().is_some_and(|e| e.role == DialogRole::Separator);
-    let restored_prompt = if ended_at_boundary { None } else { r.original_prompt };
+    let restored_task = if ended_at_boundary { None } else { r.original_prompt.map(|p| (p, r.delegated_task, r.message_line)) };
     let restored_task_started_at = if ended_at_boundary { 0 } else { r.task_started_at };
-    let original_prompt = event_prompt.or(restored_prompt);
+    let crate::label_policy::Selected { label, original_prompt: event_prompt, delegated_task: event_delegated, message_line: event_line } = selected;
+    let (original_prompt, delegated_task, message_line) = match event_prompt {
+        Some(p) => (Some(p), event_delegated, event_line),
+        None => restored_task.map_or((None, None, None), |(p, d, l)| (Some(p), d, l)),
+    };
     let task_started_at = if original_prompt.is_some() && restored_task_started_at == 0 { now_ms } else { restored_task_started_at };
     let mut dialog = r.dialog;
 
     let has_new_entry = if let Some(pending) = dialog_entry {
-        let task_start = pending.role == DialogRole::User;
+        // A prompt naming no task starts none, as in `apply_set`.
+        let task_start = pending.role == DialogRole::User && input.label.is_some();
         dialog.push(DialogEntry { role: pending.role, text: pending.text, timestamp: now_ms, status: input.status, task_start, boundary: None });
         true
     } else {
@@ -1195,6 +1424,8 @@ fn new_session(
         status_before_working: Status::Done,
         label,
         original_prompt,
+        delegated_task,
+        message_line,
         task_started_at,
         dialog,
         source: input.source.unwrap_or_else(|| "claude-code".to_string()),
@@ -1218,6 +1449,8 @@ fn new_session(
         clean_claim_at: None,
         read: false,
         name_shared_by: None,
+        row_line: None,
+        task_lines: Vec::new(),
         subagent_gate: None,
     };
     (session, has_new_entry || dialog_restored)
@@ -1654,6 +1887,9 @@ mod tests {
             dialog_entry: None,
             waiting_backstop_armed: false,
             turn_from_relay: None,
+            delegated_task: None,
+            message_line: None,
+            message_is_reply: None,
         }
     }
 
@@ -1668,6 +1904,9 @@ mod tests {
             dialog_entry: None,
             waiting_backstop_armed: false,
             turn_from_relay: None,
+            delegated_task: None,
+            message_line: None,
+            message_is_reply: None,
         }
     }
 
@@ -1751,6 +1990,8 @@ mod tests {
         let persisted = PersistedSession {
             dialog: vec![DialogEntry { role: DialogRole::User, text: "do the thing".into(), timestamp: 10, status: Status::Working, task_start: true, boundary: None }],
             original_prompt: Some("do the thing".into()),
+            delegated_task: None,
+            message_line: None,
             task_started_at: 10,
         };
         assert!(state.restore_row(set_no_label("dash", Status::Done), false, 1_000, 900_000, Some(persisted)));
@@ -1772,6 +2013,8 @@ mod tests {
                 DialogEntry { role: DialogRole::Separator, text: String::new(), timestamp: 20, status: Status::Idle, task_start: false, boundary: None },
             ],
             original_prompt: Some("old task".into()),
+            delegated_task: None,
+            message_line: None,
             task_started_at: 10,
         };
         assert!(state.restore_row(set_no_label("dash", Status::Idle), false, 1_000, 900_000, Some(persisted)));
@@ -2293,6 +2536,9 @@ mod tests {
                 dialog_entry: None,
                 waiting_backstop_armed: false,
                 turn_from_relay: None,
+                delegated_task: None,
+                message_line: None,
+                message_is_reply: None,
             },
             1000,
             NO_CONTINUATIONS,
@@ -2470,6 +2716,9 @@ mod tests {
             }),
             waiting_backstop_armed: false,
             turn_from_relay: None,
+            delegated_task: None,
+            message_line: None,
+            message_is_reply: None,
         }
     }
 
@@ -2487,6 +2736,9 @@ mod tests {
             }),
             waiting_backstop_armed: false,
             turn_from_relay: None,
+            delegated_task: None,
+            message_line: None,
+            message_is_reply: None,
         }
     }
 
@@ -2538,6 +2790,94 @@ mod tests {
         assert!(!assistant.task_start, "assistant entries are never task starts");
     }
 
+    /// What the `UserPromptSubmit` adapter makes of `prompt`, as the HTTP layer
+    /// hands it to `apply_set`.
+    fn prompt_submitted(prompt: &str) -> SetInput {
+        let cfg = crate::config::Config::default();
+        match crate::adapters::claude::dispatch("UserPromptSubmit", &serde_json::json!({ "cwd": "d:/projects/a", "prompt": prompt }), &cfg) {
+            crate::adapters::AdapterOutput::Set { input, .. } => input,
+            other => panic!("expected Set, got {other:?}"),
+        }
+    }
+
+    const HAND_BACK: &str = "<agent-message from=\"ab070651cd45c459e\">
+[Subagent hand-back] The text below is the final report of a subagent this session delegated to.
+  placeholder report
+</agent-message>";
+    const IDLE_NOTICE: &str = "[Cross-session idle notice] \"peer-2f\", which you asked to be notified about, is idle now — it finished a turn at 22:15.";
+
+    /// A subagent's hand-back and a cross-session notice run a turn of the task
+    /// already there: the row goes `Working`, keeps its task, label and timer,
+    /// and the history records the prompt without marking a task start.
+    #[test]
+    fn a_harness_prompt_keeps_the_row_s_task() {
+        for prompt in [HAND_BACK, IDLE_NOTICE] {
+            let state = AppState::new();
+            let mut first = prompt_submitted("fix the parser");
+            first.delegated_task = Some("the sender's task".into());
+            assert_eq!(first.id, "a");
+            state.apply_set(first, 0, NO_CONTINUATIONS, None);
+            state.apply_set(stop_with_dialog("a", Status::Done, "fixed"), 5_000, NO_CONTINUATIONS, None);
+            let before = get(&state, "a");
+            state.apply_set(prompt_submitted(prompt), 9_000, NO_CONTINUATIONS, None);
+            let s = get(&state, "a");
+            assert_eq!(s.status, Status::Working);
+            assert_eq!((s.original_prompt.as_deref(), s.delegated_task.as_deref(), s.label.as_str()), (Some("fix the parser"), Some("the sender's task"), "fix the parser"));
+            assert_eq!((s.task_started_at, s.working_accumulated_ms), (before.task_started_at, before.working_accumulated_ms), "the task's clock runs on");
+            let last = s.dialog.last().expect("recorded");
+            assert_eq!((last.text.as_str(), last.task_start), (prompt, false));
+            assert_eq!(s.task_lines().iter().map(|t| t.text.as_str()).collect::<Vec<_>>(), ["fix the parser"]);
+        }
+    }
+
+    /// A `<task-notification>` wakes the agent when background work finishes; it
+    /// becomes no dialog entry, and like a hand-back it is a turn of the task
+    /// already there, so the working timer keeps what the task banked.
+    #[test]
+    fn a_task_notification_keeps_the_task_timer() {
+        let state = AppState::new();
+        state.apply_set(prompt_submitted("start the dev server"), 0, NO_CONTINUATIONS, None);
+        state.apply_set(stop_with_dialog("a", Status::Waiting, "started"), 5_000, NO_CONTINUATIONS, None);
+        let before = get(&state, "a");
+        assert_eq!(before.working_accumulated_ms, 5_000);
+        let notification = prompt_submitted("<task-notification>\n<status>completed</status>\n</task-notification>");
+        assert!(notification.dialog_entry.is_none());
+        state.apply_set(notification, 9_000, NO_CONTINUATIONS, None);
+        let s = get(&state, "a");
+        assert_eq!(s.status, Status::Working);
+        assert_eq!((s.original_prompt.as_deref(), s.task_started_at, s.working_accumulated_ms), (Some("start the dev server"), before.task_started_at, 5_000));
+    }
+
+    /// A person who pasted a report to ask about it is a person, and starts a
+    /// task.
+    #[test]
+    fn a_person_asking_about_a_pasted_hand_back_starts_a_task() {
+        let state = AppState::new();
+        state.apply_set(prompt_submitted("fix the parser"), 0, NO_CONTINUATIONS, None);
+        state.apply_set(stop_with_dialog("a", Status::Done, "fixed"), 5_000, NO_CONTINUATIONS, None);
+        let asked = format!("{HAND_BACK}
+why did this become the task?");
+        state.apply_set(prompt_submitted(&asked), 9_000, NO_CONTINUATIONS, None);
+        let s = get(&state, "a");
+        assert_eq!(s.original_prompt, Some(crate::adapters::claude::clean_prompt(&asked)));
+        assert!(s.dialog.last().is_some_and(|e| e.task_start));
+    }
+
+    /// A row whose first prompt is a harness prompt has no task, and nothing on
+    /// the row shows the envelope in place of one.
+    #[test]
+    fn a_first_ever_harness_prompt_leaves_the_row_with_no_task() {
+        for prompt in [HAND_BACK, IDLE_NOTICE] {
+            let state = AppState::new();
+            state.apply_set(prompt_submitted(prompt), 1_000, NO_CONTINUATIONS, None);
+            let s = get(&state, "a");
+            assert_eq!((s.status, s.original_prompt.as_deref(), s.label.as_str()), (Status::Working, None, ""));
+            assert_eq!(s.dialog.len(), 1, "the history still records it");
+            assert!(!s.dialog[0].task_start);
+            assert_eq!((s.primary_text().as_ref(), s.row_line(), s.task_lines().len()), ("", None, 0));
+        }
+    }
+
     #[test]
     fn dialog_not_pushed_without_pending_entry() {
         let state = AppState::new();
@@ -2555,6 +2895,8 @@ mod tests {
                 DialogEntry { role: DialogRole::Assistant, text: "Done.".into(), timestamp: 200, status: Status::Done, task_start: false, boundary: None },
             ],
             original_prompt: Some("old task".into()),
+            delegated_task: None,
+            message_line: None,
             task_started_at: 100,
         };
         state.apply_set(set("a", Status::Done, "done"), 1_000, NO_CONTINUATIONS, Some(restored));
@@ -2578,6 +2920,8 @@ mod tests {
                 DialogEntry { role: DialogRole::Separator, text: String::new(), timestamp: 300, status: Status::Idle, task_start: false, boundary: None },
             ],
             original_prompt: Some("old task".into()),
+            delegated_task: None,
+            message_line: None,
             task_started_at: 100,
         };
         state.apply_set(set_no_label("a", Status::Idle), 1_000, NO_CONTINUATIONS, Some(restored));
@@ -2599,6 +2943,8 @@ mod tests {
                 DialogEntry { role: DialogRole::Separator, text: String::new(), timestamp: 300, status: Status::Idle, task_start: false, boundary: None },
             ],
             original_prompt: Some("old task".into()),
+            delegated_task: None,
+            message_line: None,
             task_started_at: 100,
         };
         state.apply_set(set("a", Status::Working, "new task"), 2_000, NO_CONTINUATIONS, Some(restored));
@@ -2649,9 +2995,13 @@ mod tests {
             canary: Canary::Off,
             attended_at: None,
             turn_from_relay: false,
+            delegated_task: None,
+            message_line: None,
             clean_claim_at: None,
             read: false,
             name_shared_by: None,
+            row_line: None,
+            task_lines: Vec::new(),
             subagent_gate: None,
         });
     }
@@ -2921,9 +3271,13 @@ mod tests {
             canary: Canary::Off,
             attended_at: None,
             turn_from_relay: false,
+            delegated_task: None,
+            message_line: None,
             clean_claim_at: None,
             read: false,
             name_shared_by: None,
+            row_line: None,
+            task_lines: Vec::new(),
             subagent_gate: None,
         }
     }
@@ -3185,7 +3539,7 @@ mod tests {
         let s = get(&state, "a");
         assert_eq!((s.status, s.label.as_str(), s.state_entered_at), (Status::Done, "", 5_000));
 
-        let restored = PersistedSession { dialog: vec![user_entry("old", 10)], original_prompt: None, task_started_at: 0 };
+        let restored = PersistedSession { delegated_task: None, message_line: None, dialog: vec![user_entry("old", 10)], original_prompt: None, task_started_at: 0 };
         let o = state.open_subagent_prompt(set("b", Status::Blocked, "needs approval: Bash"), prompt_from("agent-1", "Bash"), 7_000, Some(restored));
         assert!(o.dialog_changed, "a restored history is persisted like any new row's");
     }
@@ -3246,5 +3600,285 @@ mod tests {
         let r3 = open(&state, "b", "agent-3", "Write", 1_200).request;
         let listed: Vec<(String, u64, String)> = state.pending_subagent_prompts().into_iter().map(|(id, p)| (id, p.request, p.prompt.agent_id)).collect();
         assert_eq!(listed, vec![("a".into(), r1, "agent-1".into()), ("a".into(), r2, "agent-2".into()), ("b".into(), r3, "agent-3".into())]);
+    }
+
+    /// A row `status`, with `label`, `prompt` and `dialog` set as given.
+    fn row(status: Status, label: &str, prompt: Option<&str>, dialog: Vec<DialogEntry>) -> AgentSession {
+        let state = AppState::new();
+        state.apply_set(set("r", status, label), 0, NO_CONTINUATIONS, None);
+        let mut s = get(&state, "r");
+        s.label = label.to_string();
+        s.original_prompt = prompt.map(str::to_string);
+        s.dialog = dialog;
+        s
+    }
+
+    fn entry(role: DialogRole, text: &str, task_start: bool) -> DialogEntry {
+        DialogEntry { role, text: text.to_string(), timestamp: 0, status: Status::Done, task_start, boundary: None }
+    }
+
+    #[test]
+    fn primary_text_is_the_question_while_blocked_and_the_task_otherwise() {
+        assert_eq!(row(Status::Blocked, "needs approval: Bash", Some("Fix the build"), Vec::new()).primary_text(), "needs approval: Bash");
+        assert_eq!(row(Status::Error, "rate limited", Some("Fix the build"), Vec::new()).primary_text(), "rate limited");
+        assert_eq!(row(Status::Done, "needs approval: Bash", Some("Fix the build"), Vec::new()).primary_text(), "Fix the build", "the stale question a Stop kept is not shown");
+        assert_eq!(row(Status::Working, "thinking", None, Vec::new()).primary_text(), "thinking");
+    }
+
+    #[test]
+    fn a_stored_hand_back_is_no_task() {
+        // Rows persisted before hand-backs stopped starting a task still carry one as their prompt.
+        let hand_back = "<agent-message from=\"ab070651cd45c459e\"> [Subagent hand-back] The report. </agent-message>";
+        let s = row(Status::Done, "", Some(hand_back), Vec::new());
+        assert_eq!(s.person_task(), None);
+        assert_eq!(s.primary_text(), "");
+        // A sender's hand-back resolved into another row's delegated task before resolution refused one.
+        let mut d = row(Status::Done, "", Some("<cross-session-message from=\"uds:x\" from-name=\"y\"> hi </cross-session-message>"), Vec::new());
+        d.delegated_task = Some(hand_back.to_string());
+        assert_eq!(d.person_task(), None);
+        assert!(!d.primary_text().contains("agent-message"));
+    }
+
+    fn current(t: &str) -> Option<RowLine> {
+        Some(RowLine::Current(t.to_string()))
+    }
+
+    fn past(t: &str) -> Option<RowLine> {
+        Some(RowLine::Past(t.to_string()))
+    }
+
+    #[test]
+    fn row_line_is_the_primary_text_when_there_is_one() {
+        let dialog = vec![entry(DialogRole::User, "Older task", true)];
+        assert_eq!(row(Status::Done, "", Some("Fix the build"), dialog.clone()).row_line(), current("Fix the build"));
+        assert_eq!(row(Status::Blocked, "needs approval: Bash", Some("Fix the build"), dialog.clone()).row_line(), current("needs approval: Bash"));
+        // Only an empty primary text falls back.
+        assert_eq!(row(Status::Done, "", Some("  "), dialog).row_line(), current("  "));
+    }
+
+    #[test]
+    fn row_line_falls_back_to_the_last_task_start() {
+        let dialog = vec![entry(DialogRole::User, "First task", true), entry(DialogRole::Assistant, "Done.", false), entry(DialogRole::User, "Second task", true), entry(DialogRole::User, "and tests", false), entry(DialogRole::Separator, "", false)];
+        assert_eq!(row(Status::Idle, "", None, dialog).row_line(), past("Second task"));
+    }
+
+    #[test]
+    fn row_line_without_a_task_start_prefers_a_substantive_prompt_over_an_approval() {
+        let dialog = vec![entry(DialogRole::User, "Rename the module", false), entry(DialogRole::User, "ok", false), entry(DialogRole::User, "   ", false)];
+        assert_eq!(row(Status::Idle, "", None, dialog).row_line(), past("Rename the module"));
+        // Counted in UTF-16 units after trimming.
+        let dialog = vec![entry(DialogRole::User, "Fixes", false), entry(DialogRole::User, " 😀😀 ", false)];
+        assert_eq!(row(Status::Idle, "", None, dialog).row_line(), past("Fixes"), "two emoji are four units, so not substantive");
+    }
+
+    #[test]
+    fn row_line_falls_back_to_any_prompt_then_any_entry_then_nothing() {
+        let dialog = vec![entry(DialogRole::User, "yes", false), entry(DialogRole::Assistant, "Merged.", false)];
+        assert_eq!(row(Status::Idle, "", None, dialog).row_line(), past("yes"));
+        let dialog = vec![entry(DialogRole::Assistant, "Restored reply", false), entry(DialogRole::Separator, "---", false)];
+        assert_eq!(row(Status::Idle, "", None, dialog).row_line(), past("Restored reply"), "a separator is never the row's text");
+        assert_eq!(row(Status::Idle, "", None, Vec::new()).row_line(), None);
+        let dialog = vec![entry(DialogRole::User, "Older prompt", false), entry(DialogRole::User, "", true)];
+        assert_eq!(row(Status::Idle, "", None, dialog).row_line(), None, "an empty task start is no text, and is not passed over");
+    }
+
+    #[test]
+    fn a_row_line_is_tagged_by_kind_on_the_wire() {
+        assert_eq!(serde_json::to_value(RowLine::Past("Fix it".into())).unwrap(), serde_json::json!({ "kind": "past", "text": "Fix it" }));
+        assert_eq!(serde_json::to_value(RowLine::Current("Fix it".into())).unwrap(), serde_json::json!({ "kind": "current", "text": "Fix it" }));
+    }
+
+    // -------- delegated_task --------
+
+    /// A `SendMessage` envelope in the whitespace-collapsed form a row keeps as
+    /// its `label` and `original_prompt`, the body cut to a placeholder.
+    const ENVELOPE: &str = r#"<cross-session-message from="uds:\\.\pipe\LOCAL\cc-msg-e4b10093983d402af357640b6ef02c74" from-name="agwinterm-sidebar-label-ownership" from-mode="prompting"> placeholder message </cross-session-message>"#;
+
+    fn delegated(label: &str, task: Option<&str>) -> SetInput {
+        SetInput { delegated_task: task.map(str::to_string), message_is_reply: crate::peer_message::parse_agent_message(label).map(|m| m.is_reply()), ..set("r", Status::Working, label) }
+    }
+
+    #[test]
+    fn a_delegated_task_is_what_the_row_and_its_ping_show() {
+        let mut s = row(Status::Working, ENVELOPE, Some(ENVELOPE), Vec::new());
+        s.delegated_task = Some("add a title-bar caption to agwinterm".into());
+        assert_eq!(s.row_line(), current("add a title-bar caption to agwinterm"));
+        assert_eq!(s.primary_text(), "add a title-bar caption to agwinterm");
+        s.status = Status::Done;
+        assert_eq!(s.row_line(), current("add a title-bar caption to agwinterm"), "and after the turn ends");
+        s.status = Status::Blocked;
+        s.label = "needs approval: Bash".into();
+        assert_eq!(s.row_line(), current("needs approval: Bash"), "a row asking something still shows the question");
+    }
+
+    /// A row persisted before `delegated_task` existed, or one whose message
+    /// arrived with no task recorded, still never shows the envelope.
+    #[test]
+    fn an_envelope_without_a_delegated_task_shows_its_message_never_the_envelope() {
+        assert_eq!(row(Status::Working, ENVELOPE, Some(ENVELOPE), Vec::new()).row_line(), current("placeholder message"));
+        assert_eq!(row(Status::Working, ENVELOPE, None, Vec::new()).row_line(), current("placeholder message"), "the label is unwrapped too");
+        let raw = "<cross-session-message from=\"uds:/tmp/cc-socks/1.sock\" from-name=\"n\" from-mode=\"prompting\">\nfirst line\nsecond line\n</cross-session-message>";
+        assert_eq!(row(Status::Idle, "", None, vec![entry(DialogRole::User, raw, true)]).row_line(), past("first line"), "a past task read back out of the dialog");
+        let empty = "<cross-session-message from=\"uds:x\" from-name=\"n\" from-mode=\"prompting\">\n</cross-session-message>";
+        assert_eq!(row(Status::Idle, "", None, vec![entry(DialogRole::User, "an older real prompt", false), entry(DialogRole::User, empty, false)]).row_line(), past("an older real prompt"), "an empty message is blank, and passed over like one");
+    }
+
+    #[test]
+    fn an_agent_message_mid_turn_opens_no_task() {
+        for prior in [Status::Working, Status::Waiting] {
+            let state = AppState::new();
+            state.apply_set(set("r", Status::Working, "fix the parser"), 1_000, NO_CONTINUATIONS, None);
+            state.apply_set(set_no_label("r", prior), 2_000, NO_CONTINUATIONS, None);
+            state.apply_set(SetInput { dialog_entry: Some(PendingDialogEntry { role: DialogRole::User, text: ENVELOPE.into() }), ..delegated(ENVELOPE, Some("some other agent's task")) }, 3_000, NO_CONTINUATIONS, None);
+            let s = get(&state, "r");
+            assert_eq!((s.original_prompt.as_deref(), s.delegated_task.as_deref(), s.task_started_at), (Some("fix the parser"), None, 1_000), "{prior:?}: the person's task stands");
+            assert!(!s.dialog.last().expect("the message").task_start, "{prior:?}: the message is no task start");
+        }
+    }
+
+    /// A relayed reply to this row's own message, in the collapsed form a row
+    /// keeps as its `label`, the body cut to a placeholder.
+    fn relayed_reply() -> String {
+        let r = crate::peer_message::Relayed { origin_device: "air", from_agent: "x", from_label: None, from_task: Some("some other agent's task"), text: "placeholder answer", reply_to: Some("air/x"), message_id: "air-1-1", in_reply_to: Some("chrome-1-0"), reply_port: 9077, attestation: crate::tailnet::Attestation::Claimed, tailnet_user: None };
+        crate::peer_message::build_content(&r).split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    #[test]
+    fn a_reply_to_this_rows_message_opens_no_task_on_a_finished_row() {
+        for prior in [Status::Done, Status::Idle, Status::Working] {
+            let state = AppState::new();
+            state.apply_set(set("r", Status::Working, "ask the mac to update"), 1_000, NO_CONTINUATIONS, None);
+            state.apply_set(set_no_label("r", prior), 2_000, NO_CONTINUATIONS, None);
+            state.apply_set(delegated(&relayed_reply(), Some("some other agent's task")), 3_000, NO_CONTINUATIONS, None);
+            let s = get(&state, "r");
+            assert_eq!((s.original_prompt.as_deref(), s.delegated_task.as_deref(), s.task_started_at), (Some("ask the mac to update"), None, 1_000), "{prior:?}: the person's task stands");
+        }
+    }
+
+    #[test]
+    fn an_agent_message_on_a_finished_row_starts_a_task() {
+        for prior in [Status::Done, Status::Idle] {
+            let state = AppState::new();
+            state.apply_set(set("r", Status::Working, "fix the parser"), 1_000, NO_CONTINUATIONS, None);
+            state.apply_set(set_no_label("r", prior), 2_000, NO_CONTINUATIONS, None);
+            state.apply_set(delegated(ENVELOPE, Some("rename the tray item")), 3_000, NO_CONTINUATIONS, None);
+            let s = get(&state, "r");
+            assert_eq!((s.original_prompt.as_deref(), s.delegated_task.as_deref(), s.task_started_at), (Some(ENVELOPE), Some("rename the tray item"), 3_000), "{prior:?}");
+        }
+    }
+
+    #[test]
+    fn a_delegated_task_moves_only_with_the_prompt_it_stands_for() {
+        let state = AppState::new();
+        state.apply_set(delegated(ENVELOPE, Some("rename the tray item")), 1_000, NO_CONTINUATIONS, None);
+        assert_eq!(get(&state, "r").delegated_task.as_deref(), Some("rename the tray item"), "captured with the prompt on a new row");
+        assert_eq!(get(&state, "r").original_prompt.as_deref(), Some(ENVELOPE), "the envelope itself is kept");
+
+        state.apply_set(set("r", Status::Blocked, "has a question"), 2_000, NO_CONTINUATIONS, None);
+        state.apply_set(delegated(ENVELOPE, Some("some other agent's task")), 3_000, NO_CONTINUATIONS, None);
+        assert_eq!(get(&state, "r").delegated_task.as_deref(), Some("rename the tray item"), "an answer to a question is not a new task");
+
+        state.apply_set(set_no_label("r", Status::Done), 4_000, NO_CONTINUATIONS, None);
+        state.apply_set(set("r", Status::Working, "fix the parser"), 5_000, NO_CONTINUATIONS, None);
+        let s = get(&state, "r");
+        assert_eq!((s.original_prompt.as_deref(), s.delegated_task), (Some("fix the parser"), None), "a person's next task clears it");
+    }
+
+    #[test]
+    fn a_restored_row_brings_its_delegated_task_back_unless_a_boundary_ended_it() {
+        let persisted = |dialog| PersistedSession { dialog, original_prompt: Some(ENVELOPE.into()), delegated_task: Some("ship the hero shot".into()), message_line: None, task_started_at: 10 };
+        let state = AppState::new();
+        state.apply_set(set_no_label("r", Status::Done), 1_000, NO_CONTINUATIONS, Some(persisted(vec![user_entry(ENVELOPE, 10)])));
+        assert_eq!(get(&state, "r").delegated_task.as_deref(), Some("ship the hero shot"));
+
+        let state = AppState::new();
+        let ended = vec![user_entry(ENVELOPE, 10), DialogEntry { role: DialogRole::Separator, text: String::new(), timestamp: 20, status: Status::Done, task_start: false, boundary: Some(BoundaryKind::Clear) }];
+        state.apply_set(set_no_label("r", Status::Done), 1_000, NO_CONTINUATIONS, Some(persisted(ended)));
+        assert_eq!(get(&state, "r").delegated_task, None, "dropped with the prompt");
+
+        let state = AppState::new();
+        state.apply_set(set("r", Status::Working, "a person's prompt"), 1_000, NO_CONTINUATIONS, Some(persisted(vec![user_entry(ENVELOPE, 10)])));
+        assert_eq!(get(&state, "r").delegated_task, None, "a prompt arriving with the event does not inherit the restored one");
+    }
+
+    /// The field rides `AgentSession` on the sync wire and `PersistedSession` in
+    /// `prompt_history.json`; both must still read what an older build wrote.
+    #[test]
+    fn delegated_task_round_trips_and_is_optional_on_the_wire_and_on_disk() {
+        let mut s = row(Status::Working, ENVELOPE, Some(ENVELOPE), Vec::new());
+        s.delegated_task = Some("fix the parser".into());
+        let mut json = serde_json::to_value(&s).unwrap();
+        let back: AgentSession = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(back.delegated_task.as_deref(), Some("fix the parser"));
+        json.as_object_mut().unwrap().remove("delegated_task");
+        let older: AgentSession = serde_json::from_value(json).expect("a push from an older peer parses");
+        assert_eq!(older.delegated_task, None);
+
+        let p = PersistedSession { dialog: Vec::new(), original_prompt: Some(ENVELOPE.into()), delegated_task: Some("fix the parser".into()), message_line: Some("a line".into()), task_started_at: 1 };
+        let back: PersistedSession = serde_json::from_str(&serde_json::to_string(&p).unwrap()).unwrap();
+        assert_eq!((back.delegated_task.as_deref(), back.message_line.as_deref()), (Some("fix the parser"), Some("a line")));
+        let older: PersistedSession = serde_json::from_str(r#"{"dialog":[],"original_prompt":"fix foo","task_started_at":1}"#).expect("an older prompt_history.json loads");
+        assert_eq!((older.delegated_task, older.message_line), (None, None));
+
+        let mut s = row(Status::Working, ENVELOPE, Some(ENVELOPE), Vec::new());
+        s.message_line = Some("a line".into());
+        let mut json = serde_json::to_value(&s).unwrap();
+        assert_eq!(serde_json::from_value::<AgentSession>(json.clone()).unwrap().message_line.as_deref(), Some("a line"));
+        json.as_object_mut().unwrap().remove("message_line");
+        assert_eq!(serde_json::from_value::<AgentSession>(json).expect("a push from an older peer parses").message_line, None);
+    }
+
+    // -------- message_line --------
+
+    /// The message's own line stands in on every display surface where the
+    /// sender's task could not be had, and is kept apart from the task: neither
+    /// the chain nor the relay is handed it, so the line is never reported
+    /// onward as this row's task.
+    #[test]
+    fn a_message_line_is_shown_but_never_passed_on_as_the_row_s_task() {
+        let mut s = row(Status::Working, ENVELOPE, Some(ENVELOPE), Vec::new());
+        s.message_line = Some("Please commit your two files".into());
+        assert_eq!(s.row_line(), current("Please commit your two files"));
+        assert_eq!(s.primary_text(), "Please commit your two files");
+        assert_eq!(s.person_task(), None, "nobody is told the line is a task");
+        s.delegated_task = Some("add a title-bar caption".into());
+        assert_eq!(s.person_task(), Some("add a title-bar caption"));
+        let typed = row(Status::Working, "fix the parser", Some("fix the parser"), Vec::new());
+        assert_eq!(typed.person_task(), Some("fix the parser"));
+    }
+
+    /// The hover tooltip lists the row's tasks from the same rule the task line
+    /// uses: the task an agent message began reads as the sender's task, an
+    /// older one as its message's first line, a typed one as typed, and the
+    /// envelope the dialog keeps for the history window never shows.
+    #[test]
+    fn the_tooltip_tasks_never_show_an_envelope() {
+        let raw_envelope = ENVELOPE.replace("> placeholder message <", ">\nplaceholder message\nsecond line\n<");
+        let older = r#"<cross-session-message from="uds:\\.\pipe\LOCAL\cc-msg-0" from-name="n" from-mode="prompting">
+an older request
+</cross-session-message>"#;
+        let dialog = vec![user_entry("fix the parser\nand the tests", 10), user_entry(older, 20), user_entry(&raw_envelope, 30)];
+        let mut s = row(Status::Working, ENVELOPE, Some(&crate::adapters::claude::clean_prompt(&raw_envelope)), dialog);
+        s.delegated_task = Some("add a title-bar caption to agwinterm".into());
+        let lines = s.task_lines();
+        assert_eq!(lines, vec![TaskLine { at: 10, text: "fix the parser\nand the tests".into() }, TaskLine { at: 20, text: "an older request".into() }, TaskLine { at: 30, text: "add a title-bar caption to agwinterm".into() }]);
+        s.delegated_task = None;
+        s.message_line = Some("placeholder message".into());
+        assert_eq!(s.task_lines()[2].text, "placeholder message", "an unresolved sender's message shows its line, as the task line does");
+    }
+
+    #[test]
+    fn a_message_line_moves_and_restores_with_the_prompt_it_stands_for() {
+        let state = AppState::new();
+        state.apply_set(SetInput { message_line: Some("the first line".into()), ..set("r", Status::Working, ENVELOPE) }, 1_000, NO_CONTINUATIONS, None);
+        assert_eq!(get(&state, "r").message_line.as_deref(), Some("the first line"));
+        state.apply_set(set_no_label("r", Status::Done), 2_000, NO_CONTINUATIONS, None);
+        state.apply_set(set("r", Status::Working, "fix the parser"), 3_000, NO_CONTINUATIONS, None);
+        assert_eq!(get(&state, "r").message_line, None, "a person's next task clears it");
+
+        let persisted = PersistedSession { dialog: vec![user_entry(ENVELOPE, 10)], original_prompt: Some(ENVELOPE.into()), delegated_task: None, message_line: Some("the first line".into()), task_started_at: 10 };
+        let state = AppState::new();
+        state.apply_set(set_no_label("r", Status::Done), 1_000, NO_CONTINUATIONS, Some(persisted));
+        assert_eq!(get(&state, "r").message_line.as_deref(), Some("the first line"));
     }
 }
