@@ -21,6 +21,7 @@ mod nonce_store;
 mod notifications;
 mod peer_message;
 mod prompt_history;
+mod prompt_origin;
 mod remote_history;
 mod remote_tokens;
 mod remote_usage;
@@ -155,9 +156,9 @@ pub fn run() {
         .manage(idle_awake::IdleAwakeState::default())
         .manage(sync::SyncDirty(std::sync::Arc::new(tokio::sync::Notify::new())))
         .manage(sync::SyncListening::default())
-        // Read only by the two message routes, never by the frontend, so
-        // the builder is early enough — the build()/run() gap is for state
-        // a webview can race at mount.
+        // Read only by the two message routes and the hook route, never by
+        // the frontend, so the builder is early enough — the build()/run()
+        // gap is for state a webview can race at mount.
         .manage(session_launcher::StartGuard::default())
         .manage(start_approval::ApprovalQueue::default())
         .manage(peer_message::MessageDedupe::default())
@@ -302,15 +303,16 @@ pub fn run() {
             idle_awake::spawn(app.handle().clone());
             attention::spawn(app.handle().clone());
             session_restore::spawn(app.handle().clone());
-            // Gated by neither the platform nor `terminal_titles`, and both are
-            // deliberate. `spawn` returns early where `for_platform` has no
-            // adapter, so a `#[cfg]` here would assert in a third place what the
+            // Neither worker is gated by the platform or by `terminal_titles`, and
+            // both choices are deliberate. Each `spawn` returns early where
+            // `for_platform` has no adapter, so a `#[cfg]` here would assert in a third place what the
             // seam already decides — the coupling the adapter refactor removed.
             // And the config flag hot-reloads from the tray while `sync` re-reads
             // it every call, so gating on its start-time value left a user who
             // enabled titles later with checks requested and nothing to receive
             // them, silently.
             terminals::stale_check::spawn(app.handle().clone());
+            terminals::labels::spawn(app.handle().clone());
 
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
@@ -638,6 +640,9 @@ fn seed_dev_sessions(app: &tauri::AppHandle) {
             dialog_entry: None,
             waiting_backstop_armed: false,
             turn_from_relay: None,
+            delegated_task: None,
+            message_line: None,
+            message_is_reply: None,
         },
         now - 3 * min,
         &[],
@@ -655,6 +660,9 @@ fn seed_dev_sessions(app: &tauri::AppHandle) {
             dialog_entry: None,
             waiting_backstop_armed: false,
             turn_from_relay: None,
+            delegated_task: None,
+            message_line: None,
+            message_is_reply: None,
         },
         now - 4 * min - 12 * s,
         &[],
@@ -671,6 +679,9 @@ fn seed_dev_sessions(app: &tauri::AppHandle) {
             dialog_entry: None,
             waiting_backstop_armed: false,
             turn_from_relay: None,
+            delegated_task: None,
+            message_line: None,
+            message_is_reply: None,
         },
         now - 45 * s,
         &[],
@@ -706,9 +717,13 @@ fn seed_dev_sessions(app: &tauri::AppHandle) {
                 canary: crate::state::Canary::Off,
                 attended_at: None,
                 turn_from_relay: false,
+                delegated_task: None,
+                message_line: None,
                 clean_claim_at: None,
                 read: false,
                 name_shared_by: None,
+                row_line: None,
+                task_lines: Vec::new(),
                 subagent_gate: None,
                 terminal_stale_at: None,
             }],

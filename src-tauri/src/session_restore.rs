@@ -375,8 +375,8 @@ fn tick(app: &AppHandle, adapter: &dyn crate::terminals::TerminalAdapter) -> Pas
             id: r.id.clone(),
             status: r.status,
             // No label: one was never observed, and `label_policy` has nothing to
-            // select from. The frontend already falls back to the last task in the
-            // restored dialog, which is a thing that was actually said.
+            // select from. `AgentSession::row_line` already falls back to the last
+            // task in the restored dialog, which is a thing that was actually said.
             label: None,
             source: None,
             model: None,
@@ -384,6 +384,9 @@ fn tick(app: &AppHandle, adapter: &dyn crate::terminals::TerminalAdapter) -> Pas
             dialog_entry: None,
             waiting_backstop_armed: false,
             turn_from_relay: None,
+            delegated_task: None,
+            message_line: None,
+            message_is_reply: None,
         };
         // Whatever was persisted for this row: its dialog, its originating prompt
         // and its task clock. Nothing here is a guess — it is what the row held

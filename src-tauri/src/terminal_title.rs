@@ -33,6 +33,7 @@ use tauri::{AppHandle, Manager};
 use crate::config::ConfigState;
 use crate::notifications::context_percent;
 use crate::state::{AgentSession, AppState, Status};
+use crate::terminals::labels::{one_line, DesiredLabel};
 use crate::terminals::TerminalAdapter;
 
 /// How long a pushed title is trusted to still be on the console. Spawned
@@ -81,6 +82,23 @@ pub struct TerminalTitles {
     /// not know", never as "not in this terminal", since a write that never
     /// happened leaves no entry either.
     hosts: Mutex<HashMap<String, String>>,
+    /// Per row, where its last title write landed, so the blank written when the
+    /// row goes reaches that console or tty even after the process the write went
+    /// through has exited.
+    ///
+    /// The canonical removal is the liveness reaper's, which acts only once the
+    /// agent is dead, and the agent was the only way the write candidates had
+    /// into its tab: the registry names a live process, the hook's chain ends at
+    /// the agent, and a dead pid has no console to attach to and no tty for `ps`
+    /// to name. The shell the agent ran under is still in the tab and keeps
+    /// showing the agent's last title, which nothing else rewrites, and an
+    /// attention sensor reading that title would name the row again when a new
+    /// session recreates it. So the blank goes to the landing first.
+    ///
+    /// An entry outlives its row until the blank lands, and the next sync retries
+    /// one that reached the console and failed to write. Taken after `last` and
+    /// released with it.
+    landings: Mutex<HashMap<String, Landing>>,
     /// The newest `AppState::snapshot_versioned` ticket [`sync`] has written from.
     ///
     /// A tab title is the one thing this dashboard publishes that outlives the
@@ -134,7 +152,7 @@ impl TerminalTitles {
     /// off a `HashMap` therefore aimed the badge and the Telegram alert at an
     /// arbitrary one of them, and at a different one between passes. That is the
     /// forbidden direction, and it is the same hazard `observe_caption` already
-    /// refuses with its own `drawn` counter. A row whose recorded host *is* this
+    /// refuses through the same [`unique_best`]. A row whose recorded host *is* this
     /// surface outranks a host-less one, since that is positive attribution
     /// against mere eligibility; anything still tied answers `None`.
     ///
@@ -146,9 +164,7 @@ impl TerminalTitles {
     pub(crate) fn row_for_title(&self, title: &str, host: &str) -> Option<(String, i64)> {
         let hosts: HashMap<String, String> = self.hosts.lock().unwrap().clone();
         let last = self.last.lock().unwrap();
-        let mut best: Option<(&String, i64, bool)> = None;
-        let mut drawn = 1;
-        for (id, (_, _, changed_at)) in last.iter().filter(|(_, (t, _, _))| t == title) {
+        let ranked = last.iter().filter(|(_, (t, _, _))| t == title).filter_map(|(id, (_, _, changed_at))| {
             // A row attributed to a *different* surface is excluded outright.
             //
             // Ranking it last instead was tried and reverted. The argument for it
@@ -164,16 +180,12 @@ impl TerminalTitles {
             // repairs itself.
             let attributed = match hosts.get(id) {
                 Some(h) if h == host => true,
-                Some(_) => continue,
+                Some(_) => return None,
                 None => false,
             };
-            match best {
-                Some((_, _, b)) if b && !attributed => {}
-                Some((_, _, b)) if b == attributed => drawn += 1,
-                _ => (best, drawn) = (Some((id, *changed_at, attributed)), 1),
-            }
-        }
-        best.filter(|_| drawn == 1).map(|(id, changed_at, _)| (id.clone(), changed_at))
+            Some(((id, *changed_at), attributed))
+        });
+        unique_best(ranked).one().map(|(id, changed_at)| (id.clone(), changed_at))
     }
 
     /// Record the console-pid candidates a hook event reported for `chat_id`.
@@ -195,6 +207,20 @@ impl TerminalTitles {
     }
 }
 
+/// Where a title write landed, in the terms the platform can reach it again by.
+///
+/// On Windows the processes attached to the console when the title was written,
+/// through any of which the console can be attached to again once the one the
+/// write went through has exited: a console lives as long as any process holds
+/// it. A pid can be reused, so a blank sent through a member that exited and was
+/// replaced reaches another console; a blank names no row, and a row whose title
+/// it was is rewritten on its next sync. Elsewhere it is the tty device the
+/// escape was written to, which stays the tab's for as long as the tab is open.
+#[cfg(windows)]
+type Landing = Vec<u32>;
+#[cfg(not(windows))]
+type Landing = String;
+
 /// A process can be attached to at most one console, so every
 /// free→attach→…→free dance in [`with_console`] must hold this lock for its whole
 /// duration or two threads would corrupt each other's console attachment.
@@ -214,6 +240,7 @@ extern "system" {
     fn SetConsoleTitleW(title: *const u16) -> i32;
     fn GetConsoleTitleW(buf: *mut u16, size: u32) -> u32;
     fn GetConsoleWindow() -> isize;
+    fn GetConsoleProcessList(list: *mut u32, count: u32) -> u32;
 }
 
 #[cfg(windows)]
@@ -440,18 +467,8 @@ pub fn observe_caption(app: &AppHandle, caption: &str, now: i64, window: Option<
         // Rank on (is it byte-equal, then how much of the caption it names), so an
         // exact match outranks every prefix sibling and a draw is a draw only
         // among equals on both.
-        let mut best: Option<(&String, &(String, i64, i64), (bool, usize))> = None;
-        let mut drawn = 1;
-        for (id, entry) in last.iter().filter(|(id, _)| eligible(id)) {
-            let Some(len) = shared_label(caption, &entry.0).map(str::len) else { continue };
-            let score = (entry.0 == caption, len);
-            match best {
-                Some((_, _, b)) if b > score => {}
-                Some((_, _, b)) if b == score => drawn += 1,
-                _ => (best, drawn) = (Some((id, entry, score)), 1),
-            }
-        }
-        best.filter(|_| drawn == 1).map(|(id, (t, at, _), _)| (id.clone(), t.clone(), *at))
+        let ranked = last.iter().filter(|(id, _)| eligible(id)).filter_map(|(id, entry)| shared_label(caption, &entry.0).map(|label| ((id, entry), (entry.0 == caption, label.len()))));
+        unique_best(ranked).one().map(|(id, (t, at, _))| (id.clone(), t.clone(), *at))
     }) else {
         return;
     };
@@ -658,6 +675,65 @@ pub fn shared_label<'a>(a: &'a str, b: &str) -> Option<&'a str> {
     std::iter::once(a.rest).chain(a.rest.rmatch_indices(' ').map(|(i, _)| &a.rest[..i])).find(|label| !label.is_empty() && b.names(label))
 }
 
+/// Which of several candidates ranks highest: what [`unique_best`] answers, and
+/// so what [`title_names`] answers about the rows a title names.
+pub enum Named<T> {
+    /// One candidate, the one ranked above every other.
+    One(T),
+    /// Several candidates share the highest rank, so none of them wins.
+    Drawn(Vec<T>),
+    /// There was no candidate to rank: for [`title_names`], the title is one of
+    /// this dashboard's and names none of the rows.
+    Nothing,
+}
+
+impl<T> Named<T> {
+    /// The winner, or `None` for a draw or an empty field.
+    pub fn one(self) -> Option<T> {
+        match self {
+            Named::One(t) => Some(t),
+            Named::Drawn(_) | Named::Nothing => None,
+        }
+    }
+}
+
+/// The candidate whose rank is greatest, with a tie refused rather than settled
+/// by iteration order: the one rule behind [`title_names`], `observe_caption` and
+/// [`TerminalTitles::row_for_title`], each of which ranks its candidates its own
+/// way and would otherwise pick an arbitrary one of several equals off a
+/// `HashMap`.
+pub fn unique_best<T, K: Ord>(ranked: impl IntoIterator<Item = (T, K)>) -> Named<T> {
+    let mut best: Vec<T> = Vec::new();
+    let mut best_rank: Option<K> = None;
+    for (item, rank) in ranked {
+        match best_rank.as_ref().map(|b| rank.cmp(b)) {
+            Some(std::cmp::Ordering::Less) => {}
+            Some(std::cmp::Ordering::Equal) => best.push(item),
+            _ => (best, best_rank) = (vec![item], Some(rank)),
+        }
+    }
+    match best.len() {
+        0 => Named::Nothing,
+        1 => Named::One(best.remove(0)),
+        _ => Named::Drawn(best),
+    }
+}
+
+/// Which of `rows`, each given with the label its tab title carries, the title
+/// `title` names, or `None` when `title` is not one this dashboard wrote.
+///
+/// [`TitleReading::names`] is a token-boundary prefix match, so with a
+/// `projects_root` set the title `🟢 bga assistant` is named by both a row
+/// labelled `bga` and its subproject row `bga assistant`. Every label a title
+/// names is a prefix of the same string, so they are totally ordered by length:
+/// the longest wins, and only rows carrying literally the same label draw. The
+/// one rule `attention::resolve_row` and `terminals::labels` both join a session
+/// to a row by.
+pub fn title_names<'r, T>(title: &str, rows: impl IntoIterator<Item = (T, &'r str)>) -> Option<Named<T>> {
+    let reading = parse_title(title)?;
+    Some(unique_best(rows.into_iter().filter(|(_, label)| reading.names(label)).map(|(row, label)| (row, label.len()))))
+}
+
 /// Read back a title this dashboard wrote, or `None` for anything else — a
 /// shell's own `~/proj — zsh`, a tab we have never titled, a blank one.
 ///
@@ -697,28 +773,51 @@ fn status_from_glyph(glyph: &str) -> Option<(Status, bool)> {
     })
 }
 
-/// The tab title for a session: "<glyph> <name>", with " [N%]" appended when
-/// the session's context usage is at least `context_threshold` percent of its
-/// model's window (the same figure as the token counter), and a trailing " ⚠"
-/// when the instruction-adherence canary has flagged the row. `context_threshold
-/// <= 0` — or an unknown percentage (no tokens / model / window) — omits the
-/// percent suffix. The drift warning is orthogonal to status, so it rides
-/// alongside whatever glyph the state resolves to. Pure and testable; the
-/// console-write side effects live in `push_title`.
-fn build_title(session: &AgentSession, context_threshold: f32, window_tokens: &HashMap<String, u64>) -> String {
-    let name = session.display_name.as_deref().unwrap_or(&session.id);
-    let mut title = format!("{} {}", status_glyph(session.status, session.read), name);
+/// The volatile end of a session's title: "[N%]" when the session's context
+/// usage is at least `context_threshold` percent of its model's window (the same
+/// figure as the token counter), and "⚠" when the instruction-adherence canary
+/// has flagged the row, space-separated, or `None` when neither applies.
+/// `context_threshold <= 0` — or an unknown percentage (no tokens / model /
+/// window) — omits the percent. The drift warning is orthogonal to status, so it
+/// rides alongside whatever glyph the state resolves to.
+fn title_suffix(session: &AgentSession, context_threshold: f32, window_tokens: &HashMap<String, u64>) -> Option<String> {
+    let mut suffix = String::new();
     if context_threshold > 0.0 {
         if let Some(pct) = context_percent(session, window_tokens) {
             if pct >= context_threshold {
-                let _ = write!(title, " [{}%]", pct.round() as u32);
+                let _ = write!(suffix, "[{}%]", pct.round() as u32);
             }
         }
     }
     if session.instruction_drift {
-        let _ = write!(title, " ⚠");
+        suffix.push_str(if suffix.is_empty() { "⚠" } else { " ⚠" });
     }
-    title
+    Some(suffix).filter(|s| !s.is_empty())
+}
+
+/// The tab title for a session: "<glyph> <name>", then its [`title_suffix`]
+/// after a space. Pure and testable; the console-write side effects live in
+/// `push_title`.
+fn build_title(session: &AgentSession, context_threshold: f32, window_tokens: &HashMap<String, u64>) -> String {
+    let name = session.display_name.as_deref().unwrap_or(&session.id);
+    let head = format!("{} {}", status_glyph(session.status, session.read), name);
+    match title_suffix(session, context_threshold, window_tokens) {
+        Some(suffix) => format!("{head} {suffix}"),
+        None => head,
+    }
+}
+
+/// The labels these rows want: each row's task (`AgentSession::shown_task`) on
+/// one line as the context, under the label its tab title carries. Never the
+/// status label: the title's glyph already says the row is asking.
+///
+/// With titles off the set is empty, which withdraws every context of ours,
+/// matching the blank sweep the console gets.
+fn desired_labels(enabled: bool, sessions: &[AgentSession]) -> Vec<DesiredLabel> {
+    if !enabled {
+        return Vec::new();
+    }
+    sessions.iter().map(|s| DesiredLabel { row: s.id.clone(), label: s.display_label().to_string(), context: s.shown_task().and_then(|t| one_line(&t)) }).collect()
 }
 
 /// Reconcile terminal tab titles with the current sessions. Called from
@@ -761,6 +860,11 @@ pub fn sync(app: &AppHandle, sessions: &[AgentSession], seq: u64) {
     *applied = seq;
     let cfg = app.try_state::<ConfigState>().map(|s| s.snapshot());
     let enabled = cfg.as_ref().map(|c| c.terminal_titles).unwrap_or(true);
+    let root = cfg.as_ref().and_then(|c| c.projects_root.clone());
+    let context_threshold = cfg.as_ref().and_then(|c| c.terminal_title_context_percent).unwrap_or(0.0);
+    let empty_tokens = HashMap::new();
+    let window_tokens = cfg.as_ref().map_or(&empty_tokens, |c| &c.context_window_tokens);
+
     // Built once per sync rather than per write: the constructor is a handle
     // clone, but a title push runs per row and this is the seam every one of
     // them has to reach.
@@ -778,7 +882,6 @@ pub fn sync(app: &AppHandle, sessions: &[AgentSession], seq: u64) {
     // reaches a neighbour's tab. No answer (an older Claude Code, an
     // unreadable registry, an ambiguous cwd) keeps the chain as it was.
     let registry = app.try_state::<crate::session_registry::SessionRegistry>();
-    let root = cfg.as_ref().and_then(|c| c.projects_root.clone());
     let resolve = |chat_id: &str, chain: &[u32]| -> Vec<u32> {
         match registry.as_ref().and_then(|r| r.tab_pid(chat_id, root.as_deref(), now)) {
             Some(pid) => vec![pid],
@@ -793,16 +896,26 @@ pub fn sync(app: &AppHandle, sessions: &[AgentSession], seq: u64) {
     // from `pids` and present in `last`, and sweeping `pids` left our own last
     // glyph sitting on a tab whose row had gone — which is exactly the stale
     // title `session_restore` reads back on the next start.
-    let blank = |chat_id: &str, last: &mut HashMap<String, (String, i64, i64)>| {
+    //
+    // The blank goes first to where the row's last title landed, which is the tab
+    // showing it, and only then to the candidates; see `TerminalTitles::landings`.
+    let mut landings = titles.landings.lock().unwrap();
+    let blank = |chat_id: &str, last: &mut HashMap<String, (String, i64, i64)>, landings: &mut HashMap<String, Landing>| {
         last.remove(chat_id);
-        push_title(adapter, &resolve(chat_id, pids.get(chat_id).map_or(&[][..], Vec::as_slice)), "");
+        let pushed = push_title(adapter, landings.get(chat_id), &resolve(chat_id, pids.get(chat_id).map_or(&[][..], Vec::as_slice)), "");
+        if blank_settled(pushed.as_ref().map(|p| p.ok)) {
+            landings.remove(chat_id);
+        } else {
+            tracing::debug!(chat_id, "a blank title reached its console and did not land; retried on the next sync");
+        }
     };
+    let written = titled_rows(&last, &landings);
 
     if !enabled {
         // Toggled off: blank every title we have written, keep the pid map so
         // re-enabling resumes without waiting for the next hook event.
-        for chat_id in last.keys().cloned().collect::<Vec<_>>() {
-            blank(&chat_id, &mut last);
+        for chat_id in &written {
+            blank(chat_id, &mut last, &mut landings);
         }
         // With nothing being written there is nothing a tab can disagree with,
         // so a standing stale-tab warning would outlive its evidence. `hosts`
@@ -810,6 +923,7 @@ pub fn sync(app: &AppHandle, sessions: &[AgentSession], seq: u64) {
         // silently come to name a live, unrelated window.
         titles.pinned.lock().unwrap().clear();
         titles.hosts.lock().unwrap().clear();
+        crate::terminals::labels::request(seq, desired_labels(false, sessions));
         if let Some(state) = app.try_state::<AppState>() {
             state.clear_all_terminal_stale(now);
         }
@@ -817,18 +931,14 @@ pub fn sync(app: &AppHandle, sessions: &[AgentSession], seq: u64) {
     }
 
     let live: HashSet<&str> = sessions.iter().map(|s| s.id.as_str()).collect();
-    for chat_id in last.keys().filter(|id| !live.contains(id.as_str())).cloned().collect::<Vec<_>>() {
-        blank(&chat_id, &mut last);
+    for chat_id in written.iter().filter(|id| !live.contains(id.as_str())) {
+        blank(chat_id, &mut last, &mut landings);
     }
     pids.retain(|chat_id, _| live.contains(chat_id.as_str()));
     // The same pruning the two maps above get. Without it every chat_id this
     // process ever titled keeps an entry, and a dead row keeps a window handle
     // that has since been reused.
     titles.hosts.lock().unwrap().retain(|chat_id, _| live.contains(chat_id.as_str()));
-
-    let context_threshold = cfg.as_ref().and_then(|c| c.terminal_title_context_percent).unwrap_or(0.0);
-    let empty_tokens = HashMap::new();
-    let window_tokens = cfg.as_ref().map(|c| &c.context_window_tokens).unwrap_or(&empty_tokens);
 
     for s in sessions {
         let candidates = resolve(&s.id, pids.get(&s.id).map_or(&[][..], Vec::as_slice));
@@ -842,10 +952,12 @@ pub fn sync(app: &AppHandle, sessions: &[AgentSession], seq: u64) {
             }
         }
         let changed = last.get(&s.id).is_none_or(|(prev, _, _)| prev != &title);
-        let pushed = push_title(adapter, &candidates, &title);
-        if pushed.as_ref().is_some_and(|p| p.ok) {
+        // A write goes to the candidates alone; see the module doc.
+        let pushed = push_title(adapter, None, &candidates, &title);
+        if let Some(p) = pushed.as_ref().filter(|p| p.ok) {
             let changed_at = if changed { now } else { last.get(&s.id).map_or(now, |(_, _, c)| *c) };
             last.insert(s.id.clone(), (title, now, changed_at));
+            landings.insert(s.id.clone(), p.landing.clone());
         }
         // Recorded only on the write's own terms. `Some(Pushed)` means a console
         // was reached and the adapter was actually asked, so its answer is an
@@ -899,18 +1011,61 @@ pub fn sync(app: &AppHandle, sessions: &[AgentSession], seq: u64) {
             crate::terminals::stale_check::request();
         }
     }
+
+    // A terminal's own session labels, after the seq gate so the worker only ever
+    // holds the newest snapshot's labels, and reached for every row, including
+    // one no console pid resolves for, which the loop skips.
+    crate::terminals::labels::request(seq, desired_labels(true, sessions));
 }
 
-/// Set the console title of the first reachable candidate pid.
+/// Every row this process has titled and not yet blanked: those holding a title
+/// in `last`, and those whose blank is still owed, which have left `last` and
+/// kept their landing.
+fn titled_rows(last: &HashMap<String, (String, i64, i64)>, landings: &HashMap<String, Landing>) -> Vec<String> {
+    last.keys().chain(landings.keys()).cloned().collect::<HashSet<_>>().into_iter().collect()
+}
+
+/// Whether a blank needs no retry: it landed, or no console or tty would take it,
+/// which on either platform means the tab it was for is gone — a console lives as
+/// long as a process holds it, and a closed tab's tty no longer opens. Only a
+/// console reached that refused the write is worth asking again.
+fn blank_settled(landed: Option<bool>) -> bool {
+    landed != Some(false)
+}
+
+/// When the newest title this process wrote for a row `caption` names last
+/// changed, or `None` when it names none of them.
 ///
-/// `None` means no candidate would attach, so nothing was written and nothing was
+/// For a caption read some time ago: a title that moved since moved somewhere
+/// that caption did not follow. Erring toward "the same row", as [`same_row`]
+/// does, counts a word-sharing neighbour's writes too, which only makes the
+/// caller distrust more.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn last_change_named(app: &AppHandle, caption: &str) -> Option<i64> {
+    let titles = app.try_state::<TerminalTitles>()?;
+    let last = titles.last.lock().unwrap();
+    last_change_in(&last, caption)
+}
+
+/// [`last_change_named`] over `last`, [`TerminalTitles`]' map of that name.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn last_change_in(last: &HashMap<String, (String, i64, i64)>, caption: &str) -> Option<i64> {
+    last.values().filter(|(title, _, _)| same_row(caption, title)).map(|&(_, _, changed)| changed).max()
+}
+
+/// Set the console title through `landing`, a console this process has written
+/// to before, and then the candidate pids, stopping at the first that attaches.
+///
+/// `None` means nothing would attach, so nothing was written and nothing was
 /// learned. `Some` means a console was reached: `ok` says whether the title
 /// actually went in (false leaves the `last` cache untouched so the next sync
-/// retries), and `host` is what the adapter made of that console — `None` there
-/// being *do not know*, never "not in a terminal we recognize".
+/// retries), `host` is what the adapter made of that console — `None` there
+/// being *do not know*, never "not in a terminal we recognize" — and `landing`
+/// is every other process attached to it.
 #[cfg(windows)]
-fn push_title(adapter: Option<&dyn TerminalAdapter>, candidates: &[u32], title: &str) -> Option<Pushed> {
+fn push_title(adapter: Option<&dyn TerminalAdapter>, landing: Option<&Landing>, candidates: &[u32], title: &str) -> Option<Pushed> {
     let wide: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+    let own = std::process::id();
     // Far-to-near: the hook reports candidates ordered nearest-first (its own
     // console processes, then parent, grandparent, …). The near end is transient
     // per-hook processes holding a fresh *invisible* console (hooks are spawned
@@ -927,7 +1082,7 @@ fn push_title(adapter: Option<&dyn TerminalAdapter>, candidates: &[u32], title: 
     // `TerminalAdapter::attached_surface` reads that same console for the
     // question the walk cannot answer: which of the terminal's surfaces this
     // console is rendered in.
-    with_console(candidates.iter().rev().copied(), |pid| {
+    with_console(attach_order(landing, candidates), |pid| {
         let ok = unsafe { SetConsoleTitleW(wide.as_ptr()) } != 0;
         // Asked inside the attach, which is the only place the answer means
         // anything. That it is cheap enough to sit under `ATTACH_LOCK` is a
@@ -937,16 +1092,31 @@ fn push_title(adapter: Option<&dyn TerminalAdapter>, candidates: &[u32], title: 
         // implementor.
         let host = adapter.and_then(|a| a.attached_surface(pid));
         tracing::debug!(pid, ok, title, host = host.as_deref().unwrap_or(""), "terminal title written");
-        Some(Pushed { ok, host })
+        Some(Pushed { ok, host, landing: console_members().into_iter().filter(|&p| p != own).collect() })
     })
 }
 
-/// What a title write learned: whether it landed, and which terminal window
-/// renders the console it landed on.
-///
-/// Two facts, matching the two fields. An earlier draft carried the console pid
-/// as a third, for a console read-back the comparison no longer performs; the
-/// field went and this doc had gone on promising it.
+/// The pids to attach through, in order: the members of a console written to
+/// before, then the candidates far-to-near.
+#[cfg(windows)]
+fn attach_order(landing: Option<&Landing>, candidates: &[u32]) -> Vec<u32> {
+    landing.into_iter().flatten().copied().chain(candidates.iter().rev().copied()).collect()
+}
+
+/// The processes attached to the console this process is attached to, or none
+/// when the list does not fit, in which case the call stores nothing.
+#[cfg(windows)]
+fn console_members() -> Vec<u32> {
+    let mut buf = [0u32; 64];
+    let n = unsafe { GetConsoleProcessList(buf.as_mut_ptr(), buf.len() as u32) } as usize;
+    if n > buf.len() {
+        return Vec::new();
+    }
+    buf[..n].to_vec()
+}
+
+/// What a title write learned: whether it landed, which terminal window renders
+/// the console it landed on, and how to reach that console or tty again.
 ///
 /// Deliberately not `Default`. A default value would be a `Pushed` describing a
 /// write that never happened, and the only reader that ever saw one read its
@@ -954,6 +1124,7 @@ fn push_title(adapter: Option<&dyn TerminalAdapter>, candidates: &[u32], title: 
 struct Pushed {
     ok: bool,
     host: Option<String>,
+    landing: Landing,
 }
 
 /// macOS/Linux: resolve the candidate's controlling tty via `ps -o tty=` and
@@ -972,9 +1143,16 @@ struct Pushed {
 /// control socket and per-window state files and could well name the surface
 /// holding `pid`. It is why every reader treats an absent host as "do not know"
 /// rather than as "not in a terminal we recognize".
+///
+/// `landing`, a tty this process has written to before, is tried first, and a
+/// title written there names no pid to ask an adapter about, so its host is
+/// unknown.
 #[cfg(not(windows))]
-fn push_title(adapter: Option<&dyn TerminalAdapter>, candidates: &[u32], title: &str) -> Option<Pushed> {
-    use std::io::Write;
+fn push_title(adapter: Option<&dyn TerminalAdapter>, landing: Option<&Landing>, candidates: &[u32], title: &str) -> Option<Pushed> {
+    if let Some(tty) = landing.filter(|tty| write_tty(tty, title)) {
+        tracing::debug!(tty, title, "terminal title written");
+        return Some(Pushed { ok: true, host: None, landing: tty.clone() });
+    }
     for &pid in candidates {
         let Ok(out) = std::process::Command::new("ps").args(["-o", "tty=", "-p", &pid.to_string()]).output() else { continue };
         let tty_raw = String::from_utf8_lossy(&out.stdout);
@@ -982,14 +1160,20 @@ fn push_title(adapter: Option<&dyn TerminalAdapter>, candidates: &[u32], title: 
         if tty.is_empty() || tty.starts_with('?') {
             continue;
         }
-        let Ok(mut dev) = std::fs::OpenOptions::new().write(true).open(format!("/dev/{tty}")) else { continue };
-        if dev.write_all(format!("\x1b]0;{title}\x07").as_bytes()).is_ok() {
+        if write_tty(tty, title) {
             let host = adapter.and_then(|a| a.attached_surface(pid));
             tracing::debug!(pid, tty, title, host = host.as_deref().unwrap_or(""), "terminal title written");
-            return Some(Pushed { ok: true, host });
+            return Some(Pushed { ok: true, host, landing: tty.to_string() });
         }
     }
     None
+}
+
+/// Write an OSC 0 title escape to the tty device `tty`, as `ps` names it.
+#[cfg(not(windows))]
+fn write_tty(tty: &str, title: &str) -> bool {
+    use std::io::Write;
+    std::fs::OpenOptions::new().write(true).open(format!("/dev/{tty}")).is_ok_and(|mut dev| dev.write_all(format!("\x1b]0;{title}\x07").as_bytes()).is_ok())
 }
 
 #[cfg(test)]
@@ -1306,9 +1490,13 @@ mod tests {
             canary: crate::state::Canary::Off,
             attended_at: None,
             turn_from_relay: false,
+            delegated_task: None,
+            message_line: None,
             clean_claim_at: None,
             read: false,
             name_shared_by: None,
+            row_line: None,
+            task_lines: Vec::new(),
             subagent_gate: None,
             terminal_stale_at: None,
         }
@@ -1372,6 +1560,21 @@ mod tests {
         assert_eq!(build_title(&s, 50.0, &w), "✋ printlab [90%]");
     }
 
+    #[test]
+    fn title_suffix_carries_the_percent_and_the_drift_mark() {
+        let w = tokens_map();
+        let mut s = session("proj", Some("m"), Some(100_000));
+        assert_eq!(title_suffix(&s, 50.0, &w).as_deref(), Some("[50%]"));
+        s.instruction_drift = true;
+        assert_eq!(title_suffix(&s, 50.0, &w).as_deref(), Some("[50%] ⚠"));
+        assert_eq!(title_suffix(&s, 60.0, &w).as_deref(), Some("⚠"), "below the threshold only the drift mark is left");
+        s.instruction_drift = false;
+        assert_eq!(title_suffix(&s, 60.0, &w), None);
+        assert_eq!(title_suffix(&s, 0.0, &w), None, "threshold 0 turns the percent off");
+        s.input_tokens = None;
+        assert_eq!(title_suffix(&s, 50.0, &w), None, "no tokens, no percent");
+    }
+
     /// Seed the title cache directly. The tuple is (title, asserted_at,
     /// changed_at); `row_for_title` reads the third, so the second is deliberately
     /// a different value in these tests to catch a reader taking the wrong one.
@@ -1380,6 +1583,35 @@ mod tests {
         if let Some(h) = host {
             t.hosts.lock().unwrap().insert(id.to_string(), h.to_string());
         }
+    }
+
+    #[test]
+    fn a_rows_context_is_its_task_on_one_line_never_its_question() {
+        let mut asking = session("asking", None, None);
+        (asking.status, asking.label, asking.original_prompt) = (Status::Blocked, "has a question".to_string(), Some("Fix the build\n\nand run the tests".to_string()));
+        asking.display_name = Some("ask".to_string());
+        let blank = session("blank", None, None);
+        let got: Vec<(String, String, Option<String>)> = desired_labels(true, &[asking, blank]).into_iter().map(|d| (d.row, d.label, d.context)).collect();
+        assert_eq!(got, vec![("asking".to_string(), "ask".to_string(), Some("Fix the build and run the tests".to_string())), ("blank".to_string(), "blank".to_string(), None)], "the label is the name on the tab, custom names included");
+    }
+
+    #[test]
+    fn turning_titles_off_wants_no_label_at_all() {
+        // An empty set is what withdraws every context of ours.
+        let mut working = session("agw", None, None);
+        working.original_prompt = Some("Fix the build".to_string());
+        assert_eq!(desired_labels(false, &[working]), Vec::new());
+    }
+
+    #[test]
+    fn a_title_names_the_row_with_the_longest_label_and_refuses_a_draw() {
+        let rows = [("bga", "bga"), ("bga/assistant", "bga assistant"), ("a", "dup"), ("b", "dup")];
+        let named = |title: &str| title_names(title, rows.iter().map(|(id, label)| (*id, *label)));
+        assert!(matches!(named("🟢 bga assistant [40%]"), Some(Named::One("bga/assistant"))));
+        assert!(matches!(named("🟢 bga"), Some(Named::One("bga"))));
+        assert!(matches!(named("🔵 dup ⚠"), Some(Named::Drawn(d)) if d == ["a", "b"]));
+        assert!(matches!(named("🔵 web"), Some(Named::Nothing)));
+        assert!(named("~/p/bga — zsh").is_none(), "a title this dashboard did not write");
     }
 
     #[test]
@@ -1433,6 +1665,44 @@ mod tests {
         let t = TerminalTitles::new();
         titled(&t, "web", "⚪ web", Some("hwnd:A"));
         assert_eq!(t.row_for_title("⚪ web [61%]", "hwnd:A"), None);
+    }
+
+    #[test]
+    fn a_rows_title_change_is_found_through_any_caption_naming_it() {
+        let mut last = HashMap::new();
+        last.insert("dash".to_string(), ("🔵 dash".to_string(), 9_000, 5_000));
+        last.insert("web".to_string(), ("🟢 web".to_string(), 9_000, 7_000));
+        assert_eq!(last_change_in(&last, "🟢 dash"), Some(5_000), "the caption still shows an older glyph of the same row");
+        assert_eq!(last_change_in(&last, "🟢 dash [62%]"), Some(5_000));
+        assert_eq!(last_change_in(&last, "🟢 stranger"), None);
+        assert_eq!(last_change_in(&last, "powershell"), None);
+    }
+
+    #[test]
+    fn a_blank_is_retried_only_where_a_console_took_it_and_refused() {
+        assert!(blank_settled(Some(true)), "landed");
+        assert!(blank_settled(None), "nothing would take it: the console or tab is gone");
+        assert!(!blank_settled(Some(false)), "reached and refused");
+    }
+
+    #[test]
+    fn a_row_whose_blank_is_owed_is_still_titled_after_it_leaves_last() {
+        // The row's first blank reached its console and failed: `last` has let
+        // it go, its landing has not, and the next sync must try again.
+        let last = HashMap::from([("live".to_string(), ("🟢 live".to_string(), 1, 1))]);
+        let landings: HashMap<String, Landing> = HashMap::from([("live".to_string(), Landing::default()), ("gone".to_string(), Landing::default())]);
+        let mut rows = titled_rows(&last, &landings);
+        rows.sort();
+        assert_eq!(rows, ["gone", "live"]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_blank_reaches_the_console_through_its_surviving_members_before_the_candidates() {
+        // The agent (300) is dead; the shell it ran under (200) still holds the
+        // console the row's last title went to.
+        assert_eq!(attach_order(Some(&vec![200, 300]), &[300, 100]), [200, 300, 100, 300]);
+        assert_eq!(attach_order(None, &[300, 100]), [100, 300], "a write goes far-to-near through the candidates alone");
     }
 
     #[test]

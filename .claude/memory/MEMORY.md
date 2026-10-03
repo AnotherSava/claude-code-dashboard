@@ -4,12 +4,12 @@
 - [Benign openers for offer questions](benign_openers_offer_questions.md) — config benign_openers (prefix) keeps "Anything …?" sign-offs DONE; distinct from benign_closers (suffix), don't merge
 - [macOS ad-hoc signing strategy](macos_signing_strategy.md) — DMG uses signingIdentity="-" + documented user workaround; don't push for $99/yr Apple notarization unprompted
 - [Test SetupPanel via port override](dashboard_test_port_override.md) — `config/local.json {"server_port": 9078}` keeps prompt_history empty; revert to 9077 after or the dashboard goes deaf
-- [Run deploy directly, don't hand it back](feedback_run_deploy_directly.md) — after code changes that need visual verification, call `Bash deploy` instead of asking the user
+- [Run deploy yourself, after asking](feedback_run_deploy_directly.md) — run `deploy` rather than handing it back, but ask right before each run (it relaunches the widget); never let a subagent deploy or restart an app
 - [Frontend log bypasses tracing intentionally](feedback_frontend_log_bypasses_tracing.md) — FrontendLogger writes JSONL directly; don't "fix" by routing through tracing::*! macros
 - [Favor clean design over compat](feedback_favor_clean_design.md) — don't keep legacy fields alongside replacements; break and update consumers
 - [No redundant flags](feedback_no_redundant_flags.md) — don't add booleans when existing data values already distinguish all cases (exception: cross-layer info gap)
 - [Frontend reads backend state decisions](feedback_frontend_reads_state_decisions.md) — stamp Rust state-machine decisions (task boundaries) onto data fields; don't re-derive in TS, they drift
-- [Notification text mirrors primaryText](notification_text_mirrors_primary_text.md) — build_message_text must match frontend primaryText (label vs original_prompt by status); drifted once → stale Blocked label on done ping
+- [Row text is decided once, in Rust](notification_text_mirrors_primary_text.md) — primary_text/row_line in state.rs; frontend draws the stamped row_line, notifications call primary_text; agwinterm's context line uses shown_task, never primary_text; no TS copy (two drifted)
 - [Config wiped on deploy](project_config_wiped_on_deploy.md) — deploy rewrites config.json from local.template.json (Win) / local.json (Mac)
 - [Validate detection against history](feedback_validate_detection_against_history.md) — test is_a_question changes vs prompt_history.json; prefer phrase-matching over broad structural rules
 - [App.svelte multi-window finally-block trap](feedback_app_svelte_multi_window_routing.md) — finally{showWindow} runs even for non-main labels; guard with !historyMode && !aboutMode or hidden secondaries auto-reveal
@@ -67,3 +67,4 @@
 - [Memo backlog audited 2026-09-20](memo_backlog_audit_2026_09_20.md) — a memo can be done and left open (its body says so); the rest verified genuinely open, don't re-sweep
 - [Telegram bot identity](telegram_bot_identity.md) — pings go through the dedicated notifications bot (token in Doppler claude-code-dashboard/dev); Mac has no Telegram configured; never print config.json notifications
 - [Typed prompts are invisible to the watcher](transcript_string_content_invisible.md) — string `content` fails log_watcher's Vec wire type, so infer_state skips typed prompts; pre-existing, not fixed
+- [agwinterm label route](agwinterm_label_route.md) — status via OSC title, prompt via session context; rename, caption, capabilities routes built then deleted 2026-10-02
