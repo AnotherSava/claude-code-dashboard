@@ -368,7 +368,7 @@ Returns `204` on ingest, `400` when `device_name` is empty or equals the receive
 
 ### `GET /api/sync/dialog?id=<raw_id>&since=<epoch_ms>`
 
-Returns the *local* session's dialog entries with `timestamp > since` (the full dialog when `since` is omitted or `0`). This is the routine content path: on every push a peer asks for the range above its own newest held entry. The history window additionally asks for the *full* dialog when it opens a remote session — the dedup merge absorbs the overlap, and it covers the one case a `since` cannot express (an entry the merge dropped as an apparent re-read sits below the newest held timestamp). `404` for unknown ids.
+Returns the *local* session's dialog entries with `timestamp > since` (the full dialog when `since` is omitted or `0`). This is the routine content path: on every push a peer asks for the range above its own newest held entry. The history window additionally asks for the *full* dialog when it opens a remote session — the merge places every entry at its own timestamp, so the overlap re-merges without duplicating, and asking whole covers what a `since` structurally cannot: a gap *below* the newest entry already held. `404` for unknown ids.
 
 ### `GET /api/sync/usage?since=<epoch_ms>`
 

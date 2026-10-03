@@ -79,7 +79,7 @@ use crate::peer_message::{build_content, deliver_to_inbox, from_id, MessageDedup
 use crate::remote_history::RemoteHistoryStore;
 use crate::session_registry::InboxLookup;
 use crate::remote_usage::RemoteUsageStore;
-use crate::state::{merge_dialog_entries, AgentSession, AppState, DialogEntry, RemoteDevice};
+use crate::state::{AgentSession, AppState, DialogEntry, DialogRole, RemoteDevice};
 use crate::usage_history::{UsageHistoryRecord, UsageHistoryStore};
 
 /// Coalesce window after a state change before pushing.
@@ -1734,6 +1734,138 @@ fn emit_history_loading(app: &AppHandle, id: &str, loading: bool) {
     let _ = app.emit("history_loading", HistoryLoading { id, loading });
 }
 
+/// Merge dialog entries pulled from their origin into the copy this device
+/// holds of that session.
+///
+/// The receiver's job is to reproduce the origin's dialog, not to re-derive it.
+/// What arrives has already been through the origin's own writers, and every
+/// entry carries the timestamp that origin stamped on it, so an entry is
+/// identified by `(role, timestamp, text)` and nothing else has to be inferred.
+/// [`crate::state::merge_dialog_entries`] answers a different question for the
+/// transcript watcher, which re-reads a file and must decide whether an entry
+/// it is looking at is one it has already seen; two of its rules are actively
+/// wrong on this path:
+///
+/// - It skips a user entry when the dialog already *ends* with one of the same
+///   text, reading it as a re-read of an unanswered prompt. On the wire that is
+///   indistinguishable from the user genuinely sending the same prompt twice in
+///   a row, which `apply_set` stores unconditionally at the origin — so the
+///   second copy is dropped and this device's newest timestamp sits above an
+///   entry it never stored, the one shape the `since` of an incremental pull
+///   cannot ask for.
+/// - It appends an entry it decides is new. An append is right only while
+///   entries arrive newest-first-and-upward, which the incremental pull
+///   guarantees and the full catch-up in [`fetch_remote_dialog`] does not: a
+///   replay carrying an entry from July lands it after everything from October.
+///
+/// So a missing entry is inserted at its place in timestamp order instead, and
+/// a user entry is taken at face value.
+///
+/// Assistant entries are the exception to that identity, because they are the
+/// only ones the origin rewrites: the watcher replaces a reply in place as the
+/// turn streams, so the same entry reaches this device twice with the text
+/// grown. The rewrite carries a fresh `now_ms`, so the update usually arrives
+/// at a timestamp matching nothing held, and matching on the timestamp cannot
+/// find it. What identifies it is the turn it falls into — the origin writes at
+/// most one assistant entry per turn, `merge_dialog_entries` replacing within a
+/// turn and appending only past a user entry or a separator — so an incoming
+/// assistant entry replaces the reply of the turn its timestamp lands in
+/// ([`turn_assistant_at`]), and is inserted only where that turn has no reply
+/// yet.
+///
+/// Keying that on the turn rather than on the timestamp or on the dialog's tail
+/// is what keeps two cases from corrupting the copy, both reachable from one
+/// watcher batch, which carries a single `now_ms`:
+///
+/// - `[Assistant, User, Assistant]` in one batch — `log_watcher` emits exactly
+///   that when a queued-command attachment sits between two replies — puts two
+///   assistant entries one millisecond apart in two different turns. Matching
+///   an incoming entry against any held assistant of the same timestamp picks
+///   the wrong turn's and overwrites a reply that is not a version of it.
+/// - A stale revision of the current reply, which a slow catch-up delivers
+///   after an incremental pull has already merged a newer one, arrives *older*
+///   than the newest entry held. Treating it as a late arrival and inserting it
+///   leaves the half-written reply beside the finished one, in a turn holding
+///   two replies — a shape no origin writer produces and nothing here retracts.
+///   Replacing instead lowers this device's newest timestamp below the origin's
+///   advertised tip, so the next push re-pulls the final text.
+///
+/// Only assistant entries are matched this way. A user entry's text is never
+/// rewritten at the origin, and two of them can legitimately share a
+/// millisecond, so anything looser than full equality would merge two prompts
+/// into one.
+///
+/// Returns `true` when the dialog was modified.
+fn merge_synced_dialog(dialog: &mut Vec<DialogEntry>, incoming: &[DialogEntry]) -> bool {
+    let mut changed = false;
+    for entry in incoming {
+        // Timestamp first: it discriminates almost every pair, so the text
+        // comparison behind it runs only for a genuine match. A catch-up
+        // replays the whole dialog against the whole dialog.
+        if dialog.iter().any(|e| e.timestamp == entry.timestamp && e.role == entry.role && e.text == entry.text) {
+            continue;
+        }
+        if entry.role == DialogRole::Assistant {
+            if let Some(i) = turn_assistant_at(dialog, entry.timestamp) {
+                dialog[i] = entry.clone();
+                changed = true;
+                continue;
+            }
+        }
+        insert_in_timestamp_order(dialog, entry.clone());
+        changed = true;
+    }
+    changed
+}
+
+/// Index of the assistant entry of the turn `ts` falls into, if that turn holds
+/// one.
+///
+/// A user entry and a separator each open a turn, so the turn containing `ts`
+/// runs from just past the last of those at or before `ts` up to the next one.
+/// An assistant entry stamped inside that span is the reply being written
+/// there, whatever its timestamp says relative to the rest of the dialog.
+fn turn_assistant_at(dialog: &[DialogEntry], ts: i64) -> Option<usize> {
+    let opens_turn = |e: &DialogEntry| e.role == DialogRole::User || e.role == DialogRole::Separator;
+    let start = dialog.iter().rposition(|e| e.timestamp <= ts && opens_turn(e)).map_or(0, |i| i + 1);
+    let end = dialog.iter().skip(start).position(opens_turn).map_or(dialog.len(), |i| start + i);
+    dialog[start..end].iter().rposition(|e| e.role == DialogRole::Assistant).map(|i| start + i)
+}
+
+/// Insert `entry` after the last entry it is not older than.
+///
+/// Scanning from the end makes the ordinary case — an entry newer than
+/// everything held — one comparison and a push. Ties keep arrival order, so
+/// two entries the origin stamped in the same millisecond stay in the order it
+/// sent them.
+fn insert_in_timestamp_order(dialog: &mut Vec<DialogEntry>, entry: DialogEntry) {
+    let pos = dialog.iter().rposition(|e| e.timestamp <= entry.timestamp).map_or(0, |i| i + 1);
+    dialog.insert(pos, entry);
+}
+
+/// Merge pulled entries into the copy held for `id`, then persist and publish
+/// the result — but only where the merge changed something.
+///
+/// Both pull paths end this way, and the guard is why they have to: the device
+/// file is rewritten whole and the emit carries every dialog on it, while a
+/// range already held is the ordinary outcome. The catch-up asks for the entire
+/// dialog every time a history window opens a remote row, so without this each
+/// open rewrites megabytes to say nothing changed.
+fn store_pulled_dialog(app: &AppHandle, state: &AppState, device: &str, id: &str, entries: &[DialogEntry]) {
+    let merged = {
+        let mut remote = state.remote.lock().unwrap();
+        remote
+            .get_mut(device)
+            .and_then(|dev| dev.sessions.iter_mut().find(|s| s.id == id))
+            .and_then(|s| merge_synced_dialog(&mut s.dialog, entries).then(|| s.clone()))
+    };
+    let Some(s) = merged else { return };
+    if let Some(store) = app.try_state::<RemoteHistoryStore>() {
+        store.save_device(device, std::slice::from_ref(&s));
+    }
+    emit_sessions_updated_remote(app);
+}
+
 /// GET the origin's full dialog for one raw session id. `None` on any
 /// failure (origin offline, auth mismatch, parse error) — all logged at
 /// debug, since offline peers are routine.
@@ -1761,19 +1893,10 @@ fn fetch_dialog_range(app: AppHandle, device: String, origin_addr: String, pull:
             return;
         };
         let id = format!("{device}/{}", pull.raw_id);
-        let merged = {
-            let mut remote = state.remote.lock().unwrap();
-            remote.get_mut(&device).and_then(|dev| dev.sessions.iter_mut().find(|s| s.id == id)).map(|s| {
-                merge_dialog_entries(&mut s.dialog, &entries);
-                s.clone()
-            })
-        };
-        let Some(s) = merged else { return };
+        // Logged for the range arriving, not for it changing anything, so a
+        // pull that turns out to be a no-op is still visible.
         tracing::debug!(session = %id, entries = entries.len(), since = pull.since, "dialog range pulled");
-        if let Some(store) = app.try_state::<RemoteHistoryStore>() {
-            store.save_device(&device, std::slice::from_ref(&s));
-        }
-        emit_sessions_updated_remote(&app);
+        store_pulled_dialog(&app, &state, &device, &id, &entries);
     });
 }
 
@@ -1853,17 +1976,17 @@ async fn get_json<T: serde::de::DeserializeOwned>(url: &str, query: &[(&str, Str
 
 
 /// Catch-up fetch for one remote session's dialog, triggered when the history
-/// window targets it. Always fetches the origin's full dialog, and the merge
-/// dedups the overlap.
+/// window targets it. Always fetches the origin's full dialog, and
+/// [`merge_synced_dialog`] dedups the overlap.
 ///
 /// It deliberately asks for everything rather than for the range above our
 /// newest held entry, which is what the routine [`fetch_dialog_range`] pull
-/// does. The two differ in exactly one case: `merge_dialog_entries` can drop an
-/// entry it cannot distinguish from a transcript re-read (a prompt repeated
-/// with no reply between it and its twin), leaving our newest timestamp above
-/// something we never stored — the one shape a `since` cannot express. Asking
-/// whole is cheap at the single moment the dialog is actually read, so this
-/// stays the belt-and-braces path behind the incremental one.
+/// does. A `since` can only ask for what is newer than the newest entry we
+/// hold, so a gap *below* that is unreachable incrementally however it got
+/// there. Asking whole is cheap at the single moment the dialog is actually
+/// read, and the merge places each entry at its own timestamp and re-merges the
+/// overlap without duplicating it, so this stays the belt-and-braces path
+/// behind the incremental one.
 ///
 /// Brackets the fetch in `history_loading` events so the window can show a
 /// hint. Fire-and-forget: on failure (origin offline) the window simply shows
@@ -1888,19 +2011,7 @@ pub fn fetch_remote_dialog(app: AppHandle, session_id: String) {
         let full: Option<Vec<DialogEntry>> = get_json(&url, &query, &token, "dialog catch-up").await;
         if let Some(entries) = full.filter(|e| !e.is_empty()) {
             tracing::debug!(session = %session_id, entries = entries.len(), "dialog catch-up merged");
-            let merged = {
-                let mut remote = state.remote.lock().unwrap();
-                remote.get_mut(&device).and_then(|dev| dev.sessions.iter_mut().find(|s| s.id == session_id)).map(|s| {
-                    merge_dialog_entries(&mut s.dialog, &entries);
-                    s.clone()
-                })
-            };
-            if let Some(s) = merged {
-                if let Some(store) = app.try_state::<RemoteHistoryStore>() {
-                    store.save_device(&device, std::slice::from_ref(&s));
-                }
-                emit_sessions_updated_remote(&app);
-            }
+            store_pulled_dialog(&app, &state, &device, &session_id, &entries);
         }
         emit_history_loading(&app, &session_id, false);
     });
@@ -2188,6 +2299,195 @@ mod tests {
         let a = build_push("desktop", 9078, &sessions, 7, 3, None);
         let b = build_push("desktop", 9078, &sessions, 7, 3, None);
         assert_eq!(serde_json::to_string(&a).unwrap(), serde_json::to_string(&b).unwrap());
+    }
+
+    // -------- merge_synced_dialog --------
+
+    fn texts(dialog: &[DialogEntry]) -> Vec<&str> {
+        dialog.iter().map(|e| e.text.as_str()).collect()
+    }
+
+    #[test]
+    fn a_prompt_repeated_back_to_back_is_kept() {
+        // The origin stores both copies — `apply_set` appends unconditionally —
+        // so reading the second as a re-read of the first loses an entry the
+        // user really sent.
+        let mut dialog = vec![entry(DialogRole::User, "publish", 10)];
+        assert!(merge_synced_dialog(&mut dialog, &[entry(DialogRole::User, "publish", 20)]));
+        assert_eq!(texts(&dialog), ["publish", "publish"]);
+        assert_eq!(dialog.iter().map(|e| e.timestamp).collect::<Vec<_>>(), [10, 20]);
+    }
+
+    #[test]
+    fn an_entry_older_than_the_tail_lands_at_its_timestamp() {
+        // The catch-up replays the whole dialog, so an entry missing from the
+        // middle arrives long after the entries that follow it.
+        let mut dialog = vec![
+            entry(DialogRole::User, "july", 10),
+            entry(DialogRole::Assistant, "july reply", 30),
+            entry(DialogRole::User, "october", 90),
+        ];
+        assert!(merge_synced_dialog(&mut dialog, &[entry(DialogRole::User, "july twin", 20)]));
+        assert_eq!(texts(&dialog), ["july", "july twin", "july reply", "october"]);
+    }
+
+    #[test]
+    fn a_replayed_range_is_idempotent() {
+        let incoming = vec![
+            entry(DialogRole::User, "ask", 10),
+            entry(DialogRole::Assistant, "answer", 20),
+            entry(DialogRole::Separator, "", 30),
+        ];
+        let mut dialog = Vec::new();
+        assert!(merge_synced_dialog(&mut dialog, &incoming));
+        assert!(!merge_synced_dialog(&mut dialog, &incoming), "nothing changes on a re-send");
+        assert_eq!(dialog.len(), 3);
+        // A full catch-up re-sends everything, including what arrived first.
+        assert!(!merge_synced_dialog(&mut dialog, &incoming[..1]));
+        assert_eq!(dialog.len(), 3);
+    }
+
+    #[test]
+    fn a_restamped_assistant_update_replaces_the_turn_tail() {
+        // The origin's watcher rewrites a streaming reply in place under a
+        // fresh `now_ms`, so the update's timestamp matches nothing held.
+        let mut dialog = vec![entry(DialogRole::User, "ask", 10), entry(DialogRole::Assistant, "partial", 20)];
+        assert!(merge_synced_dialog(&mut dialog, &[entry(DialogRole::Assistant, "the whole reply", 25)]));
+        assert_eq!(texts(&dialog), ["ask", "the whole reply"]);
+        assert_eq!(dialog[1].timestamp, 25);
+    }
+
+    #[test]
+    fn an_assistant_entry_older_than_the_tail_leaves_the_current_turn_alone() {
+        // Same shape as the update above, except this one cannot be about the
+        // newest turn — overwriting it would replace a reply on screen.
+        let mut dialog = vec![
+            entry(DialogRole::User, "first", 10),
+            entry(DialogRole::User, "second", 50),
+            entry(DialogRole::Assistant, "newest reply", 60),
+        ];
+        assert!(merge_synced_dialog(&mut dialog, &[entry(DialogRole::Assistant, "old reply", 20)]));
+        assert_eq!(texts(&dialog), ["first", "old reply", "second", "newest reply"]);
+    }
+
+    #[test]
+    fn a_turn_boundary_stops_the_restamped_update() {
+        // A separator ends a turn exactly as a user entry does, so a reply
+        // arriving after one must not reach back across it.
+        let mut dialog = vec![entry(DialogRole::Assistant, "before the boundary", 10), entry(DialogRole::Separator, "", 20)];
+        assert!(merge_synced_dialog(&mut dialog, &[entry(DialogRole::Assistant, "after it", 30)]));
+        assert_eq!(texts(&dialog), ["before the boundary", "", "after it"]);
+    }
+
+    #[test]
+    fn a_changed_text_at_a_held_timestamp_updates_in_place() {
+        let mut dialog = vec![entry(DialogRole::User, "ask", 10), entry(DialogRole::Assistant, "partial", 20)];
+        assert!(merge_synced_dialog(&mut dialog, &[entry(DialogRole::Assistant, "complete", 20)]));
+        assert_eq!(texts(&dialog), ["ask", "complete"]);
+        assert_eq!(dialog.len(), 2);
+    }
+
+    #[test]
+    fn a_stale_revision_of_the_current_reply_replaces_it_rather_than_joining_it() {
+        // A catch-up body is megabytes and takes long enough that an
+        // incremental pull spawned while it was in flight can merge first. The
+        // stale copy of the turn's reply then arrives older than what is held.
+        let mut dialog = vec![entry(DialogRole::User, "ask", 10), entry(DialogRole::Assistant, "the whole reply", 25)];
+        assert!(merge_synced_dialog(&mut dialog, &[entry(DialogRole::Assistant, "partial", 20)]));
+        assert_eq!(texts(&dialog), ["ask", "partial"], "one reply in the turn, not two");
+        // Replacing drops this device's newest timestamp below the origin's
+        // advertised tip, which is what makes the next push repair it.
+        assert_eq!(dialog.iter().map(|e| e.timestamp).max(), Some(20));
+        assert!(merge_synced_dialog(&mut dialog, &[entry(DialogRole::Assistant, "the whole reply", 25)]));
+        assert_eq!(texts(&dialog), ["ask", "the whole reply"]);
+    }
+
+    #[test]
+    fn two_replies_a_millisecond_apart_in_different_turns_both_survive() {
+        // `log_watcher::extract_text_entries` emits [Assistant, User, Assistant]
+        // when a queued-command attachment sits between two replies, and
+        // `apply_text_entries` stamps the whole batch with one `now_ms` — so the
+        // origin really does hold two assistant entries at one timestamp.
+        let batch = [
+            entry(DialogRole::Assistant, "working...", 100),
+            entry(DialogRole::User, "check the build failure", 100),
+            entry(DialogRole::Assistant, "done", 100),
+        ];
+        let mut dialog = Vec::new();
+        assert!(merge_synced_dialog(&mut dialog, &batch));
+        assert_eq!(texts(&dialog), ["working...", "check the build failure", "done"]);
+        assert!(!merge_synced_dialog(&mut dialog, &batch), "and the replay is still idempotent");
+    }
+
+    #[test]
+    fn a_reply_lands_in_its_own_turn_when_a_later_turn_already_has_one() {
+        // The turn `ts` falls into is the one that decides, so a reply for an
+        // earlier turn neither overwrites the newest turn's nor piles into it.
+        let mut dialog = vec![
+            entry(DialogRole::User, "first", 10),
+            entry(DialogRole::User, "second", 50),
+            entry(DialogRole::Assistant, "newest reply", 60),
+        ];
+        assert!(merge_synced_dialog(&mut dialog, &[entry(DialogRole::Assistant, "first reply", 20)]));
+        assert_eq!(texts(&dialog), ["first", "first reply", "second", "newest reply"]);
+    }
+
+    #[test]
+    fn a_reply_for_a_turn_that_already_has_one_replaces_it_across_the_whole_dialog() {
+        let mut dialog = vec![
+            entry(DialogRole::User, "first", 10),
+            entry(DialogRole::Assistant, "first reply", 20),
+            entry(DialogRole::User, "second", 50),
+            entry(DialogRole::Assistant, "newest reply", 60),
+        ];
+        assert!(merge_synced_dialog(&mut dialog, &[entry(DialogRole::Assistant, "first reply, revised", 30)]));
+        assert_eq!(texts(&dialog), ["first", "first reply, revised", "second", "newest reply"]);
+    }
+
+    #[test]
+    fn a_user_and_an_assistant_entry_at_one_millisecond_stay_distinct() {
+        // Identity is `(role, timestamp)`, so a reply stamped in the same
+        // millisecond as the prompt is not mistaken for it.
+        let mut dialog = vec![entry(DialogRole::User, "ask", 10)];
+        assert!(merge_synced_dialog(&mut dialog, &[entry(DialogRole::Assistant, "answer", 10)]));
+        assert_eq!(texts(&dialog), ["ask", "answer"]);
+    }
+
+    #[test]
+    fn ties_keep_the_order_the_origin_sent() {
+        let mut dialog = vec![entry(DialogRole::User, "a", 10), entry(DialogRole::User, "c", 30)];
+        let incoming = [entry(DialogRole::User, "b1", 20), entry(DialogRole::User, "b2", 20)];
+        assert!(merge_synced_dialog(&mut dialog, &incoming));
+        assert_eq!(texts(&dialog), ["a", "b1", "b2", "c"]);
+    }
+
+    #[test]
+    fn an_entry_older_than_everything_held_goes_to_the_front() {
+        let mut dialog = vec![entry(DialogRole::User, "later", 50)];
+        assert!(merge_synced_dialog(&mut dialog, &[entry(DialogRole::User, "earliest", 10)]));
+        assert_eq!(texts(&dialog), ["earliest", "later"]);
+    }
+
+    #[test]
+    fn the_catch_up_finds_nothing_to_repair_after_an_incremental_pull() {
+        // The reported failure end to end: the origin holds a back-to-back
+        // repeat, the incremental pull delivers it, and reopening the history
+        // window replays the whole dialog.
+        let origin = vec![
+            entry(DialogRole::User, "pull remote changes", 10),
+            entry(DialogRole::User, "pull remote changes", 20),
+            entry(DialogRole::Assistant, "pulled", 30),
+            entry(DialogRole::User, "next", 40),
+        ];
+        let mut held = Vec::new();
+        for e in &origin {
+            // One pull per entry, which is how the push/pull cycle delivers a
+            // live conversation.
+            merge_synced_dialog(&mut held, std::slice::from_ref(e));
+        }
+        assert_eq!(held.len(), origin.len(), "nothing was dropped on the way in");
+        assert!(!merge_synced_dialog(&mut held, &origin), "the catch-up has nothing to add");
+        assert_eq!(texts(&held), ["pull remote changes", "pull remote changes", "pulled", "next"]);
     }
 
     // -------- usage_since --------

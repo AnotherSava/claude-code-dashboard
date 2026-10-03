@@ -1781,20 +1781,22 @@ impl AppState {
 }
 
 /// Merge `incoming` dialog entries (chronological order) into `dialog` with
-/// the turn-aware semantics of the transcript watcher, made replay-safe so
-/// the sync receive path can apply overlapping deltas idempotently (a failed
-/// push leaves the sender's watermark in place, so the next push re-sends
-/// the same entries):
+/// the turn-aware semantics of the transcript watcher, which is its only
+/// consumer — a peer's entries arrive through `sync::merge_synced_dialog`,
+/// which identifies an entry rather than inferring one. The rules below are
+/// therefore about one thing: the watcher re-reads a transcript it has already
+/// read, so the same entry reaches this function more than once.
 /// - User: append, unless the dialog still *ends* with a user entry of the
-///   same text (watcher dedup of a re-read transcript) or an identical entry
-///   — same timestamp and text — already exists (replayed delta).
+///   same text (the re-read of an unanswered prompt) or an identical entry
+///   — same timestamp and text — already exists.
 /// - Assistant: replace the tail assistant of the current turn in place
-///   (same-turn streaming update — also how a replayed newer version of the
-///   same turn lands), skip when its text already matches, append when a
-///   user entry or a separator intervened.
+///   (the same-turn streaming update), skip when its text already matches,
+///   append when a user entry or a separator intervened.
 /// - Separator: append, unless the dialog already ends with one (mirrors the
 ///   mark_session_boundary guard) or the same separator (by timestamp) was
-///   already merged.
+///   already merged. No caller reaches this arm: `apply_text_entries` filters
+///   the watcher's entries down to User/Assistant, separators entering a
+///   dialog through `mark_session_boundary` instead.
 /// Returns `true` when the dialog was modified.
 pub fn merge_dialog_entries(dialog: &mut Vec<DialogEntry>, incoming: &[DialogEntry]) -> bool {
     let mut changed = false;
@@ -3161,7 +3163,7 @@ why did this become the task?");
         assert_eq!(s.original_prompt.as_deref(), Some("fix foo.py"));
     }
 
-    // -------- merge_dialog_entries (sync delta path) tests --------
+    // -------- merge_dialog_entries (transcript watcher) tests --------
 
     #[test]
     fn merge_replay_of_same_delta_is_noop() {
@@ -3169,7 +3171,7 @@ why did this become the task?");
         let delta = vec![user_entry("u1", 10), assistant_entry("a1", 20), separator_entry(30)];
         assert!(merge_dialog_entries(&mut dialog, &delta));
         assert_eq!(dialog.len(), 3);
-        // A failed push re-sends the same window — must not duplicate.
+        // The watcher re-reads a stretch it has already read — must not duplicate.
         assert!(!merge_dialog_entries(&mut dialog, &delta));
         assert_eq!(dialog.len(), 3);
     }
@@ -3177,8 +3179,8 @@ why did this become the task?");
     #[test]
     fn merge_replaces_streamed_assistant_in_place() {
         let mut dialog = vec![user_entry("u1", 10), assistant_entry("partial", 20)];
-        // The origin's watcher rewrote the same-turn assistant text and
-        // bumped its timestamp; the delta carries the newer version.
+        // The watcher saw the same-turn assistant text grow and restamped it;
+        // the re-read carries the newer version.
         let delta = vec![assistant_entry("final", 25)];
         assert!(merge_dialog_entries(&mut dialog, &delta));
         assert_eq!(dialog.len(), 2);
@@ -3206,7 +3208,7 @@ why did this become the task?");
     fn merge_user_dedups_unanswered_reread() {
         let mut dialog = vec![user_entry("fix bug", 10)];
         // Same prompt re-read with a different timestamp while it is still the
-        // unanswered tail (transcript re-read on the origin) — text dedup
+        // unanswered tail (a plain transcript re-read) — text dedup
         // against the tail catches it.
         assert!(!merge_dialog_entries(&mut dialog, &[user_entry("fix bug", 30)]));
         assert_eq!(dialog.len(), 1);
@@ -3242,7 +3244,7 @@ why did this become the task?");
         let mut entry = user_entry("u1", 42);
         entry.task_start = true;
         assert!(merge_dialog_entries(&mut dialog, &[entry]));
-        assert_eq!(dialog[0].timestamp, 42, "sender timestamps survive");
+        assert_eq!(dialog[0].timestamp, 42, "the transcript's timestamps survive");
         assert!(dialog[0].task_start, "task boundary flag survives");
     }
 
