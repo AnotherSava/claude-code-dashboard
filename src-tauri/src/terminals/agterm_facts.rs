@@ -52,12 +52,23 @@
 //! (`learnings/agterm.md`): a tab that exec'd into ssh reported ssh's argv.
 //! `paneOverlays` lists a session's pane overlay terminals, which agterm's
 //! control API reports in `tree` since its pane-scoped overlays, per agwinterm's
-//! parity table. The session-wide overlay is read from `overlay`, which is how
-//! agwinterm, the Windows port of agterm's control model, spells it in its own
-//! `tree`. agterm's spelling of it has not been measured, so a node without the
-//! key reads as clear, as agwinterm's own reading does: were agterm to spell it
-//! otherwise, input typed into an open overlay would be credited to the session
-//! under it, which only marks that session read early.
+//! parity table.
+//!
+//! **A scratch overlay is reported through `surfaces`, not through `overlay`**,
+//! measured on agterm 0.25.0 (commit 94ab03f2) 2026-10-03 by toggling one and
+//! reading `tree` on either side. Opening it left `overlay` at `false` and added
+//! a `surfaces` entry with `kind: "scratch"` and `visible: true`, while the
+//! `left` surface went invisible; `scratch: true` appeared on the node too.
+//! Closing it put `visible: false` on that same entry rather than removing it,
+//! which is why [`cover`] reads the surface's `visible` and not the node's
+//! `scratch` or the entry's presence.
+//!
+//! `overlay` is a real boolean on every session node and stayed `false`
+//! throughout, so what sets it is unmeasured — 0.25.0 exposes no overlay
+//! command, `session scratch` being the only one of that shape. It is read
+//! anyway, as `paneOverlays` is, because that is how agwinterm, the Windows
+//! port of agterm's control model, spells it in its own `tree`, and because a
+//! node without either key reads as clear, as agwinterm's own reading does.
 
 use serde_json::Value;
 
@@ -96,13 +107,24 @@ pub fn occupant(node: Option<&Value>) -> Occupant {
 }
 
 /// Whether an overlay terminal is drawn over a session, from its `tree` node:
-/// covered when `overlay` is `true` or `paneOverlays` lists one, clear
-/// otherwise, the key being absent included, and unknown when the tree does not
-/// list the session. See the module doc for why an absent key reads as clear.
+/// covered when a scratch surface is visible, when `overlay` is `true`, or when
+/// `paneOverlays` lists one; clear otherwise, the key being absent included,
+/// and unknown when the tree does not list the session. See the module doc for
+/// which of those agterm was measured to report and why an absent key reads as
+/// clear.
+///
+/// The scratch test is on the surface's `visible`, never on its presence: a
+/// hidden scratch shell stays alive, so its entry outlives the overlay being on
+/// screen and presence alone would read a session as covered for the rest of
+/// its life.
 pub fn cover(node: Option<&Value>) -> Cover {
     let Some(node) = node else { return Cover::Unknown };
     let pane_overlays = node.get("paneOverlays").and_then(Value::as_array).is_some_and(|o| !o.is_empty());
-    if node.get("overlay").and_then(Value::as_bool) == Some(true) || pane_overlays {
+    let scratch_shown = node
+        .get("surfaces")
+        .and_then(Value::as_array)
+        .is_some_and(|s| s.iter().any(|f| f.get("kind").and_then(Value::as_str) == Some("scratch") && f.get("visible").and_then(Value::as_bool) == Some(true)));
+    if scratch_shown || node.get("overlay").and_then(Value::as_bool) == Some(true) || pane_overlays {
         Cover::Covered
     } else {
         Cover::Clear
@@ -429,6 +451,43 @@ mod tests {
         assert_eq!(cover(Some(&node(serde_json::json!({ "overlay": false, "paneOverlays": [] })))), Cover::Clear);
         assert_eq!(cover(Some(&node(serde_json::json!({ "overlay": false })))), Cover::Clear);
         assert_eq!(cover(None), Cover::Unknown);
+    }
+
+    /// The node shapes agterm 0.25.0 actually reported either side of a scratch
+    /// overlay being toggled, captured 2026-10-03. `overlay` never moves, so
+    /// the surfaces array is the only thing that distinguishes them.
+    #[test]
+    fn a_visible_scratch_surface_covers_the_session_it_is_drawn_over() {
+        let shown = node(serde_json::json!({
+            "overlay": false,
+            "scratch": true,
+            "surfaces": [
+                { "id": "surface:S1:left", "kind": "left", "visible": false, "active": false },
+                { "id": "surface:S1:scratch", "kind": "scratch", "visible": true, "active": true },
+            ],
+        }));
+        assert_eq!(cover(Some(&shown)), Cover::Covered, "agterm reports it through surfaces, not `overlay`");
+
+        // Hiding the scratch leaves its surface in the array — the shell stays
+        // alive — so presence cannot be the test or the session would read as
+        // covered for the rest of its life.
+        let hidden = node(serde_json::json!({
+            "overlay": false,
+            "scratch": false,
+            "surfaces": [
+                { "id": "surface:S1:left", "kind": "left", "visible": true, "active": true },
+                { "id": "surface:S1:scratch", "kind": "scratch", "visible": false, "active": false },
+            ],
+        }));
+        assert_eq!(cover(Some(&hidden)), Cover::Clear);
+
+        // Before a scratch has ever been opened the array holds only the pane.
+        let never = node(serde_json::json!({
+            "overlay": false,
+            "scratch": false,
+            "surfaces": [{ "id": "surface:S1:left", "kind": "left", "visible": true, "active": true }],
+        }));
+        assert_eq!(cover(Some(&never)), Cover::Clear);
     }
 
     #[test]
