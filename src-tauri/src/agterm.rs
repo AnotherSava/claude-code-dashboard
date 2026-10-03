@@ -7,14 +7,16 @@
 //! keep working from a GUI app that inherits no shell profile, and the timeout is
 //! what stops a wedged terminal from holding a dashboard thread forever.
 //!
-//! macOS-only in full, module gate rather than per-item: agterm does not exist on
-//! Windows, so there is no counterpart branch here to keep compiling — and no
-//! `#[cfg(not(macos))]` stub of the kind the `verify_cfg_gated_platform_branches`
-//! memory warns can rot unseen, because a `cargo test` on this machine never
-//! compiles one.
+//! Compiled on macOS, and for tests everywhere: agterm does not exist on Windows,
+//! so the transport is gated to macOS item by item and has no counterpart branch
+//! to keep compiling — no `#[cfg(not(macos))]` stub of the kind the
+//! `verify_cfg_gated_platform_branches` memory warns can rot unseen. What remains
+//! in a Windows test build is the pure reading of agterm's answers, which
+//! `terminals::agterm`'s own tests need wherever they run.
 
-#![cfg(target_os = "macos")]
+#![cfg(any(target_os = "macos", test))]
 
+#[cfg(target_os = "macos")]
 use std::path::PathBuf;
 
 /// How long any one `agtermctl` call may take before it is killed.
@@ -24,8 +26,10 @@ use std::path::PathBuf;
 /// same hazard, and the same remedy, as `tailnet::whois_uncached`. Kept well
 /// under `session_launcher::START_DEADLINE_MS` so a hung launcher cannot eat the
 /// whole budget.
+#[cfg(target_os = "macos")]
 const AGTERMCTL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
+#[cfg(target_os = "macos")]
 fn agterm_bin() -> Option<PathBuf> {
     // The bundle path first, for the same reason `tailnet::tailscale_bin`
     // spells its own out: a Tauri app on macOS inherits no shell profile, so
@@ -36,6 +40,7 @@ fn agterm_bin() -> Option<PathBuf> {
 
 /// Run one `agtermctl` command and parse its JSON answer, or `None` if it could
 /// not be run, timed out, failed, or answered `ok: false`.
+#[cfg(target_os = "macos")]
 pub(crate) fn agtermctl(args: &[&str]) -> Option<serde_json::Value> {
     use std::process::{Command, Stdio};
 
@@ -71,17 +76,19 @@ pub(crate) fn agtermctl(args: &[&str]) -> Option<serde_json::Value> {
 /// "window not open", so they are filtered out here rather than costing a failed
 /// subprocess each. Pure and fixture-pinned, like [`session_nodes`].
 pub(crate) fn open_window_ids(list: &serde_json::Value) -> Vec<String> {
+    open_windows(list).filter_map(|w| w.get("id").and_then(serde_json::Value::as_str)).map(str::to_string).collect()
+}
+
+/// Every *open* window node in a `window list --json` answer. A window with no
+/// `open` key counts as open, so this and every reader built on it agree about
+/// which windows exist.
+pub(crate) fn open_windows(list: &serde_json::Value) -> impl Iterator<Item = &serde_json::Value> {
     list.get("result")
         .and_then(|r| r.get("windows"))
         .and_then(serde_json::Value::as_array)
-        .map(|ws| {
-            ws.iter()
-                .filter(|w| w.get("open").and_then(serde_json::Value::as_bool) != Some(false))
-                .filter_map(|w| w.get("id").and_then(serde_json::Value::as_str))
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default()
+        .into_iter()
+        .flatten()
+        .filter(|w| w.get("open").and_then(serde_json::Value::as_bool) != Some(false))
 }
 
 /// Find a session node by id in an `agtermctl tree --json` answer.

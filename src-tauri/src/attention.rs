@@ -23,10 +23,13 @@
 //!   read spanning a mid-read transcript flush still ends attended.
 //! - **A terminal**, via [`crate::terminals::TerminalAdapter`]. Terminals differ
 //!   in what they expose, so the terminal-specific half lives behind that trait —
-//!   agterm today, a Windows terminal later — and this module never names one.
+//!   agterm on macOS, Windows Terminal and agwinterm on Windows — and this module
+//!   never names one.
 //!   What arrives here is a [`crate::terminals::Observation`]: a session named by
-//!   `cwd` and `title`, an absolute instant, and whether the user *left* it or
-//!   typed in it.
+//!   `cwd` and `title`, an absolute instant, whether the user *left* it or typed
+//!   in it, and the facts the terminal could gather about who did. Whether those
+//!   facts make it a person reading the row is decided here, for every terminal
+//!   alike, by [`crate::terminals::person_verdict`].
 //!
 //! Deliberately **not** sources: window focus, `toggle_main` / `reveal`, the
 //! frontend's `visibilitychange`, and row hover. The first proves a window is
@@ -40,7 +43,8 @@
 //! safe direction.
 
 use crate::state::{AgentSession, AppState, Attention};
-use crate::terminals::{Observation, ObservationKind, TerminalSession};
+use crate::terminal_title::Named;
+use crate::terminals::{NamedBy, Observation, ObservationKind, TerminalSession};
 use tauri::{AppHandle, Manager};
 
 /// How often the sensor wakes. It asks the terminal nothing unless
@@ -80,8 +84,8 @@ impl AttentionSource {
 impl From<ObservationKind> for AttentionSource {
     fn from(kind: ObservationKind) -> Self {
         match kind {
-            ObservationKind::Departed => Self::TerminalDeparted,
-            ObservationKind::Input => Self::TerminalInput,
+            ObservationKind::Departed(_) => Self::TerminalDeparted,
+            ObservationKind::Input(_) => Self::TerminalInput,
         }
     }
 }
@@ -135,7 +139,9 @@ fn local_rows(app: &AppHandle) -> Vec<AgentSession> {
 /// that behind the ordinary case.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Resolved {
-    Row(String),
+    /// The row's id, and whether the title or the working directory named it,
+    /// which the person verdict's occupant rule needs.
+    Row(String, NamedBy),
     /// This many local rows carry the *same* label, so the title names all of
     /// them equally. Only ever reached by rows labelled identically — see
     /// [`resolve_row`].
@@ -159,48 +165,30 @@ pub enum Resolved {
 /// can be off, and a session can predate the dashboard writing to it — and
 /// answers [`Resolved::Unknown`] rather than guessing when neither resolves.
 ///
-/// **The longest matching label wins, and only an exact draw is refused.**
-/// `TitleReading::names` is a token-boundary prefix match, so with a
-/// `projects_root` set — which turns `bga/assistant` into the label
-/// `bga assistant` — the title `🟢 bga assistant` is named by *both* a row
-/// labelled `bga` and its subproject row. Taking the first match, as this did,
-/// marks whichever row `AppState` happens to hold first as read: the wrong row,
-/// hiding unread work, and dependent on insertion order so it can flip between
-/// emits. Refusing every such collision would be no better — it would kill the
-/// subproject row's sensor permanently, since its label never stops being
-/// prefixed. Every match here is a prefix of the *same* string, and prefixes are
-/// totally ordered by length, so the longest is unique unless two rows carry a
-/// literally identical label — which is the only genuinely unanswerable case and
-/// the only one refused.
+/// **The longest matching label wins, and only an exact draw is refused**
+/// ([`crate::terminal_title::title_names`], the rule `terminals::labels` joins
+/// by too). Taking the first match would mark whichever row `AppState` holds
+/// first as read when a title names both a row and its subproject row: the wrong
+/// row, hiding unread work, and flipping with insertion order. Refusing every such
+/// collision would kill the subproject row's sensor for good, since its label
+/// never stops being prefixed.
 ///
 /// A refusal is a hard stop rather than a fall-through to the cwd, because
 /// dropping to the working directory is exactly the hazard the title-first
 /// ordering above exists to close.
 pub fn resolve_row(session: &TerminalSession, sessions: &[AgentSession], projects_root: Option<&str>) -> Resolved {
-    if let Some(reading) = session.title.as_deref().and_then(crate::terminal_title::parse_title) {
-        let mut best: Option<&AgentSession> = None;
-        let mut drawn = 1;
-        for s in sessions.iter().filter(|s| s.origin.is_none()) {
-            let label = s.display_label();
-            if !reading.names(label) {
-                continue;
-            }
-            match best {
-                Some(b) if b.display_label().len() > label.len() => {}
-                Some(b) if b.display_label().len() == label.len() => drawn += 1,
-                _ => (best, drawn) = (Some(s), 1),
-            }
-        }
-        if let Some(s) = best {
-            return if drawn > 1 { Resolved::Ambiguous(drawn) } else { Resolved::Row(s.id.clone()) };
-        }
+    let local = sessions.iter().filter(|s| s.origin.is_none()).map(|s| (s, s.display_label()));
+    match session.title.as_deref().and_then(|t| crate::terminal_title::title_names(t, local)) {
+        Some(Named::One(s)) => return Resolved::Row(s.id.clone(), NamedBy::Title),
+        Some(Named::Drawn(drawn)) => return Resolved::Ambiguous(drawn.len()),
+        Some(Named::Nothing) | None => {}
     }
     let Some(cwd) = session.cwd.as_deref() else { return Resolved::Unknown };
     let derived = crate::adapters::claude::derive_chat_id(Some(cwd), projects_root);
     // A row id is unique by construction, so this join matches at most one row
     // and needs no tie-break of its own.
     match sessions.iter().find(|s| s.origin.is_none() && s.id == derived) {
-        Some(s) => Resolved::Row(s.id.clone()),
+        Some(s) => Resolved::Row(s.id.clone(), NamedBy::Directory),
         None => Resolved::Unknown,
     }
 }
@@ -216,7 +204,6 @@ pub fn resolve_row(session: &TerminalSession, sessions: &[AgentSession], project
 /// terminal.
 pub fn spawn(app: AppHandle) {
     let Some(mut adapter) = crate::terminals::for_platform(&app) else { return };
-    let terminal = adapter.name();
 
     // The push half. A terminal that can be watched reports a departure the
     // moment it happens rather than at the next tick — which matters because the
@@ -228,14 +215,16 @@ pub fn spawn(app: AppHandle) {
     std::thread::spawn(move || {
         while let Ok(observation) = rx.recv() {
             let projects_root = watched.try_state::<crate::config::ConfigState>().and_then(|c| c.config.lock().unwrap().projects_root.clone());
-            apply(&watched, &local_rows(&watched), terminal, &observation, projects_root.as_deref());
+            apply(&watched, &local_rows(&watched), &observation, projects_root.as_deref());
         }
     });
 
-    // The pull half, kept as the safety net rather than the primary source: it
-    // carries `idleMs` (which no snapshot file has), it enumerates windows, and
-    // it keeps working when the watch cannot start — a schema change, a missing
-    // directory, a permission problem.
+    // The pull half, which brings the input observations: no snapshot file or
+    // caption event carries an input clock. It does not stand in for the watch.
+    // A switch found by sampling happened at an instant nobody can name, so the
+    // verdict refuses every departure the poll reports, and while a watch cannot
+    // run — a schema change, a missing directory, a lost hook — no departure is
+    // credited at all; each adapter says so at warn when that happens.
     std::thread::spawn(move || loop {
         std::thread::sleep(std::time::Duration::from_millis(TICK_MS));
         tick(&app, adapter.as_mut());
@@ -254,17 +243,24 @@ fn tick(app: &AppHandle, adapter: &mut dyn crate::terminals::TerminalAdapter) {
     let now = crate::commands::now_ms();
     let projects_root = app.try_state::<crate::config::ConfigState>().and_then(|c| c.config.lock().unwrap().projects_root.clone());
     for observation in adapter.poll(now) {
-        apply(app, &sessions, adapter.name(), &observation, projects_root.as_deref());
+        apply(app, &sessions, &observation, projects_root.as_deref());
     }
 }
 
-/// Resolve one observation and stamp the row it names.
+/// Resolve one observation, judge whether a person reading that row made it, and
+/// stamp the row when one did.
 ///
-/// Split out from [`tick`] and taking the sessions it judges against, so the
-/// resolution half is testable without a terminal or an `AppHandle`.
-fn apply(app: &AppHandle, sessions: &[AgentSession], terminal: &'static str, observation: &Observation, projects_root: Option<&str>) {
-    let id = match resolve_row(&observation.session, sessions, projects_root) {
-        Resolved::Row(id) => id,
+/// The judgment is `terminals::person_verdict`, the same rule for every terminal,
+/// applied here rather than in each adapter so a refusal reads the same in the
+/// log whichever terminal saw it. It runs after the resolution because one of
+/// its rules depends on how the row was named. Every observation that names a row
+/// leaves exactly one line here, credited or refused; those that name none leave
+/// the two below. Each names the terminal that made the observation, which on a
+/// platform where several answer as one is not the adapter `spawn` was handed.
+fn apply(app: &AppHandle, sessions: &[AgentSession], observation: &Observation, projects_root: Option<&str>) {
+    let terminal = observation.terminal;
+    let (id, named_by) = match resolve_row(&observation.session, sessions, projects_root) {
+        Resolved::Row(id, named_by) => (id, named_by),
         Resolved::Ambiguous(rows) => {
             tracing::debug!(
                 decision = "attention_poll",
@@ -289,7 +285,23 @@ fn apply(app: &AppHandle, sessions: &[AgentSession], terminal: &'static str, obs
             return;
         }
     };
-    observe(app, &id, observation.at_ms, observation.kind.into());
+    let verdict = crate::terminals::person_verdict(observation, named_by);
+    tracing::debug!(
+        decision = "attention_poll",
+        terminal,
+        outcome = verdict.err().map_or("credited", |r| r.slug()),
+        detail = ?verdict.err().and_then(|r| r.detail()),
+        id = %id,
+        named_by = ?named_by,
+        at_ms = observation.at_ms,
+        kind = ?observation.kind,
+        occupant = ?observation.occupant,
+        title = ?observation.session.title,
+        "person verdict"
+    );
+    if verdict.is_ok() {
+        observe(app, &id, observation.at_ms, observation.kind.into());
+    }
 }
 
 /// Record an observation that the user attended to `id` at `at_ms`, and push the
@@ -335,6 +347,9 @@ mod tests {
                 dialog_entry: None,
                 waiting_backstop_armed: false,
                 turn_from_relay: None,
+                delegated_task: None,
+                message_line: None,
+                message_is_reply: None,
             },
             state_entered_at,
             &[],
@@ -354,7 +369,7 @@ mod tests {
     /// [`Resolved`] directly.
     fn row_of(session: &TerminalSession, sessions: &[AgentSession], projects_root: Option<&str>) -> Option<String> {
         match resolve_row(session, sessions, projects_root) {
-            Resolved::Row(id) => Some(id),
+            Resolved::Row(id, _) => Some(id),
             _ => None,
         }
     }
@@ -489,7 +504,16 @@ mod tests {
 
     #[test]
     fn every_observation_kind_maps_to_a_distinct_logged_source() {
-        assert_eq!(AttentionSource::from(ObservationKind::Departed).key(), "terminal_departed");
-        assert_eq!(AttentionSource::from(ObservationKind::Input).key(), "terminal_input");
+        assert_eq!(AttentionSource::from(crate::terminals::verdict_tests::departure().kind).key(), "terminal_departed");
+        assert_eq!(AttentionSource::from(crate::terminals::verdict_tests::input().kind).key(), "terminal_input");
+    }
+
+    #[test]
+    fn the_resolution_says_whether_the_title_or_the_directory_named_the_row() {
+        // The person verdict's occupant rule turns on this: a row named only
+        // through a working directory may have been named by a plain shell.
+        let sessions = vec![row("dash", Status::Done, 0, None)];
+        assert_eq!(resolve_row(&named(Some("🟢 dash"), Some("/p/dash")), &sessions, None), Resolved::Row("dash".into(), NamedBy::Title));
+        assert_eq!(resolve_row(&named(Some("zsh"), Some("/p/dash")), &sessions, None), Resolved::Row("dash".into(), NamedBy::Directory));
     }
 }

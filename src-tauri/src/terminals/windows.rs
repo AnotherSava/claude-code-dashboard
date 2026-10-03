@@ -23,11 +23,13 @@
 //! to T means the user *left* S, and leaving is the moment you are done with what
 //! was on screen. Arriving marks nothing.
 //!
-//! **The watch is the primary source and the poll is the safety net**, and here
-//! that ordering is starker than on macOS. Sampling a level to catch an edge
-//! misses any visit that begins and ends between two polls, and measured on this
-//! machine real visits run 1.7 and 2.2 seconds against a 30-second tick.
-//! [`WindowsAdapter::watch`] takes the edge directly from
+//! **The watch is the only source of credited departures; the poll contributes
+//! input.** Sampling a level to catch an edge misses any visit that begins and
+//! ends between two polls, and measured on this machine real visits run 1.7 and
+//! 2.2 seconds against a 30-second tick. A switch the poll does find happened at
+//! an instant it cannot name, so the verdict refuses it, and with the watch's
+//! hooks lost no departure is credited at all. [`WindowsAdapter::watch`] takes
+//! the edge directly from
 //! `SetWinEventHook(EVENT_OBJECT_NAMECHANGE)`, which arrives in under 100 ms with
 //! no debounce to coalesce a quick in-and-out — so the residual blind window the
 //! macOS adapter still has does not exist here.
@@ -48,10 +50,39 @@
 //! - **A tab switch is not always a person.** `wt.exe focus-tab` from a script
 //!   switches tabs with nobody watching. Every human switch measured had the
 //!   window in the foreground with input under 50 ms old — a switch *is* an input
-//!   event — while script-driven ones did not, so [`human_switch`] gates the watch
-//!   on both. The poll cannot make that judgment (it learns of the switch some
-//!   time after the fact and the foreground has moved on) and does not try, which
-//!   is the honest difference between knowing an instant and knowing an interval.
+//!   event — while script-driven ones did not. This adapter does not judge that:
+//!   the watch reads the foreground, since when that window has held it, and the
+//!   input clock at the event's instant, and `crate::attention` applies
+//!   [`super::person_verdict`] to them as it does to every terminal's. The poll
+//!   learns of a switch some time after the fact, when the foreground has moved
+//!   on, so it reports the switch as unplaced and the verdict refuses it, which is
+//!   the honest difference between knowing an instant and knowing an interval.
+//!   Since when a window has held the foreground comes from the foreground hook,
+//!   and is trusted only once the hooks have delivered an event: see
+//!   [`ForegroundRecord`].
+//!
+//! Nothing Windows Terminal exposes says what runs in a pane, so every
+//! observation reports the occupant unknown. The verdict does not need it where
+//! an observation is named by the console title this dashboard wrote onto the
+//! agent's own console, which a shell beside it does not carry. **A caption is
+//! not that title until it is checked**: it is the tab's *displayed* name, and a
+//! tab renamed by hand keeps showing whatever it was showing when it was renamed,
+//! over whatever the console now holds — an exited agent's last glyph over a
+//! plain shell. So each caption is checked against the console titles of the
+//! panes behind it, read through UI Automation while that tab is the one in
+//! front, and only a caption one of them carries is reported as the session's own
+//! title. Any other is a displayed name, which keeps the verdict asking what runs
+//! in the pane, and with nothing to say that, refusing. A departure is judged by
+//! the naming read when its tab came forward, which a tab pinned while it stays in
+//! front would keep; so a caption whose row has had a title written since that
+//! read is reported as a displayed name too ([`naming_at_departure`]), since the
+//! write would have moved the caption had the tab still followed its console.
+//!
+//! The verdict's activation rule refuses the click that both focuses a window and
+//! switches its tab. Nothing here says whether the window was covered before that
+//! click, so a switch made straight from reading an unfocused but visible window,
+//! on a second monitor or beside the focused one, is refused too; see
+//! [`super::ACTIVATION_MS`].
 
 use std::collections::HashMap;
 use std::sync::mpsc::Sender;
@@ -59,14 +90,14 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use tauri::{AppHandle, Manager};
 
-use super::{FrontReading, Observation, ObservationKind, TerminalAdapter, TerminalSession};
+use super::{Cover, Front, FrontReading, InputFacts, LastInput, Naming, Observation, ObservationKind, Occupant, Selection, SelectionClock, Since, Switch, TerminalAdapter, TerminalSession};
 
 /// The slug the decision log carries. Deliberately the platform and not
 /// `"windows_terminal"`: attention really is Windows Terminal's, but
 /// [`WindowsAdapter::sessions`] reads console objects and so answers for a VS
 /// Code terminal or a bare conhost too, and a slug naming WT would be false on
 /// every `restore_scan` line for one of those.
-const NAME: &str = "windows";
+pub(super) const NAME: &str = "windows";
 
 /// Windows Terminal's top-level window class. Its other window — an invisible
 /// `Windows Terminal <hex>` — is the monarch, which is why visibility is checked
@@ -100,13 +131,6 @@ fn surface_key(hwnd: isize) -> String {
     format!("hwnd:{hwnd}")
 }
 
-/// How recent the last desktop input must be, at the instant a title change
-/// arrives, for the switch to be attributable to a person. Measured, a human tab
-/// switch lands at under 50 ms — the switch is itself a click or a keystroke — so
-/// this is loose by two orders of magnitude and still refuses the script-driven
-/// case it exists for.
-const SWITCH_INPUT_WINDOW_MS: u64 = 2_000;
-
 /// How far before the event the switch itself is assumed to have happened.
 /// Measured under 100 ms; erring early only leaves a row showing, where erring
 /// late would credit a departure with content that arrived after the user had
@@ -121,7 +145,19 @@ const PID_RECHECK_MS: u32 = 5_000;
 /// Where the hook callback puts what it saw. A `WINEVENTPROC` is a bare
 /// `extern "system" fn` with nowhere to carry state, so the channel is a static
 /// and every judgment happens on the receiving side.
-static EVENTS: OnceLock<Sender<RawEvent>> = OnceLock::new();
+static EVENTS: OnceLock<Sender<Raw>> = OnceLock::new();
+
+/// What the hook thread hands the consumer.
+enum Raw {
+    /// Hooks were installed for a new terminal process, or the last one went
+    /// away: whatever was recorded about the foreground before no longer applies.
+    /// `front` is the terminal window already in front then, posted only when
+    /// the foreground hook itself is in place, since without it nothing would
+    /// ever renew or end that record.
+    Hooked { front: Option<RawEvent> },
+    /// An event the hooks delivered.
+    Event(RawEvent),
+}
 
 /// One raw window event, with the two facts that are only true *at its instant*
 /// read there rather than whenever the consumer gets to it.
@@ -139,7 +175,58 @@ struct RawEvent {
 /// of its own: focus leaves a terminal for reasons that are not a person leaving
 /// a tab (a UAC prompt, a toast, this app's own history window), and marking on
 /// those would hide finished work.
-type Foreground = Arc<Mutex<Option<(isize, i64)>>>;
+type Foreground = Arc<Mutex<ForegroundRecord>>;
+
+/// The last terminal window the foreground events saw take the foreground, and
+/// whether the hooks have shown they deliver at all.
+///
+/// The second half is what makes the first trustworthy. The record starts from
+/// the window in front when the hooks were installed, because no event says so
+/// until focus moves, and a record nothing renews is only true for as long as
+/// events would have arrived to end it. An elevated Windows Terminal accepts the
+/// hooks, returns handles and delivers nothing to this process, so its starting
+/// record would stand for the life of the process while the user typed in other
+/// programs and came back. Until one event has arrived from the hooked process,
+/// the record answers that nothing is recorded.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ForegroundRecord {
+    held: Option<(isize, i64)>,
+    delivered: bool,
+}
+
+impl ForegroundRecord {
+    /// Since when `hwnd` has held the foreground, as far as this record can say.
+    fn since(&self, hwnd: isize) -> Since {
+        if self.delivered {
+            front_since(self.held, hwnd)
+        } else {
+            Since::Unrecorded
+        }
+    }
+}
+
+/// When each window's active tab began, written by the watch on every title
+/// change and by the poll on every reading, keyed by window handle and compared
+/// by [`same_tab`].
+type Selections = Arc<Mutex<SelectionClock<isize>>>;
+
+/// Whether two captions of one window are one selection, for
+/// [`SelectionClock`]: only when they are the same string.
+///
+/// Deliberately stricter than [`crate::terminal_title::same_row`], which the
+/// departures use and which errs toward "the same row" — `🟢 bga` and
+/// `🟢 bga assistant` share a label — because the two errors cost opposite
+/// things. A departure missed leaves a row showing; a selection start kept from
+/// the previous tab is earlier than the truth, and input made in that tab, or the
+/// click that arrived, would pass for reading the next one. Under exact equality
+/// this dashboard's own rewrite of the tab in front restarts the selection, which
+/// refuses input only within [`super::SWITCH_RELEASE_MS`] of that write.
+fn same_tab(a: &str, b: &str) -> bool {
+    a == b
+}
+
+/// Why every observation here reports the occupant unknown.
+const OCCUPANT_UNREPORTED: &str = "not_reported";
 
 pub struct WindowsAdapter {
     app: AppHandle,
@@ -152,11 +239,12 @@ pub struct WindowsAdapter {
     last_title: HashMap<isize, String>,
     last_poll_at: Option<i64>,
     foreground: Foreground,
+    selections: Selections,
 }
 
 impl WindowsAdapter {
     pub fn new(app: AppHandle) -> Self {
-        Self { app, last_title: HashMap::new(), last_poll_at: None, foreground: Arc::new(Mutex::new(None)) }
+        Self { app, last_title: HashMap::new(), last_poll_at: None, foreground: Arc::new(Mutex::new(ForegroundRecord::default())), selections: Arc::new(Mutex::new(SelectionClock::default())) }
     }
 }
 
@@ -200,28 +288,40 @@ impl TerminalAdapter for WindowsAdapter {
             return out;
         }
         let foreground_now = unsafe { GetForegroundWindow() };
-        let held = *self.foreground.lock().unwrap();
+        let record = *self.foreground.lock().unwrap();
         let idle_ms = crate::idle::idle_ms();
-        for (hwnd, title) in terminal_windows() {
+        let windows = terminal_windows();
+        let mut selections = self.selections.lock().unwrap();
+        selections.retain(|hwnd| windows.iter().any(|(w, _)| w == hwnd));
+        for (hwnd, title) in windows {
             let previous = self.last_title.insert(hwnd, title.clone());
+            let selected_since = selections.note(hwnd, &title, same_tab, now_ms);
             let outcome = match super::departure_stamp(previous.as_deref(), &title, crate::terminal_title::same_row, self.last_poll_at, now_ms) {
                 Some(at_ms) => {
                     // The row the user *left*, which is the one they were
-                    // reading — not the one they arrived at.
-                    out.push(Observation { session: named(previous.as_deref()), at_ms, kind: ObservationKind::Departed });
-                    "departed"
+                    // reading — not the one they arrived at. Its tab is no
+                    // longer in front, so its panes cannot be read for its
+                    // naming; the verdict refuses an unplaced switch first
+                    // anyway.
+                    out.push(observed(previous.as_deref(), Naming::DisplayedName, at_ms, ObservationKind::Departed(Switch::Unplaced)));
+                    "switched"
                 }
                 None if previous.is_none() => "first_sight",
                 None => "same_row",
             };
-            let typed = input_stamp(hwnd, foreground_now, held, idle_ms, now_ms);
-            if let Some(at_ms) = typed {
-                out.push(Observation { session: named(Some(&title)), at_ms, kind: ObservationKind::Input });
+            // The desktop's last input, offered for every window: which one it
+            // reached is the verdict's to decide from the foreground. The tab's
+            // naming is read only for the window in front, since the verdict
+            // refuses every other as `not_in_front` before it asks.
+            if let Some(idle) = idle_ms {
+                let front = front_of(hwnd, foreground_now);
+                let facts = InputFacts { front, front_since: record.since(hwnd), selection: Selection::Live, selected_since: Since::At(selected_since), cover: Cover::Clear };
+                out.push(observed(Some(&title), naming_where(front == Front::Yes, hwnd, &title), now_ms - idle as i64, ObservationKind::Input(facts)));
             }
             // Logged on every window every pass, including the ones observing
             // nothing: a sensor whose success and whose total failure are both
             // silent cannot be told apart from one that never ran.
-            tracing::debug!(decision = "attention_poll", terminal = NAME, source = "poll", outcome, hwnd, title, typed = typed.is_some(), "windows terminal poll");
+            tracing::debug!(decision = "attention_poll", terminal = NAME, source = "poll", outcome, hwnd, title, has_idle = idle_ms.is_some(), "windows terminal poll");
         }
         self.last_poll_at = Some(now_ms);
         out
@@ -347,7 +447,8 @@ impl TerminalAdapter for WindowsAdapter {
         }
         let app = self.app.clone();
         let foreground = self.foreground.clone();
-        std::thread::spawn(move || consume(&app, &foreground, &rx, &sink));
+        let selections = self.selections.clone();
+        std::thread::spawn(move || consume(&app, &foreground, &selections, &rx, &sink));
         std::thread::spawn(pump);
     }
 }
@@ -360,102 +461,203 @@ fn named(title: Option<&str>) -> TerminalSession {
     TerminalSession { cwd: None, title: title.map(str::to_string) }
 }
 
+/// An observation of the tab titled `title`, carrying what is true of every
+/// Windows Terminal observation: nothing says what runs in the pane, and no pane
+/// is ever drawn over — Windows Terminal's palette and search box leave the
+/// pane's output on screen, and its settings open as a tab of their own, which is
+/// a different title. `naming` is whether the title was confirmed as the pane's
+/// own, by [`naming_where`] while that tab was in front.
+fn observed(title: Option<&str>, naming: Naming, at_ms: i64, kind: ObservationKind) -> Observation {
+    Observation { terminal: NAME, session: named(title), at_ms, kind, occupant: Occupant::Unknown(OCCUPANT_UNREPORTED), naming }
+}
+
+/// How a caption names its tab's session: as the session's own title when one of
+/// the panes behind it carries exactly that console title, which this dashboard
+/// writes only onto the agent's console, and as a displayed name otherwise —
+/// including when the panes could not be read, since that is a failure to look.
+fn naming_from(caption: &str, panes: Option<&[Option<String>]>) -> Naming {
+    if panes.is_some_and(|panes| panes.iter().any(|pane| pane.as_deref() == Some(caption))) {
+        Naming::OwnTitle
+    } else {
+        Naming::DisplayedName
+    }
+}
+
+/// [`naming_from`] for window `hwnd`, read now where `worth_reading`, and a
+/// displayed name otherwise. Only meaningful while the tab carrying `caption` is
+/// the one in front, since only that tab's panes are realized, so the watch reads
+/// it on the caption change that brought the tab forward and keeps it for the
+/// departure from it. One cross-process UI Automation pass, ~5 ms warm and ~95
+/// ms cold, which is why every caller says when the answer can matter: the watch
+/// while titling is on, since otherwise nothing names a row, and the poll for the
+/// window in front, since the verdict refuses input to any other before it asks.
+fn naming_where(worth_reading: bool, hwnd: isize, caption: &str) -> Naming {
+    if !worth_reading {
+        return Naming::DisplayedName;
+    }
+    join_apartment();
+    naming_from(caption, super::wt_tabs::read_surface(hwnd).as_ref().map(|s| s.panes.as_slice()))
+}
+
+/// The naming a departure from a caption read as the session's own title at
+/// `read_ms` still has, given that the newest title this dashboard wrote for a
+/// row that caption names changed at `changed_ms`.
+///
+/// A caption is re-read on every change, and a write to the console behind it
+/// changes it, so a title that moved after the read moved somewhere this caption
+/// did not follow: a tab pinned by hand, or a console that is no longer the one
+/// the row's titles go to. Either way the read no longer says the session behind
+/// the caption is the one the row describes, and the caption is only a displayed
+/// name. Erring toward a move only refuses more: a row whose label shares a word
+/// with another's counts the other's writes too.
+fn naming_at_departure(naming: Naming, read_ms: i64, changed_ms: Option<i64>) -> Naming {
+    match (naming, changed_ms) {
+        (Naming::OwnTitle, Some(changed)) if changed > read_ms => Naming::DisplayedName,
+        (naming, _) => naming,
+    }
+}
+
+/// Join the calling thread to COM's multi-threaded apartment the first time it
+/// reads a window through UI Automation. Both threads that read here, the poll's
+/// and the watch consumer's, are plain workers owning no window.
+fn join_apartment() {
+    thread_local!(static JOINED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) });
+    JOINED.with(|joined| {
+        if !joined.replace(true) {
+            super::wt_tabs::init_apartment();
+        }
+    });
+}
+
+/// Whether `hwnd` is the window in the foreground.
+fn front_of(hwnd: isize, foreground: isize) -> Front {
+    if hwnd == foreground {
+        Front::Yes
+    } else {
+        Front::No
+    }
+}
+
+/// Since when `hwnd` has held the foreground, from a record of the last window
+/// that took it and when. A record of another window says nothing about this
+/// one. Shared with the agwinterm adapter, whose foreground hook keeps the same
+/// record for its own windows, written only from events it was delivered.
+pub(super) fn front_since(held: Option<(isize, i64)>, hwnd: isize) -> Since {
+    match held {
+        Some((held_hwnd, since)) if held_hwnd == hwnd => Since::At(since),
+        _ => Since::Unrecorded,
+    }
+}
+
 /// Whether this dashboard is writing the titles every observation is named by.
 fn titles_enabled(app: &AppHandle) -> bool {
     app.try_state::<crate::config::ConfigState>().is_some_and(|c| c.config.lock().unwrap().terminal_titles)
 }
 
-/// The instant to credit input in `hwnd` to, or `None` when this pass cannot say
-/// the user typed into that window.
-///
-/// `GetLastInputInfo` is desktop-wide and on its own says nothing about any
-/// window — it reads "not idle" while the user is deep in a game. Composing it
-/// with the foreground is still not enough on its own: input a moment ago plus
-/// this window in front *now* does not establish the input went here.
-///
-/// So the test is that the input instant falls inside a stretch this window has
-/// **already** held the foreground for, which is an interval the
-/// `EVENT_SYSTEM_FOREGROUND` hook records the start of, and that it still holds
-/// it at read time — that second half is what stops a stale `since` from
-/// crediting an hour of typing in a browser to whatever tab is on screen.
-///
-/// The stamp is absolute (`now - idle`), so the tick rate changes how fast the
-/// pill catches up and never whether it is right. Unknown idle or no recorded
-/// foreground is refused rather than guessed: nothing here infers attention from
-/// an absence.
-fn input_stamp(hwnd: isize, foreground_now: isize, held: Option<(isize, i64)>, idle_ms: Option<u64>, now_ms: i64) -> Option<i64> {
-    let (held_hwnd, since) = held?;
-    if held_hwnd != hwnd || foreground_now != hwnd {
-        return None;
-    }
-    let at_ms = now_ms - idle_ms? as i64;
-    (at_ms >= since).then_some(at_ms)
-}
-
-/// Whether a title change is attributable to a person at this keyboard.
-///
-/// A tab switch is itself a click or a keystroke, so a human one always arrives
-/// with the window in front and the input clock at nearly zero. A script driving
-/// `wt.exe focus-tab` produces the same event with neither, and crediting it
-/// would mark a row read that nobody looked at.
-fn human_switch(event_hwnd: isize, foreground: isize, idle_ms: Option<u64>) -> bool {
-    event_hwnd == foreground && idle_ms.is_some_and(|ms| ms <= SWITCH_INPUT_WINDOW_MS)
-}
-
 /// Diff each title change against what that window last showed, and push a
-/// departure when a person left one row for another.
-fn consume(app: &AppHandle, foreground: &Foreground, rx: &std::sync::mpsc::Receiver<RawEvent>, sink: &Sender<Observation>) {
-    let mut last: HashMap<isize, String> = HashMap::new();
-    while let Ok(ev) = rx.recv() {
-        // Free of charge, and only here: this caption *is* the active tab's
-        // rendered name, so comparing it against what we wrote catches a tab that
-        // has stopped following its row. Both event kinds carry one, and a
-        // foreground change is worth judging too — it is how a tab that was
-        // already stuck comes into view.
-        // The window the caption came from, so a lookalike caption in a second
-        // window cannot accuse a row this one does not render.
-        crate::terminal_title::observe_caption(app, &ev.title, ev.at_ms, Some(&surface_key(ev.hwnd)));
-        // A caption change is also the moment to ask whether the tab now in front
-        // is showing its own session's title. This is the trigger a write cannot
-        // supply: a pinned tab's caption never moves, so switching *to* it
-        // produces the only event that says "look at this one now".
-        //
-        // Gated on the same flag the departure path below reads: with titles off
-        // nothing is written, so every reading would resolve to no row — and this
-        // trigger, unlike the write one, fires on every caption event, so leaving
-        // it open meant a full cross-process read of every terminal window per
-        // tab switch for a disabled feature.
-        if titles_enabled(app) {
-            crate::terminals::stale_check::request();
-        }
+/// departure when one row was left for another, with the facts read at the
+/// event's instant for the verdict to judge.
+fn consume(app: &AppHandle, foreground: &Foreground, selections: &Selections, rx: &std::sync::mpsc::Receiver<Raw>, sink: &Sender<Observation>) {
+    // Per window, the caption on its tab in front, how it names its session and
+    // when that was read, on the caption change that brought the tab forward: the
+    // departure from it is judged by the naming read while it could still be
+    // read, as long as nothing has been written for its row since.
+    let mut last: HashMap<isize, (String, Naming, i64)> = HashMap::new();
+    while let Ok(raw) = rx.recv() {
+        let ev = match raw {
+            Raw::Hooked { front } => {
+                *foreground.lock().unwrap() = ForegroundRecord::hooked(front.as_ref().map(|ev| (ev.hwnd, ev.at_ms)));
+                if let Some(ev) = &front {
+                    caption_seen(app, ev);
+                }
+                continue;
+            }
+            Raw::Event(ev) => ev,
+        };
+        caption_seen(app, &ev);
+        foreground.lock().unwrap().delivered(ev.event, ev.hwnd, ev.at_ms);
         if ev.event == EVENT_SYSTEM_FOREGROUND {
-            *foreground.lock().unwrap() = Some((ev.hwnd, ev.at_ms));
             continue;
         }
+        let titles = titles_enabled(app);
+        // Read while this caption's tab is the one in front, which is the only
+        // time it can be.
+        let naming = naming_where(titles, ev.hwnd, &ev.title);
         // A window seen here for the first time is not a departure, for the same
         // reason the poll's first sighting is not: nothing was left.
         // Recorded before the feature gate, so turning titling back on resumes
         // against what the window is showing now rather than departing a row off
         // a title from before it was turned off.
-        let previous = last.insert(ev.hwnd, ev.title.clone());
+        let previous = last.insert(ev.hwnd, (ev.title.clone(), naming, ev.at_ms));
+        selections.lock().unwrap().note(ev.hwnd, &ev.title, same_tab, ev.at_ms);
         // The switch predates the event, so crediting the event's own instant
         // would stamp it late. `now_ms` is unreachable here and only satisfies
         // the signature.
-        let stamp = super::departure_stamp(previous.as_deref(), &ev.title, crate::terminal_title::same_row, Some(ev.at_ms - SWITCH_LATENCY_MS), ev.at_ms);
-        let outcome = match stamp {
-            _ if !titles_enabled(app) => "titles_disabled",
-            Some(_) if !human_switch(ev.hwnd, ev.foreground, ev.idle_ms) => "not_human",
-            Some(at_ms) => {
-                if sink.send(Observation { session: named(previous.as_deref()), at_ms, kind: ObservationKind::Departed }).is_err() {
+        let stamp = super::departure_stamp(previous.as_ref().map(|(t, _, _)| t.as_str()), &ev.title, crate::terminal_title::same_row, Some(ev.at_ms - SWITCH_LATENCY_MS), ev.at_ms);
+        let outcome = match (stamp, &previous) {
+            _ if !titles => "titles_disabled",
+            (Some(at_ms), Some((title, naming, read_ms))) => {
+                let naming = naming_at_departure(*naming, *read_ms, crate::terminal_title::last_change_named(app, title));
+                if sink.send(observed(Some(title), naming, at_ms, ObservationKind::Departed(switch_at(&ev, *foreground.lock().unwrap())))).is_err() {
                     return; // the consumer is gone; so is the app
                 }
-                "departed"
+                "switched"
             }
-            None if previous.is_none() => "first_sight",
-            None => "same_row",
+            (_, None) => "first_sight",
+            (None, Some(_)) => "same_row",
         };
-        tracing::debug!(decision = "attention_poll", terminal = NAME, source = "watch", outcome, hwnd = ev.hwnd, title = ev.title, "active tab title changed");
+        tracing::debug!(decision = "attention_poll", terminal = NAME, source = "watch", outcome, hwnd = ev.hwnd, title = ev.title, naming = ?naming, "active tab title changed");
     }
+}
+
+/// What a caption seen on either event kind is worth beyond attention.
+fn caption_seen(app: &AppHandle, ev: &RawEvent) {
+    // Free of charge, and only here: this caption *is* the active tab's
+    // rendered name, so comparing it against what we wrote catches a tab that
+    // has stopped following its row. Both event kinds carry one, and a
+    // foreground change is worth judging too — it is how a tab that was
+    // already stuck comes into view.
+    // The window the caption came from, so a lookalike caption in a second
+    // window cannot accuse a row this one does not render.
+    crate::terminal_title::observe_caption(app, &ev.title, ev.at_ms, Some(&surface_key(ev.hwnd)));
+    // A caption change is also the moment to ask whether the tab now in front
+    // is showing its own session's title. This is the trigger a write cannot
+    // supply: a pinned tab's caption never moves, so switching *to* it
+    // produces the only event that says "look at this one now".
+    //
+    // Gated on the same flag the departure path reads: with titles off
+    // nothing is written, so every reading would resolve to no row — and this
+    // trigger, unlike the write one, fires on every caption event, so leaving
+    // it open meant a full cross-process read of every terminal window per
+    // tab switch for a disabled feature.
+    if titles_enabled(app) {
+        crate::terminals::stale_check::request();
+    }
+}
+
+impl ForegroundRecord {
+    /// The record right after the hooks were installed: the window in front then,
+    /// if the foreground hook is among them, not yet trusted.
+    fn hooked(front: Option<(isize, i64)>) -> Self {
+        Self { held: front, delivered: false }
+    }
+
+    /// An event the hooks delivered, which proves they deliver; a foreground one
+    /// also says which window took the foreground and when.
+    fn delivered(&mut self, event: u32, hwnd: isize, at_ms: i64) {
+        self.delivered = true;
+        if event == EVENT_SYSTEM_FOREGROUND {
+            self.held = Some((hwnd, at_ms));
+        }
+    }
+}
+
+/// The switch a title change reports, with the facts read at its instant: the
+/// foreground and the input clock as the hook callback read them, and since when
+/// the window has held the foreground as the foreground events recorded it.
+fn switch_at(ev: &RawEvent, record: ForegroundRecord) -> Switch {
+    let last_input = ev.idle_ms.map_or(LastInput::Unknown, |idle| LastInput::At(ev.at_ms - idle as i64));
+    Switch::Placed { latest_ms: ev.at_ms, front: front_of(ev.hwnd, ev.foreground), front_since: record.since(ev.hwnd), last_input }
 }
 
 /// Own the hooks and the message loop they need.
@@ -464,6 +666,11 @@ fn consume(app: &AppHandle, foreground: &Foreground, rx: &std::sync::mpsc::Recei
 /// message queue, so this thread must pump one for the life of the process. The
 /// timer is what lets it wake on a silent desktop to notice Windows Terminal
 /// starting, or restarting under a new pid.
+///
+/// Without these hooks this terminal credits nothing: the poll's departures are
+/// unplaced, which the verdict refuses, and its input needs the foreground record
+/// only the foreground hook keeps. So each way the hooks can be lost is said at
+/// warn, and the record is reset so nothing is judged against a stale one.
 fn pump() {
     let mut hooks: Vec<isize> = Vec::new();
     let mut hooked: Option<u32> = None;
@@ -477,6 +684,7 @@ fn pump() {
                     UnhookWinEvent(hook);
                 }
                 hooked = pid;
+                let mut foreground_hooked = false;
                 if let Some(pid) = pid {
                     // Two narrow ranges rather than one wide one: everything
                     // between these two events would arrive as noise to be
@@ -484,23 +692,39 @@ fn pump() {
                     for event in [EVENT_SYSTEM_FOREGROUND, EVENT_OBJECT_NAMECHANGE] {
                         let hook = SetWinEventHook(event, event, 0, on_event, pid, 0, WINEVENT_OUTOFCONTEXT);
                         if hook == 0 {
-                            tracing::warn!(terminal = NAME, pid, event, "could not hook the terminal; the poll stays the only source");
+                            let lost = if event == EVENT_SYSTEM_FOREGROUND { "when a terminal window came forward is not recorded, so Windows Terminal attention credits neither departures nor input" } else { "tab switches are not seen, so Windows Terminal attention credits no departure, only input" };
+                            tracing::warn!(terminal = NAME, pid, event, "could not hook the terminal: {lost}");
                             continue;
                         }
+                        foreground_hooked |= event == EVENT_SYSTEM_FOREGROUND;
                         hooks.push(hook);
                     }
                     // An elevated terminal accepts the hook and delivers nothing
                     // to a process at lower integrity, so a handle here is not
-                    // yet evidence the watch works.
+                    // yet evidence the watch works; the foreground record stays
+                    // untrusted until an event arrives.
                     tracing::info!(terminal = NAME, pid, hooks = hooks.len(), "watching the terminal's active tab");
+                }
+                // A terminal window already in front has held it since at least
+                // now, and no event says so until focus moves. Posted through the
+                // hook's own channel, so the consumer records it in order with the
+                // events, and only with the foreground hook in place, the one
+                // thing that would end it.
+                let front = GetForegroundWindow();
+                let seed = (foreground_hooked && is_terminal_window(front)).then(|| raw_event(EVENT_SYSTEM_FOREGROUND, front));
+                if let Some(tx) = EVENTS.get() {
+                    let _ = tx.send(Raw::Hooked { front: seed });
                 }
             }
             let got = GetMessageW(&mut msg, 0, 0, 0);
             if got <= 0 {
                 // 0 is WM_QUIT and -1 an error; neither is expected on a thread
-                // that owns no window, so both end the watch and must say so
-                // rather than leaving the poll silently alone.
-                tracing::warn!(terminal = NAME, got, "the terminal watch message loop ended; the poll stays the only source");
+                // that owns no window, so both end the watch and must say so.
+                // The record is reset, since nothing will renew it again.
+                if let Some(tx) = EVENTS.get() {
+                    let _ = tx.send(Raw::Hooked { front: None });
+                }
+                tracing::warn!(terminal = NAME, got, "the terminal watch message loop ended: Windows Terminal attention credits neither departures nor input from now on");
                 break;
             }
             TranslateMessage(&msg);
@@ -519,14 +743,20 @@ unsafe extern "system" fn on_event(_hook: isize, event: u32, hwnd: isize, id_obj
     if !is_terminal_window(hwnd) {
         return;
     }
-    let _ = tx.send(RawEvent {
+    let _ = tx.send(Raw::Event(raw_event(event, hwnd)));
+}
+
+/// One event about `hwnd`, with the facts that are only true at this instant.
+fn raw_event(event: u32, hwnd: isize) -> RawEvent {
+    RawEvent {
         event,
         hwnd,
         title: window_text(hwnd),
-        foreground: GetForegroundWindow(),
+        // SAFETY: no arguments; answers a handle or zero.
+        foreground: unsafe { GetForegroundWindow() },
         idle_ms: crate::idle::idle_ms(),
         at_ms: crate::commands::now_ms(),
-    });
+    }
 }
 
 /// Every visible terminal window and the title of the tab it is showing.
@@ -578,7 +808,7 @@ fn window_text(hwnd: isize) -> String {
 /// and lossy decoding. A title longer than the buffer is truncated by the OS,
 /// which reads as a title we did not write and so names no row — the safe
 /// direction.
-unsafe fn window_string(read: impl Fn(*mut u16, i32) -> i32) -> String {
+pub(super) unsafe fn window_string(read: impl Fn(*mut u16, i32) -> i32) -> String {
     let mut buf = [0u16; 512];
     let len = read(buf.as_mut_ptr(), buf.len() as i32);
     if len <= 0 {
@@ -596,9 +826,10 @@ const CHILDID_SELF: i32 = 0;
 type WinEventProc = unsafe extern "system" fn(isize, u32, isize, i32, i32, u32, u32);
 
 /// Only the fields the loop passes back to Windows; `#[repr(C)]` supplies the
-/// x64 padding after `message`.
+/// x64 padding after `message`. Shared with the agwinterm adapter's foreground
+/// hook, which pumps a queue of its own and never reads a field either.
 #[repr(C)]
-struct Msg {
+pub(super) struct Msg {
     hwnd: isize,
     message: u32,
     w_param: usize,
@@ -647,57 +878,135 @@ mod tests {
     const WT: isize = 0xA0A2C;
     const OTHER: isize = 0xBEEF;
 
-    #[test]
-    fn input_is_credited_at_the_instant_it_happened_not_at_the_poll() {
-        // Absolute, so a reading taken late reports the same instant as one taken
-        // immediately and only the pill's latency suffers.
-        assert_eq!(input_stamp(WT, WT, Some((WT, 1_000)), Some(400), 10_000), Some(9_600));
+    use super::super::{person_verdict, NamedBy, Refusal};
+
+    fn name_change(foreground: isize, idle_ms: Option<u64>) -> RawEvent {
+        RawEvent { event: EVENT_OBJECT_NAMECHANGE, hwnd: WT, title: "🟢 b".into(), foreground, idle_ms, at_ms: 10_000 }
+    }
+
+    /// A foreground record the hooks have proven, holding `hwnd` since `since`.
+    fn held(hwnd: isize, since: i64) -> ForegroundRecord {
+        ForegroundRecord { held: Some((hwnd, since)), delivered: true }
+    }
+
+    /// A departure from the tab titled `🟢 a`, named by the pane's own title.
+    fn departed(switch: Switch) -> Observation {
+        observed(Some("🟢 a"), Naming::OwnTitle, 9_750, ObservationKind::Departed(switch))
     }
 
     #[test]
-    fn input_before_the_terminal_took_the_foreground_is_refused() {
-        // The whole point of the gate: typing at 9_600 while the terminal only
-        // came forward at 9_900 was typing somewhere else.
-        assert_eq!(input_stamp(WT, WT, Some((WT, 9_900)), Some(400), 10_000), None);
+    fn a_title_change_carries_the_foreground_and_input_clock_of_its_instant() {
+        // Measured: a real tab switch arrives with input under 50 ms old.
+        assert_eq!(switch_at(&name_change(WT, Some(16)), held(WT, 1_000)), Switch::Placed { latest_ms: 10_000, front: Front::Yes, front_since: Since::At(1_000), last_input: LastInput::At(9_984) });
     }
 
     #[test]
-    fn input_is_refused_once_the_foreground_has_moved_on() {
-        // A stale `since` must not credit an hour of typing in a browser to
-        // whatever tab happens to be on screen.
-        assert_eq!(input_stamp(WT, OTHER, Some((WT, 1_000)), Some(400), 10_000), None);
+    fn a_human_switch_passes_the_verdict_with_nothing_said_about_the_pane() {
+        // What keeps this terminal working: its observations are named by the
+        // console title this dashboard wrote, so the unknown occupant is not
+        // asked.
+        assert_eq!(person_verdict(&departed(switch_at(&name_change(WT, Some(16)), held(WT, 1_000))), NamedBy::Title), Ok(()));
     }
 
     #[test]
-    fn input_in_one_terminal_window_is_not_credited_to_another() {
-        assert_eq!(input_stamp(OTHER, OTHER, Some((WT, 1_000)), Some(400), 10_000), None);
+    fn a_scripted_switch_is_reported_as_it_happened_and_refused() {
+        // `wt.exe focus-tab` from a script, measured driving a background window,
+        // and one driving the window in front while nobody types.
+        let behind = departed(switch_at(&name_change(OTHER, Some(16)), held(OTHER, 1_000)));
+        assert_eq!(person_verdict(&behind, NamedBy::Title), Err(Refusal::NotInFront));
+        let idle = departed(switch_at(&name_change(WT, Some(6_407)), held(WT, 1_000)));
+        assert_eq!(person_verdict(&idle, NamedBy::Title), Err(Refusal::NoRecentInput));
+        let unknown = departed(switch_at(&name_change(WT, None), held(WT, 1_000)));
+        assert_eq!(person_verdict(&unknown, NamedBy::Title), Err(Refusal::InputUnknown));
     }
 
     #[test]
-    fn an_unknown_idle_clock_or_foreground_yields_no_input_observation() {
-        // Nothing infers attention from an absence.
-        assert_eq!(input_stamp(WT, WT, Some((WT, 1_000)), None, 10_000), None);
-        assert_eq!(input_stamp(WT, WT, None, Some(400), 10_000), None);
+    fn a_click_on_a_tab_of_a_window_behind_another_is_refused() {
+        // One click brought the window forward and switched its tab; the tab it
+        // left had been behind another window.
+        assert_eq!(person_verdict(&departed(switch_at(&name_change(WT, Some(16)), held(WT, 9_950))), NamedBy::Title), Err(Refusal::ActivatedBySwitch));
     }
 
     #[test]
-    fn a_switch_with_the_window_in_front_and_input_just_now_is_a_person() {
-        // Measured: a real tab switch arrives at under 50 ms, being itself a
-        // click or a keystroke.
-        assert!(human_switch(WT, WT, Some(16)));
-        assert!(human_switch(WT, WT, Some(SWITCH_INPUT_WINDOW_MS)));
+    fn a_foreground_record_speaks_only_for_its_own_window() {
+        assert_eq!(front_since(Some((WT, 1_000)), WT), Since::At(1_000));
+        assert_eq!(front_since(Some((WT, 1_000)), OTHER), Since::Unrecorded);
+        assert_eq!(front_since(None, WT), Since::Unrecorded);
     }
 
     #[test]
-    fn a_switch_in_a_window_nobody_is_looking_at_is_not_a_person() {
-        // `wt.exe focus-tab` from a script, measured driving a background window.
-        assert!(!human_switch(WT, OTHER, Some(16)));
+    fn the_window_in_front_when_the_hooks_went_in_is_trusted_only_once_they_deliver() {
+        // An elevated terminal accepts the hooks and delivers nothing, so a record
+        // seeded at startup would never be renewed or ended: typing in a browser
+        // later would pass for typing into the tab on screen.
+        let mut record = ForegroundRecord::hooked(Some((WT, 1_000)));
+        assert_eq!(record.since(WT), Since::Unrecorded);
+        record.delivered(EVENT_OBJECT_NAMECHANGE, WT, 5_000);
+        assert_eq!(record.since(WT), Since::At(1_000), "a delivered event proves the hooks reach this process");
+        record.delivered(EVENT_SYSTEM_FOREGROUND, OTHER, 6_000);
+        assert_eq!((record.since(WT), record.since(OTHER)), (Since::Unrecorded, Since::At(6_000)));
+        assert_eq!(ForegroundRecord::hooked(None).since(WT), Since::Unrecorded, "hooks reinstalled, or lost, start from nothing");
     }
 
     #[test]
-    fn a_switch_with_no_recent_input_is_not_a_person() {
-        assert!(!human_switch(WT, WT, Some(6_407)));
-        assert!(!human_switch(WT, WT, None));
+    fn input_reaches_only_the_window_that_has_held_the_foreground_since_before_it() {
+        let input = |front, since, at_ms| {
+            let facts = InputFacts { front, front_since: since, selection: Selection::Live, selected_since: Since::At(0), cover: Cover::Clear };
+            person_verdict(&observed(Some("🟢 a"), Naming::OwnTitle, at_ms, ObservationKind::Input(facts)), NamedBy::Title)
+        };
+        assert_eq!(input(front_of(WT, WT), held(WT, 1_000).since(WT), 9_600), Ok(()));
+        assert_eq!(input(front_of(WT, WT), held(WT, 9_900).since(WT), 9_600), Err(Refusal::InputBeforeFront), "typing before the terminal came forward was typing elsewhere");
+        assert_eq!(input(front_of(WT, WT), held(WT, 9_500).since(WT), 9_600), Err(Refusal::ForegroundInput), "the click that brought the window forward, released after it came");
+        assert_eq!(input(front_of(WT, OTHER), held(WT, 1_000).since(WT), 9_600), Err(Refusal::NotInFront), "a stale record must not credit typing in another program");
+        assert_eq!(input(front_of(OTHER, OTHER), held(WT, 1_000).since(OTHER), 9_600), Err(Refusal::ForegroundUnrecorded), "one terminal window's record is not another's");
+    }
+
+    #[test]
+    fn a_selections_start_is_kept_only_through_an_unchanged_caption() {
+        // `bga` and `bga assistant` share a label, so a clock comparing by row
+        // would keep the first tab's start for the second; under exact equality
+        // each caption starts its own selection.
+        let mut clock = SelectionClock::default();
+        assert_eq!(clock.note(WT, "🟢 bga", same_tab, 0), 0);
+        assert_eq!(clock.note(WT, "🟢 bga assistant", same_tab, 20_000), 20_000, "another tab starts its own selection");
+        assert_eq!(clock.note(WT, "🟢 bga assistant", same_tab, 25_000), 20_000);
+        // Our own rewrite of the tab in front restarts it, which refuses only
+        // input made within the release margin of that write.
+        assert_eq!(clock.note(WT, "🔵 bga assistant", same_tab, 30_000), 30_000);
+    }
+
+    #[test]
+    fn a_caption_is_the_sessions_own_title_only_when_a_pane_behind_it_carries_it() {
+        let panes = |titles: &[&str]| titles.iter().map(|t| Some(t.to_string())).collect::<Vec<_>>();
+        assert_eq!(naming_from("🟢 dash", Some(&panes(&["🟢 dash"]))), Naming::OwnTitle);
+        assert_eq!(naming_from("🟢 dash", Some(&panes(&["Windows PowerShell", "🟢 dash"]))), Naming::OwnTitle, "a split whose agent pane the tab follows");
+        // A tab renamed by hand at `🟢 dash` and left after its agent exited: the
+        // pane behind it is a plain shell.
+        assert_eq!(naming_from("🟢 dash", Some(&panes(&["Windows PowerShell"]))), Naming::DisplayedName);
+        assert_eq!(naming_from("🟢 dash", Some(&[None])), Naming::DisplayedName, "a pane whose title could not be read");
+        assert_eq!(naming_from("🟢 dash", None), Naming::DisplayedName, "a window that could not be read");
+    }
+
+    #[test]
+    fn a_caption_read_before_its_rows_title_moved_is_only_a_displayed_name() {
+        // Tab A was read as `🟢 dash` and then pinned; its agent exited, the row
+        // went and came back in tab B, whose first write moved the row's title
+        // after tab A's read without moving tab A's caption.
+        assert_eq!(naming_at_departure(Naming::OwnTitle, 1_000, Some(5_000)), Naming::DisplayedName);
+        let o = observed(Some("🟢 dash"), naming_at_departure(Naming::OwnTitle, 1_000, Some(5_000)), 9_750, ObservationKind::Departed(switch_at(&name_change(WT, Some(16)), held(WT, 1_000))));
+        assert_eq!(person_verdict(&o, NamedBy::Title), Err(Refusal::OccupantUnknown(OCCUPANT_UNREPORTED)));
+        // A write before the read is one the caption followed.
+        assert_eq!(naming_at_departure(Naming::OwnTitle, 5_000, Some(1_000)), Naming::OwnTitle);
+        assert_eq!(naming_at_departure(Naming::OwnTitle, 5_000, None), Naming::OwnTitle, "a caption no row's title names");
+        assert_eq!(naming_at_departure(Naming::DisplayedName, 5_000, Some(1_000)), Naming::DisplayedName);
+    }
+
+    #[test]
+    fn a_departure_from_a_tab_showing_a_name_its_pane_does_not_carry_is_refused() {
+        // Nothing says what runs in a Windows Terminal pane, so a displayed name
+        // that is not the pane's own title leaves the verdict nothing to check.
+        let o = observed(Some("🟢 dash"), Naming::DisplayedName, 9_750, ObservationKind::Departed(switch_at(&name_change(WT, Some(16)), held(WT, 1_000))));
+        assert_eq!(person_verdict(&o, NamedBy::Title), Err(Refusal::OccupantUnknown(OCCUPANT_UNREPORTED)));
     }
 
     /// The departure rules this adapter inherits, exercised through its own

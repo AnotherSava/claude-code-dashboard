@@ -5,11 +5,12 @@
 //! will be — agterm on macOS, Windows Terminal plus the Windows console on
 //! Windows. An adapter's whole job is to turn whatever its terminal exposes into
 //! this module's vocabulary; everything downstream is generic and names no
-//! terminal at all. The two answer from entirely different places: agterm from a
-//! control socket and a state file, Windows from a window title, a console
-//! object and UI Automation.
+//! terminal at all. They answer from entirely different places: agterm from a
+//! control socket and a state file, Windows Terminal from a window title, a
+//! console object and UI Automation, and agwinterm from a control pipe and a
+//! state file.
 //!
-//! Four questions, four callers:
+//! Five questions, five callers:
 //!
 //! - **Did the user look at this session?** [`TerminalAdapter::poll`] and
 //!   [`TerminalAdapter::watch`] answer it as a stream of [`Observation`]s.
@@ -29,13 +30,20 @@
 //!   title write is still in flight, so every surface-keyed reader — the write's
 //!   own record, the caption watch, the stale check — names a surface the same
 //!   way.
+//! - **What should this session's context line say?**
+//!   [`TerminalAdapter::can_label`] says whether a terminal has a per-session
+//!   context line at all, [`TerminalAdapter::label_targets`] lists each session
+//!   with its title and what its context reads now, and
+//!   [`TerminalAdapter::write_label`] writes one. `crate::terminals::labels`
+//!   consumes them for a terminal whose sessions carry a field of their own beside
+//!   the console title, writing a row's task there, decided from the live reading.
 //!
 //! They are different axes — the first is about a human, the second about a
 //! screen, the third about the gap between what a screen shows and what is behind
-//! it, the fourth about where this dashboard's own writing goes — and they share
-//! the seam because they share all of its vocabulary.
+//! it, the fourth and fifth about where and how this dashboard's own writing goes
+//! — and they share the seam because they share all of its vocabulary.
 //!
-//! **A fifth capability goes here too, not beside here.** Every terminal-specific
+//! **A new capability goes here too, not beside here.** Every terminal-specific
 //! fact this dashboard learns belongs behind this trait, however Windows-shaped
 //! the first implementation looks. The staleness check was originally written the
 //! other way — a `#[cfg(windows)]` module reaching straight into the Windows
@@ -59,7 +67,11 @@
 //! `crate::attention`, so a new adapter inherits the "spend nothing while every
 //! finished row is already read" policy instead of re-deciding it.
 
-#[cfg(target_os = "macos")]
+use std::collections::HashMap;
+
+/// The agterm adapter. Compiled for tests everywhere too, so its readings and
+/// its diff run on every platform's test build.
+#[cfg(any(target_os = "macos", test))]
 pub mod agterm;
 #[cfg(target_os = "windows")]
 pub mod windows;
@@ -74,6 +86,74 @@ pub mod wt_tabs;
 /// not platform-gated: a platform with no adapter never starts it, and an adapter
 /// that cannot answer stands it down.
 pub mod stale_check;
+/// The consumer of [`TerminalAdapter::label_targets`] and
+/// [`TerminalAdapter::write_label`]. Names no terminal; it starts only where an
+/// adapter exists and answers [`TerminalAdapter::can_label`].
+pub mod labels;
+/// Several adapters answering as one, for a platform where more than one terminal
+/// can host a session. Only Windows builds one, so it is compiled there and for
+/// tests.
+#[cfg(any(target_os = "windows", test))]
+pub mod composite;
+/// agwinterm, a terminal whose sidebar names each session, reached over its
+/// control pipe.
+#[cfg(target_os = "windows")]
+pub mod agwinterm;
+/// agwinterm's control protocol as pure functions: request lines, reply and tree
+/// parsing, and the text rules its write verbs enforce. Compiled for tests on
+/// every platform so the parsing is exercised on a Mac too.
+#[cfg(any(target_os = "windows", test))]
+pub mod agwinterm_wire;
+/// agwinterm's per-window state file as pure functions: which session a window
+/// has selected and when the user left one. Compiled for tests everywhere, like
+/// the wire module.
+#[cfg(any(target_os = "windows", test))]
+pub mod agwinterm_state;
+/// The directory watch every adapter whose terminal saves its selection to a
+/// file shares. Compiled where such an adapter exists.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+pub mod snapshot_watch;
+/// Per-window bookkeeping over a directory of window files, shared by the same
+/// adapters. Compiled for tests everywhere, so its rules run on every platform.
+#[cfg(any(target_os = "macos", target_os = "windows", test))]
+pub mod window_files;
+
+/// What agterm can tell the person verdict, as pure readings over its control
+/// answers, plus the macOS calls that ask which application is in front.
+/// Compiled for tests everywhere so the readings are exercised on Windows too.
+#[cfg(any(target_os = "macos", test))]
+pub mod agterm_facts;
+
+/// How close to a session switch the last input must be for the switch to be
+/// attributable to a person. Measured on Windows Terminal, a human tab switch
+/// lands at under 50 ms from its click or keystroke, so this is loose by two
+/// orders of magnitude and still refuses a script switching while nobody types.
+pub const SWITCH_INPUT_WINDOW_MS: i64 = 2_000;
+
+/// How long a surface must already have held the foreground when a switch in it
+/// is made for the switch to have been made by someone looking at it. One click
+/// on a background window's tab or sidebar both activates the window and selects
+/// a session, and the session selected before that click was never in front of
+/// anyone.
+///
+/// **That is true only of a window that was covered**, and the rule refuses the
+/// uncovered case too, as an accepted loss. A terminal window that was visible
+/// without the focus — on a second monitor, beside a browser, or behind a click
+/// on this dashboard's own widget — was being read, and the click straight onto
+/// its next tab is a real departure from the one on screen, refused here as
+/// `activated_by_switch`. Telling the two apart needs the window's occlusion
+/// *before* the click, and neither platform reports that after the fact: the
+/// foreground event arrives once the window is already on top, and a sampled
+/// occlusion record has the blind spot of every sampled level. What is lost is
+/// that first click alone: once the window has held the focus this long, its
+/// switches and the input made in it are credited as usual.
+pub const ACTIVATION_MS: i64 = 500;
+
+/// How long after a selection began the click or key that made it can still be
+/// landing. A key or button is released after the switch it made, so input this
+/// close to the start of a selection is the arrival rather than reading, and an
+/// arrival marks nothing.
+pub const SWITCH_RELEASE_MS: i64 = 300;
 
 /// The instant to credit a departure to, or `None` when nobody left.
 ///
@@ -102,6 +182,56 @@ pub fn departure_stamp(previous: Option<&str>, current: &str, same_selection: im
     switched.then(|| last_reading_at.unwrap_or(now_ms))
 }
 
+/// When the selection on each surface began, noted by every source that sees it.
+///
+/// A terminal's watch and its poll both see selections, at different instants
+/// and in no fixed order, so the answer is kept in one place they both write.
+/// `same` decides whether two readings are one selection: agterm compares its
+/// own session ids, Windows Terminal compares whole tab titles.
+///
+/// **Every instant noted is no earlier than the selection it reports**, which is
+/// what makes the answer safe to compare input against: a selection's start
+/// placed late refuses more input as the arrival, never less. Two things hold
+/// that up. `same` must err toward "different": one that called two selections
+/// one would keep the first one's start for the second, earlier than the truth,
+/// which is why Windows Terminal does not use `terminal_title::same_row` here,
+/// the comparator its departures use, since that one errs the other way. And a
+/// selection that began and ended between two readings is not seen, so where
+/// only a poll is running the start of the selection after it is placed too
+/// early, at the first reading that showed it rather than at the return.
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
+pub struct SelectionClock<K> {
+    by_surface: HashMap<K, (String, i64)>,
+}
+
+impl<K> Default for SelectionClock<K> {
+    fn default() -> Self {
+        Self { by_surface: HashMap::new() }
+    }
+}
+
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
+impl<K: Eq + std::hash::Hash> SelectionClock<K> {
+
+    /// Note that `surface` shows `selection` as of `at_ms`, and answer since when
+    /// it has. A reading of the selection already held keeps its start, even
+    /// when a slower source reports it with an earlier instant; anything else
+    /// starts a new selection at `at_ms`.
+    pub fn note(&mut self, surface: K, selection: &str, same: impl Fn(&str, &str) -> bool, at_ms: i64) -> i64 {
+        let since = self.by_surface.get(&surface).filter(|(held, _)| same(held, selection)).map_or(at_ms, |&(_, since)| since);
+        self.by_surface.insert(surface, (selection.to_string(), since));
+        since
+    }
+
+    /// Forget every surface `keep` refuses, so a closed window's handle reused
+    /// by a new one starts from nothing. Windows reuses window handles; agterm's
+    /// window ids are never reused, so only the Windows adapter calls this.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    pub fn retain(&mut self, keep: impl Fn(&K) -> bool) {
+        self.by_surface.retain(|k, _| keep(k));
+    }
+}
+
 /// A terminal session as its *terminal* names it — the two handles every terminal
 /// has, and the only ones `attention::resolve_row` needs to find a row.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -114,13 +244,18 @@ pub struct TerminalSession {
     pub title: Option<String>,
 }
 
-/// What the user was observed doing.
+/// What the user was observed doing, with the facts the person verdict needs
+/// about it.
 ///
-/// `dead_code` is allowed because this is the seam's vocabulary, not one
-/// terminal's: on a platform whose adapter is not written — Linux, where
-/// [`for_platform`] answers `None` — nothing constructs these, and that is the
-/// expected state rather than a defect. Deleting them to silence it would delete
-/// the interface the next adapter implements.
+/// Every enum from here to [`person_verdict`] allows `dead_code` because this is
+/// the seam's vocabulary, not one terminal's: each terminal constructs only the
+/// states it can observe — agwinterm and agterm report a covered session and
+/// Windows Terminal never does, only agterm a program other than a shell — and on
+/// a platform whose adapter is not written,
+/// Linux, where [`for_platform`] answers `None`, nothing constructs any of them.
+/// That is the expected state rather than a defect; deleting a variant to
+/// silence it would delete a state the verdict has to judge for another
+/// terminal.
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ObservationKind {
@@ -128,17 +263,180 @@ pub enum ObservationKind {
     /// signal, because leaving is the moment you are done with what was on
     /// screen — whereas arriving proves only that you got there, and reading
     /// itself produces nothing at all to observe.
-    Departed,
+    Departed(Switch),
     /// The user produced input while this session was the one on screen. Weaker
     /// and secondary: it cannot see a silent read, and it is here for the case
     /// the user reads a finished answer and then types the next prompt without
-    /// ever switching away.
-    Input,
+    /// ever switching away. [`Observation::at_ms`] is the input's instant.
+    Input(InputFacts),
 }
 
-/// One thing a terminal observed, at a known instant.
+/// The switch a departure was seen by.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Switch {
+    /// The terminal reported the switch as an edge, so it can be placed in time
+    /// and asked about.
+    ///
+    /// **A switch is placed between two bounds, and each rule reads the one
+    /// that errs its own safe way.** The earliest it can have been is
+    /// [`Observation::at_ms`]; the latest is `latest_ms`. The activation rule
+    /// refuses a switch made too soon after its surface came forward, so it
+    /// reads the earliest bound: a switch placed early refuses more. The input
+    /// rule refuses a switch with no input near it, so it reads the latest: input
+    /// compared against a late placement is refused as too old more often. Read
+    /// the other way round, a report placed late would pass the activation rule
+    /// for the very click that brought the surface forward.
+    Placed {
+        /// The latest the switch can have been, where the terminal's report puts
+        /// it.
+        latest_ms: i64,
+        /// Whether the surface the switch happened in was in front of the user.
+        front: Front,
+        /// Since when that surface had held the foreground.
+        front_since: Since,
+        /// The last input the terminal or the desktop saw, at or after the
+        /// switch's report, as an absolute instant.
+        ///
+        /// It and `front` are read after the switch, and only describe it while
+        /// the read follows the switch closely: input made after the switch
+        /// would otherwise pass for input at it. An adapter that reads them
+        /// later than its terminal's normal reporting delay reports both unknown;
+        /// see [`facts_at_switch`].
+        last_input: LastInput,
+    },
+    /// The terminal was sampled, and two samples showed different selections:
+    /// the switch happened somewhere in between, and who made it is not known.
+    Unplaced,
+}
+
+/// The facts an input observation is judged by.
+///
+/// The input instant is the desktop's last input, which says nothing about where
+/// it went: it is this surface's only when the surface has held the foreground
+/// from before the input until now. Every terminal reports it that way. A
+/// terminal's own idle clock would say which window took the input, but agterm's,
+/// the one such clock, counts something nobody has measured, and a window behind
+/// another application still receives scroll and hover events.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InputFacts {
+    /// Whether the surface is in front of the user now.
+    pub front: Front,
+    /// Since when the surface has held the foreground.
+    pub front_since: Since,
+    /// Whether the session named is still the surface's live selection.
+    pub selection: Selection,
+    /// Since when the session has been the surface's selection, no earlier than
+    /// the truth: see [`SelectionClock`].
+    pub selected_since: Since,
+    /// Whether something is drawn over the session that takes its keystrokes.
+    pub cover: Cover,
+}
+
+/// Whether a surface is in front of the user.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Front {
+    Yes,
+    /// Another program, or another window of this terminal, is in front.
+    No,
+    /// The terminal or the desktop could not be asked. The reason goes to the
+    /// log.
+    Unknown(&'static str),
+}
+
+/// Since when something has held, as an absolute instant **no earlier than the
+/// truth**. Each rule that reads one refuses more when it is late, so an adapter
+/// that knows only a window must report its end. agterm with several windows
+/// open is the one accepted exception, since macOS reports no window
+/// activation; see [`agterm_facts`].
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Since {
+    At(i64),
+    /// Nothing recorded when it began.
+    Unrecorded,
+}
+
+/// The last input seen, as an absolute instant.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LastInput {
+    At(i64),
+    Unknown,
+}
+
+/// Whether the session an input observation names is the surface's live
+/// selection, which a terminal whose selection is read from a saved file has to
+/// ask separately.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Selection {
+    Live,
+    /// The terminal says another session is selected now: what the observation
+    /// was built from is behind the screen.
+    Lagging,
+    Unknown(&'static str),
+}
+
+/// Whether something is drawn over the session that takes its keystrokes, such
+/// as an overlay terminal running over it.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Cover {
+    Clear,
+    Covered,
+    Unknown,
+}
+
+/// What runs in the session.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Occupant {
+    /// The agent, or something other than an idle shell where the terminal
+    /// cannot tell the agent from another child of the shell.
+    Agent,
+    /// An idle shell, and no agent behind it.
+    Shell,
+    /// A program the terminal names, which is not the agent.
+    Other,
+    /// The terminal does not say. The reason goes to the log.
+    Unknown(&'static str),
+}
+
+/// Where an observation's [`TerminalSession::title`] comes from.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Naming {
+    /// The session's own title: the console or tty title, which this dashboard
+    /// writes only onto the agent a row describes. An adapter reports this only
+    /// where it read the title off the session itself, or off the program
+    /// running in it, as agwinterm reports a pane's.
+    OwnTitle,
+    /// The name a terminal displays for the session, not confirmed to be the
+    /// session's own title. A displayed name can stop following the session —
+    /// a tab renamed by hand keeps the name it was showing, whatever the console
+    /// behind it now holds — so a plain shell can carry the agent's name.
+    DisplayedName,
+}
+
+/// How `attention::resolve_row` named a row from an observation's session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NamedBy {
+    Title,
+    /// The working directory, the fallback when no title names a row.
+    Directory,
+}
+
+/// One thing a terminal observed, at a known instant, with the facts the person
+/// verdict needs about it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Observation {
+    /// The slug of the terminal that observed it, the [`TerminalAdapter::name`]
+    /// of the adapter that made this rather than of whatever forwarded it. On a
+    /// platform where several terminals answer as one, the decision log needs it
+    /// to say which sensor named nothing.
+    pub terminal: &'static str,
     pub session: TerminalSession,
     /// When it happened, absolute.
     ///
@@ -149,25 +447,246 @@ pub struct Observation {
     /// of that window, not its end.
     pub at_ms: i64,
     pub kind: ObservationKind,
+    /// What runs in the session, for a departure the one left and for input the
+    /// one on screen.
+    pub occupant: Occupant,
+    pub naming: Naming,
+}
+
+/// Why an observation was not credited to a person reading its session. Logged
+/// by `crate::attention` as the `outcome` of a `decision = "attention_poll"` line,
+/// one vocabulary for every terminal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refusal {
+    SwitchUnplaced,
+    NotInFront,
+    FrontUnknown(&'static str),
+    ForegroundUnrecorded,
+    ActivatedBySwitch,
+    InputUnknown,
+    NoRecentInput,
+    InputBeforeFront,
+    ForegroundInput,
+    SelectionLagging,
+    SelectionUnknown(&'static str),
+    SelectionUnplaced,
+    SwitchInput,
+    Covered,
+    CoverUnknown,
+    BareShell,
+    NotTheAgent,
+    OccupantUnknown(&'static str),
+}
+
+impl Refusal {
+    pub fn slug(&self) -> &'static str {
+        match self {
+            Refusal::SwitchUnplaced => "switch_unplaced",
+            Refusal::NotInFront => "not_in_front",
+            Refusal::FrontUnknown(_) => "front_unknown",
+            Refusal::ForegroundUnrecorded => "foreground_unrecorded",
+            Refusal::ActivatedBySwitch => "activated_by_switch",
+            Refusal::InputUnknown => "input_unknown",
+            Refusal::NoRecentInput => "no_recent_input",
+            Refusal::InputBeforeFront => "input_before_front",
+            Refusal::ForegroundInput => "foreground_input",
+            Refusal::SelectionLagging => "selection_lagging",
+            Refusal::SelectionUnknown(_) => "selection_unknown",
+            Refusal::SelectionUnplaced => "selection_unplaced",
+            Refusal::SwitchInput => "switch_input",
+            Refusal::Covered => "covered",
+            Refusal::CoverUnknown => "cover_unknown",
+            Refusal::BareShell => "bare_shell",
+            Refusal::NotTheAgent => "not_the_agent",
+            Refusal::OccupantUnknown(_) => "occupant_unknown",
+        }
+    }
+
+    /// Why a fact was unknown, where the terminal said.
+    pub fn detail(&self) -> Option<&'static str> {
+        match self {
+            Refusal::FrontUnknown(why) | Refusal::SelectionUnknown(why) | Refusal::OccupantUnknown(why) => Some(why),
+            _ => None,
+        }
+    }
+}
+
+/// Whether an observation can be credited to a person reading the session it
+/// names, or the first rule it fails. Pure, cross-terminal, and the whole
+/// judgment: every terminal-specific fact was turned into this vocabulary by its
+/// adapter, and `crate::attention` applies this to every observation before it
+/// marks anything read.
+///
+/// **An unknown fact refuses**, because the one direction this must never fail
+/// in is marking a row read that nobody read; a refusal only leaves a row
+/// showing, which the next observation corrects. The one rule whose unknown is
+/// not refused is the occupant rule out of its scope, below.
+///
+/// A departure must be a person's switch:
+///
+/// - **Placed** (`switch_unplaced`): a switch found by comparing two samples
+///   happened at an unknown instant, so nothing below can be asked about it.
+///   A poll that finds switches finds them this way, so without a watch no
+///   departure is credited anywhere, and only input remains.
+/// - **In front** (`not_in_front`, `front_unknown`): the surface it happened in
+///   was in front. A pipe or CLI select in a window behind another is a script.
+/// - **Held before** (`foreground_unrecorded`, `activated_by_switch`): the
+///   surface had held the foreground for more than [`ACTIVATION_MS`] before the
+///   *earliest* the switch can have been, so the switch was not the click that
+///   brought it forward, whose previous selection was behind another window.
+/// - **Input at the switch** (`input_unknown`, `no_recent_input`): the last
+///   input is no more than [`SWITCH_INPUT_WINDOW_MS`] older than the *latest*
+///   the switch can have been, since a switch is itself a click or a keystroke.
+///
+/// Input must reach the session on screen:
+///
+/// - **Reach** (`not_in_front`, `front_unknown`, `foreground_unrecorded`,
+///   `input_before_front`): desktop-wide input counts only when the surface
+///   holds the foreground now and has held it since before the input.
+/// - **After the surface came forward** (`foreground_input`): the input came
+///   more than [`SWITCH_RELEASE_MS`] after the surface came to the foreground,
+///   since the click that brings a window forward is released after the
+///   activation it made and is the newest input then, an arrival rather than
+///   reading. A foreground start recorded late refuses more here, never less.
+/// - **Live** (`selection_lagging`, `selection_unknown`): the terminal confirms
+///   the session is still its selection.
+/// - **After the arrival** (`selection_unplaced`, `switch_input`): the input
+///   came more than [`SWITCH_RELEASE_MS`] after the session was selected.
+/// - **Uncovered** (`covered`, `cover_unknown`): nothing drawn over the session
+///   takes its keystrokes.
+///
+/// Both must be the agent (`bare_shell`, `not_the_agent`, `occupant_unknown`).
+/// **A session a terminal knows is not the agent is refused whatever named it.**
+/// A shell left in a tab after its agent exited keeps the agent's last title
+/// until something rewrites it, and the shells these terminals run do not, so a
+/// session's own title is no proof the agent is still in it.
+///
+/// **An occupant nobody could report is asked only where it can matter.** The
+/// rule exists because a session that is not the agent can still name the
+/// agent's row: through a name this dashboard did not write onto the agent
+/// itself — a working directory, which `resolve_row` falls back to — or through
+/// a title the agent left behind. The first keeps the rule in scope, and so does
+/// a name a terminal merely *displays*, since a displayed name can outlive what
+/// it was written for ([`Naming::DisplayedName`]). A row named by the session's
+/// own title is out of scope for an unknown occupant, which is what keeps Windows
+/// Terminal working, whose panes say nothing about what runs in them, and
+/// agwinterm's WSL sessions, whose root is no shell agwinterm recognizes. The
+/// title left behind is
+/// what that scope leaves, and `terminal_title::sync` closes it: when a row is
+/// removed its last title is blanked on the console or tty it was written to,
+/// reached through the session's surviving processes rather than the agent's, and
+/// retried until it lands. What the scope still trusts is a title outliving its
+/// agent while another session keeps the row alive, two sessions in one
+/// directory, where nothing is removed and so nothing is blanked. A Windows
+/// Terminal departure from such a tab is refused, as a [`Naming::DisplayedName`],
+/// once the row's title has moved since the tab's caption was read; input typed
+/// into it while it still carries the row's current title is credited.
+pub fn person_verdict(o: &Observation, named_by: NamedBy) -> Result<(), Refusal> {
+    match o.kind {
+        ObservationKind::Departed(switch) => person_switched(o.at_ms, switch)?,
+        ObservationKind::Input(facts) => input_reached(o.at_ms, facts)?,
+    }
+    match (o.occupant, named_by, o.naming) {
+        (Occupant::Agent, ..) => Ok(()),
+        (Occupant::Shell, ..) => Err(Refusal::BareShell),
+        (Occupant::Other, ..) => Err(Refusal::NotTheAgent),
+        (Occupant::Unknown(_), NamedBy::Title, Naming::OwnTitle) => Ok(()),
+        (Occupant::Unknown(why), ..) => Err(Refusal::OccupantUnknown(why)),
+    }
+}
+
+/// The departure half of [`person_verdict`], for a switch no earlier than
+/// `earliest_ms`.
+fn person_switched(earliest_ms: i64, switch: Switch) -> Result<(), Refusal> {
+    let Switch::Placed { latest_ms, front, front_since, last_input } = switch else { return Err(Refusal::SwitchUnplaced) };
+    in_front(front)?;
+    match front_since {
+        Since::Unrecorded => return Err(Refusal::ForegroundUnrecorded),
+        Since::At(since) if earliest_ms <= since + ACTIVATION_MS => return Err(Refusal::ActivatedBySwitch),
+        Since::At(_) => {}
+    }
+    match last_input {
+        LastInput::Unknown => Err(Refusal::InputUnknown),
+        LastInput::At(input) if input < latest_ms - SWITCH_INPUT_WINDOW_MS => Err(Refusal::NoRecentInput),
+        LastInput::At(_) => Ok(()),
+    }
+}
+
+/// The input half of [`person_verdict`], for input at `at_ms`.
+fn input_reached(at_ms: i64, facts: InputFacts) -> Result<(), Refusal> {
+    in_front(facts.front)?;
+    match facts.front_since {
+        Since::Unrecorded => return Err(Refusal::ForegroundUnrecorded),
+        Since::At(since) if at_ms < since => return Err(Refusal::InputBeforeFront),
+        Since::At(since) if at_ms <= since + SWITCH_RELEASE_MS => return Err(Refusal::ForegroundInput),
+        Since::At(_) => {}
+    }
+    match facts.selection {
+        Selection::Live => {}
+        Selection::Lagging => return Err(Refusal::SelectionLagging),
+        Selection::Unknown(why) => return Err(Refusal::SelectionUnknown(why)),
+    }
+    match facts.selected_since {
+        Since::Unrecorded => return Err(Refusal::SelectionUnplaced),
+        Since::At(since) if at_ms <= since + SWITCH_RELEASE_MS => return Err(Refusal::SwitchInput),
+        Since::At(_) => {}
+    }
+    match facts.cover {
+        Cover::Clear => Ok(()),
+        Cover::Covered => Err(Refusal::Covered),
+        Cover::Unknown => Err(Refusal::CoverUnknown),
+    }
+}
+
+fn in_front(front: Front) -> Result<(), Refusal> {
+    match front {
+        Front::Yes => Ok(()),
+        Front::No => Err(Refusal::NotInFront),
+        Front::Unknown(why) => Err(Refusal::FrontUnknown(why)),
+    }
+}
+
+/// The foreground and input facts read at `read_ms` about a switch placed no
+/// later than `latest_ms`, or both unknown when the read came too late to
+/// describe the switch.
+///
+/// For an adapter that learns of a switch from a file its terminal saves, and
+/// reads the facts when the save arrives rather than at the switch. Read
+/// promptly, they are the switch's own: the window still in front and the input
+/// that made it. Read later than `allowance_ms`, the terminal's normal delay
+/// between a switch and the read of its save, they describe whatever happened
+/// since — input made after the switch would pass for input at it, and the
+/// verdict's input rule would become "any input since". The allowance is the
+/// adapter's, since only it knows its terminal's delay.
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
+pub fn facts_at_switch(front: Front, last_input: LastInput, read_ms: i64, latest_ms: i64, allowance_ms: i64) -> (Front, LastInput) {
+    if read_ms - latest_ms > allowance_ms {
+        (Front::Unknown("read_after_switch"), LastInput::Unknown)
+    } else {
+        (front, last_input)
+    }
 }
 
 /// A terminal this dashboard can ask about.
 ///
-/// Four questions, all answered in the vocabulary above. *What did the user do*
+/// Five questions, all answered in the vocabulary above. *What did the user do*
 /// ([`poll`](TerminalAdapter::poll) / [`watch`](TerminalAdapter::watch)), *what
 /// are you showing* ([`sessions`](TerminalAdapter::sessions)), *what are you
 /// displaying versus what is really in there*
-/// ([`front_readings`](TerminalAdapter::front_readings)), and *where did that
-/// write land* ([`attached_surface`](TerminalAdapter::attached_surface)). They
-/// are different axes — a human, a screen, the gap between a screen and what is
-/// behind it, and where this dashboard's own writing goes — but they share the
-/// seam because they share its whole vocabulary: a session named by `cwd` and
-/// `title`, which is all any caller needs and all any terminal can be relied on
-/// to have.
+/// ([`front_readings`](TerminalAdapter::front_readings)), *where did that
+/// write land* ([`attached_surface`](TerminalAdapter::attached_surface)), and
+/// *what should this session's context line say*
+/// ([`label_targets`](TerminalAdapter::label_targets) /
+/// [`write_label`](TerminalAdapter::write_label)). They are different axes — a
+/// human, a screen, the gap between a screen and what is behind it, and where and
+/// how this dashboard's own writing goes — but they share the seam because they
+/// share its whole vocabulary: a session named by `cwd` and `title`, which is all
+/// any caller needs and all any terminal can be relied on to have.
 ///
-/// Only `name` is required. Every other method has a default that declines to
-/// answer, so an adapter implements what its terminal can actually tell it and
-/// each caller learns the difference between a `None` and a finding.
+/// `name`, `sessions` and `poll` are required. Every other method has a default
+/// that declines to answer, so an adapter implements what its terminal can
+/// actually tell it and each caller learns the difference between a `None` and a
+/// finding.
 pub trait TerminalAdapter: Send {
     /// Stable slug for the decision log, so `widget.jsonl` says which terminal
     /// answered.
@@ -314,6 +833,77 @@ pub trait TerminalAdapter: Send {
     /// what a reader thread needs is the adapter's business: Windows joins a COM
     /// apartment here, and a terminal read over a socket or a file needs nothing.
     fn prepare_reader(&self) {}
+
+    /// Whether this terminal gives its sessions a context line of their own at
+    /// all.
+    ///
+    /// A fact about the terminal rather than about this moment, so it is asked
+    /// separately from [`label_targets`](Self::label_targets), whose `None` also
+    /// means "could not look just now" and is retried. `labels`' worker starts
+    /// only where this is `true`, so a terminal with no context line is not asked
+    /// every few seconds for the life of the process. Cheap and blocking nothing.
+    fn can_label(&self) -> bool {
+        false
+    }
+
+    /// Every session this terminal can label, with its title and the context it
+    /// shows right now, or `None` when the terminal could not be asked.
+    ///
+    /// The line [`sessions`](Self::sessions) draws: `Some(vec![])` means the
+    /// terminal answered and has nothing to label, which includes "not running";
+    /// `None` means it could not look, and the caller retries rather than reading
+    /// silence as an empty terminal.
+    ///
+    /// Each reading is the terminal's own, never what this dashboard remembers
+    /// writing, so a write is decided against what is really there: a context the
+    /// user changed, or one the terminal lost, shows up here.
+    ///
+    /// **May block**, for as long as a cross-process read takes. It is called only
+    /// from `labels`' worker thread, never from an emit.
+    fn label_targets(&self) -> Option<Vec<LabelTarget>> {
+        None
+    }
+
+    /// Write one session's context line. `key` is a [`LabelTarget::key`] this
+    /// adapter minted.
+    ///
+    /// **May block**, for as long as the terminal takes to apply the write, and
+    /// is called only from `labels`' worker thread. The default refuses, because a
+    /// terminal that lists no targets is never asked.
+    fn write_label(&self, key: &str, write: &LabelWrite) -> Result<(), String> {
+        let _ = (key, write);
+        Err("this terminal cannot be labelled".to_string())
+    }
+}
+
+/// One labellable session, as [`TerminalAdapter::label_targets`] reports it.
+///
+/// `dead_code` is allowed off Windows for the reason [`ObservationKind`]'s is:
+/// only agwinterm constructs these, and that adapter exists only on Windows.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LabelTarget {
+    /// Which session this is, opaque to every caller, with the contract
+    /// [`FrontReading::surface`] has: compare it, pass it back to
+    /// [`TerminalAdapter::write_label`], and do nothing else with it.
+    pub key: String,
+    /// The program title of the session's focused pane, which for an agent is the
+    /// console title this dashboard writes, or `None` where it has none. What
+    /// joins the session to a row.
+    pub title: Option<String>,
+    /// The session's context line, or `None` where none is set.
+    pub context: Option<String>,
+    /// The longest context the terminal accepts, in UTF-16 code units, which
+    /// `labels` fits a row's text to.
+    pub max_utf16: usize,
+}
+
+/// One write to a session's context line. A [`LabelWrite::Context`] is never
+/// longer than its target's `max_utf16`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LabelWrite {
+    Context(String),
+    ClearContext,
 }
 
 /// The remedy wording for a terminal that has not written its own.
@@ -545,6 +1135,235 @@ mod stale_tests {
     }
 }
 
+#[cfg(test)]
+pub(crate) mod verdict_tests {
+    use super::*;
+
+    /// A departure a person made in Windows Terminal, as its watch reports one:
+    /// in front for a minute, input at the switch, nothing said about the pane.
+    pub(crate) fn departure() -> Observation {
+        let switch = Switch::Placed { latest_ms: 60_000, front: Front::Yes, front_since: Since::At(0), last_input: LastInput::At(59_990) };
+        Observation { terminal: "test", session: TerminalSession { cwd: None, title: Some("🟢 dash".into()) }, at_ms: 59_750, kind: ObservationKind::Departed(switch), occupant: Occupant::Unknown("not_reported"), naming: Naming::OwnTitle }
+    }
+
+    /// Input a person made into a session they had been on for a minute, with the
+    /// desktop clock and the foreground behind it.
+    pub(crate) fn input() -> Observation {
+        let facts = InputFacts { front: Front::Yes, front_since: Since::At(0), selection: Selection::Live, selected_since: Since::At(0), cover: Cover::Clear };
+        Observation { kind: ObservationKind::Input(facts), at_ms: 60_000, ..departure() }
+    }
+
+    fn with_switch(o: Observation, edit: impl Fn(&mut i64, &mut Front, &mut Since, &mut LastInput)) -> Observation {
+        let ObservationKind::Departed(Switch::Placed { mut latest_ms, mut front, mut front_since, mut last_input }) = o.kind else { unreachable!("a placed departure") };
+        edit(&mut latest_ms, &mut front, &mut front_since, &mut last_input);
+        Observation { kind: ObservationKind::Departed(Switch::Placed { latest_ms, front, front_since, last_input }), ..o }
+    }
+
+    fn with_input(o: Observation, edit: impl Fn(&mut InputFacts)) -> Observation {
+        let ObservationKind::Input(mut facts) = o.kind else { unreachable!("an input") };
+        edit(&mut facts);
+        Observation { kind: ObservationKind::Input(facts), ..o }
+    }
+
+    fn occupied(o: Observation, occupant: Occupant, naming: Naming) -> Observation {
+        Observation { occupant, naming, ..o }
+    }
+
+    #[test]
+    fn every_departure_rule_refuses_its_own_case_and_only_that() {
+        let cases: Vec<(&str, Observation, Result<(), Refusal>)> = vec![
+            ("a person's switch", departure(), Ok(())),
+            ("sampled, not seen as an edge", Observation { kind: ObservationKind::Departed(Switch::Unplaced), ..departure() }, Err(Refusal::SwitchUnplaced)),
+            ("a window behind another", with_switch(departure(), |_, f, _, _| *f = Front::No), Err(Refusal::NotInFront)),
+            ("the front could not be asked", with_switch(departure(), |_, f, _, _| *f = Front::Unknown("pipe_unanswered")), Err(Refusal::FrontUnknown("pipe_unanswered"))),
+            ("no record of the window coming forward", with_switch(departure(), |_, _, s, _| *s = Since::Unrecorded), Err(Refusal::ForegroundUnrecorded)),
+            ("the click that brought it forward", with_switch(departure(), |_, _, s, _| *s = Since::At(59_750 - ACTIVATION_MS)), Err(Refusal::ActivatedBySwitch)),
+            ("held just long enough before the earliest the switch can have been", with_switch(departure(), |_, _, s, _| *s = Since::At(59_750 - ACTIVATION_MS - 1)), Ok(())),
+            ("no input clock", with_switch(departure(), |_, _, _, i| *i = LastInput::Unknown), Err(Refusal::InputUnknown)),
+            ("nobody touched anything near the switch", with_switch(departure(), |_, _, _, i| *i = LastInput::At(60_000 - SWITCH_INPUT_WINDOW_MS - 1)), Err(Refusal::NoRecentInput)),
+            ("input at the edge of the window", with_switch(departure(), |_, _, _, i| *i = LastInput::At(60_000 - SWITCH_INPUT_WINDOW_MS)), Ok(())),
+        ];
+        for (name, o, want) in cases {
+            assert_eq!(person_verdict(&o, NamedBy::Title), want, "{name}");
+        }
+    }
+
+    #[test]
+    fn every_input_rule_refuses_its_own_case_and_only_that() {
+        let desktop = |front, since| move |f: &mut InputFacts| (f.front, f.front_since) = (front, since);
+        let cases: Vec<(&str, Observation, Result<(), Refusal>)> = vec![
+            ("input to the session on screen", input(), Ok(())),
+            ("typing in another program", with_input(input(), desktop(Front::No, Since::At(0))), Err(Refusal::NotInFront)),
+            ("the front could not be asked", with_input(input(), desktop(Front::Unknown("no_window"), Since::At(0))), Err(Refusal::FrontUnknown("no_window"))),
+            ("in front, but since when is not known", with_input(input(), desktop(Front::Yes, Since::Unrecorded)), Err(Refusal::ForegroundUnrecorded)),
+            ("typed before the surface came forward", with_input(input(), desktop(Front::Yes, Since::At(60_001))), Err(Refusal::InputBeforeFront)),
+            ("the click that brought the surface forward", with_input(input(), desktop(Front::Yes, Since::At(60_000))), Err(Refusal::ForegroundInput)),
+            ("the release of that click", with_input(input(), desktop(Front::Yes, Since::At(60_000 - SWITCH_RELEASE_MS))), Err(Refusal::ForegroundInput)),
+            ("just after the activation", with_input(input(), desktop(Front::Yes, Since::At(60_000 - SWITCH_RELEASE_MS - 1))), Ok(())),
+            ("the file is behind the screen", with_input(input(), |f| f.selection = Selection::Lagging), Err(Refusal::SelectionLagging)),
+            ("the terminal did not confirm the selection", with_input(input(), |f| f.selection = Selection::Unknown("tree_unanswered")), Err(Refusal::SelectionUnknown("tree_unanswered"))),
+            ("no record of the selection beginning", with_input(input(), |f| f.selected_since = Since::Unrecorded), Err(Refusal::SelectionUnplaced)),
+            ("the click that arrived", with_input(input(), |f| f.selected_since = Since::At(60_000 - SWITCH_RELEASE_MS)), Err(Refusal::SwitchInput)),
+            ("just after the arrival", with_input(input(), |f| f.selected_since = Since::At(60_000 - SWITCH_RELEASE_MS - 1)), Ok(())),
+            ("an overlay takes the keystrokes", with_input(input(), |f| f.cover = Cover::Covered), Err(Refusal::Covered)),
+            ("the terminal did not say what is drawn over it", with_input(input(), |f| f.cover = Cover::Unknown), Err(Refusal::CoverUnknown)),
+        ];
+        for (name, o, want) in cases {
+            assert_eq!(person_verdict(&o, NamedBy::Title), want, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_foreground_start_recorded_late_refuses_the_click_that_brought_the_surface_forward() {
+        // An activation is recorded when its notification reaches this process,
+        // after the click that made it, and the input clock may be read before
+        // the terminal answers. Either error puts the click before the recorded
+        // start, which is refused rather than matched to an older stretch.
+        let late = |since| with_input(input(), move |f| f.front_since = Since::At(since));
+        assert_eq!(person_verdict(&late(60_000 + 150), NamedBy::Title), Err(Refusal::InputBeforeFront), "the activating click, recorded 150 ms late");
+        assert_eq!(person_verdict(&late(60_000 - 100), NamedBy::Title), Err(Refusal::ForegroundInput), "recorded early enough to precede it, still the arrival");
+    }
+
+    #[test]
+    fn a_switch_placed_late_is_judged_by_its_earliest_bound_for_activation_and_its_latest_for_input() {
+        // A save that reached the disk long after the switch it carries: the
+        // switch is no earlier than 1 000 and the report places it at 20 000.
+        // The surface came forward at 900, by the click that made the switch.
+        let late = Observation { at_ms: 1_000, ..with_switch(departure(), |at, _, s, i| (*at, *s, *i) = (20_000, Since::At(900), LastInput::At(19_900))) };
+        assert_eq!(person_verdict(&late, NamedBy::Title), Err(Refusal::ActivatedBySwitch), "the report's late placement must not pass the activation rule");
+        // The same bounds with the surface long in front: the input rule asks
+        // about the latest placement, which refuses input older than it more.
+        let held = with_switch(late.clone(), |_, _, s, _| *s = Since::At(-60_000));
+        assert_eq!(person_verdict(&held, NamedBy::Title), Ok(()));
+        assert_eq!(person_verdict(&with_switch(held, |_, _, _, i| *i = LastInput::At(2_000)), NamedBy::Title), Err(Refusal::NoRecentInput), "input near the earliest bound is too old for the latest");
+    }
+
+    #[test]
+    fn facts_read_too_long_after_a_switch_are_unknown() {
+        let read = |read_ms| facts_at_switch(Front::Yes, LastInput::At(9_990), read_ms, 10_000, 500);
+        assert_eq!(read(10_500), (Front::Yes, LastInput::At(9_990)), "read within the terminal's normal delay");
+        assert_eq!(read(10_501), (Front::Unknown("read_after_switch"), LastInput::Unknown), "later, input since the switch would pass for input at it");
+    }
+
+    #[test]
+    fn the_occupant_matters_wherever_a_name_could_have_come_from_a_directory() {
+        // In scope: a row named through the working directory, which a plain
+        // shell in the project directory reaches, or a name a terminal only
+        // displays.
+        for (named_by, naming) in [(NamedBy::Directory, Naming::OwnTitle), (NamedBy::Title, Naming::DisplayedName), (NamedBy::Directory, Naming::DisplayedName)] {
+            for o in [departure(), input()] {
+                let case = |occupant| person_verdict(&occupied(o.clone(), occupant, naming), named_by);
+                assert_eq!(case(Occupant::Agent), Ok(()), "{named_by:?} {naming:?}");
+                assert_eq!(case(Occupant::Shell), Err(Refusal::BareShell), "{named_by:?} {naming:?}");
+                assert_eq!(case(Occupant::Other), Err(Refusal::NotTheAgent), "{named_by:?} {naming:?}");
+                assert_eq!(case(Occupant::Unknown("not_in_tree")), Err(Refusal::OccupantUnknown("not_in_tree")), "{named_by:?} {naming:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_unknown_occupant_cannot_matter_for_a_row_named_by_the_sessions_own_title() {
+        // A title this dashboard wrote onto the agent's own console names the
+        // agent's session, so an occupant nobody could report is not asked;
+        // Windows Terminal's panes never say.
+        for o in [departure(), input()] {
+            for occupant in [Occupant::Agent, Occupant::Unknown("not_reported")] {
+                assert_eq!(person_verdict(&occupied(o.clone(), occupant, Naming::OwnTitle), NamedBy::Title), Ok(()), "{occupant:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_known_non_agent_is_refused_even_under_its_own_title() {
+        // A shell left in a tab after its agent exited keeps the agent's last
+        // title: agterm reports `-zsh` in front of a tab still titled `🟢 dash`.
+        // Crediting it would mark read a new `dash` row whose answer is in
+        // another tab.
+        for o in [departure(), input()] {
+            assert_eq!(person_verdict(&occupied(o.clone(), Occupant::Shell, Naming::OwnTitle), NamedBy::Title), Err(Refusal::BareShell));
+            assert_eq!(person_verdict(&occupied(o.clone(), Occupant::Other, Naming::OwnTitle), NamedBy::Title), Err(Refusal::NotTheAgent));
+        }
+    }
+
+    #[test]
+    fn a_person_rule_outranks_the_occupant_rule() {
+        // A scripted switch on a bare shell is logged as the script, the first
+        // thing wrong with it.
+        let o = occupied(with_switch(departure(), |_, f, _, _| *f = Front::No), Occupant::Shell, Naming::OwnTitle);
+        assert_eq!(person_verdict(&o, NamedBy::Title), Err(Refusal::NotInFront));
+    }
+
+    #[test]
+    fn each_terminals_typical_facts_reach_the_expected_verdict() {
+        // A switch any terminal's poll finds by comparing two samples is refused
+        // whatever the terminal: who made it, at an unknown instant, cannot be
+        // asked. Without a watch, no terminal's departures are credited.
+        let poll_departure = Observation { kind: ObservationKind::Departed(Switch::Unplaced), ..departure() };
+        assert_eq!(person_verdict(&poll_departure, NamedBy::Title), Err(Refusal::SwitchUnplaced), "any poll");
+        // Windows Terminal: the watch knows the foreground and the input clock at
+        // the event, and nothing about the pane, and the tab's name was read off
+        // the pane's own console title.
+        assert_eq!(person_verdict(&departure(), NamedBy::Title), Ok(()), "Windows Terminal watch");
+        assert_eq!(person_verdict(&input(), NamedBy::Title), Ok(()), "Windows Terminal input");
+        assert_eq!(person_verdict(&occupied(departure(), Occupant::Unknown("not_reported"), Naming::DisplayedName), NamedBy::Title), Err(Refusal::OccupantUnknown("not_reported")), "Windows Terminal tab whose name is not its pane's title");
+        // agwinterm: the focused pane's program title, which for the agent is
+        // the console title this dashboard wrote, forwarded through WSL and tmux.
+        let agw = occupied(departure(), Occupant::Agent, Naming::OwnTitle);
+        assert_eq!(person_verdict(&agw, NamedBy::Title), Ok(()), "agwinterm departure from the agent");
+        assert_eq!(person_verdict(&occupied(agw.clone(), Occupant::Unknown("unrecognized_root"), Naming::OwnTitle), NamedBy::Title), Ok(()), "agwinterm WSL session, named by the agent's own title");
+        assert_eq!(person_verdict(&occupied(agw, Occupant::Shell, Naming::OwnTitle), NamedBy::Title), Err(Refusal::BareShell), "agwinterm session whose agent exited, its title left behind");
+        // agterm: its own title and a cwd beside it, with the agent in front.
+        let agterm = occupied(input(), Occupant::Agent, Naming::OwnTitle);
+        assert_eq!(person_verdict(&agterm, NamedBy::Title), Ok(()), "agterm input named by its title");
+        assert_eq!(person_verdict(&agterm, NamedBy::Directory), Ok(()), "agterm input named by the directory, the agent in front");
+        assert_eq!(person_verdict(&occupied(agterm.clone(), Occupant::Unknown("no_foreground"), Naming::OwnTitle), NamedBy::Directory), Err(Refusal::OccupantUnknown("no_foreground")), "agterm input named by the directory alone, nothing in front reported");
+        assert_eq!(person_verdict(&occupied(agterm, Occupant::Shell, Naming::OwnTitle), NamedBy::Title), Err(Refusal::BareShell), "agterm tab whose agent exited, its title left behind");
+    }
+
+    #[test]
+    fn every_refusal_has_its_own_slug() {
+        let all = [
+            Refusal::SwitchUnplaced,
+            Refusal::NotInFront,
+            Refusal::FrontUnknown("x"),
+            Refusal::ForegroundUnrecorded,
+            Refusal::ActivatedBySwitch,
+            Refusal::InputUnknown,
+            Refusal::NoRecentInput,
+            Refusal::InputBeforeFront,
+            Refusal::ForegroundInput,
+            Refusal::SelectionLagging,
+            Refusal::SelectionUnknown("x"),
+            Refusal::SelectionUnplaced,
+            Refusal::SwitchInput,
+            Refusal::Covered,
+            Refusal::CoverUnknown,
+            Refusal::BareShell,
+            Refusal::NotTheAgent,
+            Refusal::OccupantUnknown("x"),
+        ];
+        let mut slugs: Vec<&str> = all.iter().map(Refusal::slug).collect();
+        slugs.sort_unstable();
+        slugs.dedup();
+        assert_eq!(slugs.len(), all.len());
+        assert_eq!(Refusal::OccupantUnknown("unrecognized_root").detail(), Some("unrecognized_root"));
+        assert_eq!(Refusal::NotInFront.detail(), None);
+    }
+
+    #[test]
+    fn a_selection_keeps_its_start_until_another_selection_replaces_it() {
+        let mut clock = SelectionClock::default();
+        let eq = |a: &str, b: &str| a == b;
+        assert_eq!(clock.note(1, "S1", eq, 1_000), 1_000, "a first reading starts the selection");
+        assert_eq!(clock.note(1, "S1", eq, 5_000), 1_000, "a later reading of the same one keeps its start");
+        assert_eq!(clock.note(1, "S1", eq, 500), 1_000, "a slower source reporting it earlier does not move the start back");
+        assert_eq!(clock.note(1, "S2", eq, 6_000), 6_000, "another selection starts afresh");
+        assert_eq!(clock.note(2, "S2", eq, 7_000), 7_000, "surfaces are separate");
+        clock.retain(|k| *k == 2);
+        assert_eq!(clock.note(1, "S2", eq, 8_000), 8_000, "a forgotten surface starts from nothing");
+    }
+}
+
 /// The adapter for this platform, or `None` where no terminal is wired up.
 ///
 /// `app` is taken because an adapter may need state this process already holds:
@@ -557,9 +1376,14 @@ pub fn for_platform(app: &tauri::AppHandle) -> Option<Box<dyn TerminalAdapter>> 
         let _ = app;
         Some(Box::new(agterm::AgtermAdapter::default()))
     }
+    // A composite, because two terminals can host a session here and each knows
+    // only its own: Windows Terminal answers restore and the stale check,
+    // agwinterm answers labelling, and both answer attention. The composite keeps
+    // Windows Terminal's slug, so the lines every existing consumer logs keep
+    // theirs; an observation carries the slug of the terminal that made it.
     #[cfg(target_os = "windows")]
     {
-        Some(Box::new(windows::WindowsAdapter::new(app.clone())))
+        Some(Box::new(composite::Composite::new(windows::NAME, vec![Box::new(windows::WindowsAdapter::new(app.clone())), Box::new(agwinterm::AgwintermAdapter::new())])))
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
