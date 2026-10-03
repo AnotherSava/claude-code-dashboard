@@ -266,6 +266,15 @@ fn title_status(chat_id: &str, tabs: &[TerminalSession], derive: &dyn Fn(&str) -
             continue;
         }
         let Some(reading) = tab.title.as_deref().and_then(crate::terminal_title::parse_title) else { continue };
+        // A tab wearing `terminal_title::REMOTE_BADGE` renders a session on
+        // another machine, so the status it shows is that machine's and the row
+        // behind it is a synced one, which arrives over sync rather than being
+        // restored here. Restoring from it would mint a *local* row for an agent
+        // this machine never ran — and with the same project checked out on both,
+        // under an id a live local session may already hold.
+        if reading.remote {
+            continue;
+        }
         let seen = (reading.status, reading.read);
         match found {
             Some(prev) if prev != seen => return None,
@@ -581,6 +590,22 @@ mod tests {
         // disagreement is refused exactly as a status disagreement is.
         let split = |a, b| planned(&[live("dash", Activity::Idle, Some(10), 1)], &[tab("/p/dash", Some(a)), tab("/p/dash", Some(b))], &[]);
         assert!(split("🟢 dash", "⚪ dash").is_empty());
+    }
+
+    #[test]
+    fn a_tab_rendering_another_machines_session_restores_nothing() {
+        // A tab wearing the remote badge is an SSH or tmux attach: the status on
+        // it is the far machine's, and the row behind it arrives over sync.
+        // Restoring from it would mint a *local* row for an agent this machine
+        // never ran — under an id a live local session may already hold, since
+        // the same project is routinely checked out on both.
+        let badged = format!("{} 🟢 dash", crate::terminal_title::REMOTE_BADGE);
+        assert!(planned(&[live("dash", Activity::Idle, Some(10), 1)], &[tab("/p/dash", Some(&badged))], &[]).is_empty());
+        // And it cannot be rescued by a sibling tab that *is* ours: the badged
+        // reading is dropped, so the local tab answers alone.
+        let out = planned(&[live("dash", Activity::Idle, Some(10), 1)], &[tab("/p/dash", Some(&badged)), tab("/p/dash", Some("⚪ dash"))], &[]);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].read, "the local tab is the only reading, and it stands");
     }
 
     #[test]

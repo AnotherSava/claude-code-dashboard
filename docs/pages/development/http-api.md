@@ -114,7 +114,7 @@ Read-only: it mutates nothing, emits no event, writes no `decision` line, and ta
 - `device` / `local` — which machine the session runs on, and the authoritative local test. Kept separate because `device` can be `null` for an unnamed local box.
 - `display_name` — omitted rather than `null` when unset, so a caller falls back to `id` exactly as the app does.
 - `status` — `idle` / `working` / `waiting` / `blocked` / `error` / `done`, the same values [Classification](classification) assigns. Two of them carry more than their names suggest. **`done`** means a turn ended here and is also where every absence of evidence lands, which makes it the ordinary resting state of a session that has finished something. **`idle`** means *clean*: a confirmed claim that there is nothing left in the session to come back to, written only on positive evidence — a `/clear`, a fresh start, or a resumed conversation that had ended at one.
-- **The roster never says whether a human has read a row.** That verdict comes from watching this machine's own keyboard and terminal, and it stays here: a peer asking what an agent is doing is not told whether somebody is sitting in front of it. So a finished session reads `done` on the wire whether or not its user has looked at the answer.
+- **The roster never says whether a human has read a row.** That verdict comes from watching a machine's own keyboard and terminal, and this route does not carry it: a caller asking what an agent is *doing* is not told whether somebody is sitting in front of it. So a finished session reads `done` here whether or not its user has looked at the answer. The one place the verdict does travel is the sync push, between the dashboards the user configured as peers, so the same session reads the same on each of their screens — and even there it crosses as a yes-or-no about the row, never as a time anybody was at a keyboard.
 - `label` — the "what is it doing" line the dashboard row itself shows, `AgentSession::primary_text`: the question or error for a `blocked` or `error` row, the task for every other status. A row another agent's message started reads as the task that agent was given, never as the message's envelope. Empty where the row has no current text, which the widget fills with the row's most recent past task, drawn muted.
 - `status_age_ms` — time in the current status. All three arrays are always present and never `null`.
 
@@ -349,20 +349,30 @@ When `sync.listen` is on (and `sync.token` set), a second listener serves `sync.
 
 ### `POST /api/sync`
 
-A peer pushes its local sessions. The body is a full snapshot of the sender's session *metadata* (a session absent from the snapshot is removed on the receiver), with each session's dialog reduced to a `dialog_tip` and the account-wide 5h/7d usage timeline to a `usage_tip`. Content is fetched by the receiver afterwards, so a push stays small no matter how far behind a peer is:
+A peer pushes its local sessions. The body is a full snapshot of the sender's session *metadata* (a session absent from the snapshot is removed on the receiver), with each session's dialog reduced to a `dialog_tip`, the account-wide 5h/7d usage timeline to a `usage_tip` and the work-done records to a `token_tip`. Content is fetched by the receiver afterwards, so a push stays small no matter how far behind a peer is:
 
 ```json
 {
   "device_name": "my-laptop",
   "listen_port": 9078,
   "sessions": [
-    { "session": { ...AgentSession, "dialog": [] }, "dialog_tip": 1780789975389 }
+    { "session": { ...AgentSession, "dialog": [] }, "dialog_tip": 1780789975389, "attended": false, "origin_label": "bga-assistant" }
   ],
-  "usage_tip": 1780789975389
+  "usage_tip": 1780789975389,
+  "token_tip": 8412,
+  "registry_sessions": [
+    { "chat_id": "transcripts", "name": null, "activity": "idle", "activity_age_ms": 41000, "sessions": 1 }
+  ]
 }
 ```
 
-The push carries **no dialog or usage content** — only a full metadata snapshot plus, per session, the `dialog_tip` (the sender's newest dialog timestamp) and a device-wide `usage_tip`. The receiver compares each tip against what it already holds and fetches the difference itself from the `GET` endpoints below. This keeps the sender stateless: the same body goes to every peer on every cycle, so nothing has to be remembered about a peer's progress and a failed push costs only a retry.
+The push carries **no dialog, usage or token content** — only a full metadata snapshot plus, per session, the `dialog_tip` (the sender's newest dialog timestamp), and device-wide a `usage_tip` and a `token_tip` (the sender's newest token-record `seq`). The receiver compares each tip against what it already holds and fetches the difference itself from the `GET` endpoints below. This keeps the sender stateless: the same body goes to every peer on every cycle, so nothing has to be remembered about a peer's progress and a failed push costs only a retry.
+
+`registry_sessions` is the sender's copy of Claude Code's own list of live local sessions, which is what lets the [agent roster](#agent-roster) answer `registry_only` for a peer rather than only for this machine. It is `serde(default)`, so a peer on a build that predates it simply sends nothing and lands in `registry_unreadable` instead.
+
+`attended` is the one judgment that rides the push outright rather than as a tip: whether the sender's own user has read that finished row, which the receiver stamps onto the row's `read` flag so a session reads the same on both dashboards. A tip would hand the *verdict* to the receiver, and the only thing it could derive one from is the dialog this push deliberately strips — so it would answer from a lagging copy and call work read that the origin still calls unread. The sender is authoritative for its own sessions, so it decides this too, from its own full dialog and its own `attention_tracking`. The receiver stores it verbatim and keeps no bookkeeping of its own: a withdrawn verdict simply arrives as `false` on the next cycle, and whether this dashboard draws it is its own `attention_tracking`'s business, applied where it renders. The timestamp behind it is never sent, and nothing in this API reports when a human last sat at a machine.
+
+`origin_label` is the name the sender's own terminal tab carries for that session, present only where the sender renamed it. It is not a name to display — the receiver's own rename still wins there — but a tab on the receiver that reaches the sender's agent over SSH or tmux carries *that* string, so without it the receiver could not join such a tab to the row it names. `null` where the sender has not renamed the row, whose tab then shows an id the receiver already derives.
 
 Returns `204` on ingest, `400` when `device_name` is empty or equals the receiver's own, `401` without a valid bearer token, `403` from a source outside `sync.bind_scope`. The receiver namespaces ids to `{device_name}/{id}`, stamps `origin`, and carries over the dialog it has already accumulated (persisted per device, re-seeded after a restart). `listen_port` plus the connection's source IP becomes the address it pulls from. A device unheard from for 90 s is dropped.
 
@@ -374,10 +384,13 @@ Returns the *local* session's dialog entries with `timestamp > since` (the full 
 
 Returns the *local* usage-limit samples with `ts > since` (all of them when `since` is omitted or `0`). The usage counterpart of the dialog pull, requested when a push advertises a `usage_tip` newer than what the receiver holds for that device. Gives `remote_usage/` a repair path of its own: a peer that lost its copy asks again, rather than waiting for the origin to restart.
 
+### `GET /api/sync/tokens?since=<seq>`
+
+Returns the *local* token records above the append `seq` the caller already holds, in append order and capped at 5000 per response, so a large backlog drains over several push cycles instead of one multi-megabyte body. These are the per-API-response token counts the [Work intensity](../features#work-intensity) chart plots, and the counterpart of the `token_tip` a push advertises. The watermark is a `seq` rather than a timestamp deliberately: token records do not arrive in timestamp order — concurrent session tails append in scan order, a revision re-appends an older stamp, and a historical import writes weeks below the current maximum — so a `ts` gate would drop each of those silently.
 
 ### `POST /api/sync/message`
 
-The far half of [cross-machine messaging](#cross-machine-messaging), and the only sync route that writes outside the remote array. A peer relays one message; this dashboard resolves the target in **its own** session registry, reads that session's messaging key as the user who owns it, and writes one frame into its inbox.
+The far half of [cross-machine messaging](#cross-machine-messaging), and the first sync route that writes outside the remote array. A peer relays one message; this dashboard resolves the target in **its own** session registry, reads that session's messaging key as the user who owns it, and writes one frame into its inbox.
 
 ```json
 {
@@ -400,6 +413,20 @@ Returns `200` and a receipt for anything it observed about the socket (`written`
 **No credential crosses the wire.** The alternative shape — reaching into the other machine to read a session's key file and injecting it into that machine's IPC channel — is indistinguishable from exfiltration whatever the intent, and was refused when tried. This design exists so the only process that ever reads a messaging key is the dashboard already running as that user on that machine.
 
 **Windows is verified in one direction.** A Mac → Windows relay on 2026-08-30 closed all three questions that had been open: the Windows build does write the session registry, it does publish `messagingSocketPath`, and its named pipe accepts the same auth-line-first, `\n`-terminated frame — the receiving agent surfaced the message, and the receiving dashboard recorded the write as authenticated. Windows → Mac was exercised on 2026-08-31, a reply from that session arriving correlated on `in_reply_to`, so both directions have now been observed. What did not change is the silent close: a connection whose first line is not valid auth is dropped without a word, indistinguishable from a dead session. That is a property of the inbox rather than of Windows, so `written` means the bytes left us and nothing more on *either* platform, and one observed end-to-end delivery does not turn it into a delivery receipt. The socket path is always taken verbatim from the session's own record rather than composed from a pattern, which is what lets the Windows leg follow a path Claude Code chose for itself.
+
+### `POST /api/sync/attention`
+
+The counter-direction of `attended` above, and the only sync route that writes a **local** row. A peer reports that a human there read one of *our* sessions — it had a tab rendering this agent over SSH or tmux, and saw them leave it.
+
+```json
+{ "origin_device": "air", "chat_id": "transcripts", "attended_at": 1780789975389 }
+```
+
+Both machines can observe a read and neither can observe the other's: the origin watches its own terminal, while a tab on the peer's desk can render the same session. So each reports what it saw and the row is read if either did.
+
+`attended_at` is **our own content watermark echoed back** — the newest thing the reporter had of this row, which is a number this machine minted. It needs no clock agreement, and it cannot be read as a time anybody was at a keyboard. It is clamped on arrival to the row's current watermark, because the stamp only ever moves forward: unclamped, a value from the far future would mark the row read for every turn it ever has. A value *below* ours is kept as sent — the reporter's dialog copy lags while a pull is outstanding, and the row then stays unread here, which leaves the work showing.
+
+Answers `{"recorded": true}`, with `reason: "no_change"` when the row was already read or this machine has `attention_tracking` off; `400` without a `chat_id`, `404` when no local row derives it. The sender does not retry: a lost report leaves that row showing on the machine that owns it, and a retry would need a per-row record of what the far side had taken — the kind of guess about another device's contents this protocol removed everywhere else.
 
 ### `POST /api/sync/grant`
 

@@ -1146,6 +1146,8 @@ mod tests {
             instruction_drift: false,
             canary: crate::state::Canary::Off,
             attended_at: None,
+            content_seen_at: None,
+            origin_label: None,
             turn_from_relay: false,
             delegated_task: None,
             message_line: None,

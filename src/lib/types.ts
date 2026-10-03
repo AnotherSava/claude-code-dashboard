@@ -54,9 +54,10 @@ export interface AgentSession {
   terminal_stale_at?: number | null
   // Whether this finished row has already been looked at. DONE covers both
   // halves now, so the pill reads the same either way and only its shade
-  // differs. Stamped by the Rust display path and by nothing else: it never
-  // crosses the sync wire or `/api/agents`, because whether a human at this
-  // keyboard has looked at a screen is not a peer's business.
+  // differs. Decided entirely in Rust, by whichever machine ran the session: a
+  // local row is stamped on the display path, a synced one carries the verdict
+  // its own device reached, so one row reads the same on both dashboards. The
+  // observation behind it never travels, and `/api/agents` carries neither.
   read?: boolean
   // The text of the row's task line, decided by `AgentSession::row_line` in Rust
   // so the row and a terminal's headline cannot disagree: 'current' is what the

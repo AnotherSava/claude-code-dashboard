@@ -422,7 +422,12 @@ pub fn plan(rows: &[DesiredLabel], targets: &[LabelTarget], written: &HashMap<St
     let mut out = Plan::default();
     let mut claims: Vec<Claim> = Vec::with_capacity(targets.len());
     for t in targets {
-        let named = t.title.as_deref().and_then(|title| title_names(title, rows.iter().map(|r| (r, r.label.as_str()))));
+        // Local rows only: a context line is written *into* a session, so it is
+        // only ever about one this dashboard owns. A tab rendering another
+        // machine's session reads as foreign here and is left alone, which is
+        // also the only safe answer — the far machine owns that session's
+        // context line as surely as it owns its title.
+        let named = t.title.as_deref().and_then(|title| title_names(title, false, rows.iter().map(|r| (r, r.label.as_str()))));
         claims.push(match named {
             None => Claim::Foreign,
             Some(Named::One(r)) => Claim::Row(r),

@@ -146,8 +146,20 @@ pub(crate) fn display_snapshot(app: &AppHandle) -> Vec<AgentSession> {
 /// [`display_snapshot`] carrying the [`resolved_snapshot_versioned`] ticket.
 fn display_snapshot_versioned(app: &AppHandle) -> (u64, Vec<AgentSession>) {
     let (seq, mut sessions) = resolved_snapshot_versioned(app);
+    // `attention_tracking` is a *display* preference — "show me which finished
+    // rows I have been through" — so both arms of it are decided here, which is
+    // the only place that sees every row whatever machine ran it. A local row
+    // arrives unstamped and the first arm supplies its verdict; a synced row
+    // arrives carrying its origin's, and the second arm is what lets this
+    // dashboard decline to draw it. Deciding the second arm at the door instead
+    // (in `sync::ingest`) was tried and dropped: a push in flight carries a
+    // config snapshot read before the switch moved, so it re-added a verdict
+    // the teardown had just cleared and nothing corrected it until the next
+    // heartbeat. Level-triggered here, there is no window at all.
     if app.try_state::<ConfigState>().is_some_and(|c| c.config.lock().unwrap().attention_tracking) {
         stamp_read(&mut sessions);
+    } else {
+        forget_read(&mut sessions);
     }
     for s in sessions.iter_mut() {
         s.row_line = s.row_line();
@@ -164,21 +176,61 @@ fn display_snapshot_versioned(app: &AppHandle) -> (u64, Vec<AgentSession>) {
 /// it here would say a row was wrapped up because somebody glanced at it.
 ///
 /// Stamped at display time rather than stored in `AppState`, which buys three
-/// things. A machine reading `/api/agents` or a sync push still learns what the
-/// *agent* did, never whether a human at this keyboard has looked at their
-/// screen. `state_entered_at` is untouched, so the row keeps counting from when
+/// things. A machine reading `/api/agents` learns what the *agent* did and
+/// nothing about whether a human at this keyboard has looked at their screen —
+/// the sync push does carry the verdict, deliberately and to this user's own
+/// peers alone, but it reads `attention()` for itself rather than this flag, and
+/// the observation behind it travels nowhere.
+/// `state_entered_at` is untouched, so the row keeps counting from when
 /// the agent finished instead of restarting from when it was read. And the
 /// late-flush case needs no machinery: `Stop` settles a row `Done` before Claude
 /// Code writes the final reply, so a read landing in that gap is undone for free
 /// the moment the text arrives and moves `content_at` past the stamp.
 ///
-/// Remote rows are skipped rather than answered `false`, which is the same
-/// thing here and means something different: this device does not observe
-/// attention for another machine's sessions, so it has nothing to say either
-/// way.
+/// **Remote rows are skipped, and that is what makes them work.** They arrive
+/// with `read` already set — `sync::ingest` writes the origin's own verdict from
+/// `SessionSync::attended` — so a row reads the same on both dashboards
+/// whichever machine was in front of it. Judging one here instead would mean
+/// re-deriving `attention()` against a `content_at` whose dialog term is this
+/// device's lagging copy, which answers `Seen` for an answer the origin still
+/// calls unread: hiding unread work, the one direction this feature refuses.
+/// Overwriting the pushed value with a `false` would be the same mistake with a
+/// simpler shape.
 pub(crate) fn stamp_read(sessions: &mut [AgentSession]) {
-    for s in sessions.iter_mut().filter(|s| s.origin.is_none()) {
-        s.read = s.attention() == Attention::Seen;
+    for s in sessions.iter_mut() {
+        match s.origin {
+            // A local row's verdict is decided here and nowhere else.
+            None => s.read = s.attention() == Attention::Seen,
+            // A synced row arrives carrying its origin's verdict, and this
+            // machine may additionally have observed a read of its own — an SSH
+            // or tmux tab here rendering that agent. Either is enough, so the
+            // two are OR-ed rather than one overwriting the other: the origin
+            // cannot see a tab on this machine, and this machine cannot see the
+            // keyboard over there.
+            //
+            // Not symmetric with the arm above, and deliberately: the pushed
+            // half is never recomputed here, because re-deriving it would compare
+            // the origin's stamp against a `content_at` built from this device's
+            // lagging dialog copy and could call unread work read. The local half
+            // is derived, because the observation behind it was made here.
+            Some(_) => s.read = s.read || s.attention() == Attention::Seen,
+        }
+    }
+}
+
+/// Draw every finished row the same way — the other arm of
+/// `config.attention_tracking`, for a dashboard whose user turned the feature
+/// off.
+///
+/// It exists because the two kinds of row arrive differently. A local row is
+/// `false` in `AppState` and simply never gets stamped, so leaving it alone
+/// would do; a synced row arrives carrying its origin's verdict, and that
+/// machine's switch is not this one's to inherit. Both are swept rather than
+/// just the remote ones, so "off" means one unconditional statement about the
+/// whole snapshot instead of a claim about which half could have held a value.
+fn forget_read(sessions: &mut [AgentSession]) {
+    for s in sessions.iter_mut() {
+        s.read = false;
     }
 }
 
@@ -1498,23 +1550,82 @@ mod tests {
     }
 
     #[test]
-    fn only_finished_local_rows_are_stamped_read() {
-        // A remote row's attention is not this device's to judge, and no other
-        // status means "finished" — stamping one would be inventing a verdict.
-        let mut remote = row("a", Status::Done, 1_000, Some(2_000));
-        remote.origin = Some("chrome".into());
-        let mut rows = vec![remote, row("b", Status::Blocked, 1_000, Some(2_000)), row("c", Status::Working, 1_000, Some(2_000))];
+    fn no_status_but_finished_is_stamped_read() {
+        // "Looked at" carries no meaning for a row that isn't asking, so
+        // stamping one would be inventing a verdict.
+        let mut rows = vec![row("b", Status::Blocked, 1_000, Some(2_000)), row("c", Status::Working, 1_000, Some(2_000))];
         stamp_read(&mut rows);
-        assert!(!rows[0].read, "remote");
+        assert!(!rows[0].read);
         assert!(!rows[1].read);
-        assert!(!rows[2].read);
+    }
+
+    #[test]
+    fn a_synced_rows_verdict_is_either_machines_observation() {
+        // Neither machine can see the other's keyboard: the origin watches its
+        // own terminal, while a tab *here* can render that same agent over SSH
+        // or tmux. So the two are OR-ed, and the fixture pins all four corners —
+        // including the one that would pass if the OR were dropped either way.
+        let synced = |id: &str, pushed: bool, observed_here: Option<i64>| {
+            let mut s = row(id, Status::Done, 1_000, observed_here);
+            s.origin = Some("chrome".into());
+            s.read = pushed;
+            s
+        };
+        let mut rows = vec![
+            synced("neither", false, None),
+            synced("there", true, None),
+            synced("here", false, Some(2_000)),
+            synced("both", true, Some(2_000)),
+        ];
+        stamp_read(&mut rows);
+        assert!(!rows[0].read, "nobody has looked at it");
+        assert!(rows[1].read, "read on the machine that runs it, with no local observation at all");
+        assert!(rows[2].read, "read here, through a tab rendering it, with the origin still saying no");
+        assert!(rows[3].read);
+    }
+
+    #[test]
+    fn a_synced_rows_pushed_verdict_is_never_recomputed_here() {
+        // The asymmetry in `stamp_read`'s two arms. Re-deriving the origin's
+        // half would compare its stamp against a `content_at` built from this
+        // device's lagging dialog copy, which can call unread work read. So a
+        // pushed `true` stands even where this machine's own `content_at` has
+        // moved past everything it knows about.
+        let mut s = row("a", Status::Done, 1_000, None);
+        s.origin = Some("chrome".into());
+        s.read = true;
+        s.dialog.push(DialogEntry { role: DialogRole::Assistant, text: "a reply we have pulled".into(), timestamp: 9_000, status: Status::Done, task_start: false, boundary: None });
+        let mut rows = vec![s];
+        stamp_read(&mut rows);
+        assert!(rows[0].read, "the origin decided this, and it saw its own full dialog");
+    }
+
+    #[test]
+    fn the_feature_switch_governs_a_synced_verdict_too() {
+        // The arm that only a remote row needs. A local row is `false` in
+        // `AppState` and would read unread by simply not being stamped, so a
+        // fixture of local rows alone would pass with `forget_read` deleted.
+        let mut remote = row("a", Status::Done, 1_000, None);
+        remote.origin = Some("chrome".into());
+        remote.read = true;
+        let local = row("b", Status::Done, 1_000, Some(2_000));
+
+        let mut on = vec![remote.clone(), local.clone()];
+        stamp_read(&mut on);
+        assert_eq!((on[0].read, on[1].read), (true, true), "with the feature on, both halves read");
+
+        let mut off = vec![remote, local];
+        forget_read(&mut off);
+        assert_eq!((off[0].read, off[1].read), (false, false), "with it off, every finished row looks the same");
     }
 
     #[test]
     fn the_read_flag_never_reaches_the_roster() {
-        // `resolved_snapshot` is what `/api/agents` serves and what the sync
-        // pusher mirrors. Whether a human here looked at a screen is this
-        // machine's business, so only the display path may stamp it.
+        // `resolved_snapshot` is what `/api/agents` serves, and it carries no
+        // verdict: only the display path stamps a local row. The sync push does
+        // carry one, but it reads `attention()` for itself rather than this flag
+        // (`sync`'s `the_senders_own_verdict_rides_the_push_and_the_raw_row_does_not`),
+        // so a raw row still leaves here saying nothing about this keyboard.
         let mut rows = vec![row("a", Status::Done, 1_000, Some(2_000))];
         assert!(!rows[0].read, "raw AppState carries no verdict");
         stamp_read(&mut rows);

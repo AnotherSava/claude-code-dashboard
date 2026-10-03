@@ -602,6 +602,27 @@ fn status_glyph(status: Status, read: bool) -> &'static str {
     }
 }
 
+/// The marker another machine's attach puts in front of a title this dashboard
+/// wrote, declaring that the tab carrying it renders a session running
+/// **elsewhere**.
+///
+/// This dashboard never writes it — [`build_title`] has no arm for it, and the
+/// round-trip test pins that. It is read only. On this user's machines it comes
+/// from the `remote-session` attach, which titles a tmux client `⇄ <the title
+/// the far machine's dashboard wrote>`, and its stated purpose there is to keep
+/// the near machine's dashboard from taking that tab for one of its own
+/// sessions — two machines routinely have a row of the same name, so an
+/// unmarked match would mark the wrong one read.
+///
+/// That purpose is why the badge is worth parsing rather than merely refusing.
+/// It says *which* half of the rows the tab belongs to, which is the one fact a
+/// bare name cannot carry: `⇄ 🟢 claude` is the far machine's `claude`, and
+/// `🟢 claude` is this one's. Reading it is what lets `attention::resolve_row`
+/// credit a departure from such a tab to the synced row it actually names,
+/// instead of discarding the observation or — worse — spending it on the local
+/// row of the same name.
+pub const REMOTE_BADGE: &str = "⇄";
+
 /// One reading of a tab title *this* dashboard wrote.
 pub struct TitleReading<'a> {
     /// The status its glyph names.
@@ -610,6 +631,19 @@ pub struct TitleReading<'a> {
     /// [`Status::Done`]; `false` for every other status, which have one glyph
     /// each and say nothing about attention.
     pub read: bool,
+    /// Whether the title arrived behind [`REMOTE_BADGE`] — the tab renders a
+    /// session on another machine, and the status it shows was written by that
+    /// machine's dashboard rather than by this one.
+    ///
+    /// Every reader has to decide about it rather than inherit a default, which
+    /// is why it is a field here instead of a second parser. The three that
+    /// exist today all refuse it, each for its own reason: `session_restore`
+    /// because a tab belonging to another machine's session is not a local row
+    /// to bring back, [`shared_label`] because the stale-tab check compares a
+    /// caption against what *this* dashboard wrote onto a local console, and
+    /// `terminals::labels` because a context line is written into a session this
+    /// dashboard owns. Only `attention::resolve_row` acts on it.
+    pub remote: bool,
     /// Everything after the glyph, suffixes included — deliberately not the bare
     /// name. `build_title` appends " [N%]" and " ⚠" today and will grow more, so
     /// a parser that stripped them would have to learn each one; [`names`] does
@@ -667,8 +701,16 @@ pub fn same_row(a: &str, b: &str) -> bool {
 /// candidates sharing one `a` the results are prefixes of the same string and
 /// totally ordered by length — which is what makes "longest wins, refuse only an
 /// exact draw" well-defined, the same argument `attention::resolve_row` rests on.
+///
+/// A title carrying [`REMOTE_BADGE`] names no row here whichever side it is on:
+/// the rows this compares are local ones, since the only `b` any caller passes
+/// is a title this process wrote onto a local console, and a badged `a` is a tab
+/// rendering another machine's session that happens to share a name.
 pub fn shared_label<'a>(a: &'a str, b: &str) -> Option<&'a str> {
     let (Some(a), Some(b)) = (parse_title(a), parse_title(b)) else { return None };
+    if a.remote || b.remote {
+        return None;
+    }
     // Every token-boundary prefix of one title's rest, longest first, asked of
     // the other. `a.names(label)` holds by construction for each candidate, so
     // the test that matters is `b`'s.
@@ -729,8 +771,16 @@ pub fn unique_best<T, K: Ord>(ranked: impl IntoIterator<Item = (T, K)>) -> Named
 /// the longest wins, and only rows carrying literally the same label draw. The
 /// one rule `attention::resolve_row` and `terminals::labels` both join a session
 /// to a row by.
-pub fn title_names<'r, T>(title: &str, rows: impl IntoIterator<Item = (T, &'r str)>) -> Option<Named<T>> {
-    let reading = parse_title(title)?;
+/// `remote` is the scope the caller is asking about, and it is a parameter
+/// rather than a default so each call site states which half of the rows it
+/// means. A title names rows on one machine or the other, never both:
+/// `terminals::labels` writes into sessions this dashboard owns and so asks for
+/// local rows, while `attention::resolve_row` asks twice, once per scope. A
+/// title whose badge disagrees with the scope answers `None` — not one of ours
+/// *for this question* — which is the same answer an unrecognized title gives
+/// and wants the same handling.
+pub fn title_names<'r, T>(title: &str, remote: bool, rows: impl IntoIterator<Item = (T, &'r str)>) -> Option<Named<T>> {
+    let reading = parse_title(title).filter(|r| r.remote == remote)?;
     Some(unique_best(rows.into_iter().filter(|(_, label)| reading.names(label)).map(|(row, label)| (row, label.len()))))
 }
 
@@ -747,10 +797,22 @@ pub fn title_names<'r, T>(title: &str, rows: impl IntoIterator<Item = (T, &'r st
 /// An unrecognized leading token yields `None` rather than a guess: a title we
 /// did not write says nothing about a row, and inventing a status from one would
 /// be the single worst thing this parser could do.
+///
+/// A leading [`REMOTE_BADGE`] is stepped over and reported as
+/// [`TitleReading::remote`] rather than refused. What follows it is a title this
+/// dashboard wrote on *another* machine and tmux forwarded here verbatim, so it
+/// parses by the same map; what the badge changes is which rows it can name, not
+/// how it reads. Only one badge is stepped over, so a title that stacks them is
+/// not one of ours.
 pub fn parse_title(title: &str) -> Option<TitleReading<'_>> {
-    let (head, rest) = title.trim().split_once(' ')?;
+    let trimmed = title.trim();
+    let (remote, body) = match trimmed.strip_prefix(REMOTE_BADGE) {
+        Some(rest) => (true, rest.trim_start()),
+        None => (false, trimmed),
+    };
+    let (head, rest) = body.split_once(' ')?;
     let (status, read) = status_from_glyph(head)?;
-    Some(TitleReading { status, read, rest: rest.trim() })
+    Some(TitleReading { status, read, remote, rest: rest.trim() })
 }
 
 /// The inverse of [`status_glyph`]. Total over the glyphs that function emits
@@ -1199,6 +1261,75 @@ mod tests {
         assert_ne!(status_glyph(Status::Idle, false), status_glyph(Status::Done, true));
     }
 
+    #[test]
+    fn a_draw_can_only_be_byte_identical_labels() {
+        // The invariant `attention::resolve_row` rests on: a draw means two
+        // *rows* answer equally well, never one row answering under two of its
+        // own names. It holds because `names` is a token-boundary prefix match
+        // and the rank is `label.len()`, so two labels that tie are the same
+        // bytes — both halves are this module's rules, which is why it is pinned
+        // here rather than beside the caller that relies on it.
+        let title = "🟢 bga assistant [12%]";
+        for labels in [vec!["bga assistant", "bga"], vec!["bga", "bga assistant"], vec!["bga assistant", "nope"]] {
+            let named = title_names(title, false, labels.iter().map(|l| (*l, *l))).expect("parses");
+            assert!(matches!(named, Named::One("bga assistant")), "{labels:?}");
+        }
+        // The only shape that draws, and it is two distinct rows.
+        let drawn = title_names(title, false, [("row-a", "bga assistant"), ("row-b", "bga assistant")]).expect("parses");
+        assert!(matches!(drawn, Named::Drawn(ref v) if v.len() == 2), "identical labels are the one draw");
+    }
+
+    #[test]
+    fn the_remote_badge_is_read_and_never_written() {
+        // `build_title` has no arm for it. The badge comes from another
+        // machine's attach, so a title this dashboard emits that happened to
+        // carry one would be this process claiming to be somewhere else.
+        for status in ALL_STATUSES {
+            let mut s = session("what-is-next", None, None);
+            s.status = status;
+            assert!(!build_title(&s, 0.0, &HashMap::new()).contains(REMOTE_BADGE), "{status:?}");
+        }
+    }
+
+    #[test]
+    fn a_badged_title_parses_as_the_same_reading_plus_the_badge() {
+        // What follows the badge is a title this dashboard wrote on the *other*
+        // machine and tmux forwarded verbatim, so it reads by the same map.
+        for (status, read) in ALL_READINGS {
+            let plain = format!("{} proj [12%]", status_glyph(status, read));
+            let badged = format!("{REMOTE_BADGE} {plain}");
+            let a = parse_title(&plain).expect("plain parses");
+            let b = parse_title(&badged).expect("badged parses");
+            assert_eq!((a.status, a.read, a.rest), (b.status, b.read, b.rest), "{plain:?}");
+            assert!(!a.remote);
+            assert!(b.remote);
+            assert!(b.names("proj"), "and it still names its row");
+        }
+    }
+
+    #[test]
+    fn only_one_badge_is_stepped_over() {
+        // A title that stacks them is not one of ours, and guessing past the
+        // second would be the parser inventing a status from a string nobody
+        // here wrote.
+        assert!(parse_title(&format!("{REMOTE_BADGE} {REMOTE_BADGE} 🟢 proj")).is_none());
+        // Nor is the badge alone a title.
+        assert!(parse_title(REMOTE_BADGE).is_none());
+        assert!(parse_title(&format!("{REMOTE_BADGE} proj")).is_none());
+    }
+
+    #[test]
+    fn a_badged_caption_shares_no_label_with_a_title_we_wrote() {
+        // The stale-tab check compares a caption against what this process wrote
+        // onto a *local* console. A tab rendering the other machine's session of
+        // the same name is not that tab, and reporting it would accuse a row
+        // whose terminal is on another computer.
+        let ours = "🟢 bga assistant";
+        assert_eq!(shared_label(ours, "🔵 bga assistant"), Some("bga assistant"));
+        assert_eq!(shared_label(&format!("{REMOTE_BADGE} {ours}"), "🔵 bga assistant"), None);
+        assert_eq!(shared_label(ours, &format!("{REMOTE_BADGE} 🔵 bga assistant")), None);
+    }
+
     /// `read` is meaningful for `Done` alone. Every other status has one glyph,
     /// which is what lets `status_from_glyph` answer `false` for them without
     /// losing information.
@@ -1489,6 +1620,8 @@ mod tests {
             instruction_drift: false,
             canary: crate::state::Canary::Off,
             attended_at: None,
+            content_seen_at: None,
+            origin_label: None,
             turn_from_relay: false,
             delegated_task: None,
             message_line: None,
@@ -1606,7 +1739,7 @@ mod tests {
     #[test]
     fn a_title_names_the_row_with_the_longest_label_and_refuses_a_draw() {
         let rows = [("bga", "bga"), ("bga/assistant", "bga assistant"), ("a", "dup"), ("b", "dup")];
-        let named = |title: &str| title_names(title, rows.iter().map(|(id, label)| (*id, *label)));
+        let named = |title: &str| title_names(title, false, rows.iter().map(|(id, label)| (*id, *label)));
         assert!(matches!(named("🟢 bga assistant [40%]"), Some(Named::One("bga/assistant"))));
         assert!(matches!(named("🟢 bga"), Some(Named::One("bga"))));
         assert!(matches!(named("🔵 dup ⚠"), Some(Named::Drawn(d)) if d == ["a", "b"]));

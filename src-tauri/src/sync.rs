@@ -13,6 +13,14 @@
 //! `GET /api/sync/{dialog,usage}`. Usage samples work the same way via
 //! `usage_tip`.
 //!
+//! One judgment rides the push outright rather than as a tip, and it is the
+//! exception that proves the rule: `SessionSync::attended`, whether the sender's
+//! own user has read that finished row. A tip would make the *receiver* re-derive
+//! the verdict, and the only input it could derive it from is the dialog the push
+//! deliberately strips — so it would answer from a lagging copy and call work
+//! read that the origin still calls unread. The sender is authoritative for its
+//! own sessions, so it decides this one too.
+//!
 //! The split is deliberate. Change events originate at the sender — only it
 //! knows *when* a session moved — so notification must be pushed or peers would
 //! have to poll several times a second to keep a live widget fresh. But dialogs
@@ -176,6 +184,55 @@ pub struct SessionSync {
     /// one that can check it.
     #[serde(default)]
     pub dialog_tip: i64,
+    /// Whether the sender's own user has already looked at this finished row —
+    /// the origin's [`crate::state::Attention::Seen`] verdict, which the
+    /// receiver stamps onto `AgentSession::read` so one row reads the same on
+    /// both dashboards whichever machine it was read on.
+    ///
+    /// **The verdict rather than the observation, and that is the whole
+    /// correctness argument.** `attended_at` stays `#[serde(skip)]`: a receiver
+    /// handed the raw stamp would have to re-derive the verdict against
+    /// `AgentSession::content_at`, whose second term reduces over the row's
+    /// *dialog* — and the push strips the dialog, so the receiver's copy lags
+    /// the origin's by construction while a pull is outstanding. Re-deriving
+    /// there reads `Seen` for an answer the origin still calls unread, which
+    /// hides unread work: the one direction this feature refuses. The origin
+    /// computes it from its own full dialog, so there is one verdict and one
+    /// clock, and the receiver holds no term of its own to disagree with.
+    ///
+    /// It sits beside `session` rather than inside it because the `session` on
+    /// the wire is the raw `AppState` row, where `read` is `false` for a local
+    /// row by construction (`commands::stamp_read` runs only on the display
+    /// copy). Putting the verdict here keeps the exposure per-*route*: the sync
+    /// push goes to `sync.peers`, this user's own machines, while `/api/agents`
+    /// builds its own row type and so cannot carry it at all.
+    ///
+    /// `serde(default)` for the reason `token_tip` has one — a peer on an older
+    /// build advertises nothing and its rows read unread here, which is the
+    /// direction that leaves work showing.
+    #[serde(default)]
+    pub attended: bool,
+    /// The name the sender's own tab carries for this session, where it differs
+    /// from the id — `s.display_label()` off a snapshot with the custom names
+    /// applied, which is the string `terminal_title::build_title` puts in front
+    /// of the glyph.
+    ///
+    /// It is here because the receiver cannot derive it. Custom names are
+    /// deliberately per-machine, so a row renamed on the sender and not on the
+    /// receiver has a tab reading `⇄ ⚫ bga-assistant` while the receiver holds
+    /// it as `CHROME/assistant` — and `attention::resolve_row`, which joins a
+    /// badged tab to a synced row by that very string, could then name nothing
+    /// for the rest of that row's life. Without this the join works only where
+    /// the user happens to have typed the same rename on both machines, which is
+    /// a coincidence rather than a design.
+    ///
+    /// Distinct from the `display_name` inside `session`, which `ingest` keeps
+    /// clearing so the *receiver's* own rename still wins at emit time. This is
+    /// not a name to display; it is the string the far machine's tab shows, and
+    /// only `remote_labels` reads it. `None` where the sender has not renamed the
+    /// row, since the id it then shows is one the receiver already derives.
+    #[serde(default)]
+    pub origin_label: Option<String>,
 }
 
 /// Wire shape for `POST /api/sync/message` — one cross-machine message on the
@@ -415,6 +472,16 @@ fn source_allowed(scope: SyncBindScope, ip: IpAddr) -> bool {
 /// the moment we ask, a failed or dropped fetch is self-correcting: nothing
 /// recorded that we had it, the next push re-advertises the same tip, and we
 /// ask again.
+///
+/// The sender's `attended` verdict is stored verbatim, like every other field it
+/// is authoritative for. *This* device's `config.attention_tracking` is not
+/// consulted here: it governs what this dashboard draws, so it is applied where
+/// drawing decisions are made (`commands::display_snapshot`, which already
+/// decides the same question for a local row). Gating on arrival instead was
+/// tried and dropped — it left a window, because a push already in flight
+/// carries a config snapshot read before the switch moved and would re-add a
+/// verdict the teardown had just cleared, with nothing to correct it until the
+/// next heartbeat.
 fn ingest(
     device: &str,
     sessions: Vec<SessionSync>,
@@ -433,18 +500,34 @@ fn ingest(
         s.id = format!("{device}/{raw_id}");
         s.origin = Some(device.to_string());
         s.display_name = None; // receiver's custom names win at emit time
+        // The sender's own verdict, which `commands::stamp_read` then ORs with
+        // whatever this machine observed for itself rather than overwriting.
+        s.read = item.attended;
+        s.origin_label = item.origin_label;
+        let prior = prev.and_then(|p| p.sessions.iter().find(|ps| ps.id == s.id));
+        // Carry this machine's own attention observation across the replace. The
+        // sender cannot know about it — an SSH or tmux tab *here* can render that
+        // agent's session, and leaving it is read here — so a wholesale replace
+        // would drop it, and on a busy row the next push is 300ms away: the pill
+        // would go pale and flicker straight back to asking. It is carried for
+        // the same reason the dialog below is, and like the dialog it is only
+        // ever moved forward (`AppState::mark_remote_attended`), never merged
+        // with anything the sender said.
+        s.attended_at = prior.and_then(|ps| ps.attended_at);
         // Carry the dialog we already hold across the metadata replace: in
         // memory first, else the on-disk copy a restart would otherwise drop.
-        let dialog = prev
-            .and_then(|p| p.sessions.iter().find(|ps| ps.id == s.id))
-            .map(|ps| ps.dialog.clone())
-            .or_else(|| persisted.get(&s.id).cloned())
-            .unwrap_or_default();
+        let dialog = prior.map(|ps| ps.dialog.clone()).or_else(|| persisted.get(&s.id).cloned()).unwrap_or_default();
+        // The push replaces `state_entered_at`, one of `content_at`'s two terms,
+        // so a status change raises it here; the dialog term moves in
+        // `store_pulled_dialog` instead. Both go through `note_content_arrival`.
+        let was = prior.map(AgentSession::content_at);
+        s.content_seen_at = prior.and_then(|ps| ps.content_seen_at);
         let held = dialog.iter().map(|e| e.timestamp).max().unwrap_or(0);
         if item.dialog_tip > held {
             pulls.push(DialogPull { raw_id, since: held });
         }
         s.dialog = dialog;
+        s.note_content_arrival(was, now);
         out.push(s);
     }
     (RemoteDevice { sessions: out, last_seen: now, origin_addr, registry_sessions, identity }, pulls)
@@ -524,6 +607,132 @@ async fn post_sync(
         fetch_token_range(app.clone(), device_name, origin_addr, token_held);
     }
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Wire shape for `POST /api/sync/attention` — one machine telling another that
+/// a human there read one of *its* sessions.
+///
+/// The counter-direction of `SessionSync::attended`, and it exists because the
+/// two machines observe different things. The origin watches its own terminal;
+/// this envelope carries what the *other* machine saw, which is a tab there
+/// rendering this session over SSH or tmux. Neither can see the other's
+/// keyboard, so each reports what it saw and the row is read if either did.
+#[derive(Serialize, Deserialize, Debug, Default)]
+pub struct AttentionReport {
+    /// The reporting machine, for the log line only. Nothing resolves on it —
+    /// the session named below is one of *ours*, so there is no "whose rows are
+    /// these" question for a claimed name to answer wrongly, which is what makes
+    /// this route need no attestation beyond the shared gate.
+    #[serde(default)]
+    pub origin_device: String,
+    /// Our own chat_id, un-namespaced: the reporter strips the device prefix it
+    /// added on ingest.
+    #[serde(default)]
+    pub chat_id: String,
+    /// How much of the row the reporter saw, as **our own** `content_at` echoed
+    /// back — a number this machine minted, so it needs no clock agreement with
+    /// the reporter and cannot be read as a time anybody was at a keyboard.
+    ///
+    /// Clamped on arrival at the row's current `content_at`, so a stale or
+    /// hostile value cannot vouch for a turn that has not happened yet. It can
+    /// legitimately be *lower* than ours — the reporter's dialog copy lags while
+    /// a pull is outstanding — and then the row stays unread here, which is the
+    /// direction that leaves work showing.
+    #[serde(default)]
+    pub attended_at: i64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Default)]
+pub struct AttentionReceipt {
+    pub recorded: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// Record that a peer's user read one of our sessions.
+///
+/// Goes through `attention::observe` rather than writing the row directly, so
+/// the stamp, the decision log and the emit cannot drift from the local sensors
+/// — and so the notifier sees it, which is the point: a finished row read on the
+/// other machine must stop asking from this one's phone too.
+async fn post_attention(State(app): State<AppHandle>, Json(report): Json<AttentionReport>) -> (StatusCode, Json<AttentionReceipt>) {
+    let refuse = |code: StatusCode, why: &str| (code, Json(AttentionReceipt { recorded: false, reason: Some(why.to_string()) }));
+    if report.chat_id.is_empty() {
+        return refuse(StatusCode::BAD_REQUEST, "no_chat_id");
+    }
+    let Some(state) = app.try_state::<AppState>() else {
+        return refuse(StatusCode::INTERNAL_SERVER_ERROR, "no_state");
+    };
+    // The ceiling is the row's own content watermark. Unclamped this would be the
+    // one irreversible write on the sync surface: `mark_attended` only ever moves
+    // the stamp forward, so a value from the far future would mark the row read
+    // for every turn it ever has, silently, with nothing but the
+    // `attention_tracking` teardown able to undo it.
+    let Some(ceiling) = state.content_at_of(&report.chat_id) else {
+        return refuse(StatusCode::NOT_FOUND, "no_such_row");
+    };
+    let at = report.attended_at.min(ceiling);
+    let changed = crate::attention::observe(&app, &report.chat_id, at, crate::attention::AttentionSource::PeerRead);
+    tracing::debug!(
+        chat_id = %report.chat_id,
+        decision = "attention_peer",
+        device = %report.origin_device,
+        reported = report.attended_at,
+        recorded = at,
+        clamped = report.attended_at > ceiling,
+        changed,
+        "a peer reported reading one of our sessions"
+    );
+    // `changed = false` is an ordinary outcome — the row was already read, or
+    // this machine has attention tracking off — so the report was accepted
+    // either way. The receipt says what we did with it, which is all a sender
+    // can learn.
+    (StatusCode::OK, Json(AttentionReceipt { recorded: true, reason: (!changed).then(|| "no_change".to_string()) }))
+}
+
+/// Tell the machine that owns `id` that its session was read here.
+///
+/// Fire-and-forget, by design. There is no acknowledgement to wait on and no
+/// retry: a lost report leaves that row showing on the origin, the recoverable
+/// direction, and a retry would need a per-row record of what the origin had
+/// taken — a guess about another device's contents, which is exactly the
+/// watermark this module removed for going stale silently.
+pub fn report_attention(app: &AppHandle, id: &str, attended_at: i64) {
+    let Some(state) = app.try_state::<AppState>() else { return };
+    // Split by the device the row is filed under rather than on the first `/`,
+    // the rule `resolve_fetch_target` follows and for its reason: `device_name`
+    // is a user-editable config string that may contain a slash of its own.
+    let Some((device, raw_id, origin_addr)) = ({
+        let remote = state.remote.lock().unwrap();
+        remote.iter().find_map(|(device, d)| {
+            let raw = id.strip_prefix(device.as_str())?.strip_prefix('/')?;
+            d.sessions.iter().any(|s| s.id == id).then(|| (device.clone(), raw.to_string(), d.origin_addr.clone()))
+        })
+    }) else {
+        return;
+    };
+    if origin_addr.is_empty() {
+        return;
+    }
+    let Some(cfg) = app.try_state::<ConfigState>().map(|c| c.snapshot()) else { return };
+    let (Some(token), device_name) = (cfg.sync.token, cfg.sync.device_name) else { return };
+    tauri::async_runtime::spawn(async move {
+        let body = AttentionReport { origin_device: device_name, chat_id: raw_id, attended_at };
+        let client = reqwest::Client::builder().timeout(Duration::from_secs(10)).build().unwrap_or_default();
+        let url = format!("{origin_addr}/api/sync/attention");
+        match client.post(&url).bearer_auth(&token).json(&body).send().await {
+            Ok(resp) if resp.status().is_success() => tracing::debug!(device = %device, "attention report delivered"),
+            // A 404 is two different things and the status alone cannot tell
+            // them apart: a peer predating this route, and one that has no such
+            // row. Both are ordinary and neither is retried, so the line says so
+            // rather than implying the row was rejected.
+            Ok(resp) if resp.status() == StatusCode::NOT_FOUND => {
+                tracing::debug!(device = %device, "attention report not taken: that peer has no such row, or no route for one — it predates this build")
+            }
+            Ok(resp) => tracing::debug!(device = %device, status = %resp.status(), "attention report refused"),
+            Err(e) => tracing::debug!(device = %device, error = %e, "attention report failed"),
+        }
+    });
 }
 
 #[derive(Deserialize)]
@@ -1495,6 +1704,7 @@ pub async fn run_listener(app: AppHandle, port: u16, scope: SyncBindScope) {
         .route("/api/sync/tokens", get(get_tokens))
         .route("/api/sync/message", post(post_message))
         .route("/api/sync/grant", post(post_grant))
+        .route("/api/sync/attention", post(post_attention))
         .layer(middleware::from_fn_with_state(GuardState { app: app.clone(), scope }, guard))
         .with_state(app.clone());
 
@@ -1541,6 +1751,23 @@ fn usage_since(records: &[UsageHistoryRecord], since: i64) -> Vec<UsageHistoryRe
 /// bookkeeping to go stale, no backlog to chunk, and a failed push costs
 /// nothing but a retry. Content moves on the pull side, where the party that
 /// knows what it is missing does the asking.
+///
+/// `record_attention` is this device's `config.attention_tracking`, and it is
+/// read here rather than relied on upstream so the advertised verdict is exactly
+/// what this machine's own widget and tab titles show. The stamps it gates are
+/// normally absent when the feature is off — `attention::observe` refuses and
+/// `config_watcher` clears the rest — but `session_restore` reads `attended_at`
+/// back off a ⚪ tab left over from a run when the feature *was* on, with no gate
+/// of its own, so without this a peer could be told a row was read that this
+/// dashboard is itself drawing as unread.
+///
+/// **`sessions` must be local rows only, and this function does not check.**
+/// `push_all` passes `AppState::snapshot()`, which excludes `AppState::remote`
+/// by construction — that is where the single-writer model is enforced, and a
+/// caller handing a remote row in would make this device advertise a verdict
+/// (and a status) for a session it never ran. Filtering here as well would put
+/// the rule in two places and let the real one rot, so the test that pins it
+/// (`a_received_verdict_is_never_re_broadcast`) exercises the caller's snapshot.
 fn build_push(
     device_name: &str,
     listen_port: u16,
@@ -1548,6 +1775,7 @@ fn build_push(
     usage_tip: i64,
     token_tip: u64,
     registry: Option<&[crate::session_registry::LiveSession]>,
+    record_attention: bool,
 ) -> SyncPush {
     SyncPush {
         device_name: device_name.to_string(),
@@ -1556,9 +1784,14 @@ fn build_push(
             .iter()
             .map(|s| {
                 let dialog_tip = s.dialog.iter().map(|e| e.timestamp).max().unwrap_or(0);
+                let attended = record_attention && s.attention() == crate::state::Attention::Seen;
+                // Only where it differs from the id: the receiver derives that
+                // much itself, so shipping it would be a second copy of a string
+                // both sides already agree on.
+                let origin_label = (s.display_label() != s.id).then(|| s.display_label().to_string());
                 let mut meta = s.clone();
                 meta.dialog = Vec::new();
-                SessionSync { session: meta, dialog_tip }
+                SessionSync { session: meta, dialog_tip, attended, origin_label }
             })
             .collect(),
         usage_tip,
@@ -1596,7 +1829,16 @@ async fn push_all(app: &AppHandle, client: &reqwest::Client) {
         return;
     };
     // Local sessions only — received remote sessions are never re-broadcast.
-    let sessions = state.snapshot();
+    //
+    // The custom names are applied to this copy, and only `SessionSync::origin_label`
+    // is read off them: it has to be the string this machine's own tab shows, and
+    // that is `display_label()` after this one resolution point. The `display_name`
+    // it also fills rides along inside `session` and is cleared again by the
+    // receiver's `ingest`, so no peer's rename is affected.
+    let mut sessions = state.snapshot();
+    if let Some(names) = app.try_state::<crate::custom_names::CustomNamesStore>() {
+        names.apply(&mut sessions);
+    }
     let usage_tip = app
         .try_state::<UsageHistoryStore>()
         .and_then(|s| s.read_all().last().map(|r| r.ts))
@@ -1610,7 +1852,7 @@ async fn push_all(app: &AppHandle, client: &reqwest::Client) {
     let registry = app
         .try_state::<crate::session_registry::SessionRegistry>()
         .and_then(|r| r.live_sessions(cfg.projects_root.as_deref(), now_ms()));
-    let push = build_push(&cfg.sync.device_name, cfg.sync.listen_port, &sessions, usage_tip, token_tip, registry.as_deref());
+    let push = build_push(&cfg.sync.device_name, cfg.sync.listen_port, &sessions, usage_tip, token_tip, registry.as_deref(), cfg.attention_tracking);
     // Cycle breadcrumb: push cadence should never silently stop while peers
     // are configured — if the failure logs go quiet, this shows whether the
     // pusher loop itself is still alive.
@@ -1851,13 +2093,30 @@ fn insert_in_timestamp_order(dialog: &mut Vec<DialogEntry>, entry: DialogEntry) 
 /// range already held is the ordinary outcome. The catch-up asks for the entire
 /// dialog every time a history window opens a remote row, so without this each
 /// open rewrites megabytes to say nothing changed.
+///
+/// **Nothing tests the `content_seen_at` stamp below, so an edit that drops it
+/// fails no suite.** This function takes an `AppHandle`, so covering it would
+/// mean a seam in production code that exists only for a test. `ingest` holds
+/// the other half of the same rule and *is* covered
+/// (`ingest_records_when_this_device_saw_the_content_arrive`), which is what
+/// makes losing this one quiet rather than obvious: the gate would still refuse
+/// a stale observation on a status change and silently credit one on a pulled
+/// reply. See [`crate::state::AgentSession::content_seen_at`] for what that
+/// gate is holding up.
 fn store_pulled_dialog(app: &AppHandle, state: &AppState, device: &str, id: &str, entries: &[DialogEntry]) {
     let merged = {
         let mut remote = state.remote.lock().unwrap();
         remote
             .get_mut(device)
             .and_then(|dev| dev.sessions.iter_mut().find(|s| s.id == id))
-            .and_then(|s| merge_synced_dialog(&mut s.dialog, entries).then(|| s.clone()))
+            .and_then(|s| {
+                let was = s.content_at();
+                merge_synced_dialog(&mut s.dialog, entries).then(|| {
+                    // The dialog half of the attention gate's arrival instant.
+                    s.note_content_arrival(Some(was), now_ms());
+                    s.clone()
+                })
+            })
     };
     let Some(s) = merged else { return };
     if let Some(store) = app.try_state::<RemoteHistoryStore>() {
@@ -2043,6 +2302,8 @@ mod tests {
             instruction_drift: false,
             canary: crate::state::Canary::Off,
             attended_at: None,
+            content_seen_at: None,
+            origin_label: None,
             turn_from_relay: false,
             delegated_task: None,
             message_line: None,
@@ -2060,7 +2321,7 @@ mod tests {
         DialogEntry { role, text: text.into(), timestamp: ts, status: Status::Working, task_start: false, boundary: None }
     }
     fn push_item(id: &str, dialog_tip: i64) -> SessionSync {
-        SessionSync { session: session(id, Vec::new()), dialog_tip }
+        SessionSync { session: session(id, Vec::new()), dialog_tip, attended: false, origin_label: None }
     }
 
     // -------- ingest --------
@@ -2103,7 +2364,13 @@ mod tests {
         // 5 -> 6 with `POST /api/sync/grant`, which takes that title from it:
         // the message route acts once, this one writes a standing permission
         // that outlives every message and every restart.
-        assert_eq!(expr.matches(".route(").count(), 6, "route count changed — confirm the new route is above the layer, then update this number");
+        //
+        // 6 -> 7 with `POST /api/sync/attention`, the first route that writes a
+        // *local* row — the attention stamp a peer observed on one of our
+        // sessions, which the notifier revokes Telegram messages on. That is
+        // what makes its clamp (`post_attention`) part of the gate rather than a
+        // nicety.
+        assert_eq!(expr.matches(".route(").count(), 7, "route count changed — confirm the new route is above the layer, then update this number");
     }
 
     #[test]
@@ -2197,6 +2464,170 @@ mod tests {
         assert_eq!(dev.sessions[0].display_name, None, "receiver's custom names win");
     }
 
+    // -------- attention across the wire --------
+
+    /// A finished row the sender has read, as `build_push` sees it. `Done` and a
+    /// stamp at or past `content_at` are both required for `attention()` to
+    /// answer `Seen`, so a fixture missing either would pass this file's tests
+    /// while proving nothing.
+    fn read_row(id: &str) -> AgentSession {
+        let mut s = session(id, vec![entry(DialogRole::Assistant, "the answer", 500)]);
+        s.status = Status::Done;
+        s.state_entered_at = 500;
+        s.attended_at = Some(600);
+        s
+    }
+
+    #[test]
+    fn the_senders_own_verdict_rides_the_push_and_the_raw_row_does_not() {
+        // The split that keeps `attended_at` machine-local: the verdict is a
+        // field beside `session`, while the `session` itself is the raw
+        // `AppState` row, where `read` is false because only the display path
+        // stamps it.
+        let push = build_push("desktop", 9078, &[read_row("proj")], 0, 0, None, true);
+        assert!(push.sessions[0].attended, "the sender decided it, so the sender says so");
+        assert!(!push.sessions[0].session.read, "the raw row carries no verdict");
+        let json = serde_json::to_value(&push.sessions[0].session).expect("serialize");
+        assert!(json.get("attended_at").is_none(), "and the observation itself never leaves this machine");
+    }
+
+    #[test]
+    fn an_unread_row_advertises_nothing() {
+        let mut unread = read_row("proj");
+        unread.attended_at = None;
+        assert!(!build_push("desktop", 9078, &[unread], 0, 0, None, true).sessions[0].attended);
+    }
+
+    #[test]
+    fn a_fresh_turn_withdraws_the_verdict_from_the_wire() {
+        // The self-falsifying half has to survive the trip: a reply flushed
+        // after the read moves `content_at` past the stamp, so the next push
+        // says unread and the peer's row brightens again with it.
+        let mut row = read_row("proj");
+        row.dialog.push(entry(DialogRole::Assistant, "a later answer", 900));
+        assert!(!build_push("desktop", 9078, &[row], 0, 0, None, true).sessions[0].attended);
+    }
+
+    #[test]
+    fn the_sender_advertises_no_verdict_with_the_feature_off() {
+        // Read off the config at push time rather than trusted to be absent:
+        // `session_restore` re-stamps `attended_at` off a ⚪ tab with no gate of
+        // its own, so a row can hold a stamp this dashboard is itself drawing
+        // as unread.
+        assert!(!build_push("desktop", 9078, &[read_row("proj")], 0, 0, None, false).sessions[0].attended);
+    }
+
+    #[test]
+    fn the_receiver_stamps_the_senders_verdict_onto_the_remote_row() {
+        // Stored verbatim, like every other field the sender owns. Whether this
+        // dashboard then *draws* it is `display_snapshot`'s decision, pinned by
+        // `commands`' `the_feature_switch_governs_a_synced_verdict_too`.
+        let item = SessionSync { session: session("proj", Vec::new()), dialog_tip: 0, attended: true, origin_label: None };
+        let (dev, _) = ingest("laptop", vec![item], None, crate::tailnet::Attestation::Claimed, None, &no_persisted(), 100, String::new());
+        assert!(dev.sessions[0].read, "read on the machine that ran it, so read here");
+    }
+
+    #[test]
+    fn this_machines_own_observation_survives_the_metadata_replace() {
+        // The sender cannot know about it — the tab that saw it is here — so a
+        // wholesale replace would drop it, and on a busy row the next push is
+        // 300ms away: the pill would go pale and flicker straight back.
+        let (first, _) = ingest("laptop", vec![push_item("proj", 0)], None, crate::tailnet::Attestation::Claimed, None, &no_persisted(), 100, String::new());
+        let mut seeded = first;
+        seeded.sessions[0].attended_at = Some(4_242);
+        let (second, _) = ingest("laptop", vec![push_item("proj", 0)], None, crate::tailnet::Attestation::Claimed, Some(&seeded), &no_persisted(), 200, String::new());
+        assert_eq!(second.sessions[0].attended_at, Some(4_242));
+        // A row the sender has dropped and re-sent has no predecessor to carry
+        // one from, which is the same bound a restart has: nothing persists an
+        // observation, here or for a local row.
+        let (fresh, _) = ingest("laptop", vec![push_item("proj", 0)], None, crate::tailnet::Attestation::Claimed, None, &no_persisted(), 300, String::new());
+        assert_eq!(fresh.sessions[0].attended_at, None);
+    }
+
+    #[test]
+    fn ingest_records_when_this_device_saw_the_content_arrive() {
+        // The local-clock half of the attention gate. A first sighting is now;
+        // a push that moves `state_entered_at` is now; a push that moves nothing
+        // keeps the instant it already had, so a row sitting still does not look
+        // freshly arrived on every heartbeat.
+        let mut item = push_item("proj", 0);
+        item.session.state_entered_at = 1_000;
+        let (first, _) = ingest("laptop", vec![item], None, crate::tailnet::Attestation::Claimed, None, &no_persisted(), 100, String::new());
+        assert_eq!(first.sessions[0].content_seen_at, Some(100), "first sighting: this is when we learned of it");
+
+        let mut same = push_item("proj", 0);
+        same.session.state_entered_at = 1_000;
+        let (second, _) = ingest("laptop", vec![same], None, crate::tailnet::Attestation::Claimed, Some(&first), &no_persisted(), 200, String::new());
+        assert_eq!(second.sessions[0].content_seen_at, Some(100), "nothing moved, so neither did the arrival");
+
+        let mut moved = push_item("proj", 0);
+        moved.session.state_entered_at = 5_000;
+        let (third, _) = ingest("laptop", vec![moved], None, crate::tailnet::Attestation::Claimed, Some(&second), &no_persisted(), 300, String::new());
+        assert_eq!(third.sessions[0].content_seen_at, Some(300), "a new turn arrived at 300 by this clock");
+    }
+
+    #[test]
+    fn the_senders_own_label_rides_the_push_only_where_it_differs() {
+        let mut renamed = read_row("tauri-dashboard");
+        renamed.display_name = Some("ai-dashboard".into());
+        let push = build_push("desktop", 9078, &[renamed, read_row("plain")], 0, 0, None, true);
+        assert_eq!(push.sessions[0].origin_label.as_deref(), Some("ai-dashboard"));
+        assert_eq!(push.sessions[1].origin_label, None, "an unrenamed row shows the id, which the receiver derives");
+    }
+
+    #[test]
+    fn ingest_keeps_the_senders_label_and_still_clears_its_display_name() {
+        // Two different things that look alike: the receiver's own rename must
+        // keep winning what is *displayed*, while the sender's label is kept for
+        // `attention::remote_labels` to join a badged tab by.
+        let mut item = push_item("proj", 0);
+        item.session.display_name = Some("sender name".into());
+        item.origin_label = Some("sender name".into());
+        let (dev, _) = ingest("laptop", vec![item], None, crate::tailnet::Attestation::Claimed, None, &no_persisted(), 100, String::new());
+        assert_eq!(dev.sessions[0].display_name, None);
+        assert_eq!(dev.sessions[0].origin_label.as_deref(), Some("sender name"));
+    }
+
+    #[test]
+    fn a_withdrawn_verdict_replaces_the_one_held() {
+        // No merge and no max: the sender is authoritative for its own rows, so
+        // the push simply replaces. That is what makes the sender's teardown,
+        // its feature switch and a fresh turn all reach the peer with no
+        // bookkeeping — and it is why a dropped push costs nothing but latency.
+        let seeded = SessionSync { session: session("proj", Vec::new()), dialog_tip: 0, attended: true, origin_label: None };
+        let (first, _) = ingest("laptop", vec![seeded], None, crate::tailnet::Attestation::Claimed, None, &no_persisted(), 100, String::new());
+        assert!(first.sessions[0].read);
+        let again = SessionSync { session: session("proj", Vec::new()), dialog_tip: 0, attended: false, origin_label: None };
+        let (second, _) = ingest("laptop", vec![again], None, crate::tailnet::Attestation::Claimed, Some(&first), &no_persisted(), 200, String::new());
+        assert!(!second.sessions[0].read, "the row is asking again");
+    }
+
+    #[test]
+    fn a_push_from_an_older_peer_parses_as_unread() {
+        // Rollout skew, the rule `token_tip` and `registry_sessions` already
+        // follow. Absent means unread, which leaves the row showing.
+        let body = r#"{"device_name":"old","listen_port":9078,"sessions":[{"session":{"id":"proj","status":"done","status_before_working":"idle","label":"l","task_started_at":0,"dialog":[],"source":"claude","updated":0,"state_entered_at":0,"working_accumulated_ms":0},"dialog_tip":0}],"usage_tip":0}"#;
+        let push: SyncPush = serde_json::from_str(body).expect("an older peer's push must parse");
+        assert!(!push.sessions[0].attended);
+    }
+
+    #[test]
+    fn a_received_verdict_is_never_re_broadcast() {
+        // `build_push` reads `AppState::snapshot()`, local rows only, so a
+        // remote row cannot be relayed to a third device — which would make a
+        // second machine authoritative for a session it never ran.
+        let mut remote = read_row("proj");
+        remote.origin = Some("laptop".into());
+        remote.read = true;
+        let state = AppState::new();
+        state.remote.lock().unwrap().insert(
+            "laptop".to_string(),
+            RemoteDevice { sessions: vec![remote], last_seen: 0, origin_addr: String::new(), registry_sessions: None, identity: crate::tailnet::Attestation::Claimed },
+        );
+        let push = build_push("desktop", 9078, &state.snapshot(), 0, 0, None, true);
+        assert!(push.sessions.is_empty(), "the remote row is not ours to advertise");
+    }
+
     // -------- build_push --------
 
     #[test]
@@ -2205,7 +2636,7 @@ mod tests {
             "proj",
             vec![entry(DialogRole::User, "old", 10), entry(DialogRole::User, "new", 100)],
         )];
-        let push = build_push("desktop", 9078, &sessions, 4242, 77, None);
+        let push = build_push("desktop", 9078, &sessions, 4242, 77, None, true);
         assert_eq!(push.device_name, "desktop");
         assert_eq!(push.listen_port, 9078);
         assert!(push.sessions[0].session.dialog.is_empty(), "no dialog content on the wire");
@@ -2227,7 +2658,7 @@ mod tests {
             session_ids: vec!["abc".into()],
             pid: 4_242,
         }];
-        let push = build_push("desktop", 9078, &[], 0, 0, Some(&regs));
+        let push = build_push("desktop", 9078, &[], 0, 0, Some(&regs), true);
         let rows = push.registry_sessions.expect("registry rows ride the push");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].chat_id, "transcripts", "un-namespaced; the receiver stamps its own prefix");
@@ -2237,7 +2668,7 @@ mod tests {
 
         // An unreadable registry must stay `None` all the way across, or the
         // peer reads "that machine is running nothing" from our failure to look.
-        assert!(build_push("desktop", 9078, &[], 0, 0, None).registry_sessions.is_none());
+        assert!(build_push("desktop", 9078, &[], 0, 0, None, true).registry_sessions.is_none());
     }
 
     #[test]
@@ -2287,7 +2718,7 @@ mod tests {
     #[test]
     fn build_push_empty_dialog_tips_zero() {
         let sessions = vec![session("proj", Vec::new())];
-        assert_eq!(build_push("desktop", 9078, &sessions, 0, 0, None).sessions[0].dialog_tip, 0);
+        assert_eq!(build_push("desktop", 9078, &sessions, 0, 0, None, true).sessions[0].dialog_tip, 0);
     }
 
     #[test]
@@ -2296,8 +2727,8 @@ mod tests {
         // there is no per-peer bookkeeping that can go stale, and re-sending is
         // free. A peer that missed ten cycles is caught up by the next one.
         let sessions = vec![session("proj", vec![entry(DialogRole::User, "u", 10)])];
-        let a = build_push("desktop", 9078, &sessions, 7, 3, None);
-        let b = build_push("desktop", 9078, &sessions, 7, 3, None);
+        let a = build_push("desktop", 9078, &sessions, 7, 3, None, true);
+        let b = build_push("desktop", 9078, &sessions, 7, 3, None, true);
         assert_eq!(serde_json::to_string(&a).unwrap(), serde_json::to_string(&b).unwrap());
     }
 

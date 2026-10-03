@@ -426,6 +426,20 @@ pub enum NamedBy {
     Title,
     /// The working directory, the fallback when no title names a row.
     Directory,
+    /// A title wearing `terminal_title::REMOTE_BADGE`, which named a **synced**
+    /// row: the tab is a transport — an SSH client, a tmux attach — onto a
+    /// session running on another machine, and the status it carries was
+    /// written there.
+    ///
+    /// It is a third variant rather than a flag beside [`Title`](Self::Title)
+    /// because it answers the occupant rule differently, and that difference is
+    /// the whole reason it exists. What runs in such a tab is the transport, so
+    /// the terminal reports [`Occupant::Other`] — correctly — and the ordinary
+    /// rule refuses it. The badge is what distinguishes "another program is in
+    /// this tab, so the title may be a leftover" from "the agent is at the far
+    /// end of this program", and only a title the far machine's dashboard is
+    /// still writing can carry it.
+    RemoteTitle,
 }
 
 /// One thing a terminal observed, at a known instant, with the facts the person
@@ -556,7 +570,13 @@ impl Refusal {
 ///   takes its keystrokes.
 ///
 /// Both must be the agent (`bare_shell`, `not_the_agent`, `occupant_unknown`).
-/// **A session a terminal knows is not the agent is refused whatever named it.**
+/// **A session a terminal knows is not the agent is refused whatever named it,
+/// with one exception** — a title wearing `terminal_title::REMOTE_BADGE`
+/// ([`NamedBy::RemoteTitle`]), where the program in the tab is the transport to
+/// an agent on another machine rather than something left in front of its
+/// title. A shell is refused even there, which is what keeps the rule's reach:
+/// once the transport exits, the tab drops back to a local prompt still
+/// carrying the last title the far machine sent.
 /// A shell left in a tab after its agent exited keeps the agent's last title
 /// until something rewrites it, and the shells these terminals run do not, so a
 /// session's own title is no proof the agent is still in it.
@@ -589,6 +609,21 @@ pub fn person_verdict(o: &Observation, named_by: NamedBy) -> Result<(), Refusal>
     match (o.occupant, named_by, o.naming) {
         (Occupant::Agent, ..) => Ok(()),
         (Occupant::Shell, ..) => Err(Refusal::BareShell),
+        // A transport onto an agent on another machine. The occupant really is
+        // another program — an `ssh`, a `mosh`, a tmux client — and the rule
+        // below is right to refuse that everywhere else, because a program left
+        // in a tab keeps the title of the agent that was there before it. What
+        // makes this case different is not the program but the title: only the
+        // far machine's dashboard writes the badge, it writes it onto a session
+        // it is still tracking, and `attention::resolve_row` admits it only
+        // where a live synced row answers to the name. So the agent is at the
+        // far end of this program rather than gone from in front of it.
+        //
+        // `Shell` above still refuses, and that ordering is the guard: once the
+        // transport exits, the tab drops back to a local prompt while the title
+        // it was last sent stays on the tab, which is exactly the leftover the
+        // rule exists for.
+        (Occupant::Other, NamedBy::RemoteTitle, _) => Ok(()),
         (Occupant::Other, ..) => Err(Refusal::NotTheAgent),
         (Occupant::Unknown(_), NamedBy::Title, Naming::OwnTitle) => Ok(()),
         (Occupant::Unknown(why), ..) => Err(Refusal::OccupantUnknown(why)),
@@ -1282,6 +1317,29 @@ pub(crate) mod verdict_tests {
         for o in [departure(), input()] {
             assert_eq!(person_verdict(&occupied(o.clone(), Occupant::Shell, Naming::OwnTitle), NamedBy::Title), Err(Refusal::BareShell));
             assert_eq!(person_verdict(&occupied(o.clone(), Occupant::Other, Naming::OwnTitle), NamedBy::Title), Err(Refusal::NotTheAgent));
+        }
+    }
+
+    #[test]
+    fn a_transport_onto_another_machines_agent_is_credited_under_the_remote_badge() {
+        // An SSH or tmux tab really is running another program — the rule above
+        // is right about that and right to refuse it everywhere else. What the
+        // badge adds is that the far machine's dashboard is still writing this
+        // title, onto a session it is still tracking, so the agent is at the far
+        // end of the transport rather than gone from in front of it.
+        for o in [departure(), input()] {
+            let via_transport = occupied(o.clone(), Occupant::Other, Naming::OwnTitle);
+            assert_eq!(person_verdict(&via_transport, NamedBy::RemoteTitle), Ok(()));
+            // The guard that keeps the original rule's reach: once the transport
+            // exits, the tab drops to a local prompt while the title it was last
+            // sent stays on it — the leftover that rule exists for.
+            assert_eq!(person_verdict(&occupied(o.clone(), Occupant::Shell, Naming::OwnTitle), NamedBy::RemoteTitle), Err(Refusal::BareShell));
+            // And a terminal that says nothing about what is in the tab cannot
+            // establish the transport, so it stays refused.
+            assert_eq!(
+                person_verdict(&occupied(o.clone(), Occupant::Unknown("not_reported"), Naming::OwnTitle), NamedBy::RemoteTitle),
+                Err(Refusal::OccupantUnknown("not_reported"))
+            );
         }
     }
 

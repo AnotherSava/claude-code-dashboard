@@ -39,8 +39,10 @@ pub enum Status {
     /// landing place for every absence of evidence.
     ///
     /// It carries no claim about whether the user has *seen* the result — that
-    /// is [`Attention`], stamped onto the row as `AgentSession::read` by
-    /// `commands::display_snapshot` and by nothing else. Status used to carry it
+    /// is [`Attention`], flattened onto the row as [`AgentSession::read`] by the
+    /// machine that ran the session: `commands::display_snapshot` for a local
+    /// row, and `sync::ingest` for a synced one, from the verdict its origin
+    /// advertised. Status used to carry it
     /// (`Done` meant finished-and-unread, and a display-time rewrite turned a
     /// read row into `Idle`), which is why `Idle` ended up meaning three
     /// unrelated things at once.
@@ -74,11 +76,15 @@ impl Status {
 /// Whether a finished row is still waiting to be looked at — the "I haven't read
 /// this one yet" axis, orthogonal to [`Status`].
 ///
-/// **The verdict itself is never serialized.** It is computed on demand by
-/// [`AgentSession::attention`] and read in two places: `attention::should_poll`,
-/// which uses it to decide whether asking the terminal anything is worth the
-/// cost, and `commands::display_snapshot`, which flattens it into
-/// [`AgentSession::read`] on the way to the frontend and the tab titles.
+/// **The verdict is computed, never stored.** [`AgentSession::attention`]
+/// derives it on demand, for a local row and a synced one alike:
+/// `attention::should_poll`, which decides whether asking the terminal anything
+/// is worth the cost; `commands::display_snapshot`, which flattens it into
+/// [`AgentSession::read`] on the way to the frontend and the tab titles;
+/// `sync::build_push`, which advertises this machine's own rows to the user's
+/// other machines; and `AppState::mark_remote_attended`, which asks it either
+/// side of stamping a synced row. The flattened flag, not this enum, is what
+/// crosses a wire.
 ///
 /// That flattening is the only way the distinction reaches a reader, because
 /// `status` no longer carries it. It used to: `Done` meant finished-*and-unread*
@@ -93,8 +99,9 @@ impl Status {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Attention {
     /// This row isn't asking to be read, so "looked at" carries no meaning.
-    /// Every non-`Done` row, and every remote row — this device doesn't observe
-    /// attention for another machine's sessions.
+    /// Every non-`Done` row, synced ones included — a tab on this machine can
+    /// render another machine's agent, so this device does make observations
+    /// about synced rows, beside the verdict their origin pushes.
     Moot,
     /// Finished, and not looked at since it finished.
     Pending,
@@ -391,6 +398,54 @@ pub struct AgentSession {
     /// remote row's timestamps are the sender's clock.
     #[serde(skip)]
     pub attended_at: Option<i64>,
+    /// Wall-clock ms, **this machine's clock**, of the moment this device last
+    /// saw a synced row's [`content_at`](Self::content_at) rise. `None` on every
+    /// local row, where it would mean nothing: a local row's content is produced
+    /// here, so its own timestamps are already on this clock.
+    ///
+    /// It exists because dropping the observation's instant turned the verdict
+    /// into a tautology, and that is worth stating plainly rather than leaving
+    /// for the next reader to re-derive. [`AgentSession::attention`] asks
+    /// `attended_at >= content_at()`, which *is* the recency test: a stale
+    /// observation leaves a local row `Pending`. A synced row's `content_at` is
+    /// the origin's clock, so an instant from this machine cannot be compared
+    /// against it — but stamping `content_at` itself instead satisfies that test
+    /// by construction, and then any observation credits the row however old it
+    /// is. Those are not rare: `terminals::agterm` mints an input instant as
+    /// `now - idle` from the **desktop-wide** idle clock, so typing once into a
+    /// tab and walking away with the terminal in front re-offers that same
+    /// frozen instant every tick. Measured in this machine's own log, 132
+    /// credited input observations ran to a median age of 186s and a maximum of
+    /// 594s — all harmless only because the comparison discarded them.
+    ///
+    /// So the comparison moves rather than disappearing: `mark_remote_attended`
+    /// credits only an observation at or after this instant, which puts both
+    /// sides on one clock while the value it stamps stays the origin's. Arrival
+    /// is necessarily later than production, so the residual error falls toward
+    /// `Pending` — the direction that leaves work showing.
+    ///
+    /// Written by `sync::ingest` and `sync::store_pulled_dialog`, the two paths
+    /// that can raise a synced row's `content_at`, and carried across the
+    /// metadata replace like [`attended_at`](Self::attended_at). Internal
+    /// bookkeeping, never serialized anywhere.
+    #[serde(skip)]
+    pub content_seen_at: Option<i64>,
+    /// The name the **origin's** own tab carries for a synced row, where that
+    /// machine renamed it. `None` on a local row and on a synced row its origin
+    /// has not renamed, whose tab then shows the id this device already derives.
+    ///
+    /// Arrives on `sync::SessionSync::origin_label` and is read in one place,
+    /// `attention::remote_labels`, as a third name a badged tab may be joined by.
+    /// It is not a name to *display* — the receiver's own rename wins there,
+    /// which is why `ingest` keeps clearing `display_name`. Custom names are
+    /// per-machine by design, so without this the join works only where the same
+    /// rename was typed on both machines.
+    ///
+    /// `#[serde(skip)]` like the two fields above: it reaches a row through the
+    /// sync envelope rather than through the session object, and nothing
+    /// persists it — the next push re-delivers it.
+    #[serde(skip)]
+    pub origin_label: Option<String>,
     /// Whether the turn currently in flight was begun by a relayed peer message
     /// rather than by something a human typed — captured by `apply_set` on the
     /// same non-`Working` → `Working` transition that captures
@@ -428,12 +483,24 @@ pub struct AgentSession {
     /// Whether this finished row has been looked at — the [`Attention::Seen`]
     /// verdict, flattened for the frontend and the tab title.
     ///
-    /// Always `false` in `AppState`. Stamped by `commands::display_snapshot` and
-    /// by nothing else, which is the same split the old status rewrite used to
-    /// occupy and for the same reason: `resolved_snapshot` is what `/api/agents`
-    /// serves and what the sync pusher's raw snapshot mirrors, and a peer asking
-    /// what this machine's agents are doing must not be told whether a human
-    /// here has looked at their screen.
+    /// **A local row's verdict is stamped at display time; a remote row's
+    /// arrives already decided.** For a local row this is always `false` in
+    /// `AppState` and set by `commands::display_snapshot` and nothing else,
+    /// which is the same split the old status rewrite used to occupy and for the
+    /// same reason: `resolved_snapshot` is what `/api/agents` serves, and a
+    /// machine asking what this one's agents are *doing* must not be told
+    /// whether a human here has looked at their screen. For a remote row it is
+    /// written by `sync::ingest` from `SessionSync::attended`, the origin's own
+    /// verdict, so one row reads the same on both dashboards whichever machine
+    /// it was read on — which is why `commands::stamp_read` still skips remote
+    /// rows rather than judging them.
+    ///
+    /// The *observation* behind it ([`attended_at`](Self::attended_at)) stays
+    /// machine-local in both directions. Only the verdict crosses, and only on
+    /// the sync push: the origin computes it from its own full dialog, so a
+    /// receiver — whose dialog copy lags by construction while a pull is
+    /// outstanding — never re-derives it and so can never answer `Seen` for an
+    /// answer the origin still calls unread.
     ///
     /// It exists as a field because `status` no longer carries it. `Done` used
     /// to mean finished-*and-unread*, so a second field would have been a
@@ -813,6 +880,23 @@ impl AgentSession {
     /// agent that have finished the work"), and it keeps this decoration disjoint
     /// from `SessionItem.svelte`'s pulse, which fires on `blocked || error`, so no
     /// row can say "wants attention" and "already seen" at once.
+    /// Record that this device has seen whatever [`content_at`](Self::content_at)
+    /// now holds, where it has risen above `was` — `None` meaning the row is new
+    /// here, so now is when all of it arrived.
+    ///
+    /// The rule lives beside the field rather than at its two call sites
+    /// (`sync::ingest` for the `state_entered_at` term, `sync::store_pulled_dialog`
+    /// for the dialog one), because what counts as an arrival is one decision and
+    /// the gate reading it cannot tell which path stamped. A third writer is the
+    /// drift this exists to stop: a merge that only replaces a reply in place, or
+    /// a push that moves nothing, must leave the instant alone, or every heartbeat
+    /// would read as fresh content and the gate would stop refusing anything.
+    pub fn note_content_arrival(&mut self, was: Option<i64>, now_ms: i64) {
+        if was.is_none_or(|before| self.content_at() > before) {
+            self.content_seen_at = Some(now_ms);
+        }
+    }
+
     pub fn attention(&self) -> Attention {
         if self.status != Status::Done {
             return Attention::Moot;
@@ -1441,6 +1525,8 @@ fn new_session(
         terminal_stale_at: None,
         canary: Canary::Off,
         attended_at: None,
+        content_seen_at: None,
+        origin_label: None,
         // Carried where the event that creates the row is itself a prompt. The
         // row is still refused a CLEAN settle, because `status_before_working`
         // on a row this process has never seen before cannot say it was clean —
@@ -1687,13 +1773,97 @@ impl AppState {
         s.attention() != before
     }
 
+    /// Record that the user attended to a **synced** row here — the SSH or tmux
+    /// tab rendering another machine's agent is on this machine, so leaving it
+    /// is this machine's observation to make.
+    ///
+    /// Separate from [`mark_attended`](Self::mark_attended) for two reasons, and
+    /// the second is the one that matters.
+    ///
+    /// It reaches the other store: `sessions` holds local rows and `remote` holds
+    /// synced ones, so one function cannot serve both without taking two locks.
+    ///
+    /// And **the instant it takes is not the one it stamps.** A remote row's
+    /// `content_at` is built from timestamps the *origin* minted, so an instant
+    /// from this machine's clock cannot be compared against it. What is recorded
+    /// is the row's own `content_at` — "seen as of everything this row currently
+    /// holds", a value the origin itself produced, the same technique
+    /// [`restore_row`](Self::restore_row) uses. Read under the lock that writes
+    /// it, so a sync ingest landing between cannot move the watermark out from
+    /// under the stamp.
+    ///
+    /// But stamping that value satisfies [`attention`](AgentSession::attention)
+    /// by construction, and that comparison *is* the recency test the local path
+    /// relies on — so without a second one here, any observation would credit the
+    /// row however old it was, and stale ones are routine rather than exotic
+    /// (see [`content_seen_at`](AgentSession::content_seen_at)). The test moves
+    /// instead of disappearing: `at_ms` is the observation's instant and
+    /// `content_seen_at` is when this device saw that content arrive, both on
+    /// this machine's clock, and an observation older than the content it would
+    /// vouch for is refused. An unrecorded arrival refuses too — `ingest` writes
+    /// one on every push, so not having it means this row has not been heard
+    /// about yet rather than that the content is old.
+    ///
+    /// Erring early falls out twice over. Arrival is necessarily later than
+    /// production, so the gate refuses slightly more than strictly necessary; and
+    /// this device's dialog copy lags the origin's while a pull is outstanding,
+    /// so the watermark recorded is at most the origin's and the rest of the turn
+    /// un-reads the row when it lands, exactly as a late local flush does.
+    ///
+    /// Returns the stamp when the row's verdict changed, for the caller to report
+    /// to the origin; `None` when the row is gone, was already read, or the
+    /// observation predates the content.
+    pub fn mark_remote_attended(&self, id: &str, at_ms: i64) -> Option<i64> {
+        let mut remote = self.remote.lock().unwrap();
+        let s = remote.values_mut().flat_map(|d| d.sessions.iter_mut()).find(|s| s.id == id)?;
+        if at_ms < s.content_seen_at? {
+            return None;
+        }
+        let before = s.attention();
+        let at = s.content_at();
+        s.attended_at = Some(s.attended_at.map_or(at, |prev| prev.max(at)));
+        (s.attention() != before).then_some(at)
+    }
+
+    /// A local row's [`AgentSession::content_at`], or `None` when no such row
+    /// exists here.
+    ///
+    /// The ceiling `sync::post_attention` clamps an incoming peer report to.
+    /// Read through `AppState` rather than handed the row, because the clamp has
+    /// to be against what this machine holds *now*: the value in the report was
+    /// minted here, but on a snapshot the reporter pulled, and a bound taken
+    /// from anything else would be a bound on a row that is not this one.
+    pub fn content_at_of(&self, id: &str) -> Option<i64> {
+        let sessions = self.sessions.lock().unwrap();
+        sessions.iter().find(|s| s.id == id).map(AgentSession::content_at)
+    }
+
     /// Forget every attention observation — the teardown for
     /// `config.attention_tracking` going false, so every row renders exactly as
     /// it did before the feature existed. Mirrors [`Self::clear_all_drift`].
+    ///
+    /// A synced row carries two different things and this clears exactly one of
+    /// them. Its `attended_at` is an observation *this* machine made — a tab here
+    /// rendering that agent over SSH or tmux — so it goes with the local ones.
+    /// Its `read` is the origin's verdict, which is not this machine's to erase
+    /// and could not be erased anyway, since the origin re-advertises it on its
+    /// very next push; `commands::forget_read` is what declines to *draw* it,
+    /// on the display path where the same switch already decides the local half.
+    ///
+    /// The two locks are taken one after the other rather than together, matching
+    /// `commands::resolved_snapshot_versioned`, so neither is held across the
+    /// other and there is no order to invert.
     pub fn clear_all_attention(&self) -> bool {
-        let mut sessions = self.sessions.lock().unwrap();
         let mut changed = false;
-        for s in sessions.iter_mut().filter(|s| s.attended_at.is_some()) {
+        {
+            let mut sessions = self.sessions.lock().unwrap();
+            for s in sessions.iter_mut().filter(|s| s.attended_at.is_some()) {
+                s.attended_at = None;
+                changed = true;
+            }
+        }
+        let mut remote = self.remote.lock().unwrap();
+        for s in remote.values_mut().flat_map(|d| d.sessions.iter_mut()).filter(|s| s.attended_at.is_some()) {
             s.attended_at = None;
             changed = true;
         }
@@ -2129,21 +2299,158 @@ mod tests {
     }
 
     #[test]
-    fn attention_never_reaches_the_wire_in_any_form() {
-        // The observation never leaves this machine, and neither does the
-        // verdict derived from it. `read` is a field now, so this asserts its
-        // *value* rather than the absence of a key: the sync pusher serializes
-        // a raw `AppState` row, where it must still be `false` however long ago
-        // the user looked. A peer asking what this machine's agents are doing
-        // must not be told whether a human here has looked at their screen.
+    fn the_observation_itself_never_reaches_the_wire() {
+        // What crosses a wire is a *verdict*, on one route, and only to this
+        // user's own machines: `sync::build_push` reads `attention()` and
+        // advertises it as `SessionSync::attended`. The observation behind it
+        // does not travel at all, and neither does the enum — so a reader of a
+        // serialized row has no way to learn when a human sat at this keyboard,
+        // only whether the row is still asking.
+        //
+        // `read` is asserted by value rather than by absence of a key: the sync
+        // pusher serializes a raw `AppState` row, where a *local* row's flag
+        // must still be `false` however long ago the user looked, because only
+        // the display path stamps it. The per-route half is pinned next to the
+        // code that does it, in `sync`'s
+        // `the_senders_own_verdict_rides_the_push_and_the_raw_row_does_not`.
         let state = AppState::new();
         state.apply_set(set_no_label("a", Status::Done), 0, NO_CONTINUATIONS, None);
         state.mark_attended("a", 1_000);
         let json = serde_json::to_value(get(&state, "a")).expect("serialize");
         assert!(json.get("attended_at").is_none(), "the observation stays on this machine");
-        assert!(json.get("attention").is_none(), "and so does the verdict");
-        assert_eq!(json.get("read").and_then(|v| v.as_bool()), Some(false), "the flag is on the wire but never true off the display path");
+        assert!(json.get("attention").is_none(), "and the enum is never serialized");
+        assert_eq!(json.get("read").and_then(|v| v.as_bool()), Some(false), "a local row's flag is never true off the display path");
         assert_eq!(json.get("status").and_then(|v| v.as_str()), Some("done"), "the wire reports what the agent did");
+    }
+
+    /// A synced row as `sync::ingest` leaves one, parked on this device.
+    /// `content_seen_at` is the *local* instant the content arrived, which
+    /// `ingest` always sets — a fixture without it would make every
+    /// `mark_remote_attended` call refuse and the tests below vacuous.
+    fn seed_remote_at(state: &AppState, id: &str, state_entered_at: i64, newest_reply: Option<i64>, arrived: Option<i64>) {
+        seed_remote(state, id, state_entered_at, newest_reply);
+        let mut remote = state.remote.lock().unwrap();
+        remote.get_mut("laptop").expect("device").sessions[0].content_seen_at = arrived;
+    }
+
+    fn seed_remote(state: &AppState, id: &str, state_entered_at: i64, newest_reply: Option<i64>) {
+        let holder = AppState::new();
+        holder.apply_set(set_no_label(id, Status::Done), state_entered_at, NO_CONTINUATIONS, None);
+        let mut s = holder.snapshot().pop().expect("row");
+        s.id = format!("laptop/{id}");
+        s.origin = Some("laptop".into());
+        if let Some(ts) = newest_reply {
+            s.dialog.push(DialogEntry { role: DialogRole::Assistant, text: "a reply".into(), timestamp: ts, status: Status::Done, task_start: false, boundary: None });
+        }
+        state.remote.lock().unwrap().insert(
+            "laptop".to_string(),
+            crate::state::RemoteDevice { sessions: vec![s], last_seen: 0, origin_addr: String::new(), registry_sessions: None, identity: crate::tailnet::Attestation::Claimed },
+        );
+    }
+
+    #[test]
+    fn a_synced_row_is_stamped_with_its_own_content_watermark() {
+        // Never this machine's clock: both terms of a synced row's `content_at`
+        // were minted by the origin, so a local instant would be the one
+        // comparison here that needs the two machines to agree about the time.
+        // The value recorded is one the origin itself produced.
+        let state = AppState::new();
+        seed_remote_at(&state, "proj", 1_000, Some(7_000), Some(50));
+        assert_eq!(state.mark_remote_attended("laptop/proj", 60), Some(7_000), "the newest thing it holds, not the instant of the look");
+        assert_eq!(state.remote_snapshot()[0].attention(), Attention::Seen);
+        assert_eq!(state.mark_remote_attended("laptop/proj", 60), None, "already read, so nothing to report");
+        assert_eq!(state.mark_remote_attended("laptop/gone", 60), None);
+    }
+
+    #[test]
+    fn an_observation_older_than_the_content_does_not_credit_a_synced_row() {
+        // The gate that stops the stamp being a tautology. Stamping `content_at`
+        // satisfies `attention()` by construction, so without this ANY
+        // observation would credit the row however stale — and stale ones are
+        // routine: `terminals::agterm` mints an input instant as `now - idle`
+        // from the desktop-wide clock, so one keystroke into a tab, then walking
+        // away with the terminal in front, re-offers that frozen instant every
+        // tick. Both instants here are this machine's clock; the value stamped
+        // is still the origin's.
+        let state = AppState::new();
+        seed_remote_at(&state, "proj", 1_000, Some(7_000), Some(50_000));
+        assert_eq!(state.mark_remote_attended("laptop/proj", 49_999), None, "the look predates the answer arriving here");
+        assert_eq!(state.remote_snapshot()[0].attention(), Attention::Pending, "so the row is still asking");
+        assert_eq!(state.mark_remote_attended("laptop/proj", 50_000), Some(7_000), "a look at the moment it arrived counts");
+    }
+
+    #[test]
+    fn a_synced_row_whose_content_never_arrived_here_credits_nothing() {
+        // `ingest` writes an arrival on every push, so no recorded arrival means
+        // this device has not heard about the row rather than that its content
+        // is old. Refusing leaves it showing, which the next push corrects.
+        let state = AppState::new();
+        seed_remote_at(&state, "proj", 1_000, Some(7_000), None);
+        assert_eq!(state.mark_remote_attended("laptop/proj", i64::MAX), None);
+    }
+
+    #[test]
+    fn a_reply_arriving_after_a_synced_read_re_raises_it() {
+        // The self-falsifying half has to hold for a synced row too, and it is
+        // what makes erring early free: this device's dialog copy lags the
+        // origin's while a pull is outstanding, so the watermark recorded is at
+        // most the origin's, and the rest of the turn un-reads the row when it
+        // lands.
+        let state = AppState::new();
+        seed_remote_at(&state, "proj", 1_000, Some(7_000), Some(50));
+        state.mark_remote_attended("laptop/proj", 60);
+        {
+            let mut remote = state.remote.lock().unwrap();
+            let s = &mut remote.get_mut("laptop").expect("device").sessions[0];
+            s.dialog.push(DialogEntry { role: DialogRole::Assistant, text: "the rest".into(), timestamp: 9_000, status: Status::Done, task_start: false, boundary: None });
+        }
+        assert_eq!(state.remote_snapshot()[0].attention(), Attention::Pending, "the pull moved the watermark past the stamp");
+        // The later reply has to be recorded as *arriving* here before a look can
+        // vouch for it — the same gate, now doing the work the dialog pull makes
+        // it do in production.
+        state.remote.lock().unwrap().get_mut("laptop").expect("device").sessions[0].content_seen_at = Some(70);
+        assert_eq!(state.mark_remote_attended("laptop/proj", 80), Some(9_000), "and reading it again reports the whole of it");
+    }
+
+    #[test]
+    fn the_clamp_ceiling_is_the_rows_own_watermark() {
+        // What `sync::post_attention` bounds an incoming peer report to.
+        // Unclamped, `mark_attended` only moves forward, so a value from the far
+        // future would mark the row read for every turn it ever has.
+        let state = AppState::new();
+        state.apply_set(set_no_label("a", Status::Done), 1_000, NO_CONTINUATIONS, None);
+        assert_eq!(state.content_at_of("a"), Some(1_000));
+        assert_eq!(state.content_at_of("nobody"), None, "and a row we do not have has no ceiling to offer");
+    }
+
+    #[test]
+    fn the_teardown_forgets_every_observation_and_no_verdict() {
+        // A synced row carries one of each, and they go different ways. The
+        // `attended_at` is an observation THIS machine made through a tab here,
+        // so it is cleared with the local ones — the fixture sets it, because a
+        // `None` there is exactly the state that would hide the bug. The `read`
+        // is the origin's verdict, which this machine cannot erase: the next push
+        // re-advertises it, so `commands::forget_read` declines to draw it
+        // instead (pinned by `commands`'
+        // `the_feature_switch_governs_a_synced_verdict_too`).
+        let state = AppState::new();
+        state.apply_set(set_no_label("a", Status::Done), 0, NO_CONTINUATIONS, None);
+        state.mark_attended("a", 1_000);
+        let mut remote = get(&state, "a");
+        remote.id = "laptop/b".into();
+        remote.origin = Some("laptop".into());
+        remote.attended_at = Some(2_000);
+        remote.read = true;
+        state.remote.lock().unwrap().insert(
+            "laptop".to_string(),
+            crate::state::RemoteDevice { sessions: vec![remote], last_seen: 0, origin_addr: String::new(), registry_sessions: None, identity: crate::tailnet::Attestation::Claimed },
+        );
+
+        assert!(state.clear_all_attention());
+        assert_eq!(get(&state, "a").attention(), Attention::Pending, "the local observation is gone");
+        assert_eq!(state.remote_snapshot()[0].attended_at, None, "and so is the one made here about a synced row");
+        assert!(state.remote_snapshot()[0].read, "the origin's verdict is not this machine's to erase");
+        assert!(!state.clear_all_attention(), "idempotent once nothing is stamped");
     }
 
     #[test]
@@ -2996,6 +3303,8 @@ why did this become the task?");
             terminal_stale_at: None,
             canary: Canary::Off,
             attended_at: None,
+            content_seen_at: None,
+            origin_label: None,
             turn_from_relay: false,
             delegated_task: None,
             message_line: None,
@@ -3272,6 +3581,8 @@ why did this become the task?");
             terminal_stale_at: None,
             canary: Canary::Off,
             attended_at: None,
+            content_seen_at: None,
+            origin_label: None,
             turn_from_relay: false,
             delegated_task: None,
             message_line: None,
