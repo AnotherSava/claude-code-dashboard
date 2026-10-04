@@ -76,6 +76,20 @@ use super::{Cover, Front, Occupant, Since};
 
 /// The shells a session can sit idle in. A login shell's `argv[0]` carries a
 /// leading `-`, which is stripped before the comparison.
+///
+/// An argument that is not a flag disqualifies it: a shell running a script, or
+/// a `-c` command, is a program in front of the terminal.
+/// [`super::person_verdict`] refuses [`Occupant::Shell`] under every naming —
+/// the rule that stops a prompt left in a tab inheriting its agent's title — so
+/// reading such a shell as unoccupied silently refuses every observation from
+/// that tab. agterm draws the same line in its own
+/// `CommandRestore.isIdleShell`, and this reads agterm's `foreground`.
+///
+/// What it cannot say is that the shell sits at a prompt: a builtin runs in the
+/// shell process and leaves `argv` untouched, so a shell mid-builtin is
+/// indistinguishable from an idle one here. The verdict needs only the weaker
+/// claim — that no *other* program is in front — so nothing downstream relies
+/// on the stronger one.
 const SHELLS: [&str; 7] = ["zsh", "bash", "sh", "fish", "nu", "tcsh", "ksh"];
 
 /// The interpreters an npm install of Claude Code runs under, with the script
@@ -84,8 +98,10 @@ const INTERPRETERS: [&str; 2] = ["node", "bun"];
 
 /// What runs in a session, from its `tree` node: the agent when the program in
 /// front of its terminal is Claude Code, run directly or as a script under
-/// [`INTERPRETERS`], an idle shell when it is a shell, and another program
-/// otherwise. Unknown when the tree does not list the session or does not say.
+/// [`INTERPRETERS`], a shell when it is a shell carrying nothing but flags, and
+/// another program otherwise — a shell running a script or a `-c` command
+/// included, for the reason [`SHELLS`] gives. Unknown when the tree does not
+/// list the session or does not say.
 pub fn occupant(node: Option<&Value>) -> Occupant {
     let Some(node) = node else { return Occupant::Unknown("not_in_tree") };
     let Some(argv) = node.get("foreground").and_then(Value::as_array).filter(|argv| !argv.is_empty()) else {
@@ -99,7 +115,7 @@ pub fn occupant(node: Option<&Value>) -> Occupant {
         Occupant::Unknown("no_foreground")
     } else if crate::liveness::is_claude_image(&program) || (INTERPRETERS.contains(&program.as_str()) && (crate::liveness::is_claude_image(&name(script)) || script.contains("/@anthropic-ai/claude-code/"))) {
         Occupant::Agent
-    } else if SHELLS.contains(&program.as_str()) {
+    } else if SHELLS.contains(&program.as_str()) && argv.iter().skip(1).all(|a| a.as_str().unwrap_or_default().trim().starts_with('-')) {
         Occupant::Shell
     } else {
         Occupant::Other
@@ -426,6 +442,12 @@ mod tests {
         assert_eq!(of(serde_json::json!(["/bin/zsh", "-il"])), Occupant::Shell);
         // Measured 2026-09-24: a tab that exec'd into ssh reports ssh in front.
         assert_eq!(of(serde_json::json!(["ssh", "-t", "u@host", "cmd"])), Occupant::Other);
+        // A shell running something is not a prompt. The Mac's remote tabs hold
+        // `claude/remote-session/mac/attach.sh`, which loops over ssh rather than
+        // exec'ing into it, so the pane's leader is that shell for the tab's life
+        // — and a badged remote title is credited only for `Occupant::Other`.
+        assert_eq!(of(serde_json::json!(["/bin/sh", "/Users/u/claude/remote-session/mac/attach.sh", "claude"])), Occupant::Other, "a shell running a script");
+        assert_eq!(of(serde_json::json!(["bash", "-c", "deploy"])), Occupant::Other, "a -c command is not a prompt");
         // An npm install runs the agent as a script, and it must not read as a
         // program known not to be the agent, which the verdict refuses outright.
         assert_eq!(of(serde_json::json!(["node", "/usr/local/lib/node_modules/@anthropic-ai/claude-code/cli.js"])), Occupant::Agent);
