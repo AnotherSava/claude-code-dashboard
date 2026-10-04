@@ -42,6 +42,7 @@ pub async fn run(app: AppHandle, port: u16) {
         .route("/api/message", post(post_message))
         .route("/api/window", post(post_window))
         .route("/api/session-clean", post(post_session_clean))
+        .route("/api/project/rename", post(post_project_rename))
         .with_state(app);
 
     if let Err(e) = axum::serve(listener, router).await {
@@ -146,6 +147,47 @@ fn apply_session_clean(app: &AppHandle, req: SessionCleanRequest) -> Response {
     }
     tracing::info!(chat_id = %chat_id, decision = "pull_claim", outcome = "recorded", "a pull reported leaving nothing to come back to");
     answer(StatusCode::OK, true, "recorded; whether it settles CLEAN is decided at this turn's Stop")
+}
+
+/// What `POST /api/project/rename` is told: the project's folder before and
+/// after the move. Paths rather than ids, so the dashboard derives both ids by
+/// its own rule (`projects_root` included) and the caller cannot get it wrong.
+#[derive(Deserialize)]
+struct ProjectRenameRequest {
+    #[serde(default)]
+    old_path: String,
+    #[serde(default)]
+    new_path: String,
+}
+
+/// Carry a project's dashboard data over to the id its renamed folder derives;
+/// see [`crate::project_rename`]. Sent by the `move-project` skill's printed
+/// steps once every session in the project has exited.
+///
+/// Loopback `Host` required, like the session-clean route: the caller is a
+/// command typed on this machine, and the route rewrites stored history.
+async fn post_project_rename(State(app): State<AppHandle>, headers: HeaderMap, Json(req): Json<ProjectRenameRequest>) -> Response {
+    if let Some(detail) = csrf_refusal(&headers, true) {
+        return csrf_refused(detail).into_response();
+    }
+    // Row locks and whole-file writes, so off the async workers like every
+    // other row write.
+    let result = tauri::async_runtime::spawn_blocking(move || crate::project_rename::rename_project(&app, &req.old_path, &req.new_path, now_ms())).await;
+    match result {
+        Ok(Ok(report)) => (StatusCode::OK, Json(serde_json::json!({"ok": true, "report": report}))).into_response(),
+        Ok(Err(refusal)) => {
+            let status = match refusal {
+                crate::project_rename::RenameRefusal::EmptyPath => StatusCode::BAD_REQUEST,
+                _ => StatusCode::CONFLICT,
+            };
+            tracing::info!(decision = "project_rename", outcome = ?refusal, "project rename refused; nothing was changed");
+            (status, Json(serde_json::json!({"ok": false, "detail": refusal.detail()}))).into_response()
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "project rename handler failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
 }
 
 /// What `POST /api/window` is being asked to do.

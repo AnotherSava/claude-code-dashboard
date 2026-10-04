@@ -79,7 +79,7 @@ Under the repo root `claude-code-dashboard/`:
     - `config_watcher.rs` — notify watcher for config.json hot-reload
     - `commands.rs` — Tauri commands + event emitters
     - `setup.rs` — embedded Python hook + settings.json snippet builder for onboarding
-    - `http_server.rs` — the loopback axum server: `/api/event`, `/api/agents`, `/api/message`, `/api/window`, `/api/session-clean`
+    - `http_server.rs` — the loopback axum server: `/api/event`, `/api/agents`, `/api/message`, `/api/window`, `/api/session-clean`, `/api/project/rename`
     - `sync.rs` — multi-device session sync: source- and token-gated listener, metadata push, receiver-driven pulls
     - `tailnet.rs` — asking Tailscale which machine a connection came from, instead of trusting its envelope
     - `peer_message.rs` — relaying one message to an agent on another machine, and the honesty rules around it
@@ -87,6 +87,7 @@ Under the repo root `claude-code-dashboard/`:
     - `session_launcher.rs` — starting a terminal session for a project that has none
     - `auto_start_store.rs` — the `chat_id → absolute path` grants that permit those starts, in `auto_start.json`
     - `session_restore.rs` — giving a live session its row back after a restart
+    - `project_rename.rs` — carrying a project's history, anchors, name and start grant over to the id its renamed folder derives, and announcing the rename to peers
     - `log_watcher.rs` — per-session transcript tailing + infer_state + assistant text upsert
     - `liveness.rs` — process-liveness primitives and the per-row owning-pid store
     - `liveness_reaper.rs` — removes a row whose Claude process exited without a `SessionEnd`
@@ -140,7 +141,7 @@ Under the repo root `claude-code-dashboard/`:
 ### Where state lives at runtime
 
 - **In-memory** — `AppState` (local and remote sessions) and `ConfigState` (config) via `tauri::State`, alongside the other managed stores the frontend and the HTTP routes read.
-- **On disk** — `config.json`, `widget.jsonl`, `prompt_history.json`, `session_chat_ids.json`, `custom_names.json`, `auto_start.json`, `usage_history.jsonl`, `usage_cache.json`, `token_history.jsonl`, `token_scan_cursor.json`, and the `remote_history/`, `remote_usage/` and `remote_tokens/` directories under `app_data_dir()`:
+- **On disk** — `config.json`, `widget.jsonl`, `prompt_history.json`, `session_chat_ids.json`, `custom_names.json`, `auto_start.json`, `project_renames.json`, `usage_history.jsonl`, `usage_cache.json`, `token_history.jsonl`, `token_scan_cursor.json`, and the `remote_history/`, `remote_usage/` and `remote_tokens/` directories under `app_data_dir()`:
   - Windows: `%APPDATA%\com.anothersava.claude-code-dashboard\`
   - macOS: `~/Library/Application Support/com.anothersava.claude-code-dashboard/`
 

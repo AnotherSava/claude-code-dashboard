@@ -17,6 +17,7 @@ use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
+use crate::project_rename::{rename_key, KeyMove, ProjectRename};
 use crate::state::{AgentSession, DialogEntry};
 
 /// One device's persisted dialogs. The device name is repeated inside the
@@ -27,6 +28,12 @@ struct DeviceDialogs {
     /// Keyed by namespaced session id ("{device}/{raw_id}"), as held in
     /// `AppState::remote`.
     dialogs: HashMap<String, Vec<DialogEntry>>,
+    /// The `at` of the newest of this device's project renames already applied
+    /// here (`crate::project_rename::ProjectRename`). Every push repeats the
+    /// device's recent renames, and an id renamed away can come back into use,
+    /// so each is applied once and never again.
+    #[serde(default)]
+    renames_applied: i64,
 }
 
 pub struct RemoteHistoryStore {
@@ -68,6 +75,33 @@ impl RemoteHistoryStore {
         self.data.lock().unwrap().get(device).map(|dd| dd.dialogs.clone()).unwrap_or_default()
     }
 
+    /// Apply `device`'s project renames that this store has not applied yet, in
+    /// order, re-filing each dialog under the id its project now derives on
+    /// that device. Returns the renames newly applied.
+    ///
+    /// Where the new id already holds a dialog the two are left as they are:
+    /// both belong to someone, and choosing one would delete the other.
+    pub fn apply_renames(&self, device: &str, renames: &[ProjectRename]) -> Vec<ProjectRename> {
+        let mut data = self.data.lock().unwrap();
+        let applied_before = data.get(device).map_or(0, |dd| dd.renames_applied);
+        let mut fresh: Vec<ProjectRename> = renames.iter().filter(|r| r.at > applied_before).cloned().collect();
+        if fresh.is_empty() {
+            return fresh;
+        }
+        fresh.sort_by_key(|r| r.at);
+        let dd = data.entry(device.to_string()).or_default();
+        dd.device = device.to_string();
+        for r in &fresh {
+            let moved = rename_key(&mut dd.dialogs, &format!("{device}/{}", r.from), &format!("{device}/{}", r.to));
+            if moved == KeyMove::Conflict {
+                tracing::warn!(device, from = %r.from, to = %r.to, "a peer's renamed project already has a dialog under its new id here; both kept");
+            }
+        }
+        dd.renames_applied = fresh.last().map_or(applied_before, |r| r.at);
+        self.write_device(dd);
+        fresh
+    }
+
     /// Upsert the given sessions' dialogs into the device's file and write it.
     /// Sessions with empty dialogs and previously stored sessions absent from
     /// `sessions` are left as they are — removal never happens, mirroring
@@ -79,7 +113,11 @@ impl RemoteHistoryStore {
         for s in sessions.iter().filter(|s| !s.dialog.is_empty()) {
             dd.dialogs.insert(s.id.clone(), s.dialog.clone());
         }
-        let path = self.dir.join(format!("{}.json", sanitize_filename(device)));
+        self.write_device(dd);
+    }
+
+    fn write_device(&self, dd: &DeviceDialogs) {
+        let path = self.dir.join(format!("{}.json", sanitize_filename(&dd.device)));
         if let Err(e) = std::fs::create_dir_all(&self.dir) {
             tracing::warn!(?e, dir = %self.dir.display(), "failed to create remote history dir");
             return;
@@ -191,6 +229,80 @@ mod tests {
         assert!(dir.join("desk_top.json").exists(), "unsafe chars sanitized");
         let store2 = RemoteHistoryStore::new(dir.clone());
         assert_eq!(store2.device_dialogs("desk:top")["desk:top/p"][0].text, "b", "device name read from file content, not filename");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn rn(from: &str, to: &str, at: i64) -> ProjectRename {
+        ProjectRename { from: from.into(), to: to.into(), at }
+    }
+
+    #[test]
+    fn a_renamed_project_keeps_its_dialog_here() {
+        let dir = temp_dir("rename");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let store = RemoteHistoryStore::new(dir.clone());
+        store.save_device("laptop", &[session("laptop/my-app", vec![entry("old", 10)]), session("laptop/other", vec![entry("x", 5)])]);
+        let renames = [rn("my-app", "my-app-renamed", 100)];
+        assert_eq!(store.apply_renames("laptop", &renames).len(), 1);
+        assert!(store.apply_renames("laptop", &renames).is_empty(), "every push repeats the rename, and it applies once");
+
+        let reloaded = RemoteHistoryStore::new(dir.clone());
+        let dialogs = reloaded.device_dialogs("laptop");
+        assert_eq!(dialogs["laptop/my-app-renamed"][0].text, "old");
+        assert!(!dialogs.contains_key("laptop/my-app"));
+        assert_eq!(dialogs["laptop/other"][0].text, "x");
+        assert!(reloaded.apply_renames("laptop", &renames).is_empty(), "what was applied survives a restart");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An id renamed away can come back into use at the origin. Its new dialog
+    /// must not be carried off by the rename that keeps riding the push.
+    #[test]
+    fn a_reused_id_is_not_renamed_again() {
+        let dir = temp_dir("rename_reuse");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let store = RemoteHistoryStore::new(dir.clone());
+        store.save_device("laptop", &[session("laptop/web", vec![entry("first project", 10)])]);
+        store.apply_renames("laptop", &[rn("web", "web-old", 100)]);
+        store.save_device("laptop", &[session("laptop/web", vec![entry("a new project", 200)])]);
+        assert!(store.apply_renames("laptop", &[rn("web", "web-old", 100)]).is_empty());
+        let dialogs = store.device_dialogs("laptop");
+        assert_eq!(dialogs["laptop/web"][0].text, "a new project");
+        assert_eq!(dialogs["laptop/web-old"][0].text, "first project");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A peer asleep through a swap replays both steps in order.
+    #[test]
+    fn a_missed_swap_is_replayed_in_order() {
+        let dir = temp_dir("rename_swap");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let store = RemoteHistoryStore::new(dir.clone());
+        store.save_device("laptop", &[session("laptop/web", vec![entry("old project", 10)]), session("laptop/web-new", vec![entry("new project", 20)])]);
+        store.apply_renames("laptop", &[rn("web-new", "web", 101), rn("web", "web-old", 100)]);
+        let dialogs = store.device_dialogs("laptop");
+        assert_eq!(dialogs["laptop/web-old"][0].text, "old project");
+        assert_eq!(dialogs["laptop/web"][0].text, "new project");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_rename_onto_a_held_dialog_keeps_both() {
+        let dir = temp_dir("rename_conflict");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let store = RemoteHistoryStore::new(dir.clone());
+        store.save_device("laptop", &[session("laptop/a", vec![entry("a", 10)]), session("laptop/b", vec![entry("b", 20)])]);
+        store.apply_renames("laptop", &[rn("a", "b", 100)]);
+        let dialogs = store.device_dialogs("laptop");
+        assert_eq!((dialogs["laptop/a"][0].text.as_str(), dialogs["laptop/b"][0].text.as_str()), ("a", "b"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -20,6 +20,7 @@ mod logging;
 mod nonce_store;
 mod notifications;
 mod peer_message;
+mod project_rename;
 mod prompt_history;
 mod prompt_origin;
 mod remote_history;
@@ -471,6 +472,9 @@ pub fn run() {
     ));
     app.manage(custom_names::CustomNamesStore::new(
         app_data.join("custom_names.json"),
+    ));
+    app.manage(project_rename::RenameLog::new(
+        app_data.join("project_renames.json"),
     ));
     app.manage(auto_start_store::AutoStartStore::new(
         app_data.join(auto_start_store::FILE_NAME),

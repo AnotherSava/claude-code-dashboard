@@ -26,6 +26,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+use crate::project_rename::{same_dir, KeyMove};
+
 /// Where the grants live, relative to the app data directory.
 pub const FILE_NAME: &str = "auto_start.json";
 
@@ -113,13 +115,48 @@ impl AutoStartStore {
             return false;
         }
         current.insert(project.to_string(), dir.to_string());
-        match serde_json::to_string_pretty(&current) {
+        self.write(current)
+    }
+
+    /// Re-file a grant for a project whose folder was renamed: `from_id` at
+    /// `from_dir` becomes `to_id` at `to_dir`, in one write. Both halves change
+    /// together because `session_launcher::listed_dir` re-derives the id from
+    /// the path and refuses an entry whose two halves disagree.
+    ///
+    /// Moves only an entry that names the renamed folder. A `from_id` entry for
+    /// another directory is a different project that happens to derive the same
+    /// id, and is left alone; so is a file this build could not read, for the
+    /// reason [`Self::grant`] gives.
+    pub fn move_grant(&self, from_id: &str, from_dir: &str, to_id: &str, to_dir: &str) -> KeyMove {
+        let Ok(mut current) = self.read() else {
+            tracing::warn!(path = %self.path.display(), project = from_id, "refusing to move a grant in an auto_start.json this build could not read");
+            return KeyMove::Absent;
+        };
+        if !current.get(from_id).is_some_and(|dir| same_dir(dir, from_dir)) {
+            return KeyMove::Absent;
+        }
+        if from_id != to_id && current.contains_key(to_id) {
+            return KeyMove::Conflict;
+        }
+        current.remove(from_id);
+        current.insert(to_id.to_string(), to_dir.to_string());
+        if self.write(current) {
+            KeyMove::Moved
+        } else {
+            KeyMove::Absent
+        }
+    }
+
+    /// Replace the file with `list`, and make it the last good read once it is
+    /// on disk. Returns whether it was written.
+    fn write(&self, list: BTreeMap<String, String>) -> bool {
+        match serde_json::to_string_pretty(&list) {
             Ok(json) => {
                 if let Err(e) = std::fs::write(&self.path, format!("{json}\n")) {
                     tracing::warn!(?e, path = %self.path.display(), "failed to write auto_start.json");
                     return false;
                 }
-                *self.last_good.lock().unwrap() = current;
+                *self.last_good.lock().unwrap() = list;
                 true
             }
             Err(e) => {
@@ -175,6 +212,25 @@ mod tests {
         s.grant("transcripts", "/p/old");
         assert!(s.grant("transcripts", "/p/new"));
         assert_eq!(s.snapshot().get("transcripts").map(String::as_str), Some("/p/new"));
+    }
+
+    /// A renamed folder takes its grant along, id and directory in one write,
+    /// while a same-id grant for some other directory stays where it is.
+    #[test]
+    fn a_rename_moves_only_the_grant_for_that_folder() {
+        let s = store();
+        s.grant("my-app", "C:/src/my-app");
+        assert_eq!(s.move_grant("my-app", "C:\\src\\my-app\\", "my-app-renamed", "C:/src/my-app-renamed"), KeyMove::Moved, "separators and a trailing slash do not make it another folder");
+        let after = s.snapshot();
+        assert_eq!(after.get("my-app-renamed").map(String::as_str), Some("C:/src/my-app-renamed"));
+        assert!(!after.contains_key("my-app"));
+
+        s.grant("web", "/p/a/web");
+        assert_eq!(s.move_grant("web", "/p/b/web", "web2", "/p/b/web2"), KeyMove::Absent, "another folder's grant is not this one");
+        assert_eq!(s.snapshot().get("web").map(String::as_str), Some("/p/a/web"));
+
+        assert_eq!(s.move_grant("web", "/p/a/web", "web", "/q/web"), KeyMove::Moved, "a move that keeps the name re-points the directory");
+        assert_eq!(s.snapshot().get("web").map(String::as_str), Some("/q/web"));
     }
 
     /// Withdrawing a grant is editing the file, so a grant must not outlive an

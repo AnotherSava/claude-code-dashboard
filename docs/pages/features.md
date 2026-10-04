@@ -13,6 +13,8 @@ Each Claude Code session becomes one row. The row's `id` is *initially* derived 
 
 **Renaming a session.** Double-click a row's name to edit it — Enter saves, Esc cancels. The custom name is persisted, so a later Claude session in the same directory shows the same name.
 
+**Renaming or moving a project folder.** A row's id comes from the folder, so a renamed folder would otherwise start over as a new row with no history. Once the sessions in that folder have exited and the folder has moved, tell the widget about the move with one call to its [local API](development/http-api#post-apiprojectrename), and the history, custom name and start permission follow the project to its new name. Your other synced devices carry their copy of the history, and their own name for the row, over too.
+
 ## Live status
 
 The row's status badge tracks the agent in real time:

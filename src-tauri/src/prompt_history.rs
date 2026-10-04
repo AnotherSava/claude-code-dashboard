@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
+use crate::project_rename::{rename_key, KeyMove};
 use crate::state::{AgentSession, PersistedSession};
 
 pub struct PromptHistoryStore {
@@ -53,6 +54,20 @@ impl PromptHistoryStore {
                 task_started_at: session.task_started_at,
             },
         );
+    }
+
+    /// Move one row's persisted history to another row id, for a project whose
+    /// folder was renamed. Writes to disk only when something moved.
+    ///
+    /// Refuses where `to` already holds history rather than merging the two: a
+    /// second project deriving the same id is the one way that happens, and
+    /// interleaving two projects' dialogs cannot be undone.
+    pub fn rename(&self, from: &str, to: &str) -> KeyMove {
+        let outcome = rename_key(&mut self.data.lock().unwrap(), from, to);
+        if outcome == KeyMove::Moved {
+            self.save_to_disk();
+        }
+        outcome
     }
 
     pub fn save_to_disk(&self) {
@@ -117,6 +132,19 @@ mod tests {
         assert!(store2.get("nonexistent").is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rename_persists_the_moved_history() {
+        let path = std::env::temp_dir().join(format!("claude_dashboard_prompt_history_rename_{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let store = PromptHistoryStore::new(path.clone());
+        store.data.lock().unwrap().insert("my-app".into(), PersistedSession { original_prompt: Some("task".into()), ..Default::default() });
+        assert_eq!(store.rename("my-app", "my-app-renamed"), KeyMove::Moved);
+        let reloaded = PromptHistoryStore::new(path.clone());
+        assert_eq!(reloaded.get("my-app-renamed").and_then(|p| p.original_prompt).as_deref(), Some("task"));
+        assert!(reloaded.get("my-app").is_none());
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

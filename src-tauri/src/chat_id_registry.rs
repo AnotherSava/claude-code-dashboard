@@ -131,6 +131,26 @@ impl ChatIdRegistry {
         }
     }
 
+    /// Re-point every session anchored to `from` at `to`, for a project whose
+    /// folder was renamed. Returns how many moved.
+    ///
+    /// Without it a resumed session keeps its anchor and goes on landing on the
+    /// old row, while new sessions in the renamed folder derive the new id, so
+    /// one project ends up split across two rows with the history on the old one.
+    pub fn retarget(&self, from: &str, to: &str) -> usize {
+        let mut data = self.data.lock().unwrap();
+        let mut moved = 0;
+        for id in data.values_mut().filter(|id| id.as_str() == from) {
+            *id = to.to_string();
+            moved += 1;
+        }
+        drop(data);
+        if moved > 0 {
+            self.save_to_disk();
+        }
+        moved
+    }
+
     fn save_to_disk(&self) {
         let data = self.data.lock().unwrap();
         let json = match serde_json::to_string_pretty(&*data) {
@@ -223,6 +243,19 @@ mod tests {
         assert_eq!(r2.resolve("s1", "other"), "assistant", "persisted lock survives reload");
         // The temp file is renamed away, never left behind.
         assert!(!path.with_extension("tmp").exists(), "no temp file leaked");
+    }
+
+    #[test]
+    fn retarget_moves_only_the_renamed_projects_anchors() {
+        let r = registry();
+        r.resolve("a", "my-app");
+        r.resolve("b", "my-app");
+        r.resolve("c", "assistant");
+        assert_eq!(r.retarget("my-app", "my-app-renamed"), 2);
+        assert_eq!(r.resolve("a", "my-app"), "my-app-renamed", "a resumed session lands on the new row");
+        assert_eq!(r.anchored("c").as_deref(), Some("assistant"));
+        assert_eq!(ChatIdRegistry::new(r.path.clone()).anchored("b").as_deref(), Some("my-app-renamed"), "persisted");
+        assert_eq!(r.retarget("my-app", "my-app-renamed"), 0);
     }
 
     #[test]

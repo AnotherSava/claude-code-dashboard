@@ -5,7 +5,7 @@ parent: Development
 nav_order: 4
 ---
 
-The widget listens on `http://127.0.0.1:9077` (default) for lifecycle events from external agents. One write endpoint, one envelope shape, adapter-dispatched on the server side — plus a read-only [agent roster](#agent-roster) an agent can query to see what is running, here and on the user's other machines, a [message relay](#cross-machine-messaging) for reaching one of those agents on another machine, and [a route a local skill posts to](#post-apisession-clean) to report that its run left nothing to come back to.
+The widget listens on `http://127.0.0.1:9077` (default) for lifecycle events from external agents. One write endpoint, one envelope shape, adapter-dispatched on the server side — plus a read-only [agent roster](#agent-roster) an agent can query to see what is running, here and on the user's other machines, a [message relay](#cross-machine-messaging) for reaching one of those agents on another machine, [a route a local skill posts to](#post-apisession-clean) to report that its run left nothing to come back to, and [one that carries a project's data over](#post-apiprojectrename) when its folder is renamed.
 
 A second, separate listener serves the [multi-device sync](#sync-api) API when enabled — the hook API below stays loopback-only and unauthenticated regardless.
 
@@ -343,6 +343,45 @@ Carries the loopback `Host` gate on top of the `Origin` check, like the roster a
 
 Nothing reads the body in production — the poster closes the response unread and exits 0 whatever happens, because silence has to mean *not clean* on this side. It says why rather than just whether for whoever reaches the route with `curl`.
 
+## `POST /api/project/rename`
+
+A row's id is derived from its project folder, so renaming or moving the folder leaves the project's dashboard data under an id nothing will write again. This route re-files it under the id the new folder derives. Send it after the folder has moved; the `move-project` skill prints the call as its last step.
+
+```json
+{ "old_path": "/Users/you/Projects/my-app", "new_path": "/Users/you/Projects/my-app-renamed" }
+```
+
+The dashboard derives the ids itself, with `projects_root` applied, so the caller sends paths and never ids. Besides the folder's own id it covers each subfolder Claude Code has run a session in or a start grant names, because with `projects_root` set a subfolder's id contains the parent's name. For every id that changes it moves, under the rows' locks:
+
+- **the history** — the `prompt_history.json` entry, so the next session in the new folder opens with the old dialog
+- **session anchors** — every `session_chat_ids.json` entry pointing at the old id, so a resumed session lands on the new row rather than keeping the old one alive beside it
+- **the custom name**
+
+Every start grant whose directory moved is re-pointed at the new path, with its id changed alongside where the id changed too.
+
+Each changed id is also recorded in `project_renames.json` and rides the [sync push](#post-apisync) for 30 days. Each peer applies it once and re-files its stored copy of the dialog and its own custom name for that row.
+
+A row still present under an id it moves is removed first when its session has ended — Claude Code's live-session list does not name it, and the process the dashboard recorded for it, if any, is gone — the way an exit removes it, which saves its dialog so the move carries it. Claude Code often sends no `SessionEnd` on exit, so this is the usual state of the row when the call arrives.
+
+The route refuses, changing nothing, in these cases:
+
+- **The folder has not moved.** `new_path` is not a directory, or `old_path` still exists, which usually means the move itself failed. A case-only rename (`Web` → `web`) is accepted, since a case-insensitive file system still finds the old spelling.
+- **A Claude Code session is still running** under an id it would move, or Claude Code's live-session list could not be read while a row is present, so the row cannot be shown to have ended.
+- **Claude Code's project index (`~/.claude.json`) could not be read.** Without it neither the subfolders that move along nor a folder sharing the id can be found.
+- **Another existing folder derives an id it would move**, and so shares that row's history. With `projects_root` unset that is any other folder of the same name. Renaming or removing that folder clears the refusal.
+- **The new id already has history**, which happens when another project derives it.
+- **One id would be both moved away and moved onto**, in an order no sequence of moves can carry out without one project's data landing on another's. Only subfolders under a `projects_root` can arrange this.
+
+Carries the loopback `Host` gate on top of the `Origin` check, like the session-clean route.
+
+| Status | Body | Meaning |
+|---     |---   |---      |
+| `200`  | `{"ok": true, "report": {…}}` | done; `report.ids` lists each id that changed with whether its `history` and `custom_name` were `moved`, `absent` or hit a `conflict` and how many `anchors` moved, `start_grants` counts the grants re-pointed, `cleared_rows` counts the ended sessions' rows removed first, and `live_sessions_checked` is false where Claude Code's session list could not be read, which the call survives only when no row was present |
+| `400`  | `{"ok": false, "detail": …}` | a path is missing |
+| `409`  | `{"ok": false, "detail": …}` | one of the refusals above; `detail` says which, and what clears it |
+
+Logged as `decision = "project_rename"` under each new id, with `from` naming the old one, and `decision = "rename_cleared_row"` for each ended session's row it removed. Earlier decision lines stay under the old id. A refused call logs `decision = "project_rename"` with no chat_id and an `outcome` naming the refusal.
+
 ## Sync API
 
 When `sync.listen` is on (and `sync.token` set), a second listener serves `sync.listen_port` (default 9078) for dashboard-to-dashboard session sync. Two gates sit in front of every route, in this order: the connection's source address must be inside `sync.bind_scope` — by default this device's tailnet (100.64.0.0/10, fd7a:115c:a1e0::/48) plus loopback, anything else gets `403` — and the request must carry `Authorization: Bearer <sync.token>`, or it gets `401`. Under the default scope the listener binds only this device's Tailscale addresses and loopback; if no Tailscale address is found at startup it binds all interfaces instead, logs that at `warn`, and keeps refusing non-tailnet sources. Implementation: `src-tauri/src/sync.rs`.
@@ -362,6 +401,9 @@ A peer pushes its local sessions. The body is a full snapshot of the sender's se
   "token_tip": 8412,
   "registry_sessions": [
     { "chat_id": "transcripts", "name": null, "activity": "idle", "activity_age_ms": 41000, "sessions": 1 }
+  ],
+  "renames": [
+    { "from": "my-app", "to": "my-app-renamed", "at": 1791082748306 }
   ]
 }
 ```
@@ -371,6 +413,8 @@ The push carries **no dialog, usage or token content** — only a full metadata 
 `registry_sessions` is the sender's copy of Claude Code's own list of live local sessions, which is what lets the [agent roster](#agent-roster) answer `registry_only` for a peer rather than only for this machine. It is `serde(default)`, so a peer on a build that predates it simply sends nothing and lands in `registry_unreadable` instead.
 
 `attended` is the one judgment that rides the push outright rather than as a tip: whether the sender's own user has read that finished row, which the receiver stamps onto the row's `read` flag so a session reads the same on both dashboards. A tip would hand the *verdict* to the receiver, and the only thing it could derive one from is the dialog this push deliberately strips — so it would answer from a lagging copy and call work read that the origin still calls unread. The sender is authoritative for its own sessions, so it decides this too, from its own full dialog and its own `attention_tracking`. The receiver stores it verbatim and keeps no bookkeeping of its own: a withdrawn verdict simply arrives as `false` on the next cycle, and whether this dashboard draws it is its own `attention_tracking`'s business, applied where it renders. The timestamp behind it is never sent, and nothing in this API reports when a human last sat at a machine.
+
+`renames` lists the projects the sender [renamed](#post-apiprojectrename) in the last 30 days, as raw ids, oldest first. Before seeding dialogs, the receiver applies each rename it has not applied yet, in order of `at`: its stored copy of `{device_name}/{from}` and its own custom name for that row move to `{device_name}/{to}`, and where a dialog under the new id is already held both are kept. It remembers the newest `at` applied per device, so the repetition on every push, which lets a peer that was offline catch up, never re-applies a rename to an id that has come back into use. A peer on an older build ignores the field.
 
 `origin_label` is the name the sender's own terminal tab carries for that session, present only where the sender renamed it. It is not a name to display — the receiver's own rename still wins there — but a tab on the receiver that reaches the sender's agent over SSH or tmux carries *that* string, so without it the receiver could not join such a tab to the row it names. `null` where the sender has not renamed the row, whose tab then shows an id the receiver already derives.
 

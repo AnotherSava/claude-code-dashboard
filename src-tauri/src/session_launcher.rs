@@ -237,6 +237,13 @@ fn claude_project_index() -> Option<serde_json::Value> {
     claude_config_file().and_then(|p| std::fs::read_to_string(p).ok()).and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
 }
 
+/// Every directory Claude Code's index has recorded a session in, existing or
+/// not, or `None` when the index could not be read.
+pub fn indexed_dirs() -> Option<Vec<String>> {
+    let config = claude_project_index()?;
+    Some(config.get("projects").and_then(|p| p.as_object()).map(|p| p.keys().cloned().collect()).unwrap_or_default())
+}
+
 /// Whether this machine holds any directory that derives a project id.
 ///
 /// This is the fact that separates *a session that has ended* from *an address

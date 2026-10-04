@@ -137,6 +137,17 @@ pub struct SyncPush {
     /// over-claims nothing.
     #[serde(default)]
     pub registry_sessions: Option<Vec<RegistrySync>>,
+    /// Projects this device renamed recently, as raw ids, oldest first, so the
+    /// receiver can re-file its stored copy of their history and its own name
+    /// for the row under the new id (`crate::project_rename`).
+    ///
+    /// Repeated on every push for the announcement window rather than sent once,
+    /// so a peer that was asleep at the time still gets it; the receiver applies
+    /// each one once, by its `at`. A field on the push rather than a route of its own because a
+    /// peer on an older build ignores an unknown field but would refuse an
+    /// unknown route. `serde(default)` for the reason `token_tip` has one.
+    #[serde(default)]
+    pub renames: Vec<crate::project_rename::ProjectRename>,
 }
 
 /// One live session from a peer's Claude Code registry.
@@ -573,6 +584,19 @@ async fn post_sync(
     let origin_addr = origin_url(addr.ip(), push.listen_port);
     let now = now_ms();
     let store = app.try_state::<RemoteHistoryStore>();
+    // Before the dialogs are read for seeding, so a renamed project's history is
+    // already under the id this push's sessions carry.
+    if let Some(store) = &store {
+        let device = &push.device_name;
+        for r in store.apply_renames(device, &push.renames) {
+            // This machine's own name for the peer's row is keyed by the
+            // namespaced id too, so it moves with the dialog.
+            if let Some(names) = app.try_state::<crate::custom_names::CustomNamesStore>() {
+                names.rename(&format!("{device}/{}", r.from), &format!("{device}/{}", r.to));
+            }
+            tracing::info!(device = %device, from = %r.from, to = %r.to, "a peer renamed a project; its stored dialog and name here moved to the new id");
+        }
+    }
     let persisted = store.as_ref().map(|s| s.device_dialogs(&push.device_name)).unwrap_or_default();
     let usage_tip = push.usage_tip;
     let token_tip = push.token_tip;
@@ -1776,6 +1800,7 @@ fn build_push(
     token_tip: u64,
     registry: Option<&[crate::session_registry::LiveSession]>,
     record_attention: bool,
+    renames: Vec<crate::project_rename::ProjectRename>,
 ) -> SyncPush {
     SyncPush {
         device_name: device_name.to_string(),
@@ -1811,6 +1836,7 @@ fn build_push(
                 })
                 .collect()
         }),
+        renames,
     }
 }
 
@@ -1852,7 +1878,8 @@ async fn push_all(app: &AppHandle, client: &reqwest::Client) {
     let registry = app
         .try_state::<crate::session_registry::SessionRegistry>()
         .and_then(|r| r.live_sessions(cfg.projects_root.as_deref(), now_ms()));
-    let push = build_push(&cfg.sync.device_name, cfg.sync.listen_port, &sessions, usage_tip, token_tip, registry.as_deref(), cfg.attention_tracking);
+    let renames = app.try_state::<crate::project_rename::RenameLog>().map(|log| log.recent(now_ms())).unwrap_or_default();
+    let push = build_push(&cfg.sync.device_name, cfg.sync.listen_port, &sessions, usage_tip, token_tip, registry.as_deref(), cfg.attention_tracking, renames);
     // Cycle breadcrumb: push cadence should never silently stop while peers
     // are configured — if the failure logs go quiet, this shows whether the
     // pusher loop itself is still alive.
@@ -2484,7 +2511,7 @@ mod tests {
         // field beside `session`, while the `session` itself is the raw
         // `AppState` row, where `read` is false because only the display path
         // stamps it.
-        let push = build_push("desktop", 9078, &[read_row("proj")], 0, 0, None, true);
+        let push = build_push("desktop", 9078, &[read_row("proj")], 0, 0, None, true, Vec::new());
         assert!(push.sessions[0].attended, "the sender decided it, so the sender says so");
         assert!(!push.sessions[0].session.read, "the raw row carries no verdict");
         let json = serde_json::to_value(&push.sessions[0].session).expect("serialize");
@@ -2495,7 +2522,7 @@ mod tests {
     fn an_unread_row_advertises_nothing() {
         let mut unread = read_row("proj");
         unread.attended_at = None;
-        assert!(!build_push("desktop", 9078, &[unread], 0, 0, None, true).sessions[0].attended);
+        assert!(!build_push("desktop", 9078, &[unread], 0, 0, None, true, Vec::new()).sessions[0].attended);
     }
 
     #[test]
@@ -2505,7 +2532,7 @@ mod tests {
         // says unread and the peer's row brightens again with it.
         let mut row = read_row("proj");
         row.dialog.push(entry(DialogRole::Assistant, "a later answer", 900));
-        assert!(!build_push("desktop", 9078, &[row], 0, 0, None, true).sessions[0].attended);
+        assert!(!build_push("desktop", 9078, &[row], 0, 0, None, true, Vec::new()).sessions[0].attended);
     }
 
     #[test]
@@ -2514,7 +2541,7 @@ mod tests {
         // `session_restore` re-stamps `attended_at` off a ⚪ tab with no gate of
         // its own, so a row can hold a stamp this dashboard is itself drawing
         // as unread.
-        assert!(!build_push("desktop", 9078, &[read_row("proj")], 0, 0, None, false).sessions[0].attended);
+        assert!(!build_push("desktop", 9078, &[read_row("proj")], 0, 0, None, false, Vec::new()).sessions[0].attended);
     }
 
     #[test]
@@ -2570,7 +2597,7 @@ mod tests {
     fn the_senders_own_label_rides_the_push_only_where_it_differs() {
         let mut renamed = read_row("tauri-dashboard");
         renamed.display_name = Some("ai-dashboard".into());
-        let push = build_push("desktop", 9078, &[renamed, read_row("plain")], 0, 0, None, true);
+        let push = build_push("desktop", 9078, &[renamed, read_row("plain")], 0, 0, None, true, Vec::new());
         assert_eq!(push.sessions[0].origin_label.as_deref(), Some("ai-dashboard"));
         assert_eq!(push.sessions[1].origin_label, None, "an unrenamed row shows the id, which the receiver derives");
     }
@@ -2624,7 +2651,7 @@ mod tests {
             "laptop".to_string(),
             RemoteDevice { sessions: vec![remote], last_seen: 0, origin_addr: String::new(), registry_sessions: None, identity: crate::tailnet::Attestation::Claimed },
         );
-        let push = build_push("desktop", 9078, &state.snapshot(), 0, 0, None, true);
+        let push = build_push("desktop", 9078, &state.snapshot(), 0, 0, None, true, Vec::new());
         assert!(push.sessions.is_empty(), "the remote row is not ours to advertise");
     }
 
@@ -2636,7 +2663,7 @@ mod tests {
             "proj",
             vec![entry(DialogRole::User, "old", 10), entry(DialogRole::User, "new", 100)],
         )];
-        let push = build_push("desktop", 9078, &sessions, 4242, 77, None, true);
+        let push = build_push("desktop", 9078, &sessions, 4242, 77, None, true, Vec::new());
         assert_eq!(push.device_name, "desktop");
         assert_eq!(push.listen_port, 9078);
         assert!(push.sessions[0].session.dialog.is_empty(), "no dialog content on the wire");
@@ -2658,7 +2685,7 @@ mod tests {
             session_ids: vec!["abc".into()],
             pid: 4_242,
         }];
-        let push = build_push("desktop", 9078, &[], 0, 0, Some(&regs), true);
+        let push = build_push("desktop", 9078, &[], 0, 0, Some(&regs), true, Vec::new());
         let rows = push.registry_sessions.expect("registry rows ride the push");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].chat_id, "transcripts", "un-namespaced; the receiver stamps its own prefix");
@@ -2668,7 +2695,7 @@ mod tests {
 
         // An unreadable registry must stay `None` all the way across, or the
         // peer reads "that machine is running nothing" from our failure to look.
-        assert!(build_push("desktop", 9078, &[], 0, 0, None, true).registry_sessions.is_none());
+        assert!(build_push("desktop", 9078, &[], 0, 0, None, true, Vec::new()).registry_sessions.is_none());
     }
 
     #[test]
@@ -2694,6 +2721,15 @@ mod tests {
         let body = r#"{"device_name":"old","listen_port":9078,"sessions":[],"usage_tip":5}"#;
         let push: SyncPush = serde_json::from_str(body).expect("older push should parse");
         assert!(push.registry_sessions.is_none());
+        assert!(push.renames.is_empty(), "an older peer announces no renames");
+    }
+
+    #[test]
+    fn renames_ride_the_push_as_raw_ids() {
+        let renames = vec![crate::project_rename::ProjectRename { from: "my-app".into(), to: "my-app-renamed".into(), at: 1 }];
+        let push = build_push("desktop", 9078, &[], 0, 0, None, true, renames.clone());
+        let back: SyncPush = serde_json::from_str(&serde_json::to_string(&push).unwrap()).unwrap();
+        assert_eq!(back.renames, renames, "un-namespaced; the receiver adds the sender's device itself");
     }
 
     /// The registry's own vocabulary is `idle`/`busy`; anything else a future
@@ -2718,7 +2754,7 @@ mod tests {
     #[test]
     fn build_push_empty_dialog_tips_zero() {
         let sessions = vec![session("proj", Vec::new())];
-        assert_eq!(build_push("desktop", 9078, &sessions, 0, 0, None, true).sessions[0].dialog_tip, 0);
+        assert_eq!(build_push("desktop", 9078, &sessions, 0, 0, None, true, Vec::new()).sessions[0].dialog_tip, 0);
     }
 
     #[test]
@@ -2727,8 +2763,8 @@ mod tests {
         // there is no per-peer bookkeeping that can go stale, and re-sending is
         // free. A peer that missed ten cycles is caught up by the next one.
         let sessions = vec![session("proj", vec![entry(DialogRole::User, "u", 10)])];
-        let a = build_push("desktop", 9078, &sessions, 7, 3, None, true);
-        let b = build_push("desktop", 9078, &sessions, 7, 3, None, true);
+        let a = build_push("desktop", 9078, &sessions, 7, 3, None, true, Vec::new());
+        let b = build_push("desktop", 9078, &sessions, 7, 3, None, true, Vec::new());
         assert_eq!(serde_json::to_string(&a).unwrap(), serde_json::to_string(&b).unwrap());
     }
 

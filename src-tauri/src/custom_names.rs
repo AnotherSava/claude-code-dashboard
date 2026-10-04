@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
+use crate::project_rename::{rename_key, KeyMove};
 use crate::state::AgentSession;
 
 /// User-assigned display names, keyed by `chat_id` (the cwd-derived row id).
@@ -64,6 +65,15 @@ impl CustomNamesStore {
         self.save_to_disk();
     }
 
+    /// Carry a row's name over to the id its project folder was renamed to.
+    pub fn rename(&self, from: &str, to: &str) -> KeyMove {
+        let outcome = rename_key(&mut self.data.lock().unwrap(), from, to);
+        if outcome == KeyMove::Moved {
+            self.save_to_disk();
+        }
+        outcome
+    }
+
     fn save_to_disk(&self) {
         let data = self.data.lock().unwrap();
         match serde_json::to_string_pretty(&*data) {
@@ -119,6 +129,15 @@ mod tests {
         let s = store();
         s.set("a", "  Name  ");
         assert_eq!(s.get("a").as_deref(), Some("Name"));
+    }
+
+    #[test]
+    fn rename_carries_the_name_to_the_new_id() {
+        let s = store();
+        s.set("my-app", "Planner");
+        assert_eq!(s.rename("my-app", "my-app-renamed"), KeyMove::Moved);
+        assert_eq!(s.get("my-app-renamed").as_deref(), Some("Planner"));
+        assert_eq!(CustomNamesStore::new(s.path.clone()).get("my-app-renamed").as_deref(), Some("Planner"), "persisted");
     }
 
     #[test]
