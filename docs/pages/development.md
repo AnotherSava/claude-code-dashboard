@@ -46,7 +46,7 @@ Compiles the Rust backend, starts Vite on `localhost:1420`, and launches the nat
 
 The app pairs a Rust backend (Tauri v2) with a Svelte 5 + Vite frontend rendered in the system webview (WebView2 on Windows, WKWebView on macOS). The Rust side owns all state and external I/O; the frontend is a pure view that subscribes to Tauri events and issues invoke-style commands for window control. External tools integrate via an embedded `axum` HTTP server on `127.0.0.1:9077`, bypassing the frontend entirely.
 
-The source-of-truth `AgentSession` state lives behind a `Mutex` in Rust. Three paths mutate it — the HTTP server, the per-session transcript watcher, and Tauri commands invoked from the Svelte UI — and every mutation funnels through `state::apply_set` or `state::apply_clear` so the sticky-label state machine is enforced in exactly one place.
+The source-of-truth `AgentSession` state lives behind a `Mutex` in Rust. Hook events reach it through `state::apply_set`, which enforces the sticky-label rules, the working-time accumulator and the task boundary in one place whatever the origin. The other writers each own one narrow transition and never choose a label: the transcript watcher's promotion to working and its Esc-cancel revert, the WAIT backstop, the liveness reaper's row removal, a restart's restore, and a subagent's permission prompt. Sessions running on another device arrive pre-enriched over sync and live in a separate map; `commands::resolved_snapshot` is the one place the two sets combine.
 
 ## Project structure
 
@@ -56,6 +56,7 @@ Under the repo root `claude-code-dashboard/`:
   - `App.svelte` — top-level layout, subscribes to Tauri events
   - `HistoryApp.svelte` — root component of the history window
   - `AboutApp.svelte` — root component of the About window (Help → About)
+  - `IntensityApp.svelte` — root component of the Work intensity window
   - `main.ts` — mount entry point
   - `lib/`
     - `types.ts` — shared TS types and display helpers
@@ -65,6 +66,7 @@ Under the repo root `claude-code-dashboard/`:
       - `SessionItem.svelte` — per-row rendering (status badge, timer, tokens, label)
       - `SetupPanel.svelte` — onboarding panel: bundled hook snippet, copy-to-clipboard, hide affordance
       - `LimitBar.svelte` — header 5h / 7d usage bar (segmented fill, percent + timer caps)
+      - `StartApprovals.svelte` — the prompt asking you to approve starting a session on another machine
 - `src-tauri/`
   - `Cargo.toml` — Rust deps: tauri, axum, notify, tracing, serde, reqwest, chrono, open
   - `tauri.conf.json` — NSIS + DMG bundle targets, WebView2 bootstrapper, window config
@@ -77,23 +79,52 @@ Under the repo root `claude-code-dashboard/`:
     - `config_watcher.rs` — notify watcher for config.json hot-reload
     - `commands.rs` — Tauri commands + event emitters
     - `setup.rs` — embedded Python hook + settings.json snippet builder for onboarding
-    - `http_server.rs` — axum routes for POST /api/event
-    - `sync.rs` — multi-device session sync: bearer-gated listener + chunked delta push
+    - `http_server.rs` — the loopback axum server: `/api/event`, `/api/agents`, `/api/message`, `/api/window`, `/api/session-clean`
+    - `sync.rs` — multi-device session sync: source- and token-gated listener, metadata push, receiver-driven pulls
+    - `tailnet.rs` — asking Tailscale which machine a connection came from, instead of trusting its envelope
+    - `peer_message.rs` — relaying one message to an agent on another machine, and the honesty rules around it
+    - `start_approval.rs` — asking this machine's user to approve starting a session on another one
+    - `session_launcher.rs` — starting a terminal session for a project that has none
+    - `auto_start_store.rs` — the `chat_id → absolute path` grants that permit those starts, in `auto_start.json`
+    - `session_restore.rs` — giving a live session its row back after a restart
     - `log_watcher.rs` — per-session transcript tailing + infer_state + assistant text upsert
+    - `liveness.rs` — process-liveness primitives and the per-row owning-pid store
+    - `liveness_reaper.rs` — removes a row whose Claude process exited without a `SessionEnd`
+    - `waiting_settle.rs` — settles a `waiting` row to `done` once its killed background task can no longer report
+    - `subagent_gate.rs` — the subagent permission-prompt overlay, and finding the gated call's result that releases it
+    - `prompt_origin.rs` — what a row shows for a task another agent began
+    - `nonce_store.rs` — per-session marker nonces for the instruction-adherence canary
     - `tray.rs` — TrayIconBuilder, menu handlers, autostart
+    - `tray_badge.rs` — the usage badge drawn onto the tray icon, and the context-usage alert over it
     - `notifications.rs` — 1s-tick reconciler + Notifier trait
     - `telegram.rs` — reqwest-based Telegram Bot API client
+    - `idle.rs` — system-wide input-idle milliseconds, for the AFK half of the notification rules
+    - `idle_awake.rs` — holds off idle sleep while a local agent is working (macOS)
+    - `lid_awake.rs` — holds off sleep with the lid closed, for a bounded window (macOS)
     - `usage_limits.rs` — Anthropic OAuth usage poller + refresh (5h / 7d buckets)
+    - `usage_cache.rs` — the last good reading and the endpoint's retry deadline, in `usage_cache.json`
     - `usage_history.rs` — appends each successful usage poll to `usage_history.jsonl`
     - `token_history.rs` — one record per Claude API response in `token_history.jsonl`, and the Work intensity chart built from them
     - `token_scan.rs` — 60s scan of Claude Code's own transcripts, which is what fills that file
     - `remote_tokens.rs` — per-device remote token records under `remote_tokens/`
+    - `remote_usage.rs` — per-device remote usage samples under `remote_usage/`
     - `prompt_history.rs` — per-session dialog persistence to `prompt_history.json`
     - `remote_history.rs` — per-device remote-session dialog persistence under `remote_history/`
     - `chat_id_registry.rs` — persisted `session_id → chat_id` lock in `session_chat_ids.json`
     - `custom_names.rs` — user-assigned display names persisted to `custom_names.json`
     - `terminal_title.rs` — mirrors session status onto terminal tab titles
     - `session_registry.rs` — finds a row's terminal in Claude Code's live session list, by cwd
+    - `attention.rs` — which finished sessions you have actually looked at, and the stamp that dims them
+    - `agterm.rs` — transport for agterm's `agtermctl` control socket (macOS)
+    - `terminals/` — one adapter per terminal behind the `TerminalAdapter` seam, so nothing downstream names a terminal
+      - `mod.rs` — the trait, the shared vocabulary, and the pure verdicts over it (`person_verdict`, `departure_stamp`, `read_front`)
+      - `agterm.rs` / `agterm_facts.rs` — agterm's adapter, and the facts it reads from agterm and the system (macOS)
+      - `agwinterm.rs` / `agwinterm_state.rs` / `agwinterm_wire.rs` — agwinterm's control pipe, its per-window state files, and its protocol (Windows)
+      - `windows.rs` / `wt_tabs.rs` — Windows Terminal and the Windows console, and the UI Automation read of what a tab really holds
+      - `composite.rs` — presents several terminals on one platform as one adapter
+      - `labels.rs` — writes each row's task into a terminal's own per-session context line
+      - `stale_check.rs` — catches a tab that has stopped following its session
+      - `snapshot_watch.rs` / `window_files.rs` — the directory watch and per-window bookkeeping two adapters share
     - `auto_resize.rs` — Up/Down content-fit window + vertical resize lock (Win32 hit-test subclass / macOS height pin) + dark class brush
     - `label_policy.rs` — shared (label, original_prompt) decision used by adapters
     - `adapters.rs` — adapter dispatch for /api/event payloads
@@ -108,8 +139,8 @@ Under the repo root `claude-code-dashboard/`:
 
 ### Where state lives at runtime
 
-- **In-memory** — `AppState` (sessions) and `ConfigState` (config) via `tauri::State`.
-- **On disk** — `config.json`, `widget.jsonl`, `prompt_history.json`, `session_chat_ids.json`, `custom_names.json`, `usage_history.jsonl`, `token_history.jsonl`, and the `remote_history/`, `remote_usage/` and `remote_tokens/` directories under `app_data_dir()`:
+- **In-memory** — `AppState` (local and remote sessions) and `ConfigState` (config) via `tauri::State`, alongside the other managed stores the frontend and the HTTP routes read.
+- **On disk** — `config.json`, `widget.jsonl`, `prompt_history.json`, `session_chat_ids.json`, `custom_names.json`, `auto_start.json`, `usage_history.jsonl`, `usage_cache.json`, `token_history.jsonl`, `token_scan_cursor.json`, and the `remote_history/`, `remote_usage/` and `remote_tokens/` directories under `app_data_dir()`:
   - Windows: `%APPDATA%\com.anothersava.claude-code-dashboard\`
   - macOS: `~/Library/Application Support/com.anothersava.claude-code-dashboard/`
 
@@ -122,12 +153,13 @@ Under the repo root `claude-code-dashboard/`:
 
 ## Testing
 
-Rust tests live inline in `#[cfg(test)]` modules next to the code they cover:
+Rust tests live inline in `#[cfg(test)]` modules next to the code they cover — most modules carry one. The ones worth knowing where to look for:
 
-- `state::tests` — sticky-label machine, working-time accumulator, error transitions.
+- `state::tests` — sticky-label machine, working-time accumulator, error transitions, the subagent-prompt overlay.
 - `label_policy::tests` — the `(label, original_prompt)` decision extracted from `apply_set`.
 - `log_watcher::tests` — the transcript parser (`infer_state`, `split_complete`), the promote-to-`working`-only merge policy, and the `[Request interrupted by user]` cancel marker.
-- `sync::tests` — the receive-side `ingest` (namespacing, dialog seeding, contiguity guard) and the oldest-first chunked `build_push_chunk`.
+- `sync::tests` — the receive-side `ingest` (namespacing, dialog seeding, the attended verdict), the pulled-dialog merge, and the source/token guard that fronts every sync route.
 - `adapters::claude::tests` — `classify` / `classify_stop`, `derive_chat_id`, `clean_prompt`, `is_a_question` / `question_reason` / `evidence_snippet`, and the outer `dispatch`.
+- `terminals::*::tests` — the verdicts over the adapter seam's vocabulary, which are pure and so are tested once for every terminal rather than per platform.
 
 CI runs Rust tests on every push and PR (`build.yml`) and again before bundling on every tag push (`release.yml`), so a broken state machine can't ship a release.
