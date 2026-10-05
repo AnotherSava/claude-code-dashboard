@@ -52,3 +52,18 @@ fontdue = "0.9"
 # unifies rather than compiling a second copy.
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Variant", "Win32_UI_Accessibility"] }
+
+# Full DWARF is 82.8% of the bytes of every object file this crate graph writes
+# (measured over 300 `*.rcgu.o` in target/debug/deps), and the dev profile is
+# what `cargo check`, `cargo test --lib` and rust-analyzer all build — so the
+# debug tree reached 38 GB and filled a 228 GB disk to 510 MiB free, which is
+# where this came from. Line tables keep file and line in a backtrace and drop
+# variable and type inspection; nothing in src/ reads a backtrace, and no test
+# asserts on one.
+[profile.dev]
+debug = "line-tables-only"
+
+# Dependencies carry the bulk and are never stepped into. "*" is every
+# non-workspace crate, so it does not touch this crate's own units above.
+[profile.dev.package."*"]
+debug = 0
