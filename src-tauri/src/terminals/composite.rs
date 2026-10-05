@@ -18,7 +18,7 @@
 
 use std::sync::mpsc::Sender;
 
-use super::{FrontReading, LabelBudget, LabelTarget, LabelWrite, Observation, TerminalAdapter, TerminalSession, FALLBACK_STALE_REMEDY};
+use super::{FrontReading, LabelTarget, LabelWrite, Observation, TerminalAdapter, TerminalSession, FALLBACK_STALE_REMEDY};
 
 pub struct Composite {
     name: &'static str,
@@ -144,6 +144,7 @@ impl TerminalAdapter for Composite {
 
 #[cfg(test)]
 mod tests {
+    use super::super::LabelBudget;
     use std::sync::mpsc;
     use std::sync::{Arc, Mutex};
 

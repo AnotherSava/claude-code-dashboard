@@ -48,9 +48,14 @@ use std::collections::HashMap;
 use serde_json::Value;
 
 use super::agterm_facts as facts;
-use super::agterm_wire as wire;
 use super::window_files::Stepped;
-use super::{Front, InputFacts, LabelTarget, LabelWrite, LastInput, Naming, Observation, ObservationKind, Selection, Since, Switch, TerminalSession};
+use super::{Front, InputFacts, LastInput, Naming, Observation, ObservationKind, Selection, Since, Switch, TerminalSession};
+// Only the adapter impl and `walk_windows` touch these, and both are macOS-only,
+// so a Windows test build compiles this file without a user for them.
+#[cfg(target_os = "macos")]
+use super::agterm_wire as wire;
+#[cfg(target_os = "macos")]
+use super::{LabelTarget, LabelWrite};
 #[cfg(target_os = "macos")]
 use super::window_files::WindowFiles;
 #[cfg(target_os = "macos")]

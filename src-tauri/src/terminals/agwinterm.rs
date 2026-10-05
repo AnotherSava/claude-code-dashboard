@@ -121,7 +121,7 @@ use std::time::{Duration, Instant};
 
 use super::agwinterm_state::{self as state, Frontmost, Watch, TERMINAL as NAME};
 use super::agwinterm_wire as wire;
-use super::{Front, LabelBudget, LabelTarget, LabelWrite, LastInput, Observation, Selection, TerminalAdapter, TerminalSession};
+use super::{Front, LabelTarget, LabelWrite, LastInput, Observation, Selection, TerminalAdapter, TerminalSession};
 
 /// How long `ping`, `window.list` and `tree` get to answer. `tree` is served on
 /// the pipe thread without a hop to the UI, measured at 12 ms.
@@ -785,6 +785,7 @@ extern "system" {
 
 #[cfg(test)]
 mod tests {
+    use super::super::LabelBudget;
     use std::io::{BufRead, Read, Write};
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::mpsc;
