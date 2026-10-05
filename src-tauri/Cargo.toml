@@ -48,8 +48,12 @@ fontdue = "0.9"
 # dispatch across four interfaces with BSTR and VARIANT marshalling, where a
 # miscounted slot is a silent call through the wrong function pointer — no
 # compiler check, and a crash the user sees in an always-on-top widget. Keep the
-# version in step with what tauri/tao/wry already resolve to (0.61.3), so cargo
-# unifies rather than compiling a second copy.
+# version in step with what tauri/tao/wry already resolve to, so cargo unifies
+# rather than compiling a second copy. It is not in step: since tauri 2.12.1
+# those crates resolve `windows` 0.62 while this pin names 0.61, so a Windows
+# build compiles both. Raising it has to be built on Windows, since every call
+# it feeds is `cfg(windows)` and this graph will not cross-compile (aws-lc-sys
+# needs windows.h).
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Variant", "Win32_UI_Accessibility"] }
 

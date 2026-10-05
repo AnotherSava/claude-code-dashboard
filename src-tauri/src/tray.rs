@@ -328,6 +328,12 @@ pub fn setup(app: &AppHandle) -> tauri::Result<()> {
         .icon(icon)
         .tooltip("Claude Code Dashboard")
         .menu(&menu)
+        // Needs tray-icon 0.25.1 or newer: below that the menu stays attached to
+        // the NSStatusItem for the status item's whole life, so on macOS 27 the
+        // OS routes every left click into the menu — this call has no effect and
+        // the `Click` arm below never runs (tauri-apps/tray-icon#355). tauri
+        // 2.12.1 asks for `"0.25"`, which admits the unfixed 0.25.0, so
+        // Cargo.lock is what pins it.
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| handle_menu_event(app, event.id.as_ref()))
         .on_tray_icon_event(|tray, event| {
@@ -344,8 +350,8 @@ pub fn setup(app: &AppHandle) -> tauri::Result<()> {
                 // convention by opening the tray's *native* menu — the same
                 // one right-click and two-finger click show (status-item
                 // highlight, anchored under the icon) — instead of toggling.
-                // `show_menu` (tray-icon 0.22+) drives the identical
-                // `performClick` path, so both gestures render the same menu.
+                // `show_menu` presents the status item's own menu, so both
+                // gestures render the same one.
                 #[cfg(target_os = "macos")]
                 if control_key_held() {
                     let _ = tray.with_inner_tray_icon(|inner| inner.show_menu());
