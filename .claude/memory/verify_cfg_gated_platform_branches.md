@@ -15,7 +15,28 @@ stub kept the old name, breaking the build on `1d69821`.
 
 Cross-compiling to check it does **not** work here — `cargo check --target
 x86_64-pc-windows-msvc` dies in `aws-lc-sys` (pulled in by reqwest's rustls
-backend), whose C needs `windows.h`.
+backend), whose C needs `windows.h`. Re-confirmed 2026-10-04 on
+`aws-lc-sys-0.43.0`, compiling `jitterentropy-timer.c`, after installing the
+target; the target install is not the missing piece and adding it buys nothing.
+
+**A stale stub is not the only class this hides — an UNUSED IMPORT is the other,
+and it is easier to produce.** Windows compiles `composite.rs` and
+`agwinterm.rs` in the *lib* build, where their `#[cfg(test)]` modules do not
+exist, and compiles `agterm.rs` only in the *test* build, where its
+`#[cfg(target_os = "macos")]` adapter impl does not exist. So a type imported at
+the top of any of those files, used only from inside one of those regions, has no
+user on the other platform and `-D warnings` refuses the build. macOS cannot see
+it in either direction: a file gated `cfg(any(windows, test))` compiles there
+only under `test`, which is exactly where the use does exist. Four such errors
+shipped a red Windows build on 2026-10-04, from one seam change that added
+`LabelBudget` to two files and `agterm_wire`/`LabelTarget`/`LabelWrite` to a
+third.
+
+The scratch-copy recipe below catches it, and so does a static check that costs
+seconds: for each symbol imported at the top of a multi-platform file, find its
+use sites and confirm each one lies **outside** every `cfg(test)` module and
+every `cfg(target_os = ...)` region — any symbol whose uses are all inside one
+needs its import moved in there with them.
 
 What does work, locally and in seconds:
 
