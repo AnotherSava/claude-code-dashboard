@@ -49,13 +49,15 @@ fontdue = "0.9"
 # miscounted slot is a silent call through the wrong function pointer — no
 # compiler check, and a crash the user sees in an always-on-top widget. Keep the
 # version in step with what tauri/tao/wry already resolve to, so cargo unifies
-# rather than compiling a second copy. It is not in step: since tauri 2.12.1
-# those crates resolve `windows` 0.62 while this pin names 0.61, so a Windows
-# build compiles both. Raising it has to be built on Windows, since every call
-# it feeds is `cfg(windows)` and this graph will not cross-compile (aws-lc-sys
-# needs windows.h).
+# rather than compiling a second copy. Declare every feature `terminals::wt_tabs`
+# calls need, `Win32_System_Ole` included, rather than counting on those crates
+# to switch one on: the day they move to another `windows` minor, a feature
+# reached only through unification vanishes and the methods it gates go with it.
+# A change here has to be built on Windows, since every call it feeds is
+# `cfg(windows)` and this graph will not cross-compile (aws-lc-sys needs
+# windows.h).
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Variant", "Win32_UI_Accessibility"] }
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Ole", "Win32_System_Variant", "Win32_UI_Accessibility"] }
 
 # Full DWARF is 82.8% of the bytes of every object file this crate graph writes
 # (measured over 300 `*.rcgu.o` in target/debug/deps), and the dev profile is
