@@ -70,6 +70,61 @@ pub(crate) fn agtermctl(args: &[&str]) -> Option<serde_json::Value> {
     value.get("ok").and_then(serde_json::Value::as_bool).unwrap_or(false).then_some(value)
 }
 
+/// Run one `agtermctl` command and answer either its JSON or the reason it
+/// failed, for a caller that owes a reason rather than a `None`.
+///
+/// [`agtermctl`] collapses a spawn failure, the kill, a non-zero exit and an
+/// explicit `ok: false` into one `None`, and discards stderr. That is the right
+/// shape for the two callers that act on an answer or give up, and the wrong one
+/// for `TerminalAdapter::write_label`, whose `Err` is printed on the
+/// `label_write` log line: a context agterm refused — over 256 UTF-8 bytes, a
+/// control character, an ambiguous target — would otherwise be logged as a
+/// failure with nothing saying which. agterm's own `error` string is served
+/// verbatim because it is already specific (`context must be at most 256 UTF-8
+/// bytes`), and inventing a wording here would mean maintaining a second copy of
+/// agterm's rules.
+#[cfg(target_os = "macos")]
+pub(crate) fn agtermctl_checked(args: &[&str]) -> Result<serde_json::Value, String> {
+    use std::process::{Command, Stdio};
+
+    let bin = agterm_bin().ok_or("agtermctl not found")?;
+    let mut child = Command::new(&bin)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .stdin(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("could not run agtermctl: {e}"))?;
+    let deadline = std::time::Instant::now() + AGTERMCTL_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if std::time::Instant::now() < deadline => std::thread::sleep(std::time::Duration::from_millis(20)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("agtermctl timed out".to_string());
+            }
+            Err(e) => return Err(format!("could not wait for agtermctl: {e}")),
+        }
+    }
+    let out = child.wait_with_output().map_err(|e| format!("could not read agtermctl: {e}"))?;
+    let parsed: Option<serde_json::Value> = serde_json::from_slice(&out.stdout).ok();
+    // agterm answers a refusal as `{"ok":false,"error":"…"}` on stdout with exit
+    // 0, so the envelope is read before the exit status is judged.
+    if let Some(value) = parsed {
+        if value.get("ok").and_then(serde_json::Value::as_bool) == Some(true) {
+            return Ok(value);
+        }
+        if let Some(reason) = value.get("error").and_then(serde_json::Value::as_str) {
+            return Err(reason.to_string());
+        }
+    }
+    let code = out.status.code().map_or_else(|| "signal".to_string(), |c| c.to_string());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    Err(format!("agtermctl exit {code}: {}", stderr.lines().next().unwrap_or("no output").trim()))
+}
+
 /// The ids of every *open* window in a `window list --json` answer.
 ///
 /// Closed windows are listed too, and `tree --window <closed>` errors with

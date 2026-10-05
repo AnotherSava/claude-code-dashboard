@@ -18,7 +18,7 @@
 
 use std::sync::mpsc::Sender;
 
-use super::{FrontReading, LabelTarget, LabelWrite, Observation, TerminalAdapter, TerminalSession, FALLBACK_STALE_REMEDY};
+use super::{FrontReading, LabelBudget, LabelTarget, LabelWrite, Observation, TerminalAdapter, TerminalSession, FALLBACK_STALE_REMEDY};
 
 pub struct Composite {
     name: &'static str,
@@ -117,8 +117,15 @@ impl TerminalAdapter for Composite {
 
     /// Whether any child has a context line: one that does is enough for the
     /// worker to have something to ask.
-    fn can_label(&self) -> bool {
-        self.children.iter().any(|c| c.can_label())
+    fn can_label(&self) -> Option<bool> {
+        // Any child that can label makes the composite labellable, and a child
+        // that could not be asked leaves the answer open rather than settling it
+        // as a no — the union rule every other read on this seam follows.
+        let answers: Vec<Option<bool>> = self.children.iter().map(|c| c.can_label()).collect();
+        if answers.iter().any(|a| *a == Some(true)) {
+            return Some(true);
+        }
+        answers.iter().all(|a| a.is_some()).then_some(false)
     }
 
     fn label_targets(&self) -> Option<Vec<LabelTarget>> {
@@ -175,8 +182,8 @@ mod tests {
         fn attached_surface(&self, _pid: u32) -> Option<String> {
             self.surface.clone()
         }
-        fn can_label(&self) -> bool {
-            self.labels
+        fn can_label(&self) -> Option<bool> {
+            Some(self.labels)
         }
         fn label_targets(&self) -> Option<Vec<LabelTarget>> {
             self.targets.clone()
@@ -192,7 +199,7 @@ mod tests {
     }
 
     fn target(key: &str) -> LabelTarget {
-        LabelTarget { key: key.to_string(), title: Some("🔵 x".to_string()), context: None, max_utf16: 200 }
+        LabelTarget { key: key.to_string(), title: Some("🔵 x".to_string()), context: None, budget: LabelBudget::Utf16(200) }
     }
 
     fn composite(children: Vec<Fake>) -> Composite {
@@ -243,8 +250,11 @@ mod tests {
 
     #[test]
     fn the_set_labels_when_any_child_does() {
-        assert!(!composite(vec![Fake { name: "windows", ..Fake::default() }]).can_label(), "a terminal that never overrides it has no context line");
-        assert!(composite(vec![Fake { name: "windows", ..Fake::default() }, Fake { name: "agwinterm", labels: true, ..Fake::default() }]).can_label());
+        assert_eq!(composite(vec![Fake { name: "windows", ..Fake::default() }]).can_label(), Some(false), "a terminal that never overrides it has no context line");
+        assert_eq!(
+            composite(vec![Fake { name: "windows", ..Fake::default() }, Fake { name: "agwinterm", labels: true, ..Fake::default() }]).can_label(),
+            Some(true)
+        );
     }
 
     #[test]

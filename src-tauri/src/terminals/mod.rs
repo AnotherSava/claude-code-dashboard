@@ -123,6 +123,11 @@ pub mod window_files;
 /// Compiled for tests everywhere so the readings are exercised on Windows too.
 #[cfg(any(target_os = "macos", test))]
 pub mod agterm_facts;
+/// agterm's `session context` protocol as pure functions: the argv it takes, the
+/// targets its tree reports, and the release that first served the verb.
+/// Compiled for tests everywhere, like the agwinterm wire module.
+#[cfg(any(target_os = "macos", test))]
+pub mod agterm_wire;
 
 /// How close to a session switch the last input must be for the switch to be
 /// attributable to a person. Measured on Windows Terminal, a human tab switch
@@ -875,10 +880,18 @@ pub trait TerminalAdapter: Send {
     /// A fact about the terminal rather than about this moment, so it is asked
     /// separately from [`label_targets`](Self::label_targets), whose `None` also
     /// means "could not look just now" and is retried. `labels`' worker starts
-    /// only where this is `true`, so a terminal with no context line is not asked
-    /// every few seconds for the life of the process. Cheap and blocking nothing.
-    fn can_label(&self) -> bool {
-        false
+    /// only where this answers `Some(true)`, so a terminal with no context line
+    /// is not asked every few seconds for the life of the process.
+    ///
+    /// `None` is the third answer, and it is why this is not a bool: agterm's
+    /// answer needs its control socket, and at login the dashboard and the
+    /// terminal start in no fixed order, so "could not ask yet" has to be
+    /// distinguishable from "this terminal has no context line". The caller
+    /// retries a `None` and takes a `Some` as settled for the life of the
+    /// process. A terminal that knows statically answers `Some` and blocks
+    /// nothing.
+    fn can_label(&self) -> Option<bool> {
+        Some(false)
     }
 
     /// Every session this terminal can label, with its title and the context it
@@ -913,9 +926,10 @@ pub trait TerminalAdapter: Send {
 
 /// One labellable session, as [`TerminalAdapter::label_targets`] reports it.
 ///
-/// `dead_code` is allowed off Windows for the reason [`ObservationKind`]'s is:
-/// only agwinterm constructs these, and that adapter exists only on Windows.
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+/// `dead_code` is allowed only where no adapter labels, for the reason
+/// [`ObservationKind`]'s is: agwinterm and agterm both construct these, so the
+/// platforms that do are Windows and macOS.
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LabelTarget {
     /// Which session this is, opaque to every caller, with the contract
@@ -928,13 +942,38 @@ pub struct LabelTarget {
     pub title: Option<String>,
     /// The session's context line, or `None` where none is set.
     pub context: Option<String>,
-    /// The longest context the terminal accepts, in UTF-16 code units, which
-    /// `labels` fits a row's text to.
-    pub max_utf16: usize,
+    /// The longest context the terminal accepts, in the unit that terminal
+    /// enforces, which `labels` fits a row's text to.
+    pub budget: LabelBudget,
+}
+
+/// How long a context a terminal accepts, in the unit it measures.
+///
+/// The unit is on the seam because the two terminals do not agree on it *or* on
+/// what happens past it, and the difference is not cosmetic. agwinterm's 200 is
+/// UTF-16 code units and advisory — a longer write is accepted and shown cut.
+/// agterm's 256 is UTF-8 bytes and enforced: the write is refused outright with
+/// `context must be at most 256 UTF-8 bytes`, leaving the previous value
+/// standing. So a budget stated in the wrong unit is not a cosmetic slip —
+/// 200 UTF-16 units of Cyrillic or emoji is up to 800 UTF-8 bytes, and
+/// `labels::pass` abandons the rest of its pass on the first `Err`, so one
+/// over-budget row would starve every row planned after it on a 10s retry loop.
+/// The adapter states the unit; the pure fitter in `labels` obeys it.
+/// `dead_code` is allowed unconditionally here, which no sibling type needs: a
+/// variant is constructed by whichever adapter enforces that unit, so the lib
+/// build constructs exactly one of them on each platform — `Utf8Bytes` on macOS
+/// and `Utf16` on Windows — and a cfg-conditional allow would therefore be wrong
+/// on both. The vocabulary is deliberately wider than any one platform, which is
+/// the whole point of stating the unit on the seam.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LabelBudget {
+    Utf16(usize),
+    Utf8Bytes(usize),
 }
 
 /// One write to a session's context line. A [`LabelWrite::Context`] is never
-/// longer than its target's `max_utf16`.
+/// longer than its target's [`LabelTarget::budget`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LabelWrite {
     Context(String),

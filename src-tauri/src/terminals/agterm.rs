@@ -48,8 +48,9 @@ use std::collections::HashMap;
 use serde_json::Value;
 
 use super::agterm_facts as facts;
+use super::agterm_wire as wire;
 use super::window_files::Stepped;
-use super::{Front, InputFacts, LastInput, Naming, Observation, ObservationKind, Selection, Since, Switch, TerminalSession};
+use super::{Front, InputFacts, LabelTarget, LabelWrite, LastInput, Naming, Observation, ObservationKind, Selection, Since, Switch, TerminalSession};
 #[cfg(target_os = "macos")]
 use super::window_files::WindowFiles;
 #[cfg(target_os = "macos")]
@@ -130,16 +131,59 @@ impl TerminalAdapter for AgtermAdapter {
     /// reserved for having been unable to ask agterm at all, which is the only
     /// case the caller must not read as "there are no tabs".
     fn sessions(&self) -> Option<Vec<TerminalSession>> {
-        let list = crate::agterm::agtermctl(&["window", "list", "--json"])?;
-        let mut out = Vec::new();
-        for window in crate::agterm::open_window_ids(&list) {
-            let Some(tree) = crate::agterm::agtermctl(&["tree", "--json", "--window", &window]) else {
-                tracing::debug!(terminal = NAME, window = %window, "no tree for this window; its sessions are not restorable this pass");
-                continue;
-            };
-            out.extend(crate::agterm::session_nodes(&tree).map(session_from_node));
+        walk_windows("restorable", |_, nodes| nodes.iter().map(session_from_node).collect())
+    }
+
+    /// Whether this agterm serves a `session context` verb at all.
+    ///
+    /// A version check rather than a probe of the verb: 0.25.0 answers
+    /// `unexpected arguments: 'context'`, and a failed write is logged, so
+    /// probing would put a refusal on a log line once per start for a terminal
+    /// that is simply older. Answered from one `version` call, which needs no
+    /// open window.
+    ///
+    /// `None` means agterm could not be asked — it is not running yet, which at
+    /// login is the ordinary case — and the caller retries. `Some(false)` is a
+    /// settled no, and stands the labeller down for the life of the process.
+    fn can_label(&self) -> Option<bool> {
+        let value = crate::agterm::agtermctl(&["version", "--json"])?;
+        let version = wire::app_version(&value)?;
+        let serves = wire::supports_context(version);
+        if !serves {
+            tracing::info!(terminal = NAME, version, "this agterm has no session context verb; not labelling");
         }
-        Some(out)
+        Some(serves)
+    }
+
+    /// Every session in every open window, with the title that joins it to a row
+    /// and the context it is showing now.
+    ///
+    /// The same walk [`sessions`](Self::sessions) makes, and for the reason its
+    /// doc gives: a bare `tree` projects only the frontmost window. A window that
+    /// does not answer is skipped rather than failing the pass, since its
+    /// sessions are simply not labellable this time round; `None` is reserved for
+    /// not having reached agterm at all, which the caller retries rather than
+    /// reading as a terminal with nothing in it.
+    fn label_targets(&self) -> Option<Vec<LabelTarget>> {
+        walk_windows("labellable", wire::targets_from)
+    }
+
+    /// Write or clear one session's context.
+    ///
+    /// Through [`crate::agterm::agtermctl_checked`] rather than `agtermctl`, so a
+    /// refusal arrives as agterm's own sentence and reaches the `label_write` log
+    /// line. The text is already inside the byte budget — `labels::plan` fits it
+    /// to [`LabelTarget::budget`] — so a `context must be at most 256 UTF-8
+    /// bytes` here means the fitter and this adapter disagree about the limit,
+    /// which is worth reading in a log rather than silently retrying.
+    fn write_label(&self, key: &str, write: &LabelWrite) -> Result<(), String> {
+        let (window, session) = wire::split_key(key).ok_or_else(|| format!("not a key this adapter minted: {key}"))?;
+        let argv = match write {
+            LabelWrite::Context(text) => wire::context_argv(window, session, text),
+            LabelWrite::ClearContext => wire::clear_argv(window, session),
+        };
+        let args: Vec<&str> = argv.iter().map(String::as_str).collect();
+        crate::agterm::agtermctl_checked(&args).map(|_| ())
     }
 
     /// Input to the session on screen in agterm's active window.
@@ -444,6 +488,43 @@ fn departure(left: &Left, tree: Option<&Value>, front: Front, front_since: Since
 fn input_observation(reading: &Reading, front: Front, front_since: Since, selected_since: i64, at_ms: i64) -> Observation {
     let facts = InputFacts { front, front_since, selection: Selection::Live, selected_since: Since::At(selected_since), cover: reading.cover };
     Observation { terminal: NAME, session: reading.selected.clone(), at_ms, kind: ObservationKind::Input(facts), occupant: reading.occupant, naming: Naming::OwnTitle }
+}
+
+/// Ask every open window for its tree and collect what `map` makes of each
+/// window's session nodes.
+///
+/// The walk is shared because its three rules are a contract two callers must
+/// not state differently, and both of them answer an `Option` whose `None` the
+/// caller acts on:
+///
+/// * **Per-window, never a bare `tree`**, which projects only the frontmost
+///   window — and asking again returns that same window, so a session in a
+///   background one would not merely be late but permanently invisible, with the
+///   caller's "is anything missing?" gate staying true forever and paying a
+///   subprocess per tick to rediscover the same nothing.
+/// * **A window that does not answer is skipped, not fatal.** A window closing
+///   between the list and the read is ordinary, and the sessions in the windows
+///   that did answer are still worth returning.
+/// * **`None` means agterm could not be asked at all**, which is the one case a
+///   caller must not read as "there are no sessions" — `sessions` would tell
+///   `session_restore` every tab had gone, and `label_targets` would have
+///   `labels::plan` withdraw every context.
+///
+/// `what` names the subject in the skipped-window log line, the only part that
+/// legitimately differs between callers.
+#[cfg(target_os = "macos")]
+fn walk_windows<T>(what: &str, map: impl Fn(&str, &[Value]) -> Vec<T>) -> Option<Vec<T>> {
+    let list = crate::agterm::agtermctl(&["window", "list", "--json"])?;
+    let mut out = Vec::new();
+    for window in crate::agterm::open_window_ids(&list) {
+        let Some(tree) = crate::agterm::agtermctl(&["tree", "--json", "--window", &window]) else {
+            tracing::debug!(terminal = NAME, window = %window, "no tree for this window; its sessions are not {what} this pass");
+            continue;
+        };
+        let nodes: Vec<Value> = crate::agterm::session_nodes(&tree).cloned().collect();
+        out.extend(map(&window, &nodes));
+    }
+    Some(out)
 }
 
 /// Read a session node's two portable handles.

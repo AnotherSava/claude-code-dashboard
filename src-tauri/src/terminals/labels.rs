@@ -1,14 +1,25 @@
 //! Mirroring each row's current prompt onto a terminal's own per-session
 //! context line.
 //!
-//! Some terminals give a session a field the console title never reaches:
-//! agwinterm draws a dim context line beside each session's name, in the sidebar
-//! and in the title bar. The name needs no writing from here, since agwinterm's
-//! sidebar follows the program title of each session's focused pane, which for an
-//! agent is the console title `terminal_title::sync` already writes, glyph and
-//! suffix included. So the one field written is the context, and it carries the
-//! row's task (`AgentSession::shown_task`), what the session was asked to do. The
-//! status is not repeated there: the title's glyph already says it.
+//! Some terminals give a session a field the console title never reaches, and
+//! two of them do: agwinterm on Windows draws a dim context line beside each
+//! session's name, in the sidebar and in the title bar, and agterm on macOS
+//! shows one in the title bar of its window's active session. The name needs no
+//! writing from here, because each terminal's own label follows the program
+//! title of the session's focused pane, which for an agent is the console title
+//! `terminal_title::sync` already writes, glyph and suffix included. So the one
+//! field written is the context, and it carries the row's task
+//! (`AgentSession::shown_task`), what the session was asked to do. The status is
+//! not repeated there: the title's glyph already says it.
+//!
+//! **The budget is the one place the two terminals genuinely differ**, and it is
+//! not a difference of degree: `LabelTarget::budget` names its unit, because
+//! agwinterm's 200 UTF-16 units are a display cap that shows a longer write cut,
+//! while agterm's 256 UTF-8 bytes are enforced and an over-long write is refused
+//! with the previous context left standing. Since [`pass`] abandons the rest of
+//! its pass on the first `Err`, a row fitted in the wrong unit would starve
+//! every row planned after it for as long as the row lived. [`fit`] dispatches on
+//! the unit the terminal reported.
 //!
 //! **A session is joined to a row by its title.** The title is the string this
 //! dashboard wrote, so it names the row rather than guessing at it, and it is
@@ -50,7 +61,7 @@ use std::time::{Duration, Instant};
 
 use tauri::AppHandle;
 
-use super::{LabelTarget, LabelWrite, TerminalAdapter};
+use super::{LabelBudget, LabelTarget, LabelWrite, TerminalAdapter};
 use crate::terminal_title::{title_names, Named};
 
 /// How long requests have to stop arriving before the worker acts, so a `/clear`
@@ -75,6 +86,16 @@ const RESYNC: Duration = Duration::from_millis(15_000);
 /// How long after a pass that could not look, or whose write failed, the next one
 /// runs.
 const RETRY: Duration = Duration::from_millis(10_000);
+
+/// How often, and how many times, the worker asks whether its terminal labels at
+/// all before giving up for this run.
+///
+/// The same shape, and the same reason, as `session_restore`'s retry: the
+/// dashboard and the terminal both start at login in no fixed order, so the
+/// first ask routinely reaches a terminal that is not up yet. Bounded so a
+/// terminal that never answers is reported once instead of polled forever.
+const CAN_LABEL_RETRY: Duration = Duration::from_millis(3_000);
+const CAN_LABEL_ATTEMPTS: u32 = 20;
 
 /// `text` as one line: every run of whitespace and control characters becomes
 /// one space and the ends are trimmed. `None` when nothing is left. Not yet
@@ -104,6 +125,36 @@ pub fn fit_utf16(line: &str, max: usize) -> String {
     });
     let head = cut.map_or(line, |(at, _)| &line[..at]);
     format!("{}…", head.trim_end())
+}
+
+/// `line` within `max` UTF-8 bytes, the same shape as [`fit_utf16`] in the unit
+/// agterm enforces. The ellipsis is three bytes, so that much is kept back.
+///
+/// The `trim_end` is not tidiness: agterm stores the *trimmed* value, so a cut
+/// landing after a space would make the read-back differ from what was sent and
+/// [`plan`] would rewrite the same text on every pass, forever.
+pub fn fit_utf8(line: &str, max: usize) -> String {
+    if line.len() <= max {
+        return line.trim_end().to_string();
+    }
+    const ELLIPSIS: usize = '…'.len_utf8();
+    let room = max.saturating_sub(ELLIPSIS);
+    let mut head = &line[..0];
+    for (at, c) in line.char_indices() {
+        if at + c.len_utf8() > room {
+            break;
+        }
+        head = &line[..at + c.len_utf8()];
+    }
+    format!("{}…", head.trim_end())
+}
+
+/// `line` within `target`'s budget, in whichever unit that terminal enforces.
+pub fn fit(line: &str, budget: LabelBudget) -> String {
+    match budget {
+        LabelBudget::Utf16(max) => fit_utf16(line, max),
+        LabelBudget::Utf8Bytes(max) => fit_utf8(line, max),
+    }
 }
 
 /// One row, as `terminal_title::sync` wants its sessions labelled.
@@ -216,14 +267,36 @@ fn should_read(changed: bool, last: Option<LastPass>, now: Instant) -> bool {
 /// hands over an empty set, and that withdraws every context of ours.
 pub fn spawn(app: AppHandle) {
     let Some(adapter) = super::for_platform(&app) else { return };
-    if !adapter.can_label() {
-        tracing::debug!(terminal = adapter.name(), "this terminal has no session context line; the label worker does not start");
-        return;
-    }
     if WORKER.set(()).is_err() {
         return;
     }
-    std::thread::spawn(move || run(adapter.as_ref()));
+    // The capability question is asked on the WORKER thread, never here. This
+    // runs inside Tauri's `setup` at `RunEvent::Ready`, i.e. on the main thread,
+    // and agterm's answer costs a subprocess that at login may have to be
+    // retried for a minute — a wait there freezes the widget, the tray and the
+    // history window, which is the deadlock `commands::emit_sessions_updated`
+    // documents and which was already shipped and reverted once.
+    std::thread::spawn(move || {
+        let adapter = adapter.as_ref();
+        let terminal = adapter.name();
+        for attempt in 1..=CAN_LABEL_ATTEMPTS {
+            match adapter.can_label() {
+                Some(true) => return run(adapter),
+                Some(false) => {
+                    tracing::debug!(terminal, "this terminal has no session context line; the label worker does not start");
+                    return;
+                }
+                None => {
+                    tracing::debug!(terminal, attempt, "could not ask this terminal whether it labels; retrying");
+                    std::thread::sleep(CAN_LABEL_RETRY);
+                }
+            }
+        }
+        // Reported rather than retried forever: a terminal that never answers is
+        // a fact worth seeing in the log, and the dashboard and the terminal both
+        // start at login, so the window this covers is seconds, not hours.
+        tracing::warn!(terminal, attempts = CAN_LABEL_ATTEMPTS, "no answer on whether this terminal labels; giving up for this run");
+    });
 }
 
 fn run(adapter: &dyn TerminalAdapter) {
@@ -456,7 +529,7 @@ pub fn plan(rows: &[DesiredLabel], targets: &[LabelTarget], written: &HashMap<St
         let ours = match claim {
             Claim::Row(r) => {
                 let purpose = Purpose::Label { row: r.row.clone() };
-                match (&t.context, r.context.as_deref().map(|c| fit_utf16(c, t.max_utf16))) {
+                match (&t.context, r.context.as_deref().map(|c| fit(c, t.budget))) {
                     (Some(c), Some(want)) if *c == want => out.in_place.push((t.key.clone(), Placed { row: r.row.clone(), text: want })),
                     (shown, Some(want)) => out.writes.push(PlannedWrite { key: t.key.clone(), write: LabelWrite::Context(want), replaced: shown.clone(), purpose }),
                     (Some(c), None) => out.writes.push(PlannedWrite { key: t.key.clone(), write: LabelWrite::ClearContext, replaced: Some(c.clone()), purpose }),
@@ -494,7 +567,7 @@ mod tests {
 
     /// A session titled `title`, showing `context`.
     fn target(key: &str, title: Option<&str>, context: Option<&str>) -> LabelTarget {
-        LabelTarget { key: key.into(), title: title.map(Into::into), context: context.map(Into::into), max_utf16: BUDGET }
+        LabelTarget { key: key.into(), title: title.map(Into::into), context: context.map(Into::into), budget: LabelBudget::Utf16(BUDGET) }
     }
 
     fn write(row: &str, key: &str, text: &str, replaced: Option<&str>) -> PlannedWrite {
@@ -665,7 +738,7 @@ mod tests {
         // Its read-back of the fitted text compares equal, so it is not rewritten
         // every pass.
         let rows = [row("dash", Some("Fix the build and run the tests"))];
-        let short = |shown: Option<&str>| LabelTarget { max_utf16: 10, ..target("k", Some("🔵 dash"), shown) };
+        let short = |shown: Option<&str>| LabelTarget { budget: LabelBudget::Utf16(10), ..target("k", Some("🔵 dash"), shown) };
         assert_eq!(fresh(&rows, &[short(None)]).writes, vec![write("dash", "k", "Fix the b…", None)]);
         assert_eq!(fresh(&rows, &[short(Some("Fix the b…"))]), Plan { in_place: vec![("k".into(), placed("dash", "Fix the b…"))], ..Plan::default() });
     }
@@ -718,6 +791,45 @@ mod tests {
     #[test]
     fn fit_utf16_does_not_leave_a_space_before_the_ellipsis() {
         assert_eq!(fit_utf16(&format!("{} {}", "x".repeat(198), "y".repeat(10)), BUDGET), format!("{}…", "x".repeat(198)));
+    }
+
+    /// agterm's budget is bytes, so the unit is what these pin: the same line is
+    /// inside a 256-unit budget and outside a 256-byte one once it stops being
+    /// ASCII, which is the mistake that would have every Cyrillic task refused.
+    #[test]
+    fn fit_utf8_counts_bytes_and_not_characters() {
+        const MAX: usize = 256;
+        let cyrillic = "ф".repeat(200); // 400 bytes, 200 UTF-16 units
+        assert_eq!(fit_utf16(&cyrillic, MAX), cyrillic, "inside a 256-unit budget");
+        let fitted = fit_utf8(&cyrillic, MAX);
+        assert!(fitted.len() <= MAX, "{} bytes is over the byte budget", fitted.len());
+        assert!(fitted.ends_with('…'));
+    }
+
+    #[test]
+    fn fit_utf8_keeps_a_line_at_the_ceiling_whole() {
+        let line = "x".repeat(256);
+        assert_eq!(fit_utf8(&line, 256), line);
+    }
+
+    #[test]
+    fn fit_utf8_never_splits_a_character() {
+        // 4-byte characters against a budget that is not a multiple of 4, so a
+        // naive byte slice would land mid-character and panic.
+        let line = "🔵".repeat(20);
+        let fitted = fit_utf8(&line, 30);
+        assert!(fitted.len() <= 30);
+        assert!(fitted.chars().all(|c| c == '🔵' || c == '…'));
+    }
+
+    /// The one that read-back equality rests on: agterm stores the TRIMMED value,
+    /// so a fitted line ending in a space would never equal what it reads back
+    /// and `plan` would rewrite it on every pass for the life of the session.
+    #[test]
+    fn fit_utf8_leaves_no_trailing_space_either_way() {
+        let cut = fit_utf8(&format!("{} {}", "x".repeat(250), "y".repeat(40)), 256);
+        assert!(!cut.trim_end_matches('…').ends_with(' '), "{cut:?} would never match its own read-back");
+        assert_eq!(fit_utf8("short task   ", 256), "short task", "a line inside the budget is trimmed too");
     }
 
     /// A terminal that records each write asked of it, and fails the ones whose

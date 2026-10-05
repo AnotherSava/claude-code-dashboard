@@ -74,7 +74,7 @@ This rule only fires on what would otherwise be a task boundary (transitions int
 
 ## What the widget actually shows
 
-`AgentSession::primary_text` (`src-tauri/src/state.rs`) chooses between the label and the task based on the row's current status. Telegram notifications show the same text. The row draws it through `AgentSession::row_line`, which the display snapshot stamps onto every row it sends the frontend. agwinterm's context line is written from the task alone (`AgentSession::shown_task`), never the label, since the tab title's glyph already says the row is asking:
+`AgentSession::primary_text` (`src-tauri/src/state.rs`) chooses between the label and the task based on the row's current status. Telegram notifications show the same text. The row draws it through `AgentSession::row_line`, which the display snapshot stamps onto every row it sends the frontend. A terminal's own context line — agwinterm's on Windows, agterm's on macOS — is written from the task alone (`AgentSession::shown_task`), never the label, since the tab title's glyph already says the row is asking:
 
 | Status                      | Widget shows                                          |
 |---                          |---                                                    |

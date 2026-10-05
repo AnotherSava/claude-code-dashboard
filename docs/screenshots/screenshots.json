@@ -136,7 +136,7 @@
           "Colour profile: a committed frame is sRGB. Output from `screencapture` is tagged with the display's own profile — Color LCD on this machine, a wide-gamut one — and the same colour is then stored as a less saturated number: re-tagging work-intensity-macos.png back to that profile moves its three title-bar lights from saturation 1.00 to 0.80, 0.74 and 0.72, against the 0.55 floor check-figures.py uses to recognise a macOS window by its traffic lights. Conversion to sRGB is the last step of `dash.capture_window`, but this figure is cropped out of that capture afterwards, so read the committed frame's tag back with `sips -g profile <png>` — the frame on disk predates the script and carries no profile at all."
         ]
       },
-      "verifiedAt": "5c248d5"
+      "verifiedAt": "7badd3a"
     },
     {
       "id": "history-window-windows",

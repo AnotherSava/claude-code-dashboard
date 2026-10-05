@@ -42,6 +42,8 @@ Compiles the Rust backend, starts Vite on `localhost:1420`, and launches the nat
 - `RUSTFLAGS="-D warnings" cargo check --manifest-path src-tauri/Cargo.toml --all-targets` — compile every target, in both configurations, with warnings as errors. The test run above sees only the test cfg, and `--lib --tests` never performs the bin's plain build, so this is the only command that catches an item in `src/main.rs` that is live under `cfg(test)` and dead without it.
 - `bash .claude/commit-checks.sh` — everything CI will run, in CI's order, in about ten seconds, plus the checks that read files under `~/.claude/` and so cannot run on a runner at all: the conventions checker, and an assertion that the shared scripts the screenshot capture shells out to still resolve. Run it before committing.
 
+The dev profile carries line tables rather than full DWARF (`[profile.dev]` in `src-tauri/Cargo.toml`, with dependencies at `debug = 0`), and that profile is what `cargo check`, `cargo test --lib` and rust-analyzer all build. A backtrace still names its files and lines; what goes is variable and type inspection in a debugger, which nothing here depends on. Full DWARF was 82.8% of the bytes of every object file in the graph and had taken `target/debug` to 38 GB.
+
 ## Architecture
 
 The app pairs a Rust backend (Tauri v2) with a Svelte 5 + Vite frontend rendered in the system webview (WebView2 on Windows, WKWebView on macOS). The Rust side owns all state and external I/O; the frontend is a pure view that subscribes to Tauri events and issues invoke-style commands for window control. External tools integrate via an embedded `axum` HTTP server on `127.0.0.1:9077`, bypassing the frontend entirely.
@@ -120,6 +122,7 @@ Under the repo root `claude-code-dashboard/`:
     - `terminals/` — one adapter per terminal behind the `TerminalAdapter` seam, so nothing downstream names a terminal
       - `mod.rs` — the trait, the shared vocabulary, and the pure verdicts over it (`person_verdict`, `departure_stamp`, `read_front`)
       - `agterm.rs` / `agterm_facts.rs` — agterm's adapter, and the facts it reads from agterm and the system (macOS)
+      - `agterm_wire.rs` — agterm's `session context` protocol: the argv a write takes, the targets its tree reports, and the release that first served the verb (macOS)
       - `agwinterm.rs` / `agwinterm_state.rs` / `agwinterm_wire.rs` — agwinterm's control pipe, its per-window state files, and its protocol (Windows)
       - `windows.rs` / `wt_tabs.rs` — Windows Terminal and the Windows console, and the UI Automation read of what a tab really holds
       - `composite.rs` — presents several terminals on one platform as one adapter

@@ -52,6 +52,10 @@ Each session's status is mirrored onto the terminal tab it runs in, next to the 
 
 Once a session's context usage climbs past a threshold (50% by default), the tab title also shows it — `🔵 printlab [67%]` — so a tab that's filling toward a `/compact` stands out among the rest. The number falls off again when a new task or `/clear` frees the context. See [Settings](settings#color-terminal-tabs) to change the threshold or turn the number off.
 
+{% include os_chip.html os="macos" %}
+
+agterm shows each session's current prompt as well, on the context line in the title bar of the window's active session. While the widget tracks a session it owns that line, so a note an agent left there is replaced, and the line is cleared when the session's row leaves the widget. It needs agterm 0.26.0 or newer, which is the release that gave a session a context line at all; on anything earlier the status glyph still shows and nothing is written beside it.
+
 {% include os_chip.html os="windows" %}
 
 If you run your sessions in agwinterm, its sidebar shows the status too: each session there is named after the title of what runs in it, so it carries the same symbol, context percentage and ⚠ as a terminal tab. A name you give the session yourself takes the place of that title. The session's current prompt goes on the dim line beside its name, in the sidebar and in the title bar. While the widget tracks a session it owns that line, so a note an agent left there is replaced, and the line is cleared when the session's row leaves the widget. Both need an agwinterm build whose sessions are named after their titles; stock agwinterm shows neither. If Claude Code runs inside tmux there, tmux has to pass the title on: see [the tmux note in Settings](settings#color-terminal-tabs).

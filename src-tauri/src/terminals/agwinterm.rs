@@ -121,7 +121,7 @@ use std::time::{Duration, Instant};
 
 use super::agwinterm_state::{self as state, Frontmost, Watch, TERMINAL as NAME};
 use super::agwinterm_wire as wire;
-use super::{Front, LabelTarget, LabelWrite, LastInput, Observation, Selection, TerminalAdapter, TerminalSession};
+use super::{Front, LabelBudget, LabelTarget, LabelWrite, LastInput, Observation, Selection, TerminalAdapter, TerminalSession};
 
 /// How long `ping`, `window.list` and `tree` get to answer. `tree` is served on
 /// the pipe thread without a hop to the UI, measured at 12 ms.
@@ -536,8 +536,8 @@ impl TerminalAdapter for AgwintermAdapter {
         let _ = self.shared.watching.set(watching);
     }
 
-    fn can_label(&self) -> bool {
-        true
+    fn can_label(&self) -> Option<bool> {
+        Some(true)
     }
 
     /// Every session in every open window. `Some(vec![])` when agwinterm is not
@@ -951,7 +951,7 @@ mod tests {
         let tree = r#"{"ok":true,"result":{"workspaces":[{"sessions":[{"id":"s1","name":"session 1","title":"🔵 dash","context":"Fix the build"}]}]}}"#;
         let s = serve(&path, vec![PING.to_string(), r#"{"ok":true,"result":{"windows":[{"id":"w1","open":true,"active":true},{"id":"w2","open":false}]}}"#.to_string(), tree.to_string()]);
         let targets = pipe(&path).targets().unwrap();
-        assert_eq!(targets, vec![LabelTarget { key: "w1/s1".into(), title: Some("🔵 dash".into()), context: Some("Fix the build".into()), max_utf16: wire::CONTEXT_MAX_UTF16 }]);
+        assert_eq!(targets, vec![LabelTarget { key: "w1/s1".into(), title: Some("🔵 dash".into()), context: Some("Fix the build".into()), budget: LabelBudget::Utf16(wire::CONTEXT_MAX_UTF16) }]);
         assert_eq!(s.join().unwrap().len(), 3, "a ping, the window list and one tree: a closed window is not asked");
     }
 
