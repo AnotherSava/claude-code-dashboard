@@ -62,6 +62,8 @@ Read-only: it mutates nothing, emits no event, writes no `decision` line, and ta
       "project": "tauri dashboard",
       "device": "air",
       "local": true,
+      "name": "tauri-dashboard",
+      "sessions": 1,
       "status": "working",
       "label": "add the /api/agents route",
       "status_age_ms": 18400
@@ -113,21 +115,23 @@ Read-only: it mutates nothing, emits no event, writes no `decision` line, and ta
 - `project` — the same id with the device prefix stripped (identical to `id` for a local row). Chat ids are derived from the cwd with backslashes normalized and the projects root removed, so one project yields the same string on macOS and on Windows — this is the field to compare across machines.
 - `device` / `local` — which machine the session runs on, and the authoritative local test. Kept separate because `device` can be `null` for an unnamed local box.
 - `display_name` — omitted rather than `null` when unset, so a caller falls back to `id` exactly as the app does.
+- `name` — on a local row, Claude Code's own name for the session behind it: the address `ListAgents` and `SendMessage` use, and the same fact `registry_only[].name` reports. A different fact with a different owner than `display_name`, which is the dashboard's own rename. Present only when exactly one live session backs the row and that session has a name; two sessions in one directory are two addresses and neither is picked. Never present on a remote row.
+- `sessions` — on a local row, how many live interactive sessions in Claude Code's registry back it: `0` where none does, `2` or more where `name` is withheld for ambiguity, `1` where the one session simply has no name. Omitted on a remote row and when this machine's registry could not be read, which `registry_unreadable` then names — so a row without `name` always says which reason applies.
 - `status` — `idle` / `working` / `waiting` / `blocked` / `error` / `done`, the same values [Classification](classification) assigns. Two of them carry more than their names suggest. **`done`** means a turn ended here and is also where every absence of evidence lands, which makes it the ordinary resting state of a session that has finished something. **`idle`** means *clean*: a confirmed claim that there is nothing left in the session to come back to, written only on positive evidence — a `/clear`, a fresh start, or a resumed conversation that had ended at one.
 - **The roster never says whether a human has read a row.** That verdict comes from watching a machine's own keyboard and terminal, and this route does not carry it: a caller asking what an agent is *doing* is not told whether somebody is sitting in front of it. So a finished session reads `done` here whether or not its user has looked at the answer. The one place the verdict does travel is the sync push, between the dashboards the user configured as peers, so the same session reads the same on each of their screens — and even there it crosses as a yes-or-no about the row, never as a time anybody was at a keyboard.
 - `label` — the "what is it doing" line the dashboard row itself shows, `AgentSession::primary_text`: the question or error for a `blocked` or `error` row, the task for every other status. A row another agent's message started reads as the task that agent was given, never as the message's envelope. Empty where the row has no current text, which the widget fills with the row's most recent past task, drawn muted.
-- `status_age_ms` — time in the current status. All three arrays are always present and never `null`.
+- `status_age_ms` — time in the current status. Every array in the body is always present and never `null`.
 
 The `registry_only` entries carry a deliberately smaller vocabulary:
 
 - `registry_only[]` — one entry per **project directory**, on any known machine, that has at least one live interactive session and no `agents` row *for that same device*; `sessions` says how many collapsed into it, so counting entries counts directories, not sessions. Peers' registries ride the sync push, so this array is no longer local-only — which is why each row carries `local` and, when remote, `last_seen_age_ms`.
 - `registry_unreadable[]` — the devices whose live-session list could not be obtained: the registry was unreadable there, or that peer has not sent one. A **list of devices, not a flag**, because the array above spans machines and one unreadable box must not be able to hide every other box's rows. Empty means every known device answered.
 - `id` / `project` — the same cwd derivation as an `agents` row, which is what lets a caller compare across both arrays with one pair of keys. Equal to each other here, since a local id is never namespaced.
-- `name` — Claude Code's own name for the session (what the session picker shows). A different fact with a different owner than `display_name`, which is the dashboard's own rename; omitted rather than `null` when the session has none.
+- `name` — Claude Code's own name for the session (what the session picker shows). A different fact with a different owner than `display_name`, which is the dashboard's own rename; omitted rather than `null` when the session has none, and when `sessions` is above 1, by the rule an `agents` row follows.
 - `activity` — `idle` / `busy` / `unknown`, the registry's own two words plus a degrade value. **This is not a `status` and must not be read as one.** Claude Code records only idle-versus-busy, which cannot express `blocked`, `waiting` or `error` — so `busy` → `working` would not be coarse but wrong: a session parked on a question or a permission dialog has a turn in flight and is what the dashboard calls `blocked`, while `idle` covers done, errored and a settled hand-back alike. An unrecognized or missing value reads `unknown` rather than being guessed at.
 - `activity_age_ms` — how long since the registry last wrote that activity. **Free of skew on both paths**, unlike `status_age_ms`: a local row measures it here, and a remote row arrives as an age the sender measured at push time with this receiver's own since-the-push elapsed added to it. Two durations summed need no clock agreement. Omitted when the record carries no stamp.
 - `local` / `last_seen_age_ms` — which machine the session runs on, and how long ago the push that carried it arrived. `last_seen_age_ms` is omitted for a local row, where a `0` would claim freshness on a channel that doesn't exist.
-- `sessions` — how many interactive sessions collapsed into this row. A row's identity is its directory, so two sessions in one directory (what a `--fork-session --resume` migration leaves) are one row; the freshest of them speaks for it and this number says the collapse happened.
+- `sessions` — how many interactive sessions collapsed into this row. A row's identity is its directory, so two sessions in one directory (what a `--fork-session --resume` migration leaves) are one row; the freshest of them speaks for its `activity`, and this number says the collapse happened.
 
 ### Judging staleness
 

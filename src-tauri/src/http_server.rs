@@ -6,7 +6,7 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::SocketAddr;
 use tauri::{AppHandle, Emitter, Manager};
 
@@ -654,6 +654,24 @@ struct AgentRow {
     local: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     display_name: Option<String>,
+    /// Claude Code's own name for the session behind a local row — the address
+    /// `ListAgents`/`SendMessage` use — read from the same registry join as
+    /// `RegistryRow::name` and meaning the same. Distinct from `display_name`,
+    /// which comes from this dashboard's rename store.
+    ///
+    /// Present only where exactly one live session backs the row (`sessions ==
+    /// 1`) and that session has a name: with two in one directory either could
+    /// be meant, and naming the freshest would hand a caller one of two
+    /// addresses as if it were the only one. Never present on a remote row.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    /// How many live sessions in Claude Code's registry back this local row — 0
+    /// where none does, 2 after a fork migration left two in one directory, 1
+    /// where the one session has no name. Omitted on a remote row and wherever
+    /// this machine's registry could not be read (which `registry_unreadable`
+    /// then names), so a missing `name` always says which reason it has.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sessions: Option<usize>,
     status: Status,
     /// What the dashboard row itself shows — the "what is it doing" line. Withheld
     /// it would force the caller to guess from `status` alone, and it is already on
@@ -708,6 +726,7 @@ struct RegistryRow {
     device: Option<String>,
     /// Claude Code's own name for the session. Distinct in provenance from
     /// `AgentRow::display_name`, which comes from this dashboard's rename store.
+    /// Withheld where `sessions > 1`, by `AgentRow::name`'s rule.
     #[serde(skip_serializing_if = "Option::is_none")]
     name: Option<String>,
     /// `idle` / `busy` / `unknown`, the registry's own words. **Never a
@@ -772,6 +791,20 @@ fn agent_roster(
 ) -> AgentsResponse {
     let age_since = |then: i64| (now_ms - then).max(0);
 
+    // Each registry entry paired with the row it writes to, and the live
+    // sessions summed per row. Summed rather than taken from one entry because
+    // `live_rows` groups by the *current* cwd derivation while a row is keyed
+    // by its anchor, so a session that has `cd`-ed and a sibling still at the
+    // root are two entries landing on one row.
+    let registry_rows: Option<Vec<(&LiveSession, String)>> = registry.map(|regs| regs.iter().map(|s| (s, s.row_id(anchored))).collect());
+    let mut live_by_row: HashMap<&str, (usize, Option<&str>)> = HashMap::new();
+    for (s, id) in registry_rows.iter().flatten() {
+        let entry = live_by_row.entry(id.as_str()).or_default();
+        entry.0 += s.sessions;
+        entry.1 = s.name.as_deref();
+    }
+    let sole_name = |count: usize, name: Option<&str>| name.filter(|_| count == 1).map(str::to_string);
+
     let agents: Vec<AgentRow> = sessions
         .iter()
         .filter_map(|s| {
@@ -783,12 +816,21 @@ fn agent_roster(
                     (Some(origin.to_string()), project, Some(age_since(*seen)))
                 }
             };
+            let (sessions, name) = match (&s.origin, &registry_rows) {
+                (None, Some(_)) => {
+                    let (count, name) = live_by_row.get(s.id.as_str()).copied().unwrap_or_default();
+                    (Some(count), sole_name(count, name))
+                }
+                _ => (None, None),
+            };
             Some(AgentRow {
                 id: s.id.clone(),
                 project,
                 device,
                 local: s.origin.is_none(),
                 display_name: s.display_name.clone(),
+                name,
+                sessions,
                 status: s.status,
                 // The row's own text, read by the one function the widget row
                 // and the Telegram ping read, so a task
@@ -825,16 +867,15 @@ fn agent_roster(
     let mut registry_only: Vec<RegistryRow> = Vec::new();
     let mut registry_unreadable: Vec<String> = Vec::new();
 
-    match registry {
+    match registry_rows {
         Some(regs) => registry_only.extend(
-            regs.iter()
-                .map(|s| (s, s.row_id(anchored)))
+            regs.into_iter()
                 .filter(|(_, id)| !hook_rows.contains(&(this_device, id.as_str())))
                 .map(|(s, id)| RegistryRow {
                     project: id.clone(),
                     id,
                     device: this_device.map(str::to_string),
-                    name: s.name.clone(),
+                    name: sole_name(s.sessions, s.name.as_deref()),
                     activity: s.activity,
                     activity_age_ms: s.activity_age_ms,
                     sessions: s.sessions,
@@ -862,7 +903,7 @@ fn agent_roster(
                     id: format!("{device}/{}", s.chat_id),
                     project: s.chat_id.clone(),
                     device: Some(device.clone()),
-                    name: s.name.clone(),
+                    name: sole_name(s.sessions, s.name.as_deref()),
                     activity: s.activity,
                     // Two durations summed: the sender's age at push time, plus
                     // how long ago that push arrived here. No clock agreement
@@ -2347,6 +2388,53 @@ mod tests {
         let rows = agent_roster(&[], Some(&[live("landlord", Activity::Busy, 2)]), &BTreeMap::new(), &BTreeMap::new(), &|_| None, &devices(&[]), Some("air"), false, 1_000);
         assert_eq!(rows.registry_only.len(), 1);
         assert_eq!(rows.registry_only[0].sessions, 2);
+        assert_eq!(rows.registry_only[0].name, None, "two sessions are two addresses, so neither is named");
+    }
+
+    #[test]
+    fn a_local_hook_row_carries_its_sessions_registry_name() {
+        // A session the hooks have classified moves out of `registry_only`; the
+        // name it carried there must move with it, or a caller finding a
+        // project's session through this route loses it the moment it speaks.
+        let sessions = [session("transcripts", Status::Working, None, 900)];
+        let rows = agent_roster(&sessions, Some(&[live("transcripts", Activity::Busy, 1)]), &BTreeMap::new(), &BTreeMap::new(), &|_| None, &devices(&[]), Some("air"), false, 1_000);
+        assert_eq!(rows.agents[0].name.as_deref(), Some("transcripts"));
+        assert_eq!(rows.agents[0].sessions, Some(1));
+    }
+
+    #[test]
+    fn a_missing_name_says_whether_none_or_several_sessions_back_the_row() {
+        let sessions = [session("transcripts", Status::Done, None, 0), session("landlord", Status::Done, None, 0)];
+        let rows = agent_roster(&sessions, Some(&[live("landlord", Activity::Idle, 2)]), &BTreeMap::new(), &BTreeMap::new(), &|_| None, &devices(&[]), Some("air"), false, 1_000);
+        let by = |id: &str| rows.agents.iter().find(|a| a.id == id).unwrap();
+        assert_eq!((by("transcripts").name.as_deref(), by("transcripts").sessions), (None, Some(0)));
+        assert_eq!((by("landlord").name.as_deref(), by("landlord").sessions), (None, Some(2)));
+
+        let unreadable = agent_roster(&sessions, None, &BTreeMap::new(), &BTreeMap::new(), &|_| None, &devices(&[]), Some("air"), false, 1_000);
+        assert!(unreadable.agents.iter().all(|a| a.sessions.is_none()), "could not look is not zero sessions");
+        assert!(!serde_json::to_string(&unreadable).unwrap().contains(r#""sessions":0"#));
+    }
+
+    #[test]
+    fn sessions_landing_on_one_row_from_two_cwds_are_summed() {
+        // One session still at the project root, one that `cd`-ed into a
+        // subdirectory: `live_rows` groups them under two derivations, but the
+        // anchor puts both on the root's row, so that row has two addresses.
+        let mut moved = live("transcripts/src", Activity::Busy, 1);
+        moved.session_ids = vec!["sid-moved".to_string()];
+        let registry = [live("transcripts", Activity::Idle, 1), moved];
+        let anchored = |sid: &str| (sid == "sid-moved").then(|| "transcripts".to_string());
+        let sessions = [session("transcripts", Status::Working, None, 0)];
+        let rows = agent_roster(&sessions, Some(&registry), &BTreeMap::new(), &BTreeMap::new(), &anchored, &devices(&[]), Some("air"), false, 1_000);
+        assert_eq!(rows.agents[0].sessions, Some(2));
+        assert_eq!(rows.agents[0].name, None);
+    }
+
+    #[test]
+    fn a_remote_row_carries_no_name_or_session_count() {
+        let sessions = [session("chrome/transcripts", Status::Working, Some("chrome"), 0)];
+        let rows = agent_roster(&sessions, Some(&[live("transcripts", Activity::Idle, 1)]), &BTreeMap::new(), &BTreeMap::new(), &|_| None, &devices(&[("chrome", 900)]), Some("air"), true, 1_000);
+        assert_eq!((rows.agents[0].name.as_deref(), rows.agents[0].sessions), (None, None), "this machine's registry says nothing about chrome's session");
     }
 
     #[test]
