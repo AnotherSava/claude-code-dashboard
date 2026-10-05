@@ -145,9 +145,21 @@ impl UsageCacheStore {
 mod tests {
     use super::*;
 
+    /// A store no other test shares.
+    ///
+    /// Keyed on a counter and not on `process::id()`, which cargo gives every
+    /// test in the binary alike — they are threads of one process, so that
+    /// spelling handed all five tests in this module the SAME file and one
+    /// read another's write whenever the interleaving allowed it. That is the
+    /// flake behind four `1 failed` gate runs between 2026-09-11 and
+    /// 2026-10-04: `a_non_positive_retry_after_blocks_nothing` read
+    /// `NOW + 832_000`, which only `a_deadline_survives_and_expires` writes.
+    /// The pid stays in the name so a crashed run's leftovers are identifiable.
     fn store() -> UsageCacheStore {
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut p = std::env::temp_dir();
-        p.push(format!("ccdash-usage-cache-test-{}.json", std::process::id()));
+        p.push(format!("ccdash-usage-cache-test-{}-{n}.json", std::process::id()));
         let _ = std::fs::remove_file(&p);
         UsageCacheStore::new(p)
     }
