@@ -70,3 +70,4 @@
 - [Typed prompts are invisible to the watcher](transcript_string_content_invisible.md) — string `content` fails log_watcher's Vec wire type, so infer_state skips typed prompts; pre-existing, not fixed
 - [agwinterm label route](agwinterm_label_route.md) — status via OSC title, prompt via session context; rename, caption, capabilities routes built then deleted 2026-10-02
 - [Vite dev port launch chain](vite-dev-port-launch-chain.md) — `"dev": "vite"` stays bare; the wrapper goes on `"tauri"`, since the CLI runs `beforeDevCommand` itself and reads `devUrl` first; our dev.mjs then forwards a stray `vite` to the CLI
+- [Relay target aliasing rejected](relay_target_aliasing_rejected.md) — display-name fallback built and withdrawn 2026-10-06; receipt restamp loses the resolved id, aliases prove no repo identity
