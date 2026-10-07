@@ -1,6 +1,6 @@
 ---
 name: vite-dev-port-launch-chain
-description: package.json's "dev": "vite" must stay bare — the Tauri CLI runs it under scripts/dev.mjs, which has already set PORT
+description: package.json's "dev": "vite" must stay bare — the Tauri CLI runs it with PORT already set by scripts/dev.mjs, which wraps "tauri"
 metadata:
   type: project
 ---
@@ -11,10 +11,13 @@ overriding `build.devUrl`, and re-enters itself with `PORT` set. The Tauri CLI t
 `beforeDevCommand`, which is `npm run dev` — so a bare `vite` is correct there, and `vite.config.ts`
 reads `process.env.PORT` out of the environment that chain built.
 
-**Why:** the `ports-from-registry` convention (v15) tells an adopting repo to rewrite its `"dev"` script
-to call `scripts/dev.mjs`, its example being a Next project where `next dev` is itself the server. Doing
-that here recurses — `dev.mjs` spawns the Tauri CLI, which runs `npm run dev`, which re-enters `dev.mjs`.
-The entry point is the `"tauri"` script, not `"dev"`.
+**Why:** the `ports-from-registry` convention (v15) tells an adopting repo to point a dev script at
+`scripts/dev.mjs`, and its example is a Next project where `next dev` is itself the server. Rewriting
+`"dev"` rather than `"tauri"` resolves the port *after* the Tauri CLI has read `build.devUrl`, so Vite
+binds the registry's number while the webview opens on the committed one — that is the generic failure,
+and v15 step 3 now states it. This repo fails louder: `scripts/dev.mjs` forwards every subcommand other
+than `dev` straight to the Tauri CLI, so a `"dev": "node scripts/dev.mjs vite"` re-entered through
+`beforeDevCommand` hands the CLI `vite` as a subcommand. The entry point is the `"tauri"` script.
 
 **How to apply:** leave `"dev": "vite"` alone in any ports or dev-script refactor, and keep a real port in
 `build.devUrl` rather than emptying it. A hand-run `npm run dev` refusing with "PORT is unset" is the
