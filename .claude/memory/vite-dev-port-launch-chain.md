@@ -20,3 +20,9 @@ The entry point is the `"tauri"` script, not `"dev"`.
 `build.devUrl` rather than emptying it. A hand-run `npm run dev` refusing with "PORT is unset" is the
 `requireResolvedPort` plugin in `vite.config.ts` working as designed, not something to route around. See
 [[debug_dev_build_alongside_installed]].
+
+The Vite half is checkable **without launching the widget**, which matters because the window needs the
+user's go-ahead: `npm run dev` with `PORT` unset must fail inside `configureServer` during `_createServer`
+and exit on its own, and `PORT=<n> npm run dev` must bind that port and serve 200. Both are servers with no
+window. What those two cannot reach is the `dev.mjs` → registry → `devUrl`-override → Tauri CLI leg, which
+has no headless path and is the only part a dev run has to confirm.
