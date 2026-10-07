@@ -109,4 +109,67 @@ esac
 echo "==> python docs/screenshots/check-figures.py"
 python docs/screenshots/check-figures.py
 
+# A notice, not a gate: it exits 0 even when it fires, and it belongs in no
+# workflow because what it reports is owed by THIS machine. A runner installs
+# nothing, so the warning has no audience there.
+#
+# The fault is measured. On 2026-10-04 a commit added two fields to the roster's
+# local rows, nothing deployed for 21 hours, and two agents working in other
+# repos read a response that lacked them — one of them then substituted a worse
+# lookup. The row was there; the field was not.
+#
+# It deliberately does NOT check whether the install is stale. The install lags
+# the tree most of the time (32 of 38 recoverable compile events opened a window,
+# median 22.9h), so a check for that fires in the resting state, and a gate on it
+# would block most commits and teach the override. What correlates with the harm
+# is far narrower: a serialized field arriving on a shape something outside this
+# process reads. Over four months, 17 of 182 code commits add one — about one a
+# week — and that set contains the commit above.
+#
+# Last in the file so the notice is the final thing on screen rather than three
+# minutes of suite output above it. The pattern is run against the commit it was
+# written for on every pass, so it cannot quietly stop matching; a test nobody
+# runs would not have that property. `pub ` has to be optional, because these
+# structs are private and Serialize-only — a `pub`-only pattern misses the very
+# commit this exists for, which is the mistake made first and caught by
+# requiring the match.
+WIRE_FILES="src-tauri/src/http_server.rs src-tauri/src/sync.rs"
+WIRE_PATTERN='^\+[[:space:]]+(pub )?[a-z_]+: (Option<|Vec<|String|bool|usize|u64|i64)'
+WIRE_CASE=cf77f59
+
+echo "==> wire-shape notice"
+absent=""
+for f in $WIRE_FILES; do [ -f "$f" ] || absent="$absent $f"; done
+if [ -n "$absent" ]; then
+  echo "    BROKEN:$absent no longer exist, so this notice can never fire again."
+  echo "    Point it at the files carrying the published roster/sync shape now."
+  exit 1
+fi
+
+# `grep -c` rather than `grep -q`: under `pipefail` a quiet grep closes the pipe
+# on its first match, git takes SIGPIPE, and the pipeline reports 141 — which
+# would read as a drifted pattern on exactly the passes where it matched.
+if git cat-file -e "${WIRE_CASE}^{commit}" 2>/dev/null; then
+  case_hits=$(git show "$WIRE_CASE" -- $WIRE_FILES | grep -cE "$WIRE_PATTERN" || true)
+  if [ "$case_hits" -eq 0 ]; then
+    echo "    BROKEN: the pattern no longer matches $WIRE_CASE, the commit it was written for."
+    exit 1
+  fi
+else
+  echo "    pattern self-check: NOT MEASURED — $WIRE_CASE is absent from this clone"
+fi
+
+# Based at the merge-base so the notice reads the same before the commit (step 6)
+# and after it (step 9), both of which are undeployed work.
+if WIRE_BASE=$(git merge-base HEAD '@{upstream}' 2>/dev/null); then :; else WIRE_BASE=HEAD; fi
+added=$(git diff "$WIRE_BASE" -- $WIRE_FILES | grep -E "$WIRE_PATTERN" || true)
+if [ -n "$added" ]; then
+  echo "    This change set adds a field to a published shape:"
+  printf '%s\n' "$added" | sed 's/^/      /'
+  echo "    peer_relay.py, the capture scripts and the other machine's dashboard read"
+  echo "    the old shape until this machine deploys. Deploy before relying on it."
+else
+  echo "    no new published field since $(git rev-parse --short "$WIRE_BASE")"
+fi
+
 echo "All CI checks passed."
