@@ -30,7 +30,27 @@ npm install
 npm run tauri dev
 ```
 
-Compiles the Rust backend, starts Vite on `localhost:1420`, and launches the native window. Frontend edits hot-reload; Rust edits trigger a rebuild on save.
+Compiles the Rust backend, starts Vite, and launches the native window. Frontend edits hot-reload; Rust edits trigger a rebuild on save.
+
+The dev server's port is not written into the repo. Instead `scripts/dev.mjs` settles it at launch and hands the same number to Vite and to the Tauri CLI, so the server and the webview cannot disagree about the address. It prints which of three sources answered:
+
+- **`PORT` from the environment**, if you set one. This outranks the other two.
+- **A ports registry outside the checkout**, where the maintainer's machine has one installed.
+- **The OS**, which names a free port. This is what a fresh clone gets, and it means `npm run tauri dev` works with nothing else set up. The number changes every run, and because it is claimed about a second after it is picked, something else can take it in between — Vite then stops with `Port <n> is already in use` instead of moving elsewhere, so re-run and a different number is chosen.
+
+A registry that is installed but unreadable stops the run instead of falling back, since a port nothing allocated would collide with whatever that registry has recorded.
+
+To fix the number yourself:
+
+```bash
+PORT=1420 npm run tauri dev                      # bash / zsh
+$env:PORT="1420"; npm run tauri dev              # PowerShell
+set PORT=1420                                    # cmd.exe, then: npm run tauri dev
+```
+
+The `devUrl` committed in `src-tauri/tauri.conf.json` is replaced on every dev run through `--config` and is not the port — it is only read by something that bypasses `npm run tauri`.
+
+Running `npm run dev` on its own starts Vite with no port settled, so it refuses rather than binding Vite's own default at an address nothing else was told. It is the `beforeDevCommand` the Tauri CLI invokes, not an entry point of its own.
 
 ## Commands
 
@@ -134,6 +154,7 @@ Under the repo root `claude-code-dashboard/`:
     - `adapters.rs` — adapter dispatch for /api/event payloads
     - `adapters/claude.rs` — Claude Code lifecycle classifier + chat-id derivation
     - `logging.rs` — tracing subscriber → widget.jsonl + FrontendLogger for IPC log lines
+- `scripts/dev.mjs` — fronts `npm run tauri`; settles the dev server's port and hands it to both Vite and the Tauri CLI
 - `integrations/claude_hook.py` — thin Claude Code hook that forwards the stdin payload to /api/event
 - `docs/` — this site
 - `.github/workflows/`
