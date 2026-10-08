@@ -31,6 +31,45 @@ use crate::project_rename::{same_dir, KeyMove};
 /// Where the grants live, relative to the app data directory.
 pub const FILE_NAME: &str = "auto_start.json";
 
+/// What became of an [`AutoStartStore::grant`] call.
+///
+/// Three outcomes rather than a bool, because two of them are "nothing was
+/// written" and they are opposite facts: an entry already naming that directory
+/// means the permission stands, while a refused or failed write means it does
+/// not exist and the next message will ask for it again. A bool makes the
+/// caller pick one reading for both, and the optimistic pick tells a peer that
+/// its user's approval was recorded when the file was never touched — after
+/// which the sender re-sends, this machine refuses the message a second time,
+/// and the Allow click has silently done nothing.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum Granted {
+    /// Written, and in force from now on.
+    Recorded,
+    /// The file already named that directory for that project, so nothing had
+    /// to be written. The permission is in force.
+    Already,
+    /// Nothing was written and nothing is in force — the file could not be
+    /// read, or the write itself failed. Both are logged where they happen.
+    Failed,
+}
+
+impl Granted {
+    /// Whether the permission is in the file now, however it got there.
+    pub fn is_in_force(self) -> bool {
+        matches!(self, Self::Recorded | Self::Already)
+    }
+
+    /// The stable slug for the log line, so a grant that was already there is
+    /// greppable apart from one this call wrote.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Recorded => "recorded",
+            Self::Already => "already",
+            Self::Failed => "failed",
+        }
+    }
+}
+
 pub struct AutoStartStore {
     path: PathBuf,
     /// Serializes read-modify-write, and holds the last good read so an
@@ -100,22 +139,25 @@ impl AutoStartStore {
     /// Idempotent, and it does **not** validate: every caller must have run
     /// [`crate::session_launcher::check_startable`] against the same pair first,
     /// because those checks are what make the entry mean anything and they have
-    /// to run on the machine the directory is on. Returns whether the list
-    /// actually changed, so a real grant logs differently from a repeat.
-    pub fn grant(&self, project: &str, dir: &str) -> bool {
+    /// to run on the machine the directory is on.
+    pub fn grant(&self, project: &str, dir: &str) -> Granted {
         // Never write over a file we could not read. The alternative is worse
         // than refusing: a fallback list plus the new entry, written over a
         // hand-edited file that merely had a stray comma in it, silently
         // replaces every other grant with this one.
         let Ok(mut current) = self.read() else {
             tracing::warn!(path = %self.path.display(), project, "refusing to record a grant over an auto_start.json this build could not read");
-            return false;
+            return Granted::Failed;
         };
         if current.get(project).map(String::as_str) == Some(dir) {
-            return false;
+            return Granted::Already;
         }
         current.insert(project.to_string(), dir.to_string());
-        self.write(current)
+        if self.write(current) {
+            Granted::Recorded
+        } else {
+            Granted::Failed
+        }
     }
 
     /// Re-file a grant for a project whose folder was renamed: `from_id` at
@@ -198,8 +240,8 @@ mod tests {
     #[test]
     fn a_grant_is_recorded_and_survives_a_reload() {
         let s = store();
-        assert!(s.grant("transcripts", "/p/transcripts"), "a new entry is a change");
-        assert!(!s.grant("transcripts", "/p/transcripts"), "the same entry again is not");
+        assert_eq!(s.grant("transcripts", "/p/transcripts"), Granted::Recorded, "a new entry is written");
+        assert_eq!(s.grant("transcripts", "/p/transcripts"), Granted::Already, "the same entry again needs no write, and still stands");
         let reloaded = AutoStartStore::new(s.path().to_path_buf());
         assert_eq!(reloaded.snapshot().get("transcripts").map(String::as_str), Some("/p/transcripts"));
     }
@@ -210,7 +252,7 @@ mod tests {
     fn re_granting_replaces_the_directory() {
         let s = store();
         s.grant("transcripts", "/p/old");
-        assert!(s.grant("transcripts", "/p/new"));
+        assert_eq!(s.grant("transcripts", "/p/new"), Granted::Recorded);
         assert_eq!(s.snapshot().get("transcripts").map(String::as_str), Some("/p/new"));
     }
 
@@ -266,7 +308,11 @@ mod tests {
         let path = std::env::temp_dir().join(format!("auto_start_nowrite_{}.json", std::process::id()));
         std::fs::write(&path, "{\"transcripts\": \"/p/t\", }").unwrap();
         let s = AutoStartStore::new(path.clone());
-        assert!(!s.grant("scheduler", "/p/s"), "the grant is refused, not written");
+        // `Failed`, specifically, and not merely "no write": this is the case a
+        // caller must never report to its user as a recorded permission, and a
+        // bool cannot tell it apart from the entry having been there already.
+        assert_eq!(s.grant("scheduler", "/p/s"), Granted::Failed, "the grant is refused, not written");
+        assert!(!s.grant("scheduler", "/p/s").is_in_force(), "and nothing is in force for it");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"transcripts\": \"/p/t\", }", "the user's list is untouched");
         let _ = std::fs::remove_file(&path);
     }

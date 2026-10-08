@@ -316,6 +316,10 @@ fn candidates_in(config: &serde_json::Value, project: &str, projects_root: Optio
 ///
 /// Split from [`launch`] so the whole policy is testable without spawning
 /// anything, and so a refusal costs no process.
+///
+/// Includes [`can_launch`], which is what lets a caller validating a *grant*
+/// through this function — `sync::post_grant` — rely on it to record nothing
+/// `launch` would later refuse.
 pub fn check_startable(project: &str, auto_start: &BTreeMap<String, String>, projects_root: Option<&str>) -> Result<PathBuf, StartRefusal> {
     let dir = match listed_dir(project, auto_start, projects_root) {
         Ok(dir) => dir,
@@ -337,13 +341,22 @@ pub fn check_startable(project: &str, auto_start: &BTreeMap<String, String>, pro
         return Err(StartRefusal::NoSuchDirectory);
     }
     match claude_project_index() {
-        Some(config) if trusted_in(&config, &dir) => Ok(dir),
+        Some(config) if trusted_in(&config, &dir) => {}
         // An unreadable config file is treated the same as an untrusted
         // directory. It is the conservative direction and the honest one: we
         // could not establish the trust decision, and a start that stops at the
         // prompt leaves an orphan window on an unattended machine.
-        _ => Err(StartRefusal::UntrustedDirectory),
+        _ => return Err(StartRefusal::UntrustedDirectory),
     }
+    // Asked last, so every refusal naming something about *this project* is
+    // reached first. A machine with no launcher must still answer
+    // `unknown_project` for an id nothing here derives and `NotListed` for one
+    // awaiting a grant, or its own missing capability would mask what the
+    // caller got wrong about the address.
+    if !can_launch() {
+        return Err(StartRefusal::NoLauncher);
+    }
+    Ok(dir)
 }
 
 /// One start at a time per project, so the 5s registry cache cannot turn two
@@ -538,6 +551,20 @@ fn launch(dir: &Path) -> Result<LaunchHandle, StartRefusal> {
     }
 }
 
+/// Whether this machine can start a session at all — asked before a directory
+/// is offered or a grant recorded, not only when a start is attempted.
+///
+/// Sited beside [`launch`] under the same `#[cfg]`, because the two have to
+/// agree. Leaving the question to `launch` alone costs something real: the
+/// sender's approval prompt is gated on [`StartRefusal::NotListed`]'s slug, so
+/// a machine that offers its directories and refuses `NoLauncher` only
+/// afterwards asks its user to approve a grant that can never produce a
+/// session — and the grant, once recorded, replaces that slug and so silences
+/// the prompt for good.
+pub fn can_launch() -> bool {
+    cfg!(target_os = "macos")
+}
+
 /// A session a launcher created, so the caller can ask whether it came to life
 /// and clean it up when it did not.
 ///
@@ -710,6 +737,38 @@ mod tests {
         assert!(trusted_in(&cfg, Path::new("D:/projects/transcripts")));
         assert!(trusted_in(&cfg, Path::new("D:/projects/transcripts/")));
         assert!(!trusted_in(&cfg, Path::new("D:/projects/Transcripts")), "case is left alone; the ids these paths derive are case-sensitive");
+    }
+
+    /// The predicate and the launcher are two statements about one capability,
+    /// and a disagreement between them is invisible until a grant has already
+    /// been recorded against it.
+    #[test]
+    fn the_predicate_agrees_with_the_launcher_it_speaks_for() {
+        #[cfg(target_os = "macos")]
+        assert!(can_launch(), "agterm is wired up here, and `launch` dispatches to `launch_macos`");
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert!(!can_launch());
+            assert!(
+                matches!(launch(Path::new("/zz-no-such-dir-4f2a")), Err(StartRefusal::NoLauncher)),
+                "the predicate must not promise a launch this platform refuses"
+            );
+        }
+    }
+
+    /// The capability is this machine's business and the address is the
+    /// caller's. Ordering the launcher check last is what stops the first from
+    /// masking the second — a mistyped id has to keep answering
+    /// `unknown_project` on a machine that could not have started it anyway,
+    /// since that is the half the sender can act on.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn a_missing_launcher_does_not_mask_what_the_caller_got_wrong() {
+        let answer = check_startable("zz-derives-nowhere-4f2a", &BTreeMap::new(), None);
+        assert!(
+            matches!(answer, Err(StartRefusal::NotListed) | Err(StartRefusal::NoSuchProject)),
+            "the listing and existence questions come first, got {answer:?}"
+        );
     }
 
     /// The guard exists for the cache race, so the second claim must fail even

@@ -860,6 +860,13 @@ async fn post_message(
         );
         (status, Json(r))
     };
+    // Every refusal that comes from the start path, in one place: the status is
+    // taken from the canonical map rather than chosen per site, so this handler
+    // and `receipt_status` cannot disagree about what one slug means.
+    let refuse_start = |refusal: crate::session_launcher::StartRefusal| {
+        let r = receipt(Outcome::Refused).because(refusal.slug()).detailed(refusal.detail());
+        refuse(refusal.slug(), receipt_status(&r), Some(refusal.detail().into()))
+    };
 
     // The opt-in, checked before anything else. Passing the guard proves the
     // caller holds the sync token and comes from an allowed source — it does not
@@ -967,6 +974,15 @@ async fn post_message(
     if matches!(inbox, InboxLookup::NotFound) && !listed && sender_is_bound {
         let candidates = crate::session_launcher::candidates_for(&env.target_project, cfg.projects_root.as_deref());
         if !candidates.is_empty() {
+            // There is nothing to approve on a machine with no launcher: the
+            // grant would be recorded and then refused by `launch` on every
+            // message, while the prompt the sender raises for this slug asks
+            // its user for exactly that permission. The capability is the
+            // honest answer, and it is the one a project already listed gets
+            // from `check_startable` a few lines down.
+            if !crate::session_launcher::can_launch() {
+                return refuse_start(crate::session_launcher::StartRefusal::NoLauncher);
+            }
             let r = receipt(Outcome::Refused)
                 .because("start_not_listed")
                 .detailed("nothing is running for that project and it is not listed as startable here; its owner can approve one of the offered directories")
@@ -1001,13 +1017,7 @@ async fn post_message(
             return (StatusCode::INTERNAL_SERVER_ERROR, Json(receipt(Outcome::Refused).because("state_unavailable")));
         };
         match crate::session_launcher::start_and_wait(&env.target_project, &startable, cfg.projects_root.as_deref(), &registry, &guard, now).await {
-            crate::session_launcher::StartResult::Refused(refusal) => {
-                let r = receipt(Outcome::Refused).because(refusal.slug()).detailed(refusal.detail());
-                // The status comes from the canonical map rather than being
-                // chosen here, so the handler and `receipt_status` cannot
-                // disagree about what the same slug means.
-                return refuse(refusal.slug(), receipt_status(&r), Some(refusal.detail().into()));
-            }
+            crate::session_launcher::StartResult::Refused(refusal) => return refuse_start(refusal),
             crate::session_launcher::StartResult::Settled { inbox: settled, started } => {
                 inbox = settled;
                 started_session = started;
@@ -1386,9 +1396,10 @@ impl GrantReceipt {
 /// The approval was given on the *other* machine, which is the only place a
 /// human was, and that is the one fact this route takes on faith. Everything
 /// else is re-established locally: the directory is checked here, against this
-/// machine's filesystem and this machine's Claude Code trust state, by exactly
-/// the function that will gate the start itself. A peer cannot grant anything
-/// this dashboard would not have granted about its own disk.
+/// machine's filesystem, this machine's Claude Code trust state and whether
+/// this machine can start a session at all, by exactly the function that will
+/// gate the start itself. A peer cannot grant anything this dashboard would not
+/// have granted about its own disk.
 async fn post_grant(State(app): State<AppHandle>, ConnectInfo(peer): ConnectInfo<SocketAddr>, Json(env): Json<GrantEnvelope>) -> (StatusCode, Json<GrantReceipt>) {
     let refuse = |reason: &str, status: StatusCode, detail: String| {
         tracing::warn!(chat_id = %env.project, decision = "peer_refused", peer_ip = %peer.ip(), origin_device = %env.origin_device, reason, "grant refused");
@@ -1424,7 +1435,11 @@ async fn post_grant(State(app): State<AppHandle>, ConnectInfo(peer): ConnectInfo
 
     // The pair is validated as if it were already in the list, by the same
     // function that will gate the start — so a grant can never record something
-    // `check_startable` would later refuse, and the two cannot drift.
+    // the start would later refuse, and the two cannot drift. That covers the
+    // capability as well as the pair, `check_startable` asking
+    // `session_launcher::can_launch`: a permission outlives the message, the
+    // session and the reboot, so a machine that could never honour one must
+    // decline to store it rather than accept it and refuse every message.
     let candidate: std::collections::BTreeMap<String, String> = [(env.project.clone(), env.dir.clone())].into_iter().collect();
     if let Err(refusal) = crate::session_launcher::check_startable(&env.project, &candidate, cfg.projects_root.as_deref()) {
         let r = GrantReceipt::refused(refusal.slug(), refusal.detail());
@@ -1432,14 +1447,26 @@ async fn post_grant(State(app): State<AppHandle>, ConnectInfo(peer): ConnectInfo
         return (StatusCode::BAD_REQUEST, Json(r));
     }
 
-    let changed = store.grant(&env.project, env.dir.trim());
+    let outcome = store.grant(&env.project, env.dir.trim());
+    if !outcome.is_in_force() {
+        // This machine's own failure rather than anything the caller got wrong,
+        // and the one answer here that must not read as success: a human on the
+        // other side clicked Allow, and `granted: true` would send them back
+        // round to re-send the message into a machine that still holds no grant
+        // for it. `grant` has already logged why it could not write.
+        return refuse(
+            "grant_not_recorded",
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "this device could not write the permission to auto_start.json, so nothing was recorded and the project is still not startable here".into(),
+        );
+    }
     tracing::info!(
         chat_id = %env.project,
         decision = "peer_grant",
         peer_ip = %peer.ip(),
         origin_device = %env.origin_device,
         dir = %env.dir,
-        changed,
+        outcome = outcome.as_str(),
         "recorded a user-approved permission to start this project"
     );
     (StatusCode::OK, Json(GrantReceipt { granted: true, reason: None, detail: None }))
