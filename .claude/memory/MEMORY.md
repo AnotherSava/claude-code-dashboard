@@ -44,7 +44,7 @@
 - [Startup session restore](startup_session_restore.md) — rejected 2026-06-21, built 2026-09-02 (`session_restore.rs`); registry vouches for liveness, the tab title for status; bar for any third source
 - [Preview tray rendering via PNG test](debug_preview_tray_rendering.md) — throwaway #[ignore] test + png dev-dep renders tray_badge fns to scratchpad PNGs; view, then remove
 - [Verify macOS window geometry via AX](verify_macos_window_geometry_via_ax.md) — project-specific gotchas only now (setupOverride, auto_resize default); general AX-testing technique moved to the global macos-ax-window-testing learning
-- [Verify cfg-gated platform branches](verify_cfg_gated_platform_branches.md) — macOS cargo test skips the #[cfg(not(macos))] stub; can't cross-compile (aws-lc-sys needs windows.h) — invert gates in a scratch module copy
+- [Verify cfg-gated platform branches](verify_cfg_gated_platform_branches.md) — macOS skips the #[cfg(not(macos))] arm; no cross-compile — scratch copy to build it, flip a cfg!() predicate to run it
 - [Context-alert tracking not persisted](context_alert_outstanding_not_persisted.md) — context_outstanding is in-memory; app restart orphans Telegram alerts (known, deliberately unfixed); grep decision=context_alert/context_dismiss
 - [Hook research findings](hooks_research_findings.md) — adopted Stop.last_assistant_message + background_tasks + SessionStart.source/SessionEnd.reason; UserPromptSubmit.source declared but never emitted (#94675); token data DOES arrive now; CLAUDE_CODE_SESSION_ID is in the Bash env
 - [A Status variant is a wire break](status_variant_is_a_wire_break.md) — a new variant 422s the whole sync push on an older peer and wipes prompt_history.json on a downgrade; redefine or add a field instead

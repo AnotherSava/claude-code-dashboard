@@ -1,6 +1,6 @@
 ---
 name: verify_cfg_gated_platform_branches
-description: macOS cargo test never compiles the #[cfg(not(macos))] stub — invert the gates in a scratch copy, since cross-compiling to Windows is blocked
+description: macOS cargo test never compiles the #[cfg(not(macos))] stub — invert the gates in a scratch copy to build the other arm, or flip a cfg!() predicate to run it
 metadata:
   type: project
 ---
@@ -52,5 +52,33 @@ name-resolution and signature drift surface immediately; the only noise is
 `dead_code` warnings from the duplicate module. A name-resolution error aborts
 before type checking, so CI's "1 previous error" never proves the rest is clean
 — this is how to find out.
+
+**A `cfg!()` predicate is a third instrument, and it runs rather than compiles.**
+Everything above answers whether the other platform's arm *builds*. None of it
+answers what that platform *does*, because `cargo test` here still skips every
+`#[cfg(not(target_os = "macos"))]` test. Where the platform fact is funnelled
+through a single predicate *function* instead of being spread across `#[cfg]`
+attributes — `session_launcher::can_launch`, whose body is one
+`cfg!(target_os = "macos")` — flipping that one body makes the behaviour
+runnable locally:
+
+1. `cp <mod>.rs /tmp/<mod>-real.rs` first; a self-inverse `sed` cannot undo
+   step 3.
+2. Confirm the macro form is unique (`grep -n 'cfg!(target_os = "macos")'`),
+   since the `#[cfg(...)]` attributes must not be caught by the same `sed`.
+3. `sed` the predicate's body to a never-true target (`cfg!(target_os = "ios")`)
+   and delete the `#[cfg(not(target_os = "macos"))]` gate on the tests asserting
+   the other platform's behaviour.
+4. `cargo test --lib <names>` — they now execute. Restore with `cp` from step 1.
+
+The predicate's own agreement test fails while flipped, which is the point of
+having one: run the behavioural tests by name rather than the whole module. Used
+2026-10-08 on `can_launch`, which `check_startable` asks last, confirming both
+arms macOS cannot reach — an unlisted id still answers `NotListed`/
+`NoSuchProject` rather than `NoLauncher`, and a listed, present, trusted project
+answers `NoLauncher`, which is what `sync::post_grant` relies on to refuse a
+grant this machine could never honour. The design consequence is worth more than
+the technique: one predicate behind one `cfg!()` is exercisable on both
+platforms, while the same fact spread over `#[cfg]` arms is only compilable.
 
 Related: [[macos_signing_strategy]], [[verify_macos_window_geometry_via_ax]].
