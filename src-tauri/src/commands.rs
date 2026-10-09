@@ -1241,7 +1241,7 @@ pub async fn test_telegram_notification(app: AppHandle) -> Result<(), String> {
         .ok_or_else(|| "no telegram config".to_string())?;
 
     let notifier = std::sync::Arc::new(TelegramNotifier::new());
-    notifier.sync_config(Some(tg_cfg));
+    notifier.sync_config(Some(tg_cfg), &cfg.sync.device_name);
     if !notifier.is_enabled() {
         return Err("telegram bot_token and chat_id are required".to_string());
     }

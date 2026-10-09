@@ -24,6 +24,7 @@ struct Creds {
 struct Inner {
     creds: Option<Creds>,
     rules: HashMap<String, StateNotify>,
+    device: String,
 }
 
 pub struct TelegramNotifier {
@@ -64,8 +65,9 @@ impl TelegramNotifier {
     /// Reconcile internal state against current config. Returns whether the
     /// effective credentials changed, so the caller can decide whether to
     /// drop the outstanding-message map (messages sent under the old bot
-    /// can't be deleted with the new credentials).
-    pub fn sync_config(&self, cfg: Option<&TelegramConfig>) -> SyncOutcome {
+    /// can't be deleted with the new credentials). `device` is this machine's
+    /// `sync.device_name`, kept for the tag `send` puts on each message.
+    pub fn sync_config(&self, cfg: Option<&TelegramConfig>, device: &str) -> SyncOutcome {
         let new_creds = cfg.and_then(|c| {
             let token = c
                 .bot_token
@@ -84,6 +86,7 @@ impl TelegramNotifier {
         let mut inner = self.inner.write().unwrap();
         let prev = inner.creds.clone();
         inner.rules = new_rules;
+        inner.device = device.to_string();
         inner.creds = new_creds.clone();
 
         match (prev, new_creds) {
@@ -229,7 +232,8 @@ impl Notifier for TelegramNotifier {
     }
 
     async fn send(&self, session: &AgentSession) -> Result<String, SendError> {
-        let text = build_message_text(session);
+        let device = self.inner.read().unwrap().device.clone();
+        let text = build_message_text(session, &device);
         self.send_raw_tracked(&text).await
     }
 
@@ -276,7 +280,7 @@ mod tests {
     #[test]
     fn sync_from_empty_to_empty_is_disabled() {
         let n = TelegramNotifier::new();
-        assert_eq!(n.sync_config(None), SyncOutcome::Disabled);
+        assert_eq!(n.sync_config(None, ""), SyncOutcome::Disabled);
         assert!(!n.is_enabled());
     }
 
@@ -284,7 +288,7 @@ mod tests {
     fn sync_missing_token_is_disabled() {
         let n = TelegramNotifier::new();
         let c = cfg(None, Some("123"), &[]);
-        assert_eq!(n.sync_config(Some(&c)), SyncOutcome::Disabled);
+        assert_eq!(n.sync_config(Some(&c), ""), SyncOutcome::Disabled);
         assert!(!n.is_enabled());
     }
 
@@ -292,7 +296,7 @@ mod tests {
     fn sync_empty_string_token_is_disabled() {
         let n = TelegramNotifier::new();
         let c = cfg(Some("   "), Some("123"), &[]);
-        assert_eq!(n.sync_config(Some(&c)), SyncOutcome::Disabled);
+        assert_eq!(n.sync_config(Some(&c), ""), SyncOutcome::Disabled);
         assert!(!n.is_enabled());
     }
 
@@ -300,7 +304,7 @@ mod tests {
     fn sync_sets_credentials_and_rules() {
         let n = TelegramNotifier::new();
         let c = cfg(Some("t"), Some("c"), &[("blocked", 60_000)]);
-        assert_eq!(n.sync_config(Some(&c)), SyncOutcome::CredsChanged);
+        assert_eq!(n.sync_config(Some(&c), ""), SyncOutcome::CredsChanged);
         assert!(n.is_enabled());
         assert_eq!(n.state_rules().get("blocked").and_then(|s| s.reaction_window_ms), Some(60_000));
     }
@@ -309,19 +313,19 @@ mod tests {
     fn sync_unchanged_when_same_creds() {
         let n = TelegramNotifier::new();
         let c = cfg(Some("t"), Some("c"), &[("blocked", 60_000)]);
-        let _ = n.sync_config(Some(&c));
+        let _ = n.sync_config(Some(&c), "");
         // rule change alone is not a credential change
         let c2 = cfg(Some("t"), Some("c"), &[("blocked", 120_000)]);
-        assert_eq!(n.sync_config(Some(&c2)), SyncOutcome::Unchanged);
+        assert_eq!(n.sync_config(Some(&c2), ""), SyncOutcome::Unchanged);
         assert_eq!(n.state_rules().get("blocked").and_then(|s| s.reaction_window_ms), Some(120_000));
     }
 
     #[test]
     fn sync_detects_token_change() {
         let n = TelegramNotifier::new();
-        let _ = n.sync_config(Some(&cfg(Some("t1"), Some("c"), &[])));
+        let _ = n.sync_config(Some(&cfg(Some("t1"), Some("c"), &[])), "");
         assert_eq!(
-            n.sync_config(Some(&cfg(Some("t2"), Some("c"), &[]))),
+            n.sync_config(Some(&cfg(Some("t2"), Some("c"), &[])), ""),
             SyncOutcome::CredsChanged
         );
     }
@@ -329,9 +333,9 @@ mod tests {
     #[test]
     fn sync_detects_chat_change() {
         let n = TelegramNotifier::new();
-        let _ = n.sync_config(Some(&cfg(Some("t"), Some("c1"), &[])));
+        let _ = n.sync_config(Some(&cfg(Some("t"), Some("c1"), &[])), "");
         assert_eq!(
-            n.sync_config(Some(&cfg(Some("t"), Some("c2"), &[]))),
+            n.sync_config(Some(&cfg(Some("t"), Some("c2"), &[])), ""),
             SyncOutcome::CredsChanged
         );
     }
@@ -339,8 +343,8 @@ mod tests {
     #[test]
     fn sync_clearing_creds_reports_disabled() {
         let n = TelegramNotifier::new();
-        let _ = n.sync_config(Some(&cfg(Some("t"), Some("c"), &[])));
-        assert_eq!(n.sync_config(None), SyncOutcome::Disabled);
+        let _ = n.sync_config(Some(&cfg(Some("t"), Some("c"), &[])), "");
+        assert_eq!(n.sync_config(None, ""), SyncOutcome::Disabled);
         assert!(!n.is_enabled());
     }
 }

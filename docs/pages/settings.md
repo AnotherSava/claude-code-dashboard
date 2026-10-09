@@ -241,7 +241,7 @@ Using the feature again afterwards reinstalls them, with one more password promp
 
 The `sync` block shows sessions from your other computers — see [Features → multi-device sync](features#multi-device-sync). The devices must be able to reach each other by address; across different networks the simplest way is a VPN like [Tailscale](https://tailscale.com/). On each device, point `peers` at the other devices, turn `listen` on, and set the same `token` everywhere:
 
-- `device_name` — the name other dashboards show on this device's session badges. Filled in from the computer's hostname on first launch; edit it if you'd like a friendlier label.
+- `device_name` — the name other dashboards show on this device's session badges, and the machine named, lowercased, in this device's Telegram messages (`[my-project:laptop] done`). Filled in from the computer's hostname on first launch; edit it if you'd like a friendlier label.
 - `listen` — accept session pushes from peers. Needs an app restart to change, like `server_port`.
 - `listen_port` — port the sync listener uses (peers connect here). Also restart-required.
 - `bind_scope` — how far the listener opens up. `"tailnet"` (the default) keeps it on your Tailscale network and your own computer, and turns away anything else; `"any"` opens it to every network this computer is on, leaving the `token` as the only protection — use it only if your devices reach each other some other way. Also restart-required. On `"tailnet"`, if Tailscale isn't running when the widget starts, the listener still comes up on all networks and says so in the log, and it still turns away anything that isn't on your tailnet; start Tailscale first, or restart the widget afterwards, to get the narrower setup back.

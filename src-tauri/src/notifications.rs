@@ -87,14 +87,27 @@ pub fn status_key(s: Status) -> &'static str {
     }
 }
 
-pub fn build_message_text(session: &AgentSession) -> String {
+/// The bracketed tag every per-session Telegram message carries: the row's
+/// name, then this machine's `sync.device_name` lowercased, as `[claude:air]`,
+/// so a ping says which machine it came from. A bare `[claude]` where no device
+/// name is set.
+pub fn session_tag(session: &AgentSession, device: &str) -> String {
+    let device = device.trim();
+    if device.is_empty() {
+        format!("[{}]", session.display_label())
+    } else {
+        format!("[{}:{}]", session.display_label(), device.to_lowercase())
+    }
+}
+
+pub fn build_message_text(session: &AgentSession, device: &str) -> String {
     let status = status_key(session.status);
-    let name = session.display_label();
+    let name = session_tag(session, device);
     let text = session.primary_text();
     if text.trim().is_empty() {
-        format!("[{}] {}", name, status)
+        format!("{} {}", name, status)
     } else {
-        format!("[{}] {}\n{}", name, status, text)
+        format!("{} {}\n{}", name, status, text)
     }
 }
 
@@ -124,19 +137,19 @@ fn tokens_k(n: u64) -> String {
 
 /// Telegram text for a context-usage alert, e.g. `[proj] context 72% (144k/200k)`.
 /// `None` when the percent can't be computed (same conditions as [`context_percent`]).
-pub fn build_context_message(session: &AgentSession, window_tokens: &HashMap<String, u64>) -> Option<String> {
+pub fn build_context_message(session: &AgentSession, device: &str, window_tokens: &HashMap<String, u64>) -> Option<String> {
     let pct = context_percent(session, window_tokens)?;
     let tokens = session.input_tokens?;
     let max = window_for(session.model.as_ref()?, window_tokens)?;
-    Some(format!("[{}] context {}% ({}/{})", session.display_label(), pct.round() as u32, tokens_k(tokens), tokens_k(max)))
+    Some(format!("{} context {}% ({}/{})", session_tag(session, device), pct.round() as u32, tokens_k(tokens), tokens_k(max)))
 }
 
 /// Telegram text for an instruction-drift alert, e.g.
 /// `⚠ [proj] instruction drift — the last reply dropped its adherence marker; treat its output with caution.`
-pub fn build_drift_message(session: &AgentSession) -> String {
+pub fn build_drift_message(session: &AgentSession, device: &str) -> String {
     format!(
-        "⚠ [{}] instruction drift — the last reply dropped its adherence marker; treat its output with caution.",
-        session.display_label()
+        "⚠ {} instruction drift — the last reply dropped its adherence marker; treat its output with caution.",
+        session_tag(session, device)
     )
 }
 
@@ -182,8 +195,8 @@ pub fn stale_reconcile<'a>(delay_ms: Option<u64>, sessions: &'a [AgentSession], 
 /// `feedback_warning_leads_with_instruction`, and the seam requires it to read as
 /// a mid-sentence clause — see
 /// [`stale_remedy`](crate::terminals::TerminalAdapter::stale_remedy)'s contract.
-pub fn build_stale_tab_message(session: &AgentSession, remedy: &str) -> String {
-    format!("⚠ [{}] its terminal tab is showing a stale status: {}.", session.display_label(), remedy)
+pub fn build_stale_tab_message(session: &AgentSession, device: &str, remedy: &str) -> String {
+    format!("⚠ {} its terminal tab is showing a stale status: {}.", session_tag(session, device), remedy)
 }
 
 /// Reconcile context-usage alerts against the currently-over set, mirroring the
@@ -745,7 +758,7 @@ impl NotificationManager {
                     .as_ref()
                     .and_then(|n| n.telegram.as_ref());
 
-                let outcome = telegram.sync_config(tg_cfg);
+                let outcome = telegram.sync_config(tg_cfg, &cfg.sync.device_name);
                 if matches!(outcome, SyncOutcome::CredsChanged | SyncOutcome::Disabled) {
                     if !outstanding.is_empty() || !context_outstanding.is_empty() || !drift_outstanding.is_empty() || !stale_outstanding.is_empty() {
                         tracing::warn!(
@@ -829,7 +842,7 @@ impl NotificationManager {
                     }
                     dismiss_and_forget(telegram.as_ref() as &dyn Notifier, &mut context_outstanding, to_dismiss, |h| h.as_str()).await;
                     for s in to_send {
-                        let Some(text) = build_context_message(s, &cfg.context_window_tokens) else { continue };
+                        let Some(text) = build_context_message(s, &cfg.sync.device_name, &cfg.context_window_tokens) else { continue };
                         // Skip while a maybe-delivered hold is active (don't re-send a
                         // possibly-delivered alert every tick).
                         if context_backoff.get(&s.id).is_some_and(|until| now < *until) {
@@ -890,7 +903,7 @@ impl NotificationManager {
                         // keeps it; nothing in the trait promises a constructor
                         // stays free.
                         let remedy = crate::terminals::for_platform(&app).map_or(crate::terminals::FALLBACK_STALE_REMEDY, |a| a.stale_remedy());
-                        match telegram.send_raw_tracked(&build_stale_tab_message(s, remedy)).await {
+                        match telegram.send_raw_tracked(&build_stale_tab_message(s, &cfg.sync.device_name, remedy)).await {
                             Ok(handle) => {
                                 tracing::debug!(channel = "telegram", id = %s.id, decision = "stale_tab_alert", reason = "the terminal tab stopped following this row", "stale-tab alert sent");
                                 stale_outstanding.insert(s.id.clone(), handle);
@@ -934,7 +947,7 @@ impl NotificationManager {
                         if drift_backoff.get(&s.id).is_some_and(|until| now < *until) {
                             continue;
                         }
-                        match telegram.send_raw_tracked(&build_drift_message(s)).await {
+                        match telegram.send_raw_tracked(&build_drift_message(s, &cfg.sync.device_name)).await {
                             Ok(handle) => {
                                 tracing::debug!(
                                     channel = "telegram",
@@ -1674,9 +1687,20 @@ mod tests {
     }
 
     #[test]
+    fn every_message_tags_the_machine_lowercased() {
+        let s = session("proj", Status::Done, 0);
+        assert_eq!(build_message_text(&s, "AIR"), "[proj:air] done");
+        assert_eq!(build_message_text(&s, "  "), "[proj] done");
+        assert!(build_drift_message(&s, "AIR").starts_with("⚠ [proj:air] instruction drift"));
+        assert!(build_stale_tab_message(&s, "AIR", "x").starts_with("⚠ [proj:air] its terminal tab"));
+        let w = windows();
+        assert_eq!(build_context_message(&ctx_session("proj", "m", 144_000), "AIR", &w).as_deref(), Some("[proj:air] context 72% (144k/200k)"));
+    }
+
+    #[test]
     fn message_text_omits_label_line_when_empty() {
         let s = session("proj", Status::Blocked, 0);
-        assert_eq!(build_message_text(&s), "[proj] blocked");
+        assert_eq!(build_message_text(&s, ""), "[proj] blocked");
     }
 
     #[test]
@@ -1684,7 +1708,7 @@ mod tests {
         let mut s = session("proj", Status::Blocked, 0);
         s.label = "Can I run bash: pytest?".into();
         assert_eq!(
-            build_message_text(&s),
+            build_message_text(&s, ""),
             "[proj] blocked\nCan I run bash: pytest?"
         );
     }
@@ -1693,14 +1717,14 @@ mod tests {
     fn message_text_uses_custom_display_name_when_set() {
         let mut s = session("proj", Status::Blocked, 0);
         s.display_name = Some("printlab".into());
-        assert_eq!(build_message_text(&s), "[printlab] blocked");
+        assert_eq!(build_message_text(&s, ""), "[printlab] blocked");
     }
 
     #[test]
     fn message_text_treats_whitespace_only_label_as_empty() {
         let mut s = session("proj", Status::Done, 0);
         s.label = "   ".into();
-        assert_eq!(build_message_text(&s), "[proj] done");
+        assert_eq!(build_message_text(&s, ""), "[proj] done");
     }
 
     #[test]
@@ -1712,7 +1736,7 @@ mod tests {
         let mut s = session("printlab", Status::Done, 0);
         s.label = "needs approval: tool".into();
         s.original_prompt = Some("add the print queue page".into());
-        assert_eq!(build_message_text(&s), "[printlab] done\nadd the print queue page");
+        assert_eq!(build_message_text(&s, ""), "[printlab] done\nadd the print queue page");
     }
 
     #[test]
@@ -1720,7 +1744,7 @@ mod tests {
         // No original_prompt captured → fall back to the label so the line isn't lost.
         let mut s = session("proj", Status::Done, 0);
         s.label = "wrapped up the refactor".into();
-        assert_eq!(build_message_text(&s), "[proj] done\nwrapped up the refactor");
+        assert_eq!(build_message_text(&s, ""), "[proj] done\nwrapped up the refactor");
     }
 
     #[test]
@@ -1729,7 +1753,7 @@ mod tests {
         let mut s = session("proj", Status::Blocked, 0);
         s.label = "Can I run bash: pytest?".into();
         s.original_prompt = Some("add pytest coverage".into());
-        assert_eq!(build_message_text(&s), "[proj] blocked\nCan I run bash: pytest?");
+        assert_eq!(build_message_text(&s, ""), "[proj] blocked\nCan I run bash: pytest?");
     }
 
     fn ctx_session(id: &str, model: &str, tokens: u64) -> AgentSession {
@@ -1996,7 +2020,7 @@ mod tests {
     #[test]
     fn stale_tab_message_format() {
         assert_eq!(
-            build_stale_tab_message(&session("proj", Status::Working, 0), crate::terminals::FALLBACK_STALE_REMEDY),
+            build_stale_tab_message(&session("proj", Status::Working, 0), "", crate::terminals::FALLBACK_STALE_REMEDY),
             "⚠ [proj] its terminal tab is showing a stale status: check whether the tab was renamed, and reset its title."
         );
     }
@@ -2004,7 +2028,7 @@ mod tests {
     #[test]
     fn drift_message_format() {
         assert_eq!(
-            build_drift_message(&session("proj", Status::Done, 0)),
+            build_drift_message(&session("proj", Status::Done, 0), ""),
             "⚠ [proj] instruction drift — the last reply dropped its adherence marker; treat its output with caution."
         );
     }
@@ -2013,10 +2037,10 @@ mod tests {
     fn context_message_format() {
         let w = windows();
         assert_eq!(
-            build_context_message(&ctx_session("proj", "m", 144_000), &w).as_deref(),
+            build_context_message(&ctx_session("proj", "m", 144_000), "", &w).as_deref(),
             Some("[proj] context 72% (144k/200k)")
         );
-        assert_eq!(build_context_message(&session("proj", Status::Working, 0), &w), None);
+        assert_eq!(build_context_message(&session("proj", Status::Working, 0), "", &w), None);
     }
 
     #[test]
@@ -2025,7 +2049,7 @@ mod tests {
         let mut s = ctx_session("proj", "m", 144_000);
         s.display_name = Some("printlab".into());
         assert_eq!(
-            build_context_message(&s, &w).as_deref(),
+            build_context_message(&s, "", &w).as_deref(),
             Some("[printlab] context 72% (144k/200k)")
         );
     }

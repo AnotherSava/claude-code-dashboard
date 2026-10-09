@@ -380,8 +380,9 @@ pub enum SyncBindScope {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SyncConfig {
-    /// Name other dashboards show on this device's session badges. Empty =
-    /// resolved once at startup from the hostname and written back.
+    /// Name other dashboards show on this device's session badges, and the
+    /// machine tag on this device's Telegram messages (`notifications::session_tag`).
+    /// Empty = resolved once at startup from the hostname and written back.
     pub device_name: String,
     /// Accept session pushes from peers on `listen_port`. Off by default; when
     /// on, `bind_scope` decides how far the listener opens up.
