@@ -17,6 +17,7 @@ mod liveness;
 mod liveness_reaper;
 mod log_watcher;
 mod logging;
+mod membership;
 mod nonce_store;
 mod notifications;
 mod peer_message;
@@ -150,7 +151,7 @@ pub fn run() {
         .manage(commands::HistoryTarget(std::sync::Mutex::new(None)))
         .manage(terminal_title::TerminalTitles::new())
         .manage(session_registry::SessionRegistry::new())
-        .manage(liveness::AgentPids::new())
+        .manage(membership::Members::default())
         .manage(commands::RowLocks::default())
         .manage(nonce_store::NonceStore::new())
         .manage(lid_awake::LidAwakeState::default())

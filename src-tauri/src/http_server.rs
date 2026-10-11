@@ -12,10 +12,10 @@ use tauri::{AppHandle, Emitter, Manager};
 
 use crate::adapters::{self, AdapterOutput, SubagentEffect};
 use crate::chat_id_registry::ChatIdRegistry;
-use crate::commands::{emit_sessions_updated, now_ms, resolved_snapshot};
+use crate::commands::{emit_sessions_updated, now_ms, remove_session, resolved_snapshot, LeaveVia};
 use crate::config::ConfigState;
-use crate::liveness::RecordedPid;
-use crate::log_watcher::WatcherRegistry;
+use crate::log_watcher::{Graft, WatcherRegistry};
+use crate::membership::{self, Admission, Departure, EventFacts, Left, Members, Membership};
 use crate::nonce_store::NonceStore;
 use crate::peer_message::{self, Outcome, Receipt};
 use crate::prompt_history::PromptHistoryStore;
@@ -126,19 +126,10 @@ fn apply_session_clean(app: &AppHandle, req: SessionCleanRequest) -> Response {
     let row_lock = app.try_state::<crate::commands::RowLocks>().map(|locks| locks.row(&chat_id));
     let _row_guard = row_lock.as_deref().map(crate::commands::RowLocks::hold);
 
-    // A chat_id is cwd-derived, so every instance in that directory addresses one
-    // row, and a `--fork-session --resume` migration routinely leaves two
-    // resident. Only the instance that last wrote the row may speak for it:
-    // otherwise a sibling's clean pull settles a row whose other session has work
-    // parked in it — `status_before_working` keeps its older `Idle` across a
-    // `Working` → `Working` prompt — and CLEAN then hides it, which is the
-    // hiding-unread-work direction. Same rule and same reasoning as
-    // `clear_permitted`: refused only where the owner is known and differs, so an
-    // unclaimed row (nothing since a restart) still accepts the claim.
-    let owner = app.try_state::<ChatIdRegistry>().and_then(|r| r.owner_of(&chat_id));
-    if !clear_permitted(owner.as_deref(), &req.session_id) {
-        tracing::info!(chat_id = %chat_id, decision = "pull_claim", outcome = "not_owner", "a pull reported a clean run for a row a live sibling holds");
-        return answer(StatusCode::CONFLICT, false, "another session owns that row, so this claim is not its to make");
+    let main = app.try_state::<Members>().and_then(|m| m.main_session(&chat_id));
+    if !clean_claim_permitted(main.as_deref(), &req.session_id) {
+        tracing::info!(chat_id = %chat_id, decision = "pull_claim", outcome = "not_owner", "a pull reported a clean run for a row another session drives");
+        return answer(StatusCode::CONFLICT, false, "another session drives that row, so this claim is not its to make");
     }
 
     if !state.record_clean_claim(&chat_id, now_ms()) {
@@ -355,10 +346,15 @@ struct EventRequest {
     #[serde(default)]
     console_pids: Vec<u32>,
     /// Pid of the owning Claude Code process (`claude.exe` / `claude`), resolved
-    /// by the hook from its ancestor chain and reported fresh on every event.
-    /// `liveness_reaper` checks it to remove a row whose session exited without a
-    /// `SessionEnd`. `None` when the hook couldn't identify it (e.g. a node-based
-    /// install) or from pre-field hooks.
+    /// by the hook from its ancestor chain and reported fresh on every event. It
+    /// keys the sender's membership in its row (`membership::Members`). It also
+    /// picks the row ahead of the session's `ChatIdRegistry` anchor
+    /// (`Members::row_of_pid`), except on the end signal, which is matched by
+    /// session id because a process shutting down often has no resolvable pid.
+    /// `liveness_reaper` judges each pid-keyed member by it. `None` (the hook
+    /// couldn't identify the process, e.g. a node-based install, or a pre-field
+    /// hook) admits the sender as a session-keyed member, which nothing reaps
+    /// until a later event carries its pid and rekeys it.
     #[serde(default)]
     agent_pid: Option<u32>,
 }
@@ -385,67 +381,45 @@ struct EventResponse {
 /// bug). If a resume has no retained nonce (the app restarted mid-session), the
 /// marker the model is already emitting is unknowable, so return `None` rather
 /// than mint a conflict — the row reads `Off` until its next fresh start.
-fn session_start_nonce(ns: &NonceStore, chat_id: &str, source: &str, now_ms: i64) -> Option<String> {
+///
+/// `may_mint` is whether the starting session drives the row: the main, or any
+/// member while none is elected (see `membership` and [`set_effects`]). Any
+/// other session in the folder is handed the row's current nonce and never
+/// mints, since a mint replaces the marker the main is emitting and its next
+/// `Stop` would read as drift.
+fn session_start_nonce(ns: &NonceStore, chat_id: &str, source: &str, now_ms: i64, may_mint: bool) -> Option<String> {
     // `fork` belongs with the other two and was missing: a `--fork-session`
     // start carries its parent's context *and* the marker instruction already in
     // it, so minting a fresh nonce there strands the row Pending on a marker the
     // model will never emit — the exact failure the paragraph above describes.
-    if matches!(source, "resume" | "compact" | "fork") {
+    if !may_mint || matches!(source, "resume" | "compact" | "fork") {
         ns.get(chat_id).map(|(nonce, _seen)| nonce)
     } else {
         Some(ns.mint(chat_id, now_ms))
     }
 }
 
-/// Whether an end signal may remove the row it names. A cwd-derived chat_id is
-/// shared by every Claude Code instance in that directory, so a `SessionEnd`
-/// from one can arrive for a row another is still writing — canonically after a
-/// `--fork-session --resume` migrates a terminal session into a background one,
-/// leaving both resident. The row's owner is the `session_id` of whichever
-/// instance wrote it last (`ChatIdRegistry::claim`).
-///
-/// Ownership is deliberately keyed on the payload's `session_id` rather than
-/// the hook's `agent_pid`. The pid is resolved by walking the hook's ancestors
-/// for a live `claude` image, so it comes back `None` for a session that is
-/// *shutting down* — precisely when this guard has to hold. A real `SessionEnd`
-/// from a killed sibling was let through that way; `session_id` is in the
-/// payload unconditionally and needs no live process to read.
-///
-/// Permitted unless both ids are known *and* differ: nothing claimed since a
-/// restart, or a payload without a `session_id`, means ownership is unknown and
-/// an authoritative end signal beats a guess. `/clear` still removes its own
-/// row — it fires `SessionEnd` under the *old* session_id, which is the one
-/// that claimed the row, and mints the new id only on the following
-/// `SessionStart`. When that `SessionStart` arrives first instead,
-/// [`clear_overtook_its_end`] does the removal and this refuses the late end.
-fn clear_permitted(owner: Option<&str>, ending: &str) -> bool {
-    match owner {
-        Some(owner) if !ending.is_empty() => owner == ending,
-        _ => true,
-    }
+/// The marker instruction a `SessionStart` hands the hook to inject, if any.
+fn canary_instruction(ns: &NonceStore, chat_id: &str, source: &str, now_ms: i64, may_mint: bool) -> Option<String> {
+    let nonce = session_start_nonce(ns, chat_id, source, now_ms, may_mint)?;
+    let marker = crate::adapters::claude::marker_for(crate::adapters::claude::CANARY_MARKER, &nonce);
+    Some(format!(
+        "Adherence check for this session: end every response you write with the exact text {marker}, \
+         placed inline on the same line right after your final character (a single space before it, \
+         no blank line) — a hidden marker, so do not mention, explain, or alter it."
+    ))
 }
 
-/// Whether a `SessionStart` is a `/clear` that reached this server ahead of its
-/// own `SessionEnd`. Both are async hooks, separate processes racing here, and
-/// the start wins often enough to matter. It claims the row for the new
-/// session_id, so `clear_permitted` refuses the late end as a sibling's, and the
-/// teardown the end would have done (a `Clear` separator, the stale context
-/// gauge, a drift flag) is done by nobody.
-///
-/// The test is that the row's owner is the session that recorded the row's pid
-/// and that pid is this event's: `/clear` keeps the process, so that is the
-/// session this one replaces, the same fact `clear_permitted` reads from the
-/// session_id. Pid equality alone is not enough — the hook reports no pid when
-/// its process walk fails, so a sibling sharing the cwd can own the row while
-/// the pid held for it is still this process's. A different pid, or an owner
-/// other than the recording session, is a sibling, whose row this must not
-/// reset. The pid is safe to use here, unlike on a `SessionEnd`, because a
-/// starting session's process is alive to be found. With no row left (the end
-/// got here first) nothing is recorded, so this answers `false` and the
-/// ordinary order runs. A hook that resolves no pid gets the old behaviour.
-fn clear_overtook_its_end(event: &str, source: Option<&str>, recorded: Option<&RecordedPid>, owner: Option<&str>, agent_pid: Option<u32>) -> bool {
-    let Some(recorded) = recorded else { return false };
-    event == "SessionStart" && source == Some("clear") && agent_pid == Some(recorded.pid) && owner.is_some() && recorded.session_id.as_deref() == owner
+/// Whether a `/pull` run's clean claim from `claimant` may land on a row whose
+/// main session is `main`. A chat_id is cwd-derived, so every session in that
+/// directory addresses one row; a claim from one that does not drive the row
+/// would settle work the main has parked there — `status_before_working` keeps
+/// its older `Idle` across a `Working` → `Working` prompt — and CLEAN then hides
+/// it, the hiding-unread-work direction. Refused only where a main is known and
+/// differs, so a row with no main (none elected, or nothing since a restart)
+/// still accepts.
+fn clean_claim_permitted(main: Option<&str>, claimant: &str) -> bool {
+    main.is_none_or(|m| m == claimant)
 }
 
 /// What the per-`Stop` canary check should do to the surfaced `instruction_drift`
@@ -800,7 +774,7 @@ fn agent_roster(
     let mut live_by_row: HashMap<&str, (usize, Option<&str>)> = HashMap::new();
     for (s, id) in registry_rows.iter().flatten() {
         let entry = live_by_row.entry(id.as_str()).or_default();
-        entry.0 += s.sessions;
+        entry.0 += s.sessions();
         entry.1 = s.name.as_deref();
     }
     let sole_name = |count: usize, name: Option<&str>| name.filter(|_| count == 1).map(str::to_string);
@@ -875,10 +849,10 @@ fn agent_roster(
                     project: id.clone(),
                     id,
                     device: this_device.map(str::to_string),
-                    name: sole_name(s.sessions, s.name.as_deref()),
+                    name: sole_name(s.sessions(), s.name.as_deref()),
                     activity: s.activity,
                     activity_age_ms: s.activity_age_ms,
-                    sessions: s.sessions,
+                    sessions: s.sessions(),
                     local: true,
                     last_seen_age_ms: None,
                 }),
@@ -1517,7 +1491,7 @@ async fn post_event(
     // hyper does the moment the hook's 2s client timeout closes the socket. An
     // event waiting on its row lock must not vanish that way: a lost
     // `SessionStart` leaves a row with no pid, which the reaper never removes.
-    match tauri::async_runtime::spawn_blocking(move || apply_event(&app, req)).await {
+    match tauri::async_runtime::spawn_blocking(move || apply_event(&app, &req)).await {
         Ok(response) => response,
         Err(e) => {
             tracing::error!(error = %e, "hook event handler failed");
@@ -1526,12 +1500,103 @@ async fn post_event(
     }
 }
 
-fn apply_event(app: &AppHandle, req: EventRequest) -> Response {
+/// The row an event lands on: the row its process is already a member of,
+/// else the row its session is anchored to, else the one its directory derives.
+///
+/// A process already in a row stays in it, whatever its session's anchor says,
+/// so a `/clear` after a `cd` (a new session id, anchored to wherever the cwd
+/// now derives) lands on the row the process was already in. The anchor still
+/// decides for the session's events that carry no pid.
+fn pick_row(pid_row: Option<&str>, anchored: Option<String>, derived: &str) -> String {
+    pid_row.map(str::to_string).or(anchored).unwrap_or_else(|| derived.to_string())
+}
+
+/// What one admitted `Set` event does beyond being recorded, decided from its
+/// admission alone so the handler branches on these fields and holds no rule
+/// of its own.
+#[derive(Debug, PartialEq, Eq)]
+struct SetEffects {
+    /// Do a `/clear` end's teardown first: its start reached the server before
+    /// it, on the session driving the row.
+    teardown: bool,
+    /// Apply the event to the row. `false` records it as a `member_event` and
+    /// touches nothing the row shows.
+    apply: bool,
+    /// Hand back a marker instruction: a `SessionStart` with the canary on.
+    /// Whether it may mint a fresh nonce is `apply` (see
+    /// [`session_start_nonce`]).
+    mint: bool,
+    /// Judge this `Stop` for canary drift.
+    judge_drift: bool,
+}
+
+/// The session that drives the row mints: the main, or any member while none is
+/// elected, which is the last-writer-wins state membership degrades to. Drift is
+/// judged only for an elected main, because with several members driving, the
+/// one that did not mint last drops a marker it was never given, and once the
+/// other's `Stop` had confirmed the nonce that drop would read as drift.
+fn set_effects(adm: &Admission, event: &str, canary_on: bool) -> SetEffects {
+    SetEffects {
+        teardown: adm.rotation.as_ref().is_some_and(|r| r.teardown),
+        apply: adm.drives_row,
+        mint: canary_on && event == "SessionStart",
+        judge_drift: canary_on && event == "Stop" && adm.is_main(),
+    }
+}
+
+/// What a `SessionEnd` does, from what membership made of it.
+#[derive(Debug, PartialEq, Eq)]
+enum ClearAction {
+    /// The end of a `/clear` whose start already did the teardown.
+    Superseded,
+    /// A `/clear` end from the session driving the row: remove the row, keep
+    /// its members for the start to find, forget the nonce.
+    Teardown,
+    /// A `/clear` end from a session that does not drive the row.
+    MemberOnly,
+    /// A member left: [`crate::commands::apply_departure`].
+    Leave(Left),
+    /// Nobody is known in the row, so there is nobody the end could be wrong
+    /// about and it is taken at its word. Only a `/clear` forgets the nonce.
+    RemoveUnknown { forget_nonce: bool },
+    /// The ending session is not a member of a row that has members.
+    Refuse,
+}
+
+fn clear_action(departure: Departure, wiped: bool) -> ClearAction {
+    match departure {
+        Departure::Superseded => ClearAction::Superseded,
+        Departure::Clearing { drives_row: true } => ClearAction::Teardown,
+        Departure::Clearing { drives_row: false } => ClearAction::MemberOnly,
+        Departure::Left(left) => ClearAction::Leave(left),
+        Departure::Unmatched { row_known: false } => ClearAction::RemoveUnknown { forget_nonce: wiped },
+        Departure::Unmatched { row_known: true } => ClearAction::Refuse,
+    }
+}
+
+/// Apply one hook event, moving it to the row its pid turned out to be in when
+/// that row was not the one locked (see [`Members::admit`]). Terminates because
+/// a pid is a member of at most one row, and the retry locks that row.
+fn apply_event(app: &AppHandle, req: &EventRequest) -> Response {
+    let mut placed = None;
+    loop {
+        match apply_event_in(app, req, placed.take()) {
+            Ok(response) => return response,
+            Err(row) => placed = Some(row),
+        }
+    }
+}
+
+/// `Err` names the row the event's pid is a member of, with nothing changed.
+fn apply_event_in(app: &AppHandle, req: &EventRequest, placed: Option<String>) -> Result<Response, String> {
     let Some(state) = app.try_state::<AppState>() else {
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(EventResponse::default())).into_response();
+        return Ok((StatusCode::INTERNAL_SERVER_ERROR, Json(EventResponse::default())).into_response());
     };
     let Some(cfg_state) = app.try_state::<ConfigState>() else {
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(EventResponse::default())).into_response();
+        return Ok((StatusCode::INTERNAL_SERVER_ERROR, Json(EventResponse::default())).into_response());
+    };
+    let Some(members) = app.try_state::<Members>() else {
+        return Ok((StatusCode::INTERNAL_SERVER_ERROR, Json(EventResponse::default())).into_response());
     };
     let cfg = cfg_state.snapshot();
     let mut resp = EventResponse::default();
@@ -1541,26 +1606,41 @@ fn apply_event(app: &AppHandle, req: EventRequest) -> Response {
     // Lock the row to the Claude session_id so a mid-session cwd change (the
     // agent `cd`s into a subdirectory) doesn't fragment one conversation across
     // multiple rows. `/clear` mints a new session_id with the same cwd, so it
-    // re-derives the same id and the row stays continuous.
+    // re-derives the same id and the row stays continuous. The pid is checked
+    // first (see `pick_row`). The end signal is the exception, matched by
+    // session id alone because the pid of a process shutting down is often
+    // unresolvable.
+    //
+    // The row is chosen from the anchor without writing one; `anchor` writes it
+    // once the event is placed, so an event moved to its pid's row never leaves
+    // its session anchored to the row it was first aimed at.
     let session_id = req.payload.get("session_id").and_then(|v| v.as_str()).unwrap_or("");
-    if let Some(registry) = app.try_state::<ChatIdRegistry>() {
-        match &mut output {
-            AdapterOutput::Set { input, .. } => {
-                input.id = registry.resolve(session_id, &input.id);
-            }
-            AdapterOutput::Clear { id } => {
+    let pid_row = placed.or_else(|| req.agent_pid.and_then(|pid| members.row_of_pid(pid)));
+    let registry = app.try_state::<ChatIdRegistry>();
+    let anchored = registry.as_ref().and_then(|r| r.anchored(session_id));
+    match &mut output {
+        AdapterOutput::Set { input, .. } => input.id = pick_row(pid_row.as_deref(), anchored, &input.id),
+        AdapterOutput::Clear { id } => {
+            if let Some(registry) = &registry {
                 *id = registry.resolve(session_id, id);
                 registry.forget(session_id);
             }
-            AdapterOutput::Boundary { id } => {
-                *id = registry.resolve(session_id, id);
-            }
-            AdapterOutput::SubagentStopped { id, .. } => {
-                *id = registry.resolve(session_id, id);
-            }
-            AdapterOutput::Ignore => {}
         }
+        AdapterOutput::Boundary { id } | AdapterOutput::SubagentStopped { id, .. } => *id = pick_row(pid_row.as_deref(), anchored, id),
+        AdapterOutput::Ignore => {}
     }
+    let anchor = |row: &str| {
+        if let Some(registry) = &registry {
+            registry.resolve(session_id, row);
+        }
+    };
+    // Taken here rather than inside the predicate because `admit` asks it while
+    // holding the `Members` mutex, which must never wait on a process
+    // enumeration. Only a start can reach the rekey that asks, so no other event
+    // pays for it. A snapshot that cannot be taken answers "running" (see
+    // `EventFacts`).
+    let images = (req.event == "SessionStart").then(crate::liveness::process_images).flatten();
+    let still_running = |pid: u32| images.as_ref().is_none_or(|images| crate::liveness::is_live_claude(images, pid));
 
     // Held to the end of the handler, so this event's writes across every
     // per-row store land as a unit — see `RowLocks` for the `/clear` race.
@@ -1577,26 +1657,63 @@ fn apply_event(app: &AppHandle, req: EventRequest) -> Response {
 
     match output {
         AdapterOutput::Set { input, transcript_path, reason, subagent, agent_message } => {
-            // Do the `/clear` teardown its `SessionEnd` will be refused for, ahead
-            // of everything this event records — its pid, console and ownership,
-            // which the removal would otherwise forget — and of its own
-            // `classify` line, so the log reads in the order end-first does.
-            let owner = app.try_state::<ChatIdRegistry>().and_then(|r| r.owner_of(&input.id));
-            let recorded = app.try_state::<crate::liveness::AgentPids>().and_then(|p| p.recorded(&input.id));
+            let chat_id = input.id.clone();
             let source = req.payload.get("source").and_then(|v| v.as_str());
-            if clear_overtook_its_end(&req.event, source, recorded.as_ref(), owner.as_deref(), req.agent_pid) && crate::commands::remove_session(app, &input.id, None, BoundaryKind::Clear, now_ms()) {
-                if let (Some(registry), Some(ended)) = (app.try_state::<ChatIdRegistry>(), owner.as_deref()) {
-                    registry.supersede(ended);
+            let facts = EventFacts { event: &req.event, source, pid: req.agent_pid, session_id, transcript_path: transcript_path.as_deref(), still_running: &still_running };
+            let adm = members.admit(&chat_id, &facts, now_ms())?;
+            anchor(&chat_id);
+            membership::log_admission(&chat_id, &req.event, session_id, &adm);
+            let fx = set_effects(&adm, &req.event, cfg.instruction_canary_enabled);
+            // A `/clear` whose start reached this server before its end does the
+            // end's teardown, ahead of everything this event records and of its
+            // own `classify` line, so the log reads in the order end-first does.
+            // The member is kept: it is the same process, now under the new id,
+            // which is how the late end is recognised as superseded.
+            if fx.teardown {
+                if remove_session(app, &chat_id, BoundaryKind::Clear, now_ms(), Membership::Keep) {
+                    tracing::debug!(
+                        client = %req.client,
+                        event = %req.event,
+                        chat_id = %chat_id,
+                        decision = "session_clear",
+                        reason = "SessionStart:clear arrived before its SessionEnd; row removed on the end's behalf",
+                        ending = ?adm.rotation.as_ref().map(|r| &r.from),
+                        "event -> clear"
+                    );
                 }
+            }
+            // --- Instruction-adherence canary (see Config::instruction_canary_enabled) ---
+            // On SessionStart, mint (startup/clear) or reuse (resume/compact) the
+            // session's nonce and hand the hook the instruction to inject; on Stop
+            // (below), a dropped marker on the settled turn's final message flags
+            // orthogonal drift (status is untouched).
+            if fx.mint {
+                if let Some(ns) = app.try_state::<NonceStore>() {
+                    // A `resume`/`compact` keeps the model's prior context (and
+                    // its original marker), so reuse the existing nonce rather
+                    // than mint a second, conflicting one; only `startup`/`clear`
+                    // (no prior marker in context) rotate, and only for the
+                    // session driving the row. See `session_start_nonce`.
+                    resp.additional_context = canary_instruction(&ns, &chat_id, source.unwrap_or(""), now_ms(), fx.apply);
+                }
+            }
+            // Another session in this folder: what it did is recorded, and the
+            // row, its title, its watcher, its subagent prompts and its clean
+            // claim stay the main session's.
+            if !fx.apply {
                 tracing::debug!(
                     client = %req.client,
                     event = %req.event,
-                    chat_id = %input.id,
-                    decision = "session_clear",
-                    reason = "SessionStart:clear arrived before its SessionEnd; row removed on the end's behalf",
-                    ending = ?owner,
-                    "event -> clear"
+                    chat_id = %chat_id,
+                    decision = "member_event",
+                    status = ?input.status,
+                    member = %membership::key_text(adm.member.as_ref()),
+                    main = %membership::key_text(adm.main.as_ref()),
+                    subagent_prompt_dropped = matches!(subagent, SubagentEffect::PromptOpened(_)),
+                    reason = "an event from a session that does not drive this row; recorded, not applied",
+                    "event -> member"
                 );
+                return Ok((StatusCode::OK, Json(resp)).into_response());
             }
             // Permanent decision record: why this row landed in this state. The
             // `decision` field makes it greppable (the `investigate` skill reads
@@ -1606,17 +1723,17 @@ fn apply_event(app: &AppHandle, req: EventRequest) -> Response {
             tracing::debug!(
                 client = %req.client,
                 event = %req.event,
-                chat_id = %input.id,
+                chat_id = %chat_id,
                 decision = "classify",
                 status = ?input.status,
                 label = ?input.label,
                 reason = %reason,
                 agent_id = ?req.payload.get("agent_id").and_then(|v| v.as_str()),
+                member = %membership::key_text(adm.member.as_ref()),
                 console_pids = ?req.console_pids,
                 agent_pid = ?req.agent_pid,
                 "event -> set"
             );
-            let chat_id = input.id.clone();
             // The event's own verdict, before a subagent prompt can overlay it:
             // the canary below judges the turn the main agent just ended.
             let classified = input.status;
@@ -1627,19 +1744,6 @@ fn apply_event(app: &AppHandle, req: EventRequest) -> Response {
             // manual removal) the title is blanked and the pids forgotten.
             if let Some(titles) = app.try_state::<crate::terminal_title::TerminalTitles>() {
                 titles.register(&chat_id, &req.console_pids);
-            }
-            // Record the owning Claude pid so `liveness_reaper` can detect a
-            // session that exits without a SessionEnd. Overwrite each event so a
-            // same-cwd restart's new pid supersedes a now-dead one.
-            if let Some(pid) = req.agent_pid {
-                if let Some(pids) = app.try_state::<crate::liveness::AgentPids>() {
-                    pids.set(&chat_id, pid, (!session_id.is_empty()).then_some(session_id));
-                }
-            }
-            // Claim the row for this session, so a `SessionEnd` from another
-            // instance sharing the cwd can't remove it (see `clear_permitted`).
-            if let Some(registry) = app.try_state::<ChatIdRegistry>() {
-                registry.claim(&chat_id, session_id);
             }
             let history = app.try_state::<PromptHistoryStore>();
             let restored = history.as_ref().and_then(|h| h.get(&chat_id));
@@ -1670,7 +1774,7 @@ fn apply_event(app: &AppHandle, req: EventRequest) -> Response {
                 input.message_is_reply = Some(msg.is_reply());
             }
             let arriving_prompt = origin.as_ref().and(input.label.clone());
-            if resume_is_clean(&req.event, req.payload.get("source").and_then(|v| v.as_str()), restored.as_ref().map(|r| r.dialog.as_slice())) {
+            if resume_is_clean(&req.event, source, restored.as_ref().map(|r| r.dialog.as_slice())) {
                 input.status = Status::Idle;
             }
             // The other CLEAN source the adapter cannot answer: a peer asked this
@@ -1746,82 +1850,54 @@ fn apply_event(app: &AppHandle, req: EventRequest) -> Response {
                 }
             }
             if set_changed {
-                if let Some(ref h) = history {
-                    let sessions = state.sessions.lock().unwrap();
-                    if let Some(s) = sessions.iter().find(|s| s.id == chat_id) {
-                        h.save_session(s);
-                    }
-                    drop(sessions);
-                    h.save_to_disk();
-                }
+                crate::commands::persist_row(app, &state, &chat_id);
             }
-            // --- Instruction-adherence canary (see Config::instruction_canary_enabled) ---
-            // On SessionStart, mint (startup/clear) or reuse (resume/compact) the
-            // session's nonce and hand the hook the instruction to inject; on Stop,
-            // a dropped marker on the settled turn's final message flags orthogonal
-            // drift (status is untouched).
-            if cfg.instruction_canary_enabled {
-                if req.event == "SessionStart" {
-                    if let Some(ns) = app.try_state::<crate::nonce_store::NonceStore>() {
-                        // A `resume`/`compact` keeps the model's prior context (and
-                        // its original marker), so reuse the existing nonce rather
-                        // than mint a second, conflicting one; only `startup`/`clear`
-                        // (no prior marker in context) rotate. See `session_start_nonce`.
-                        let source = req.payload.get("source").and_then(|v| v.as_str()).unwrap_or("");
-                        if let Some(nonce) = session_start_nonce(&ns, &chat_id, source, now) {
-                            let marker = crate::adapters::claude::marker_for(crate::adapters::claude::CANARY_MARKER, &nonce);
-                            resp.additional_context = Some(format!(
-                                "Adherence check for this session: end every response you write with the exact text {marker}, \
-                                 placed inline on the same line right after your final character (a single space before it, \
-                                 no blank line) — a hidden marker, so do not mention, explain, or alter it."
-                            ));
+            // Canary drift (see the SessionStart half above the `!fx.apply` return).
+            if fx.judge_drift {
+                // Judged only when this session has a nonce and produced a final
+                // message; a tool-only / empty-final turn is exempt (left as-is).
+                let final_msg = req.payload.get("last_assistant_message").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty());
+                if let (Some(final_msg), Some(ns)) = (final_msg, app.try_state::<crate::nonce_store::NonceStore>()) {
+                    if let Some((nonce, seen)) = ns.get(&chat_id) {
+                        let marker = crate::adapters::claude::marker_for(crate::adapters::claude::CANARY_MARKER, &nonce);
+                        let present = final_msg.contains(&marker);
+                        if present {
+                            ns.mark_seen(&chat_id);
                         }
-                    }
-                } else if req.event == "Stop" {
-                    // Judged only when this session has a nonce and produced a final
-                    // message; a tool-only / empty-final turn is exempt (left as-is).
-                    let final_msg = req.payload.get("last_assistant_message").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty());
-                    if let (Some(final_msg), Some(ns)) = (final_msg, app.try_state::<crate::nonce_store::NonceStore>()) {
-                        if let Some((nonce, seen)) = ns.get(&chat_id) {
-                            let marker = crate::adapters::claude::marker_for(crate::adapters::claude::CANARY_MARKER, &nonce);
-                            let present = final_msg.contains(&marker);
-                            if present {
-                                ns.mark_seen(&chat_id);
-                            }
-                            // "starts to skip": flag drift only once the session has
-                            // PROVEN it can emit the marker (`seen`). An unconfirmed
-                            // session — e.g. one whose SessionStart response was lost, so
-                            // the marker instruction never reached the model — is held
-                            // unflagged, so a delivery miss can't manufacture a permanent
-                            // false drift; only a drop *after* prior adherence flags.
-                            // Two-tier: a drop on a `Blocked` handback (the model mid-
-                            // workflow — e.g. a `/commit` reflection ending on a question)
-                            // is deferred, not confirmed, and re-judged next turn (see
-                            // `drift_action`), so a self-correcting skill turn never pings.
-                            // Read off this `Stop`'s own classification: the row
-                            // may read Blocked because a subagent is prompting.
-                            let is_handback = classified == Status::Blocked;
-                            let (action, reason) = drift_action(present, seen, is_handback);
-                            let changed = match action {
-                                DriftAction::Clear => state.set_drift(&chat_id, false, now),
-                                DriftAction::Confirm => state.set_drift(&chat_id, true, now),
-                                DriftAction::Hold => false,
-                            };
-                            let drifted = state.drift_confirmed(&chat_id);
-                            let deferred = matches!(action, DriftAction::Hold) && seen && !present;
-                            tracing::debug!(chat_id = %chat_id, decision = "drift_check", drifted, deferred, seen, changed, marker = %marker, reason, "canary drift check");
-                        }
+                        // "starts to skip": flag drift only once the session has
+                        // PROVEN it can emit the marker (`seen`). An unconfirmed
+                        // session — e.g. one whose SessionStart response was lost, so
+                        // the marker instruction never reached the model — is held
+                        // unflagged, so a delivery miss can't manufacture a permanent
+                        // false drift; only a drop *after* prior adherence flags.
+                        // Two-tier: a drop on a `Blocked` handback (the model mid-
+                        // workflow — e.g. a `/commit` reflection ending on a question)
+                        // is deferred, not confirmed, and re-judged next turn (see
+                        // `drift_action`), so a self-correcting skill turn never pings.
+                        // Read off this `Stop`'s own classification: the row
+                        // may read Blocked because a subagent is prompting.
+                        let is_handback = classified == Status::Blocked;
+                        let (action, reason) = drift_action(present, seen, is_handback);
+                        let changed = match action {
+                            DriftAction::Clear => state.set_drift(&chat_id, false, now),
+                            DriftAction::Confirm => state.set_drift(&chat_id, true, now),
+                            DriftAction::Hold => false,
+                        };
+                        let drifted = state.drift_confirmed(&chat_id);
+                        let deferred = matches!(action, DriftAction::Hold) && seen && !present;
+                        tracing::debug!(chat_id = %chat_id, decision = "drift_check", drifted, deferred, seen, changed, marker = %marker, reason, "canary drift check");
                     }
                 }
             }
             if let Some(tp) = transcript_path {
                 if let Some(reg) = watcher {
-                    reg.start(app.clone(), chat_id, tp);
+                    reg.start(app.clone(), chat_id, tp, Graft::IfFresh);
                 }
             }
             emit_sessions_updated(&app);
         }
         AdapterOutput::SubagentStopped { id, agent_id } => {
+            anchor(&id);
             // Untagged because it moves no status by itself. It is the record
             // of which agents' `SubagentStop` arrives at all, a workflow
             // agent's included.
@@ -1833,61 +1909,6 @@ fn apply_event(app: &AppHandle, req: EventRequest) -> Response {
             }
         }
         AdapterOutput::Clear { id } => {
-            // The end of a `/clear` whose start got here first and already
-            // removed the row. Refusing it is right, but it is not a sibling's,
-            // and logging it as one would make every such race read as a fork.
-            if app.try_state::<ChatIdRegistry>().is_some_and(|r| r.take_superseded(session_id)) {
-                tracing::debug!(
-                    client = %req.client,
-                    event = %req.event,
-                    chat_id = %id,
-                    decision = "clear_superseded",
-                    reason = "end of a /clear whose SessionStart already removed the row",
-                    ending = %session_id,
-                    "event -> clear"
-                );
-                return (StatusCode::OK, Json(resp)).into_response();
-            }
-            // Two Claude Code instances can hold one cwd — canonically a terminal
-            // session forked into a background/desktop one (`--fork-session
-            // --resume`) — and the chat_id is cwd-derived, so both address the
-            // same row. Whoever wrote last owns it: refuse an end signal from the
-            // *other* instance, which would otherwise flush and drop a row a live
-            // sibling is still using.
-            let owner = app.try_state::<ChatIdRegistry>().and_then(|r| r.owner_of(&id));
-            if !clear_permitted(owner.as_deref(), session_id) {
-                tracing::debug!(
-                    client = %req.client,
-                    event = %req.event,
-                    chat_id = %id,
-                    decision = "clear_ignored",
-                    reason = "end signal from a non-owning session sharing this cwd",
-                    owner = ?owner,
-                    ending = %session_id,
-                    "event -> clear"
-                );
-                return (StatusCode::OK, Json(resp)).into_response();
-            }
-            if let Some(registry) = app.try_state::<ChatIdRegistry>() {
-                registry.disown(&id);
-            }
-            tracing::debug!(
-                client = %req.client,
-                event = %req.event,
-                chat_id = %id,
-                decision = "session_clear",
-                reason = "session ended; row removed",
-                "event -> clear"
-            );
-            // Remove the row through the shared helper — the same path the
-            // liveness reaper uses, so the two can't drift. It appends a history
-            // separator before dropping the in-memory session: Claude `/clear`
-            // fires SessionEnd → SessionStart, so persisting a dialog that ends
-            // with the separator lets the next SessionStart's "new" branch
-            // restore it and land the upcoming UserPromptSubmit after the
-            // boundary. `None` = remove unconditionally (this is the
-            // authoritative end signal, not a speculative reap).
-            //
             // The adapter answers `Clear` for every `SessionEnd` reason, so the
             // reason is read here and nowhere else decides it. It settles two
             // separate things, and conflating them is what made the boundary
@@ -1897,7 +1918,6 @@ fn apply_event(app: &AppHandle, req: EventRequest) -> Response {
             // `--continue` will bring straight back.
             let wiped = req.payload.get("reason").and_then(|v| v.as_str()) == Some("clear");
             let kind = if wiped { BoundaryKind::Clear } else { BoundaryKind::Ended };
-            crate::commands::remove_session(&app, &id, None, kind, now_ms());
             // Drop the session's canary nonce only on a `/clear`, which wipes the
             // model's context (and its marker instruction); the next
             // SessionStart:clear then mints a fresh one. A plain exit/logout keeps
@@ -1905,13 +1925,45 @@ fn apply_event(app: &AppHandle, req: EventRequest) -> Response {
             // marker) intact, and `session_start_nonce` reuses it so a resumed
             // session stays confirmed instead of falsely rotating to a marker the
             // model isn't emitting.
-            if wiped {
-                if let Some(ns) = app.try_state::<crate::nonce_store::NonceStore>() {
+            let forget_nonce = || {
+                if let Some(ns) = app.try_state::<NonceStore>() {
                     ns.forget(&id);
                 }
+            };
+            let log_clear = |decision: &str, reason: &str| tracing::debug!(client = %req.client, event = %req.event, chat_id = %id, decision, reason, ending = %session_id, "event -> clear");
+            match clear_action(members.depart(&id, session_id, req.agent_pid, wiped, now_ms()), wiped) {
+                ClearAction::Superseded => log_clear("clear_superseded", "end of a /clear whose SessionStart already removed the row"),
+                // Removing the row appends a history separator before dropping it:
+                // Claude `/clear` fires SessionEnd → SessionStart, so persisting a
+                // dialog that ends with the separator lets the next SessionStart's
+                // "new" branch restore it and land the upcoming UserPromptSubmit
+                // after the boundary. The member is kept for that start to find.
+                ClearAction::Teardown => {
+                    log_clear("session_clear", "/clear ended the session driving this row; row removed until its SessionStart");
+                    remove_session(app, &id, BoundaryKind::Clear, now_ms(), Membership::Keep);
+                    forget_nonce();
+                }
+                ClearAction::MemberOnly => log_clear("member_event", "a /clear in a session that does not drive this row; the row is not its to clear"),
+                ClearAction::Leave(left) => crate::commands::apply_departure(app, &id, &left, LeaveVia::SessionEnd { kind }, now_ms()),
+                ClearAction::RemoveUnknown { forget_nonce: forget } => {
+                    log_clear("session_clear", "session ended; the row has no known members, so the end signal is taken at its word");
+                    remove_session(app, &id, kind, now_ms(), Membership::Forget);
+                    if forget {
+                        forget_nonce();
+                    }
+                }
+                ClearAction::Refuse => log_clear("end_unmatched", "end signal from a session that is not a member of this row; refused"),
             }
         }
         AdapterOutput::Boundary { id } => {
+            let facts = EventFacts { event: &req.event, source: None, pid: req.agent_pid, session_id, transcript_path: None, still_running: &still_running };
+            let adm = members.admit(&id, &facts, now_ms())?;
+            anchor(&id);
+            membership::log_admission(&id, &req.event, session_id, &adm);
+            if !adm.drives_row {
+                tracing::debug!(client = %req.client, event = %req.event, chat_id = %id, decision = "member_event", reason = "a compaction in a session that does not drive this row; no separator", "event -> member");
+                return Ok((StatusCode::OK, Json(resp)).into_response());
+            }
             tracing::debug!(
                 client = %req.client,
                 event = %req.event,
@@ -1925,14 +1977,7 @@ fn apply_event(app: &AppHandle, req: EventRequest) -> Response {
             // transcript-rotation marking the same boundary is harmless.
             let now = now_ms();
             if state.mark_session_boundary(&id, now) {
-                if let Some(h) = app.try_state::<PromptHistoryStore>() {
-                    let sessions = state.sessions.lock().unwrap();
-                    if let Some(s) = sessions.iter().find(|s| s.id == id) {
-                        h.save_session(s);
-                    }
-                    drop(sessions);
-                    h.save_to_disk();
-                }
+                crate::commands::persist_row(&app, &state, &id);
                 emit_sessions_updated(&app);
             }
         }
@@ -1944,7 +1989,7 @@ fn apply_event(app: &AppHandle, req: EventRequest) -> Response {
             );
         }
     }
-    (StatusCode::OK, Json(resp)).into_response()
+    Ok((StatusCode::OK, Json(resp)).into_response())
 }
 
 #[cfg(test)]
@@ -2190,7 +2235,8 @@ mod tests {
     }
 
     fn live(chat_id: &str, activity: Activity, sessions: usize) -> LiveSession {
-        LiveSession { chat_id: chat_id.to_string(), name: Some(chat_id.to_string()), activity, activity_age_ms: Some(600), sessions, session_ids: Vec::new(), pid: 4_242 }
+        let records = (0..sessions).map(|i| crate::session_registry::RecordKey { pid: 4_242 + i as u32, session_id: None }).collect();
+        LiveSession { chat_id: chat_id.to_string(), name: Some(chat_id.to_string()), activity, activity_age_ms: Some(600), records }
     }
 
     fn reg_sync(chat_id: &str, activity: Activity, activity_age_ms: Option<i64>, sessions: usize) -> crate::sync::RegistrySync {
@@ -2421,7 +2467,7 @@ mod tests {
         // subdirectory: `live_rows` groups them under two derivations, but the
         // anchor puts both on the root's row, so that row has two addresses.
         let mut moved = live("transcripts/src", Activity::Busy, 1);
-        moved.session_ids = vec!["sid-moved".to_string()];
+        moved.records = vec![crate::session_registry::RecordKey { pid: 4_243, session_id: Some("sid-moved".to_string()) }];
         let registry = [live("transcripts", Activity::Idle, 1), moved];
         let anchored = |sid: &str| (sid == "sid-moved").then(|| "transcripts".to_string());
         let sessions = [session("transcripts", Status::Working, None, 0)];
@@ -2547,15 +2593,12 @@ mod tests {
     }
 
     #[test]
-    fn a_siblings_clean_claim_cannot_speak_for_a_shared_row() {
-        // One cwd-derived row, two resident instances — what a
-        // `--fork-session --resume` migration leaves. The guard is
-        // `clear_permitted`, reused rather than reimplemented, so this pins the
-        // reuse for *this* caller: a claim from the owner lands, one from the
-        // sibling does not, and an unclaimed row still accepts.
-        assert!(clear_permitted(Some("owner-sid"), "owner-sid"), "the instance that last wrote the row may speak for it");
-        assert!(!clear_permitted(Some("owner-sid"), "sibling-sid"), "a sibling's pull must not settle a row holding the owner's work");
-        assert!(clear_permitted(None, "owner-sid"), "nothing claimed since a restart: ownership unknown, so the claim stands");
+    fn a_clean_claim_lands_only_from_the_session_driving_the_row() {
+        // One cwd-derived row, two resident sessions — what a
+        // `--fork-session --resume` migration leaves.
+        assert!(clean_claim_permitted(Some("main-sid"), "main-sid"), "the main may speak for its row");
+        assert!(!clean_claim_permitted(Some("main-sid"), "sibling-sid"), "a sibling's pull must not settle a row holding the main's work");
+        assert!(clean_claim_permitted(None, "main-sid"), "no main elected, or none since a restart: the claim stands");
     }
 
     #[test]
@@ -2599,80 +2642,188 @@ mod tests {
         // instruction already in it, so minting a fresh nonce strands the row
         // Pending on a marker the model will never emit.
         let ns = NonceStore::default();
-        let minted = session_start_nonce(&ns, "a", "startup", 1_000).expect("minted");
+        let minted = session_start_nonce(&ns, "a", "startup", 1_000, true).expect("minted");
         for source in ["resume", "compact", "fork"] {
-            assert_eq!(session_start_nonce(&ns, "a", source, 2_000).as_deref(), Some(minted.as_str()), "{source}");
+            assert_eq!(session_start_nonce(&ns, "a", source, 2_000, true).as_deref(), Some(minted.as_str()), "{source}");
         }
-        assert_ne!(session_start_nonce(&ns, "a", "clear", 3_000).as_deref(), Some(minted.as_str()), "a wipe rotates");
+        assert_ne!(session_start_nonce(&ns, "a", "clear", 3_000, true).as_deref(), Some(minted.as_str()), "a wipe rotates");
     }
 
     #[test]
-    fn clear_permitted_when_the_owning_session_ends_it() {
-        // The ordinary case, `/clear` included: one instance holds the cwd, so
-        // the end signal carries the same session_id that claimed the row.
-        // (`/clear` fires SessionEnd under the old id and mints the new one on
-        // the following SessionStart, so it matches here.)
-        assert!(clear_permitted(Some("cc152457"), "cc152457"));
-    }
-
-    #[test]
-    fn clear_refused_from_a_sibling_sharing_the_cwd() {
-        // A terminal session forked into a background one: both derive the same
-        // cwd chat_id, so exiting the abandoned tab must not drop the live row.
-        assert!(!clear_permitted(Some("add18820"), "cc152457"));
-    }
-
-    #[test]
-    fn clear_refused_even_when_the_ending_session_is_already_dying() {
-        // The regression this guard exists for. Keying on `agent_pid` let a real
-        // SessionEnd through: the hook resolves that pid by walking its ancestors
-        // for a live `claude` image, and a session being killed has none, so it
-        // reported null and "unknown ownership" waved the removal past. The
-        // session_id is in the payload either way.
-        assert!(!clear_permitted(Some("add18820"), "83820-is-dying"));
-    }
-
-    fn recorded(pid: u32, session: &str) -> RecordedPid {
-        RecordedPid { pid, session_id: Some(session.to_string()) }
-    }
-
-    #[test]
-    fn a_clear_start_from_the_rows_own_process_does_the_late_ends_teardown() {
-        assert!(clear_overtook_its_end("SessionStart", Some("clear"), Some(&recorded(31644, "old")), Some("old"), Some(31644)));
-    }
-
-    #[test]
-    fn a_clear_start_leaves_alone_a_row_it_did_not_write() {
-        // A sibling instance sharing the cwd wrote it last, with its own pid.
-        assert!(!clear_overtook_its_end("SessionStart", Some("clear"), Some(&recorded(2208, "sib")), Some("sib"), Some(31644)));
-        // The sibling wrote last but its hook resolved no pid, so the pid held
-        // is still this process's: the owner is what tells them apart.
-        assert!(!clear_overtook_its_end("SessionStart", Some("clear"), Some(&recorded(31644, "old")), Some("sib"), Some(31644)));
-        // The end got here first and removed the row, taking its pid with it.
-        assert!(!clear_overtook_its_end("SessionStart", Some("clear"), None, None, Some(31644)));
-        // No pid resolved by this hook: nothing to compare.
-        assert!(!clear_overtook_its_end("SessionStart", Some("clear"), Some(&recorded(31644, "old")), Some("old"), None));
-        // A restored row's pid names no session, and nothing owns the row.
-        assert!(!clear_overtook_its_end("SessionStart", Some("clear"), Some(&RecordedPid { pid: 31644, session_id: None }), None, Some(31644)));
-    }
-
-    #[test]
-    fn only_a_clear_start_does_the_teardown() {
-        let own = recorded(31644, "old");
-        for source in [Some("startup"), Some("resume"), Some("compact"), Some("fork"), None] {
-            assert!(!clear_overtook_its_end("SessionStart", source, Some(&own), Some("old"), Some(31644)), "{source:?}");
+    fn a_session_that_is_not_main_is_handed_the_rows_nonce_and_never_mints() {
+        let ns = NonceStore::default();
+        assert_eq!(session_start_nonce(&ns, "a", "startup", 1_000, false), None, "nothing minted, nothing to hand over");
+        let minted = session_start_nonce(&ns, "a", "startup", 1_000, true).expect("the main mints");
+        ns.mark_seen("a");
+        for source in ["startup", "clear", "resume", ""] {
+            assert_eq!(session_start_nonce(&ns, "a", source, 2_000, false).as_deref(), Some(minted.as_str()), "{source}");
         }
-        assert!(!clear_overtook_its_end("UserPromptSubmit", Some("clear"), Some(&own), Some("old"), Some(31644)));
+        assert_eq!(ns.get("a"), Some((minted, true)), "the main's confirmation is untouched");
     }
 
     #[test]
-    fn clear_permitted_when_ownership_is_unknown() {
-        // Nothing claimed since a restart, or a payload with no session_id.
-        // Unknown ownership defers to the authoritative end signal rather than
-        // stranding the row.
-        assert!(clear_permitted(None, "cc152457"));
-        assert!(clear_permitted(Some("cc152457"), ""));
-        assert!(clear_permitted(None, ""));
+    fn a_probes_start_in_the_folder_leaves_the_working_row_and_its_canary_alone() {
+        // The incident, at the level of the stores the hook handler composes:
+        // a main mid-turn, then a second `claude` started in the same folder.
+        // The handler acts only on `set_effects`, which is asserted here and
+        // then honoured the way the handler honours it.
+        use crate::membership::{EventFacts, Members};
+        let (members, state, ns) = (Members::default(), AppState::default(), NonceStore::default());
+        let facts = |event, source, pid, sid| EventFacts { event, source, pid: Some(pid), session_id: sid, transcript_path: None, still_running: &|_| false };
+        let input = |status, label: Option<&str>| crate::state::SetInput {
+            id: "dash".into(),
+            status,
+            label: label.map(str::to_string),
+            source: None,
+            model: None,
+            input_tokens: None,
+            dialog_entry: None,
+            waiting_backstop_armed: false,
+            turn_from_relay: None,
+            delegated_task: None,
+            message_line: None,
+            message_is_reply: None,
+        };
+
+        let main = members.admit("dash", &facts("UserPromptSubmit", None, 34_390, "s1"), 1_000).unwrap();
+        assert!(set_effects(&main, "UserPromptSubmit", true).apply);
+        state.apply_set(input(Status::Working, Some("fix it")), 1_000, &[], None);
+        session_start_nonce(&ns, "dash", "startup", 1_000, true).expect("minted");
+        ns.mark_seen("dash");
+        let nonce_before = ns.get("dash");
+
+        let probe = members.admit("dash", &facts("SessionStart", Some("startup"), 51_016, "probe"), 2_000).unwrap();
+        let fx = set_effects(&probe, "SessionStart", true);
+        assert_eq!(fx, SetEffects { teardown: false, apply: false, mint: true, judge_drift: false });
+        if fx.apply {
+            state.apply_set(input(Status::Idle, None), 2_000, &[], None);
+        }
+        session_start_nonce(&ns, "dash", "startup", 2_000, fx.apply);
+
+        let row = state.snapshot().into_iter().find(|s| s.id == "dash").expect("row");
+        assert_eq!((row.status, row.state_entered_at), (Status::Working, 1_000), "the probe's start did not touch the row");
+        assert_eq!(ns.get("dash"), nonce_before, "nor the nonce, nor its seen bit");
+        let left = members.drop_dead("dash", &[51_016], 3_000).expect("the probe was a member");
+        assert_eq!((left.was_main, left.remaining), (false, 1), "its death leaves the row and its main in place");
+        assert!(!left.hands_over());
+    }
+
+    #[test]
+    fn a_second_sessions_prompt_leaves_the_row_and_its_drift_check_with_the_main() {
+        use crate::membership::{EventFacts, Members};
+        let members = Members::default();
+        let facts = |event, pid, sid| EventFacts { event, source: None, pid: Some(pid), session_id: sid, transcript_path: None, still_running: &|_| false };
+        members.admit("dash", &facts("UserPromptSubmit", 1, "a"), 0).unwrap();
+        members.admit("dash", &facts("SessionStart", 2, "second"), 0).unwrap();
+        let adm = members.admit("dash", &facts("UserPromptSubmit", 2, "second"), 0).unwrap();
+        assert_eq!(adm.main_change, None);
+        let fx = set_effects(&adm, "UserPromptSubmit", true);
+        assert!(!fx.apply, "recorded, not applied");
+        let other = members.admit("dash", &facts("Stop", 2, "second"), 0).unwrap();
+        assert!(!set_effects(&other, "Stop", true).judge_drift, "the second session's Stop is not judged for drift");
+        let own = members.admit("dash", &facts("Stop", 1, "a"), 0).unwrap();
+        assert!(set_effects(&own, "Stop", true).apply && set_effects(&own, "Stop", true).judge_drift);
+        assert!(!set_effects(&own, "Stop", false).judge_drift, "nothing is judged with the canary off");
+    }
+
+    #[test]
+    fn a_headless_probe_run_from_inside_a_session_leaves_the_working_row_alone() {
+        // `claude -p` from inside a working session: a second process in the
+        // same folder fires SessionStart, a prompt, Stop and SessionEnd. Each
+        // event is honoured the way the handler honours `set_effects` and
+        // `clear_action`.
+        use crate::membership::{EventFacts, Members};
+        let (members, state) = (Members::default(), AppState::default());
+        let input = |status, label: &str| crate::state::SetInput {
+            id: "dash".into(),
+            status,
+            label: Some(label.to_string()),
+            source: None,
+            model: None,
+            input_tokens: None,
+            dialog_entry: None,
+            waiting_backstop_armed: false,
+            turn_from_relay: None,
+            delegated_task: None,
+            message_line: None,
+            message_is_reply: None,
+        };
+        let facts = |event, source, pid, sid| EventFacts { event, source, pid: Some(pid), session_id: sid, transcript_path: None, still_running: &|_| false };
+
+        members.admit("dash", &facts("UserPromptSubmit", None, 34_390, "s1"), 1_000).unwrap();
+        state.apply_set(input(Status::Working, "fix it"), 1_000, &[], None);
+        let prompt = crate::state::SubagentPromptRequest { agent_id: "agent-1".into(), session_id: "s1".into(), agent_type: None, tool_name: "Bash".into(), tool_input: serde_json::Value::Null, label: "needs approval: Bash".into(), subagents_dir: None };
+        state.open_subagent_prompt(input(Status::Blocked, "needs approval: Bash"), prompt, 1_500, None);
+        let before = state.snapshot().into_iter().find(|s| s.id == "dash").expect("row");
+
+        for (event, source, status, label) in [("SessionStart", Some("startup"), Status::Idle, "probe"), ("UserPromptSubmit", None, Status::Working, "probe prompt"), ("Stop", None, Status::Done, "probe done")] {
+            let adm = members.admit("dash", &facts(event, source, 51_016, "probe"), 2_000).unwrap();
+            assert_eq!(adm.main_change, None, "{event}");
+            let fx = set_effects(&adm, event, true);
+            assert!(!fx.apply && !fx.teardown, "{event}");
+            if fx.apply {
+                state.apply_set(input(status, label), 2_000, &[], None);
+            }
+        }
+        let action = clear_action(members.depart("dash", "probe", None, false, 3_000), false);
+        let ClearAction::Leave(left) = &action else { panic!("the probe was a member: {action:?}") };
+        assert_eq!((left.was_main, left.remaining, &left.main_change), (false, 1, &None));
+        assert!(!left.hands_over(), "no hand-over, so no Done and no separator");
+
+        let after = state.snapshot().into_iter().find(|s| s.id == "dash").expect("row");
+        assert_eq!((after.status, &after.label, after.state_entered_at), (before.status, &before.label, before.state_entered_at));
+        assert_eq!(after.subagent_gate.as_ref().map(|g| g.pending.len()), Some(1), "the main's subagent prompt is still open");
+        assert_eq!(after.dialog.len(), before.dialog.len(), "no separator");
+        assert_eq!(members.main_session("dash").as_deref(), Some("s1"));
+    }
+
+    #[test]
+    fn a_clear_start_that_overtook_its_end_tears_the_row_down() {
+        use crate::membership::{EventFacts, Members};
+        let members = Members::default();
+        let facts = |event, source, sid| EventFacts { event, source, pid: Some(7), session_id: sid, transcript_path: None, still_running: &|_| false };
+        members.admit("dash", &facts("UserPromptSubmit", None, "s1"), 0).unwrap();
+        let adm = members.admit("dash", &facts("SessionStart", Some("clear"), "s2"), 0).unwrap();
+        let fx = set_effects(&adm, "SessionStart", true);
+        assert!(fx.teardown && fx.mint);
+        assert!(fx.apply, "a /clear wiped the marker, so the main mints a fresh one");
+    }
+
+    #[test]
+    fn with_no_main_elected_the_session_driving_the_row_mints() {
+        // Two records seeded after a restart elect nobody, and the nonce store
+        // is in memory only, so this `/clear` is the moment the row can be armed.
+        let members = Members::default();
+        let rec = |pid, sid: &str| crate::session_registry::RecordKey { pid, session_id: Some(sid.into()) };
+        members.seed("dash", &[rec(1, "a"), rec(2, "b")], 0);
+        assert_eq!(members.depart("dash", "a", None, true, 0), Departure::Clearing { drives_row: true });
+        let adm = members.admit("dash", &EventFacts { event: "SessionStart", source: Some("clear"), pid: Some(1), session_id: "a2", transcript_path: None, still_running: &|_| false }, 0).unwrap();
+        let fx = set_effects(&adm, "SessionStart", true);
+        assert!(fx.mint && fx.apply);
+        assert!(!fx.teardown, "the end already tore the row down");
+        let ns = NonceStore::default();
+        assert!(session_start_nonce(&ns, "dash", "clear", 0, fx.apply).is_some(), "minted");
+        let stop = members.admit("dash", &EventFacts { event: "Stop", source: None, pid: Some(2), session_id: "b", transcript_path: None, still_running: &|_| false }, 0).unwrap();
+        assert!(set_effects(&stop, "Stop", true).apply && !set_effects(&stop, "Stop", true).judge_drift, "drift is judged only for an elected main");
+    }
+
+    #[test]
+    fn a_session_end_maps_onto_what_the_handler_does() {
+        let left = Left { was_main: true, drove_last: true, remaining: 1, main_change: None };
+        assert_eq!(clear_action(Departure::Superseded, true), ClearAction::Superseded);
+        assert_eq!(clear_action(Departure::Clearing { drives_row: true }, true), ClearAction::Teardown);
+        assert_eq!(clear_action(Departure::Clearing { drives_row: false }, true), ClearAction::MemberOnly);
+        assert_eq!(clear_action(Departure::Left(left.clone()), false), ClearAction::Leave(left));
+        assert_eq!(clear_action(Departure::Unmatched { row_known: false }, true), ClearAction::RemoveUnknown { forget_nonce: true });
+        assert_eq!(clear_action(Departure::Unmatched { row_known: false }, false), ClearAction::RemoveUnknown { forget_nonce: false }, "only a /clear wipes the marker");
+        assert_eq!(clear_action(Departure::Unmatched { row_known: true }, true), ClearAction::Refuse);
+    }
+
+    #[test]
+    fn a_process_already_in_a_row_stays_there_whatever_its_session_is_anchored_to() {
+        assert_eq!(pick_row(Some("dash"), Some("dash-sub".into()), "dash-sub"), "dash", "a /clear after a cd stays on its row");
+        assert_eq!(pick_row(None, Some("dash".into()), "dash-sub"), "dash", "a pid-less event follows its anchor");
+        assert_eq!(pick_row(None, None, "dash-sub"), "dash-sub");
     }
 
     #[test]
@@ -2707,7 +2858,7 @@ mod tests {
     #[test]
     fn startup_mints_and_stores_a_fresh_unseen_nonce() {
         let ns = NonceStore::new();
-        let n = session_start_nonce(&ns, "proj", "startup", 1000).expect("startup mints");
+        let n = session_start_nonce(&ns, "proj", "startup", 1000, true).expect("startup mints");
         assert_eq!(ns.get("proj"), Some((n, false)), "the minted nonce is stored, unseen");
     }
 
@@ -2717,8 +2868,8 @@ mod tests {
         // rotating to a fresh nonce is correct (restored-history stale markers are
         // scrubbed by `strip_response_marker`).
         let ns = NonceStore::new();
-        let first = session_start_nonce(&ns, "proj", "startup", 1000).unwrap();
-        let after_clear = session_start_nonce(&ns, "proj", "clear", 2000).unwrap();
+        let first = session_start_nonce(&ns, "proj", "startup", 1000, true).unwrap();
+        let after_clear = session_start_nonce(&ns, "proj", "clear", 2000, true).unwrap();
         assert_ne!(first, after_clear, "clear must rotate the nonce");
         assert_eq!(ns.get("proj").map(|(n, _)| n), Some(after_clear));
     }
@@ -2730,9 +2881,9 @@ mod tests {
         // NOT rotate — else the backend expects a marker the model never emits and
         // the row is stuck Pending forever.
         let ns = NonceStore::new();
-        let first = session_start_nonce(&ns, "proj", "startup", 1000).unwrap();
+        let first = session_start_nonce(&ns, "proj", "startup", 1000, true).unwrap();
         ns.mark_seen("proj"); // confirmed adherent (green)
-        let resumed = session_start_nonce(&ns, "proj", "resume", 2000);
+        let resumed = session_start_nonce(&ns, "proj", "resume", 2000, true);
         assert_eq!(resumed.as_ref(), Some(&first), "resume keeps context → same marker");
         assert_eq!(ns.get("proj"), Some((first, true)), "reuse keeps the session green");
     }
@@ -2740,8 +2891,8 @@ mod tests {
     #[test]
     fn compact_reuses_like_resume() {
         let ns = NonceStore::new();
-        let first = session_start_nonce(&ns, "proj", "startup", 1000).unwrap();
-        assert_eq!(session_start_nonce(&ns, "proj", "compact", 2000), Some(first));
+        let first = session_start_nonce(&ns, "proj", "startup", 1000, true).unwrap();
+        assert_eq!(session_start_nonce(&ns, "proj", "compact", 2000, true), Some(first));
     }
 
     #[test]
@@ -2750,7 +2901,7 @@ mod tests {
         // injection rather than minting a nonce the model isn't emitting (which
         // would recreate the conflict).
         let ns = NonceStore::new();
-        assert_eq!(session_start_nonce(&ns, "proj", "resume", 1000), None);
+        assert_eq!(session_start_nonce(&ns, "proj", "resume", 1000, true), None);
         assert_eq!(ns.get("proj"), None, "a resume miss must not mint");
     }
 
@@ -2759,7 +2910,7 @@ mod tests {
         // A missing/unknown `source` is treated as a fresh start — mint — never a
         // silent reuse.
         let ns = NonceStore::new();
-        assert!(session_start_nonce(&ns, "proj", "", 1000).is_some());
+        assert!(session_start_nonce(&ns, "proj", "", 1000, true).is_some());
     }
 
     // -------- the message route's two gates --------

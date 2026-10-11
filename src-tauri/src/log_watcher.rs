@@ -1,7 +1,6 @@
 use crate::adapters::claude::USER_GATING_TOOLS;
 use crate::commands::{emit_sessions_updated, now_ms};
 use crate::config::ConfigState;
-use crate::prompt_history::PromptHistoryStore;
 use crate::state::{AgentSession, AppState, Status};
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::Deserialize;
@@ -337,6 +336,26 @@ struct WatchTask {
     abort: tauri::async_runtime::JoinHandle<()>,
 }
 
+/// Whether a watcher's first read may put the transcript's last reply onto
+/// the row. Model and token readings are taken either way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Graft {
+    /// Graft the last reply, provided the row had no watcher before this one.
+    IfFresh,
+    /// Graft nothing.
+    Never,
+}
+
+/// The dialog text a watcher's first read contributes. The transcript's
+/// earlier turns are already in the row's restored dialog, so only the last
+/// reply is taken.
+fn initial_text_entries(lines: &[&str], graft: Graft) -> Vec<(DialogRole, String)> {
+    match graft {
+        Graft::IfFresh => extract_text_entries(lines).into_iter().rev().find(|(r, _)| *r == DialogRole::Assistant).into_iter().collect(),
+        Graft::Never => Vec::new(),
+    }
+}
+
 impl WatcherRegistry {
     pub fn new() -> Self {
         Self::default()
@@ -344,18 +363,25 @@ impl WatcherRegistry {
 
     /// Idempotent. If `chat_id` already watches `path`, no-op. If it watches a
     /// different path, stop the old watcher first.
-    pub fn start(&self, app: AppHandle, chat_id: String, path: PathBuf) {
+    ///
+    /// `graft` is honoured only for a row with no watcher: one that had a
+    /// watcher already holds its dialog up to now, so grafting the new
+    /// transcript's last reply would duplicate it or attribute another
+    /// conversation's reply to this row.
+    pub fn start(&self, app: AppHandle, chat_id: String, path: PathBuf, graft: Graft) {
         let mut entries = self.entries.lock().unwrap();
-        if let Some(existing) = entries.get(&chat_id) {
-            if existing.path == path {
-                return;
+        let graft = match entries.get(&chat_id) {
+            Some(existing) if existing.path == path => return,
+            Some(existing) => {
+                existing.abort.abort();
+                Graft::Never
             }
-            existing.abort.abort();
-        }
+            None => graft,
+        };
         let id_for_task = chat_id.clone();
         let path_for_task = path.clone();
         let handle = tauri::async_runtime::spawn(async move {
-            watch_loop(app, id_for_task, path_for_task).await;
+            watch_loop(app, id_for_task, path_for_task, graft).await;
         });
         entries.insert(
             chat_id,
@@ -374,7 +400,7 @@ impl WatcherRegistry {
     }
 }
 
-async fn watch_loop(app: AppHandle, chat_id: String, path: PathBuf) {
+async fn watch_loop(app: AppHandle, chat_id: String, path: PathBuf, graft: Graft) {
     let parent = match path.parent() {
         Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
         _ => {
@@ -414,6 +440,7 @@ async fn watch_loop(app: AppHandle, chat_id: String, path: PathBuf) {
         position: 0,
         leftover: String::new(),
         initial_read: true,
+        graft,
     }));
 
     // Initial drain — the transcript usually exists already with prior turns.
@@ -442,12 +469,13 @@ struct DrainState {
     position: u64,
     leftover: String,
     initial_read: bool,
+    graft: Graft,
 }
 
 async fn drain(app: &AppHandle, chat_id: &str, path: &Path, state: &Arc<Mutex<DrainState>>) {
-    let (mut position, mut leftover, initial_read) = {
+    let (mut position, mut leftover, initial_read, graft) = {
         let s = state.lock().unwrap();
-        (s.position, s.leftover.clone(), s.initial_read)
+        (s.position, s.leftover.clone(), s.initial_read, s.graft)
     };
 
     let mut file = match File::open(path) {
@@ -495,8 +523,7 @@ async fn drain(app: &AppHandle, chat_id: &str, path: &Path, state: &Arc<Mutex<Dr
         // A stale interrupt marker at the tail of a pre-existing transcript
         // must not demote a session being restored on app start.
         update.ended = false;
-        let all = extract_text_entries(&borrowed);
-        all.into_iter().rev().find(|(r, _)| *r == DialogRole::Assistant).into_iter().collect()
+        initial_text_entries(&borrowed, graft)
     } else {
         extract_text_entries(&borrowed)
     };
@@ -595,14 +622,7 @@ fn apply_and_emit(app: &AppHandle, chat_id: &str, update: &InferredState, text_e
         false
     };
     if dialog_changed {
-        if let Some(h) = app.try_state::<PromptHistoryStore>() {
-            let sessions = app_state.sessions.lock().unwrap();
-            if let Some(s) = sessions.iter().find(|s| s.id == chat_id) {
-                h.save_session(s);
-            }
-            drop(sessions);
-            h.save_to_disk();
-        }
+        crate::commands::persist_row(app, &app_state, chat_id);
     }
     if metric_changed || dialog_changed || demoted {
         emit_sessions_updated(app);
@@ -828,6 +848,26 @@ mod tests {
         .to_string();
         let lines = [assistant_text("Batch B done."), sidechain_tool];
         assert_eq!(infer_state(&refs(&lines)).unwrap().state, Some(Status::Done));
+    }
+
+    // -------- initial_text_entries tests --------
+
+    #[test]
+    fn a_fresh_graft_takes_only_the_last_reply() {
+        let lines = [assistant_text("earlier"), user_text("next"), assistant_text("latest"), attachment("queued")];
+        assert_eq!(initial_text_entries(&refs(&lines), Graft::IfFresh), vec![(DialogRole::Assistant, "latest".to_string())]);
+    }
+
+    #[test]
+    fn a_fresh_graft_of_a_transcript_with_no_reply_takes_nothing() {
+        let lines = [user_text("hi"), attachment("queued")];
+        assert!(initial_text_entries(&refs(&lines), Graft::IfFresh).is_empty());
+    }
+
+    #[test]
+    fn graft_never_takes_no_text() {
+        let lines = [assistant_text("earlier"), assistant_text("latest")];
+        assert!(initial_text_entries(&refs(&lines), Graft::Never).is_empty());
     }
 
     // -------- extract_text_entries tests --------

@@ -195,26 +195,33 @@ pub struct LiveSession {
     /// Time since `status` was last written, or `None` when the record carries
     /// no stamp. Clamped at 0 like every other age in the roster.
     pub activity_age_ms: Option<i64>,
-    /// How many interactive sessions collapsed into this one row — 1 normally,
-    /// 2 after a fork migration left two tabs in one directory.
-    pub sessions: usize,
-    /// The session ids behind this row, so the caller can prefer an id already
-    /// anchored in `ChatIdRegistry` over `chat_id`'s fresh cwd derivation.
-    pub session_ids: Vec<String>,
-    /// The pid of the record speaking for this row.
-    ///
-    /// Only meaningful when `sessions == 1`, and that is a caller's obligation
-    /// rather than this field's: with two records collapsed the speaker is
-    /// merely the one with the freshest stamp, so treating its pid as *the* row's
-    /// owner would let the sibling's death — or its survival — be read as the
-    /// row's. `session_launcher` and `terminal_title` refuse ambiguity outright;
-    /// a reader of this field must do the same. Never crosses the wire: the
-    /// `RegistrySync` a peer receives is built field by field and does not
-    /// include it.
+    /// Every record collapsed into this row, so a caller can prefer an id
+    /// already anchored in `ChatIdRegistry` over `chat_id`'s fresh cwd
+    /// derivation, and can name each process behind the row rather than only
+    /// the speaker.
+    pub records: Vec<RecordKey>,
+}
+
+/// One registry record behind a [`LiveSession`]: its process and, where the
+/// record carries one, its Claude Code session id.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecordKey {
     pub pid: u32,
+    pub session_id: Option<String>,
 }
 
 impl LiveSession {
+    /// How many interactive sessions collapsed into this one row — 1 normally,
+    /// 2 after a fork migration left two tabs in one directory.
+    pub fn sessions(&self) -> usize {
+        self.records.len()
+    }
+
+    /// The session ids behind this row; a record without one contributes nothing.
+    pub fn session_ids(&self) -> impl Iterator<Item = &str> {
+        self.records.iter().filter_map(|r| r.session_id.as_deref())
+    }
+
     /// The dashboard row this session belongs to: the anchored id where
     /// `ChatIdRegistry` has pinned one of its session ids, else the cwd
     /// derivation.
@@ -225,13 +232,13 @@ impl LiveSession {
     /// `http_server::agent_roster` dedupes registry rows against hook rows with
     /// it — getting it wrong reports one live session twice, once in each array —
     /// and `session_restore` *creates* rows with it, where getting it wrong makes
-    /// a duplicate the session's next hook event then declines to use, leaving an
-    /// orphan with no owning pid and no owner.
+    /// a duplicate and seeds the session's pid into it, so the session's next hook
+    /// event follows that pid there and the conversation splits across two rows.
     ///
     /// `anchored` is deliberately a read-only lookup that inserts nothing, so
     /// both callers stay read paths.
     pub fn row_id(&self, anchored: &dyn Fn(&str) -> Option<String>) -> String {
-        row_for(self.session_ids.iter().map(String::as_str), &self.chat_id, anchored)
+        row_for(self.session_ids(), &self.chat_id, anchored)
     }
 
     /// Whether this dashboard has ever processed an event for one of the sessions
@@ -250,7 +257,7 @@ impl LiveSession {
     /// of eleven session ids were anchored, and the eleventh shares its row with
     /// one that was.
     pub fn known_to(&self, anchored: &dyn Fn(&str) -> Option<String>) -> bool {
-        self.session_ids.iter().any(|sid| anchored(sid).is_some())
+        self.session_ids().any(|sid| anchored(sid).is_some())
     }
 }
 
@@ -470,7 +477,7 @@ fn live(records: Vec<Record>, images: Option<HashMap<u32, String>>) -> Vec<Recor
     records
         .into_iter()
         .filter(|r| match &images {
-            Some(images) => images.get(&r.pid).is_some_and(|img| liveness::is_claude_image(img)),
+            Some(images) => liveness::is_live_claude(images, r.pid),
             None => true,
         })
         .collect()
@@ -516,9 +523,7 @@ fn live_row(chat_id: String, recs: &[&Record], now: i64) -> Option<LiveSession> 
         name: speaker.name.clone(),
         activity: Activity::parse(speaker.status.as_deref()),
         activity_age_ms: speaker.status_updated_at.map(|t| (now - t).max(0)),
-        sessions: recs.len(),
-        session_ids: recs.iter().filter_map(|r| r.session_id.clone()).collect(),
-        pid: speaker.pid,
+        records: recs.iter().map(|r| RecordKey { pid: r.pid, session_id: r.session_id.clone() }).collect(),
     })
 }
 
@@ -703,7 +708,7 @@ mod tests {
         assert_eq!(rows[0].name.as_deref(), Some("printlab"));
         assert_eq!(rows[0].activity, Activity::Busy);
         assert_eq!(rows[0].activity_age_ms, Some(100));
-        assert_eq!(rows[0].sessions, 1);
+        assert_eq!(rows[0].sessions(), 1);
     }
 
     /// A record with no `status`, and one carrying a value upstream may add
@@ -729,7 +734,7 @@ mod tests {
         ];
         let rows = rows(recs, Some("/Users/x/Projects"), all_claude(&[100, 200]), 1_000);
         assert_eq!(rows.len(), 1, "the dashboard's row model is one row per cwd");
-        assert_eq!(rows[0].sessions, 2, "the collapse is reported, not hidden");
+        assert_eq!(rows[0].sessions(), 2, "the collapse is reported, not hidden");
         assert_eq!(rows[0].name.as_deref(), Some("new tab"), "the freshest status stamp speaks for the row");
         assert_eq!(rows[0].activity, Activity::Busy);
     }

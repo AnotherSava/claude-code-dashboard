@@ -134,12 +134,14 @@ pub struct Config {
     /// instant cancel with no output. Off keeps the row `Working` until the next
     /// prompt.
     pub detect_cancelled_turns: bool,
-    /// Remove a session's row once its owning Claude process has exited without
-    /// a `SessionEnd` — which Claude Code fails to deliver on `exit` / Ctrl-D /
-    /// terminal close (unlike `/clear`), stranding the row in its last state
-    /// (often `Working` if the user exited mid-turn). Read by `liveness_reaper`,
-    /// which removes the row only once the owning pid is positively confirmed
-    /// gone. Off keeps the stranded row until the next `/clear` or app restart.
+    /// Remove a session's row once the last Claude process in it has exited
+    /// without a `SessionEnd` — which Claude Code fails to deliver on `exit` /
+    /// Ctrl-D / terminal close (unlike `/clear`), stranding the row in its last
+    /// state (often `Working` if the user exited mid-turn). Read by
+    /// `liveness_reaper`, which drops a member once its pid is positively
+    /// confirmed gone whatever this says; the flag gates only removing the row
+    /// when no member is left. Off keeps that row until the next `/clear` or app
+    /// restart.
     pub reap_exited_sessions: bool,
     /// Track which finished sessions the user has actually looked at, so a row
     /// that finished and hasn't been read stands apart from one already read.
@@ -553,6 +555,20 @@ pub struct TelegramConfig {
     /// feature and is an unexplained buzz when you have just installed the thing.
     /// Setting the field explicitly wins either way.
     pub stale_tab_alert_ms: Option<u64>,
+    /// Alert when two or more Claude Code sessions share one row's folder.
+    ///
+    /// A row is derived from its folder, so every session started there
+    /// addresses the same row, and the row can follow only one of them. One
+    /// session per folder is how this dashboard is meant to be used, so a second
+    /// one that lasts is a fault worth hearing about rather than a mode to
+    /// display. Follows the stale-tab alert's lifecycle: sent once the row has had
+    /// two or more sessions for this long, and the message deleted once it is
+    /// back to one, the row vanishes, or this is turned off.
+    ///
+    /// The delay lets a short-lived second session (a probe, a quick check run in
+    /// the folder) come and go without a ping. `null` or `0` disables the alert,
+    /// so the value is also the switch.
+    pub shared_row_alert_ms: Option<u64>,
     /// Reading pace, in characters per second, used to defer a notification by
     /// how long the final assistant message takes to read. The reconciler adds
     /// `chars / reading_speed_cps` (capped, see `notifications::READING_CAP_MS`)
@@ -565,6 +581,10 @@ pub struct TelegramConfig {
 
 /// The stale-tab alert's delay wherever it is on by default.
 const STALE_TAB_ALERT_MS: u64 = 600_000;
+
+/// The shared-row alert's default delay: several times the 13s a probe started
+/// in a working session's folder was measured to live.
+const SHARED_ROW_ALERT_MS: u64 = 60_000;
 
 /// Whether this binary came out of the release workflow — the build people
 /// download — rather than one built and deployed by hand.
@@ -597,6 +617,7 @@ impl Default for TelegramConfig {
             context_alert_percent: Some(80.0),
             limit_reset_percent: Some(90.0),
             stale_tab_alert_ms: (!built_for_release()).then_some(STALE_TAB_ALERT_MS),
+            shared_row_alert_ms: Some(SHARED_ROW_ALERT_MS),
             reading_speed_cps: Some(10),
         }
     }
@@ -958,6 +979,15 @@ mod tests {
         assert_eq!(set.stale_tab_alert_ms, Some(1234));
         let off: TelegramConfig = serde_json::from_str(r#"{ "stale_tab_alert_ms": null }"#).unwrap();
         assert_eq!(off.stale_tab_alert_ms, None);
+    }
+
+    #[test]
+    fn the_shared_row_alert_is_on_by_default_and_null_turns_it_off() {
+        assert_eq!(TelegramConfig::default().shared_row_alert_ms, Some(SHARED_ROW_ALERT_MS));
+        let missing: TelegramConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(missing.shared_row_alert_ms, Some(SHARED_ROW_ALERT_MS));
+        let off: TelegramConfig = serde_json::from_str(r#"{ "shared_row_alert_ms": null }"#).unwrap();
+        assert_eq!(off.shared_row_alert_ms, None);
     }
 
     #[test]

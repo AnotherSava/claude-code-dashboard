@@ -77,6 +77,16 @@ impl NonceStore {
         }
     }
 
+    /// Disarm drift detection for `chat_id` without changing its nonce, when the
+    /// row starts following another session (`membership`'s main changed). That
+    /// session was handed the row's nonce at its start but has never been seen to
+    /// emit it, so until it does its dropped marker is held rather than flagged.
+    pub fn unconfirm(&self, chat_id: &str) {
+        if let Some(e) = self.entries.lock().unwrap().get_mut(chat_id) {
+            e.seen = false;
+        }
+    }
+
     /// Drop a session's nonce on a `/clear` SessionEnd so the `/clear`-recreated
     /// row starts clean (its next `SessionStart:clear` mints anew). Not called for
     /// a plain exit/logout, whose session may resume with its marker intact.
@@ -114,6 +124,17 @@ mod tests {
         s.mark_seen("proj");
         let second = s.mint("proj", 2000);
         assert_eq!(s.get("proj"), Some((second, false)), "re-mint replaces the token and clears seen");
+    }
+
+    #[test]
+    fn unconfirm_keeps_the_nonce_and_disarms_it() {
+        let s = NonceStore::new();
+        let n = s.mint("proj", 1000);
+        s.mark_seen("proj");
+        s.unconfirm("proj");
+        assert_eq!(s.get("proj"), Some((n, false)));
+        s.unconfirm("nope");
+        assert_eq!(s.get("nope"), None, "nothing is minted by unconfirming");
     }
 
     #[test]

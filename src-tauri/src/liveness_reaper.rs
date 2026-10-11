@@ -1,5 +1,5 @@
-//! Removes a local session row whose owning Claude process has exited without a
-//! `SessionEnd` reaching the dashboard.
+//! Drops row members whose Claude process has exited without a `SessionEnd`
+//! reaching the dashboard, and removes a row once its last member is gone.
 //!
 //! `SessionEnd` fires cleanly on `/clear`, but not reliably on `exit` / Ctrl-D /
 //! terminal close (see [`crate::liveness`] for the why). When it doesn't fire,
@@ -7,77 +7,65 @@
 //! `exit` before the watcher settles it, leaving the row wedged in `Working`
 //! with its console already gone.
 //!
-//! This task is the backstop. Each tick it takes one process enumeration and,
-//! for every local session with a hook-reported owning pid ([`AgentPids`]),
-//! checks whether that pid is still a live claude. A row is reaped only after
-//! the pid reads dead for [`DEAD_STREAK_TO_REAP`] consecutive ticks over an
-//! unchanged pid and a quiet `updated` timestamp — so a still-alive (merely
-//! slow) session, whose claude process stays alive, can never be reaped, and a
-//! same-cwd restart (new live pid, bumped `updated`) restarts the count rather
-//! than deleting the fresh row. Removal goes through the shared
-//! [`crate::commands::remove_session`] — the exact path `SessionEnd` uses — so a
-//! reaped row restores cleanly (with history) on its next start, and it is
-//! guarded by the row's `updated` to abort if an event lands mid-reap.
+//! This task is the backstop. Each tick it takes one process enumeration and
+//! checks every pid-keyed member of every row ([`Members::pid_members`]) — not
+//! every row, so a member inside a `/clear` gap, whose row is momentarily gone,
+//! is still judged. A member is dropped only after its pid reads dead for
+//! [`DEAD_STREAK_TO_REAP`] consecutive ticks, counted per (row, pid) pair, so a
+//! still-alive (merely slow) session can never be dropped and one dead process
+//! never borrows another's count. The drop and what follows it go through
+//! [`crate::commands::apply_departure`], the path a `SessionEnd` takes, so a
+//! reaped row restores cleanly (with history) on its next start.
 //!
-//! Cross-platform: the enumeration in [`crate::liveness::process_images`] has a
-//! macOS implementation as well as Windows. Reaps rows in any state — matching
-//! SessionEnd, which removes the row regardless of what it last showed.
+//! Only the judged pids are dropped, under the row's lock, so a session that
+//! joined the row since the last read keeps it: that is what replaces comparing
+//! the row's `updated` against the one observed.
+//!
+//! `reap_exited_sessions` gates only removing a row whose last member died. The
+//! dead member is dropped either way, so a dead process never stays in charge
+//! of a row.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Duration;
 
 use tauri::{AppHandle, Manager};
 
-use crate::commands::now_ms;
+use crate::commands::{now_ms, LeaveVia};
 use crate::config::ConfigState;
-use crate::liveness::{is_claude_image, process_images, AgentPids};
-use crate::state::{AppState, BoundaryKind};
+use crate::liveness::{is_live_claude, process_images};
+use crate::membership::Members;
 
 /// Poll cadence. Reaping a vanished session is a backstop, not latency-critical,
 /// so a slower 2s tick is fine.
 const POLL: Duration = Duration::from_secs(2);
 
-/// Consecutive confirmed-dead reads — over an unchanged owning pid and a quiet
-/// row — required before a row is reaped. Rides out the brief window in which a
-/// same-cwd restart re-reports a fresh live pid, plus any one-off enumeration
-/// oddity. At [`POLL`] this is a ~6s reap latency, fine for a backstop.
+/// Consecutive confirmed-dead reads required before a member is dropped. Rides
+/// out any one-off enumeration oddity. At [`POLL`] this is a ~6s reap latency,
+/// fine for a backstop.
 const DEAD_STREAK_TO_REAP: u32 = 3;
 
-#[derive(Clone, Copy)]
-struct DeadStreak {
-    pid: u32,
-    updated: i64,
-    count: u32,
-}
-
-/// Per-chat_id consecutive-dead bookkeeping. The owning process being dead is
-/// the primary signal; the streak (with pid + `updated` reset) is the guard
-/// against transient reads and the reap-vs-restart race.
+/// Consecutive dead reads per (row, pid).
 #[derive(Default)]
 struct ReapTracker {
-    streaks: HashMap<String, DeadStreak>,
+    streaks: HashMap<(String, u32), u32>,
 }
 
 impl ReapTracker {
-    /// Record a confirmed-dead read for `id`; returns the running streak length.
-    /// Restarts the count when the owning `pid` changed (a same-cwd restart
-    /// overwrote it) or the row's `updated` advanced (a real event landed) —
-    /// either means this isn't the same quiet, dead session we were counting.
-    fn record_dead(&mut self, id: &str, pid: u32, updated: i64) -> u32 {
-        let e = self.streaks.entry(id.to_string()).or_insert(DeadStreak { pid, updated, count: 0 });
-        if e.pid != pid || e.updated != updated {
-            *e = DeadStreak { pid, updated, count: 0 };
-        }
-        e.count += 1;
-        e.count
+    /// Record a confirmed-dead read; returns the running streak length.
+    fn record_dead(&mut self, row: &str, pid: u32) -> u32 {
+        let count = self.streaks.entry((row.to_string(), pid)).or_insert(0);
+        *count += 1;
+        *count
     }
 
-    fn reset(&mut self, id: &str) {
-        self.streaks.remove(id);
+    fn reset(&mut self, row: &str, pid: u32) {
+        self.streaks.remove(&(row.to_string(), pid));
     }
 
-    fn retain<F: Fn(&str) -> bool>(&mut self, keep: F) {
-        self.streaks.retain(|id, _| keep(id));
+    /// Forget the pairs that are no longer members, so a pid that leaves and is
+    /// later reused starts from nothing.
+    fn retain(&mut self, members: &HashSet<(String, u32)>) {
+        self.streaks.retain(|pair, _| members.contains(pair));
     }
 }
 
@@ -92,65 +80,51 @@ pub fn spawn(app: AppHandle) {
         loop {
             ticker.tick().await;
 
-            let Some(cfg) = app.try_state::<ConfigState>() else { continue };
-            if !cfg.snapshot().reap_exited_sessions {
-                tracker.streaks.clear();
-                continue;
-            }
-            let Some(app_state) = app.try_state::<AppState>() else { continue };
-            let Some(agent_pids) = app.try_state::<AgentPids>() else { continue };
+            let Some(members) = app.try_state::<Members>() else { continue };
 
             // One enumeration per tick. If it fails we can't prove anything is
             // dead — skip the whole tick (streaks untouched, never a false reap).
             let Some(images) = process_images() else { continue };
 
-            let sessions = app_state.snapshot(); // local sessions only
-            tracker.retain(|id| sessions.iter().any(|s| s.id == id));
+            let pairs: HashSet<(String, u32)> = members.pid_members().into_iter().collect();
+            tracker.retain(&pairs);
 
-            for s in &sessions {
-                let Some(pid) = agent_pids.get(&s.id) else {
-                    // No owning pid reported (pre-field hook, or a node-based
-                    // install the hook couldn't resolve) — can't judge; leave it.
-                    tracker.reset(&s.id);
-                    continue;
-                };
-                let alive = match images.get(&pid) {
-                    Some(img) => is_claude_image(img), // present: alive iff still claude
-                    None => false,                     // absent from a full snapshot: gone
-                };
+            let mut judged: BTreeMap<String, Vec<u32>> = BTreeMap::new();
+            for (row, pid) in &pairs {
+                // Present: alive iff still claude. Absent from a full snapshot: gone.
+                let alive = is_live_claude(&images, *pid);
                 if alive {
-                    tracker.reset(&s.id);
-                    continue;
+                    tracker.reset(row, *pid);
+                } else if tracker.record_dead(row, *pid) >= DEAD_STREAK_TO_REAP {
+                    judged.entry(row.clone()).or_default().push(*pid);
                 }
-                if tracker.record_dead(&s.id, pid, s.updated) >= DEAD_STREAK_TO_REAP {
-                    // A hook event for this row either finishes before the
-                    // removal (moving `updated`, so it aborts) or waits for it,
-                    // so its fresh pid is never forgotten by this teardown.
-                    let row_lock = app.try_state::<crate::commands::RowLocks>().map(|locks| locks.row(&s.id));
-                    let _row_guard = row_lock.as_deref().map(crate::commands::RowLocks::hold);
-                    // `Some(s.updated)` makes remove_session abort if an event
-                    // landed since this snapshot — closes the reap-vs-restart race.
-                    //
-                    // `Ended`, never `Clear`: a reaped session exited without
-                    // announcing itself, so its transcript is intact on disk and
-                    // the `--continue` that brings it back brings the whole
-                    // conversation with it. Tagging this boundary `Clear` would
-                    // make every exited session come back claiming to be clean.
-                    if crate::commands::remove_session(&app, &s.id, Some(s.updated), BoundaryKind::Ended, now_ms()) {
-                        tracing::debug!(
-                            chat_id = %s.id,
-                            decision = "reap_exited",
-                            pid,
-                            prior_status = ?s.status,
-                            reason = "owning Claude process exited without a SessionEnd (exit / Ctrl-D / terminal close); row removed",
-                            "decision"
-                        );
-                    }
-                    tracker.reset(&s.id);
+            }
+
+            for (row, pids) in judged {
+                for pid in &pids {
+                    tracker.reset(&row, *pid);
+                }
+                // Off the async workers: the row lock can be held by a hook
+                // event in the middle of a 12MB history write.
+                let app = app.clone();
+                if let Err(e) = tauri::async_runtime::spawn_blocking(move || reap_row(&app, &row, &pids)).await {
+                    tracing::error!(error = %e, "reaping a row failed");
                 }
             }
         }
     });
+}
+
+/// Drop `pids` from `row` and act on what that leaves.
+fn reap_row(app: &AppHandle, row: &str, pids: &[u32]) {
+    let remove_row = app.try_state::<ConfigState>().is_none_or(|c| c.snapshot().reap_exited_sessions);
+    let row_lock = app.try_state::<crate::commands::RowLocks>().map(|locks| locks.row(row));
+    let _row_guard = row_lock.as_deref().map(crate::commands::RowLocks::hold);
+    let Some(members) = app.try_state::<Members>() else { return };
+    let now = now_ms();
+    if let Some(left) = members.drop_dead(row, pids, now) {
+        crate::commands::apply_departure(app, row, &left, LeaveVia::Reaped { pids, remove_row }, now);
+    }
 }
 
 #[cfg(test)]
@@ -160,34 +134,38 @@ mod tests {
     #[test]
     fn streak_counts_consecutive_dead_reads() {
         let mut t = ReapTracker::default();
-        assert_eq!(t.record_dead("a", 100, 5), 1);
-        assert_eq!(t.record_dead("a", 100, 5), 2);
-        assert_eq!(t.record_dead("a", 100, 5), 3);
+        assert_eq!(t.record_dead("a", 100), 1);
+        assert_eq!(t.record_dead("a", 100), 2);
+        assert_eq!(t.record_dead("a", 100), 3);
     }
 
     #[test]
-    fn pid_change_restarts_streak() {
-        // A same-cwd restart reports a new live pid; the dead streak for the old
-        // pid must not carry over and reap the freshly-restarted row.
+    fn each_member_of_a_row_keeps_its_own_streak() {
+        // The incident's shape: a probe that died beside a live main must be
+        // counted alone, and the main's live reads must not reset the probe.
         let mut t = ReapTracker::default();
-        t.record_dead("a", 100, 5);
-        assert_eq!(t.record_dead("a", 200, 5), 1);
-    }
-
-    #[test]
-    fn updated_change_restarts_streak() {
-        // A new event bumped the row's `updated`, so it isn't the quiet, dead
-        // row we were counting — start over.
-        let mut t = ReapTracker::default();
-        t.record_dead("a", 100, 5);
-        assert_eq!(t.record_dead("a", 100, 6), 1);
+        t.record_dead("dash", 51_016);
+        t.reset("dash", 34_390);
+        assert_eq!(t.record_dead("dash", 51_016), 2);
+        assert_eq!(t.record_dead("dash", 34_390), 1);
+        assert_eq!(t.record_dead("web", 51_016), 1, "the same pid in another row is another pair");
     }
 
     #[test]
     fn reset_clears_the_streak() {
         let mut t = ReapTracker::default();
-        t.record_dead("a", 100, 5);
-        t.reset("a");
-        assert_eq!(t.record_dead("a", 100, 5), 1);
+        t.record_dead("a", 100);
+        t.reset("a", 100);
+        assert_eq!(t.record_dead("a", 100), 1);
+    }
+
+    #[test]
+    fn a_pair_that_is_no_longer_a_member_is_forgotten() {
+        let mut t = ReapTracker::default();
+        t.record_dead("a", 100);
+        t.record_dead("a", 200);
+        t.retain(&HashSet::from([("a".to_string(), 200)]));
+        assert_eq!(t.record_dead("a", 100), 1, "a reused pid starts from nothing");
+        assert_eq!(t.record_dead("a", 200), 2);
     }
 }

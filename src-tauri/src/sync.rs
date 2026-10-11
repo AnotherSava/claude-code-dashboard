@@ -1859,7 +1859,7 @@ fn build_push(
                     name: s.name.clone(),
                     activity: s.activity,
                     activity_age_ms: s.activity_age_ms,
-                    sessions: s.sessions,
+                    sessions: s.sessions(),
                 })
                 .collect()
         }),
@@ -2708,9 +2708,7 @@ mod tests {
             name: Some("transcripts-87".into()),
             activity: crate::session_registry::Activity::Busy,
             activity_age_ms: Some(1_500),
-            sessions: 2,
-            session_ids: vec!["abc".into()],
-            pid: 4_242,
+            records: vec![crate::session_registry::RecordKey { pid: 4_242, session_id: Some("abc".into()) }, crate::session_registry::RecordKey { pid: 4_243, session_id: Some("def".into()) }],
         }];
         let push = build_push("desktop", 9078, &[], 0, 0, Some(&regs), true, Vec::new());
         let rows = push.registry_sessions.expect("registry rows ride the push");

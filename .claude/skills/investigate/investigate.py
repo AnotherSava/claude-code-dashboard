@@ -90,8 +90,15 @@ def status_from(fields):
         return fields.get("status")
     if d == "settle_waiting":
         return "Done"
-    if d == "session_clear":
+    if d in ("session_clear", "reap_exited"):
         return "(cleared)"
+    # The session whose state the row showed left with others still in the
+    # folder: the row was handed over and settled DONE behind a separator
+    # (`AppState::hand_over`). `prior_status` is logged only where that ran; a
+    # leave without it changed nothing the row shows (the row was absent inside
+    # a `/clear` gap, or the session that left was not the one the row showed).
+    if d == "member_leave" and fields.get("prior_status") is not None:
+        return "Done"
     return None
 
 
@@ -117,8 +124,11 @@ def replay(trail):
                 gated = False
             else:
                 s = None
-        elif d in ("session_clear", "restore_row"):
+        elif s == "(cleared)" or d == "restore_row":
             # The row is gone or rebuilt from scratch; either way no gate survives.
+            gated = False
+        elif s is not None and d == "member_leave":
+            # A hand-over drops every subagent prompt with the session that raised it.
             gated = False
         elif gated or fields.get("gated") is True:
             gated = True

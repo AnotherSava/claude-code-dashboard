@@ -27,9 +27,9 @@ A second, separate listener serves the [multi-device sync](#sync-api) API when e
 
 - `client` — identifies which adapter should handle this event. Today: `"claude"`. New clients are new server-side adapter modules; the envelope shape never grows a per-client variant.
 - `event` — the agent's own event name (for Claude Code this is the `hook_event_name` field from its hook payload, such as `UserPromptSubmit` or `Stop`; [Classification](classification#event--status) lists every event the adapter handles).
-- `payload` — forwarded verbatim to the adapter, which knows what fields it cares about. The HTTP layer reads exactly one field out of it directly: `session_id`, which locks a row to a session across a mid-conversation `cd` (`ChatIdRegistry::resolve`) and decides who may end that row (`ChatIdRegistry::claim` + `http_server::clear_permitted`).
+- `payload` — forwarded verbatim to the adapter, which knows what fields it cares about. The HTTP layer reads exactly one field out of it directly: `session_id`, which locks a row to a session across a mid-conversation `cd` (`ChatIdRegistry::resolve`) and matches an end signal to the row member it ends (`membership::Members::depart`).
 - `console_pids` — optional. Candidate pids the hook gathered — its console's process list plus its ancestor chain on Windows, the ancestor chain alone on macOS, stopping at the owning Claude Code process. These are now a **fallback**: the widget prefers to find the row's terminal in Claude Code's own list of live sessions, and only falls back to these pids when that list can't place the row (see [Features → color terminal tabs](../features#color-terminal-tabs)). Empty is a valid answer; the widget then writes no title. Plays no part in classification.
-- `agent_pid` — optional. The pid of the owning Claude Code process — the image (`claude` / `claude.exe`) the `console_pids` walk stopped on, so both fields come off one pass over the process table. The widget tracks it so it can remove a row whose session exited without a `SessionEnd` (see [Features → live status](../features#live-status)). `null` when the hook can't identify it (e.g. a node-based install, whose chain is then unbounded). Plays no part in classification.
+- `agent_pid` — optional. The pid of the owning Claude Code process — the image (`claude` / `claude.exe`) the `console_pids` walk stopped on, so both fields come off one pass over the process table. The widget keys each session's place in its row by it, which says which of several processes in one folder sent an event and lets the widget remove a row whose session exited without a `SessionEnd` (see [Features → live status](../features#live-status)). `null` when the hook can't identify it (e.g. a node-based install, whose chain is then unbounded). Plays no part in classification.
 
 ## Payload interpretation
 
@@ -345,7 +345,7 @@ Carries the loopback `Host` gate on top of the `Origin` check, like the roster a
 | `200`  | `{"recorded": true, …}` | a claim is on the row; whether it settles CLEAN is decided at this turn's `Stop` |
 | `400`  | `{"recorded": false, …}` | no `session_id` |
 | `404`  | `{"recorded": false, …}` | no row here for that session |
-| `409`  | `{"recorded": false, …}` | another session owns that row — a cwd-derived row can have two resident instances, and only the one that last wrote it may speak for it (the `clear_permitted` rule, refusing only where the owner is known and differs) |
+| `409`  | `{"recorded": false, …}` | another session drives that row — a cwd-derived row can have two resident instances, and only the row's main may speak for it (`http_server::clean_claim_permitted`, refusing only where a main is elected and differs) |
 
 Nothing reads the body in production — the poster closes the response unread and exits 0 whatever happens, because silence has to mean *not clean* on this side. It says why rather than just whether for whoever reaches the route with `curl`.
 

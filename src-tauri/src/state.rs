@@ -687,6 +687,15 @@ pub struct OpenOutcome {
     pub dialog_changed: bool,
 }
 
+/// What [`AppState::hand_over`] did, for its decision log lines.
+#[derive(Clone, Debug)]
+pub struct HandOver {
+    /// The departed session's status, before the row settled `Done`.
+    pub prior: Status,
+    /// The subagent prompts it dropped, if any were open.
+    pub prompts: Option<SettleOutcome>,
+}
+
 /// What [`AppState::settle_subagent_prompts`] released.
 #[derive(Clone, Debug)]
 pub struct SettleOutcome {
@@ -727,6 +736,13 @@ pub(crate) fn with_base<R>(s: &mut AgentSession, f: impl FnOnce(&mut AgentSessio
     s.subagent_gate = Some(gate);
     show_gate(s);
     out
+}
+
+/// Add the Working run that began at `state_entered_at` to the working-time
+/// bank, clamping a clock that went backwards to zero.
+fn bank_working(s: &mut AgentSession, now_ms: i64) {
+    let delta = (now_ms - s.state_entered_at).max(0) as u64;
+    s.working_accumulated_ms = s.working_accumulated_ms.saturating_add(delta);
 }
 
 impl AgentSession {
@@ -1200,8 +1216,7 @@ impl AppState {
                 let task_boundary = raw_task_boundary && !is_continuation && !prompt_names_no_task && !message_in_exchange;
 
                 if prior == Status::Working && input.status != Status::Working {
-                    let delta = (now_ms - existing.state_entered_at).max(0) as u64;
-                    existing.working_accumulated_ms = existing.working_accumulated_ms.saturating_add(delta);
+                    bank_working(existing, now_ms);
                 }
 
                 // Remember where to revert if this turn is cancelled with Esc. Only
@@ -1546,21 +1561,47 @@ impl AppState {
 
     /// Remove a session and return it, after appending a session boundary to its
     /// dialog (so a restored copy ends with a separator, exactly like `/clear`).
-    /// When `expect_updated` is `Some`, the removal is aborted (returns `None`)
-    /// if the row's `updated` no longer matches — used by the liveness reaper to
-    /// avoid deleting a row that received a new event between observation and
-    /// removal. The check, boundary append, and removal all happen under one
-    /// lock, so it is atomic against a concurrent hook event.
-    pub fn take_session(&self, id: &str, expect_updated: Option<i64>, kind: BoundaryKind, now_ms: i64) -> Option<AgentSession> {
+    /// Callers hold the row's `commands::RowLocks` entry, which is what orders a
+    /// removal against a hook event for the same row.
+    pub fn take_session(&self, id: &str, kind: BoundaryKind, now_ms: i64) -> Option<AgentSession> {
         let mut sessions = self.sessions.lock().unwrap();
         let pos = sessions.iter().position(|s| s.id == id)?;
-        if let Some(expected) = expect_updated {
-            if sessions[pos].updated != expected {
-                return None;
-            }
-        }
         append_boundary(&mut sessions[pos], kind, now_ms);
         Some(sessions.remove(pos))
+    }
+
+    /// Settle a row whose state-bearing session left while other sessions remain
+    /// in its folder: the main, or the last writer while no main was elected (see
+    /// `membership::Left::hands_over`). What the row showed was the departed session's
+    /// state, and a question or an error it was holding can no longer be
+    /// answered, so the row settles `Done` — the evidence-free sink — and its
+    /// dialog gets an `Ended` separator, since the next thing it shows is another
+    /// conversation. Every open subagent prompt goes with the gate (they were the
+    /// departed session's), and so do the clean claim, the shell-task backstop and
+    /// the context reading, all of which describe that session.
+    ///
+    /// `None` when the row is gone, which is the ordinary state inside a
+    /// `/clear` gap.
+    pub fn hand_over(&self, id: &str, now_ms: i64) -> Option<HandOver> {
+        let mut sessions = self.sessions.lock().unwrap();
+        let s = sessions.iter_mut().find(|s| s.id == id)?;
+        let gate = s.subagent_gate.take();
+        if let Some(g) = &gate {
+            g.base.write_into(s);
+        }
+        let prior = s.status;
+        if prior == Status::Working {
+            bank_working(s, now_ms);
+        }
+        s.status = Status::Done;
+        s.state_entered_at = now_ms;
+        s.waiting_backstop_armed = false;
+        s.clean_claim_at = None;
+        s.input_tokens = None;
+        append_boundary(s, BoundaryKind::Ended, now_ms);
+        s.updated = now_ms;
+        let prompts = gate.map(|g| SettleOutcome { settled: g.pending, remaining: 0, released: true, status: Status::Done });
+        Some(HandOver { prior, prompts })
     }
 
     /// Revert a `Working` session whose turn was cancelled with Esc back to the
@@ -1595,10 +1636,7 @@ impl AppState {
         let gated = s.subagent_gate.is_some();
         with_base(s, |s| {
             match s.status {
-                Status::Working => {
-                    let delta = (now_ms - s.state_entered_at).max(0) as u64;
-                    s.working_accumulated_ms = s.working_accumulated_ms.saturating_add(delta);
-                }
+                Status::Working => bank_working(s, now_ms),
                 Status::Blocked => {}
                 _ => return None,
             }
@@ -1634,7 +1672,7 @@ impl AppState {
     /// `state_entered_at` and bank working time for a bookkeeping write. It does
     /// not bump `updated` either, for the reason `mark_attended` does not — a
     /// claim is not activity, and `updated` is the compare-and-swap guard the
-    /// reaper and the WAIT backstop abort on.
+    /// WAIT backstop aborts on.
     pub fn record_clean_claim(&self, id: &str, now_ms: i64) -> bool {
         let mut sessions = self.sessions.lock().unwrap();
         let Some(s) = sessions.iter_mut().find(|s| s.id == id) else { return false };
@@ -1752,10 +1790,8 @@ impl AppState {
     ///
     /// Deliberately does **not** bump `updated`. Unlike [`Self::set_drift`], this
     /// is a local observation of the user rather than a fact about the agent, and
-    /// `updated` is the compare-and-swap guard that `take_session` (the liveness
-    /// reaper) and `settle_stale_waiting` abort on — and whose *stability* the
-    /// reaper's dead-streak counter requires. Stamping it here would restart that
-    /// count every time the user looked at a row.
+    /// `updated` is the compare-and-swap guard that `settle_stale_waiting` aborts
+    /// on. Stamping it here would let a glance at a row abort that settle.
     ///
     /// Monotonic, so a slow poll answering with an older observation can't walk
     /// the stamp backwards. Returns whether the row's [`AgentSession::attention`]
@@ -2279,9 +2315,8 @@ mod tests {
 
     #[test]
     fn mark_attended_does_not_bump_updated() {
-        // `updated` is the compare-and-swap guard the liveness reaper and
-        // `settle_stale_waiting` abort on, and the reaper's dead-streak counter
-        // needs it to stay still. Looking at a row must not disturb either.
+        // `updated` is the compare-and-swap guard `settle_stale_waiting` aborts
+        // on. Looking at a row must not disturb it.
         let state = AppState::new();
         state.apply_set(set_no_label("a", Status::Done), 7_000, NO_CONTINUATIONS, None);
         state.mark_attended("a", 9_000);
@@ -2798,24 +2833,11 @@ mod tests {
         let state = AppState::new();
         state.apply_set(set("a", Status::Working, "task"), 0, NO_CONTINUATIONS, None);
         state.apply_set(set("b", Status::Working, "other"), 0, NO_CONTINUATIONS, None);
-        let removed = state.take_session("a", None, BoundaryKind::Clear, 0);
+        let removed = state.take_session("a", BoundaryKind::Clear, 0);
         assert!(removed.is_some(), "the removed session is returned");
         assert_eq!(removed.unwrap().id, "a");
         let ids: Vec<String> = state.snapshot().into_iter().map(|s| s.id).collect();
         assert_eq!(ids, vec!["b"]);
-    }
-
-    #[test]
-    fn take_session_aborts_when_updated_moved() {
-        // The reaper passes the last-seen `updated`; if an event bumped it
-        // between observation and removal, take_session must not delete the row.
-        let state = AppState::new();
-        state.apply_set(set("a", Status::Working, "task"), 0, NO_CONTINUATIONS, None);
-        let updated = get(&state, "a").updated;
-        assert!(state.take_session("a", Some(updated + 1), BoundaryKind::Clear, 0).is_none(), "stale expectation aborts");
-        assert_eq!(state.snapshot().len(), 1, "row survives a mismatched expectation");
-        assert!(state.take_session("a", Some(updated), BoundaryKind::Clear, 0).is_some(), "matching expectation removes");
-        assert!(state.snapshot().is_empty());
     }
 
     #[test]
@@ -2826,7 +2848,7 @@ mod tests {
         let mut input = set("a", Status::Working, "task");
         input.dialog_entry = Some(PendingDialogEntry { role: DialogRole::User, text: "task".into() });
         state.apply_set(input, 0, NO_CONTINUATIONS, None);
-        let removed = state.take_session("a", None, BoundaryKind::Clear, 100).expect("removed");
+        let removed = state.take_session("a", BoundaryKind::Clear, 100).expect("removed");
         assert_eq!(removed.dialog.last().map(|e| e.role), Some(DialogRole::Separator));
     }
 
@@ -3759,7 +3781,35 @@ why did this become the task?");
         assert!(state.settle_subagent_prompts("a", SettleScope::Request(999), 9_000).is_none());
         assert!(state.settle_subagent_prompts("nope", SettleScope::Session("sess"), 9_000).is_none());
         let s = get(&state, "a");
-        assert_eq!((s.status, s.updated), (Status::Blocked, 5_000), "a no-op settle leaves `updated`, the reaper's guard, alone");
+        assert_eq!((s.status, s.updated), (Status::Blocked, 5_000), "a no-op settle leaves `updated`, the WAIT backstop's guard, alone");
+    }
+
+    #[test]
+    fn a_hand_over_settles_the_departed_sessions_row_done_behind_a_separator() {
+        let state = AppState::new();
+        let mut input = set("a", Status::Working, "task");
+        input.dialog_entry = Some(PendingDialogEntry { role: DialogRole::User, text: "task".into() });
+        input.input_tokens = Some(90_000);
+        state.apply_set(input, 1_000, NO_CONTINUATIONS, None);
+        state.record_clean_claim("a", 2_000);
+        open(&state, "a", "agent-1", "Bash", 3_000);
+
+        let h = state.hand_over("a", 11_000).expect("row exists");
+        assert_eq!(h.prior, Status::Working, "the base under the gate, not the BLOCK over it");
+        let prompts = h.prompts.expect("the gate went with the session that raised it");
+        assert_eq!((prompts.settled.len(), prompts.released, prompts.status), (1, true, Status::Done));
+
+        let s = get(&state, "a");
+        assert_eq!(s.status, Status::Done);
+        assert!(s.subagent_gate.is_none());
+        assert_eq!(s.clean_claim_at, None);
+        assert_eq!(s.input_tokens, None);
+        assert!(!s.waiting_backstop_armed);
+        assert_eq!((s.state_entered_at, s.updated), (11_000, 11_000));
+        assert_eq!(s.working_accumulated_ms, 10_000, "the departed turn's run is banked");
+        let last = s.dialog.last().expect("dialog");
+        assert_eq!((last.role, last.boundary), (DialogRole::Separator, Some(BoundaryKind::Ended)));
+        assert!(state.hand_over("gone", 12_000).is_none());
     }
 
     #[test]
@@ -3895,7 +3945,7 @@ why did this become the task?");
         let state = AppState::new();
         state.apply_set(set("a", Status::Working, "task"), 0, NO_CONTINUATIONS, None);
         let r = open(&state, "a", "agent-1", "Bash", 1_000).request;
-        assert!(state.take_session("a", None, BoundaryKind::Clear, 2_000).is_some());
+        assert!(state.take_session("a", BoundaryKind::Clear, 2_000).is_some());
         assert!(state.pending_subagent_prompts().is_empty());
 
         state.apply_set(set_no_label("a", Status::Idle), 3_000, NO_CONTINUATIONS, None);

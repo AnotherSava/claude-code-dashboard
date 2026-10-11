@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -11,19 +11,6 @@ use std::sync::Mutex;
 pub struct ChatIdRegistry {
     path: PathBuf,
     data: Mutex<HashMap<String, String>>,
-    /// Inverse view: which `session_id` most recently *wrote* each chat_id.
-    /// `data` can't answer this — several sessions legitimately map to one
-    /// cwd-derived row and it carries no recency — so ownership is tracked
-    /// separately, claimed on every `Set` and read by the `Clear` guard.
-    /// In-memory only: a restart leaves ownership unknown, which the guard
-    /// treats as "defer to the end signal", i.e. today's behavior.
-    owners: Mutex<HashMap<String, String>>,
-    /// Sessions whose row a `/clear` `SessionStart` already tore down because it
-    /// reached the server before their `SessionEnd`. That end then arrives
-    /// from a session that no longer owns the row, and this is how the `Clear`
-    /// guard tells it from a sibling's. Taken on arrival; an end that never
-    /// arrives leaves one id behind, in memory only.
-    superseded: Mutex<HashSet<String>>,
 }
 
 impl ChatIdRegistry {
@@ -40,47 +27,7 @@ impl ChatIdRegistry {
             HashMap::new()
         };
         tracing::debug!(sessions = data.len(), "chat id registry loaded");
-        Self {
-            path,
-            data: Mutex::new(data),
-            owners: Mutex::new(HashMap::new()),
-            superseded: Mutex::new(HashSet::new()),
-        }
-    }
-
-    /// Record that `session_id` wrote `chat_id`, making it the row's owner.
-    /// Called on every `Set` — never on `Clear`, or a departing session would
-    /// claim the row moments before the guard asks who owns it.
-    pub fn claim(&self, chat_id: &str, session_id: &str) {
-        if session_id.is_empty() {
-            return;
-        }
-        self.owners.lock().unwrap().insert(chat_id.to_string(), session_id.to_string());
-    }
-
-    /// The `session_id` that last wrote `chat_id`, or `None` when nothing has
-    /// been written since startup.
-    pub fn owner_of(&self, chat_id: &str) -> Option<String> {
-        self.owners.lock().unwrap().get(chat_id).cloned()
-    }
-
-    /// Records that `session_id`'s row was torn down ahead of its `SessionEnd`.
-    pub fn supersede(&self, session_id: &str) {
-        if !session_id.is_empty() {
-            self.superseded.lock().unwrap().insert(session_id.to_string());
-        }
-    }
-
-    /// Whether `session_id`'s row was already torn down by a `/clear` start,
-    /// consuming the record.
-    pub fn take_superseded(&self, session_id: &str) -> bool {
-        self.superseded.lock().unwrap().remove(session_id)
-    }
-
-    /// Drops ownership of a row that is going away, so a later session reusing
-    /// the same cwd-derived id isn't measured against a departed owner.
-    pub fn disown(&self, chat_id: &str) {
-        self.owners.lock().unwrap().remove(chat_id);
+        Self { path, data: Mutex::new(data) }
     }
 
     /// Returns the stable chat_id for `session_id`. On first sight, locks in
@@ -199,17 +146,6 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&path);
         ChatIdRegistry::new(path)
-    }
-
-    #[test]
-    fn a_superseded_session_is_reported_once() {
-        let r = registry();
-        r.supersede("old");
-        r.supersede("");
-        assert!(!r.take_superseded("sibling"));
-        assert!(r.take_superseded("old"));
-        assert!(!r.take_superseded("old"), "consumed by the end it was kept for");
-        assert!(!r.take_superseded(""));
     }
 
     #[test]

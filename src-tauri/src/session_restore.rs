@@ -53,15 +53,13 @@
 //! `waiting_backstop_armed` does not survive a restart either.
 //!
 //! **A restored row is created outside every mechanism that exists to remove
-//! one** — `AgentPids` (the reaper), `ChatIdRegistry::owners` (`clear_permitted`)
-//! and `waiting_backstop_armed` are all in-memory and all hook-populated. The
-//! reaper is the one that matters, since without it a row whose session exits
-//! without a `SessionEnd` is immortal, so [`spawn`] records the owning pid the
-//! registry names — but only where the registry names exactly one, mirroring
-//! `terminal_title::tab_pid` and `session_registry::inbox_for`, both of which
-//! refuse ambiguity rather than pick. With two sessions collapsed into one row,
-//! recording the speaker's pid would let the sibling's death reap a row the other
-//! is still using.
+//! one** — `membership::Members` (the reaper, the end-signal match) and
+//! `waiting_backstop_armed` are both in-memory and hook-populated. The reaper is
+//! the one that matters, since without it a row whose session exits without a
+//! `SessionEnd` is immortal, so [`spawn`] seeds the row's members with every
+//! record the registry collapsed into it. Only a single record is made main: with
+//! two, the speaker is merely the freshest, so the row runs with no main (every
+//! member drives it) until only one of them remains.
 //!
 //! **Two costs of the row being real, both accepted.** A restored row writes its
 //! tab title like any other, and it has no `input_tokens` (those come from the
@@ -80,8 +78,8 @@
 //! removed while its session still lives exactly never. The 162 `session_clear`s
 //! are all `/clear`, which fires `SessionEnd` then `SessionStart` and recreates
 //! the row immediately; the 4 `reap_exited`s are sessions that genuinely ended,
-//! which this must not bring back; the 5 `clear_ignored`s were refusals that
-//! removed nothing.
+//! which this must not bring back; the 5 end signals refused for another
+//! session's row removed nothing.
 //!
 //! What is real is the *startup* race: the dashboard and the terminal both start
 //! at login in no fixed order, so a single pass at `Ready` routinely asks a
@@ -109,7 +107,7 @@ use tauri::{AppHandle, Manager};
 
 use crate::commands::now_ms;
 use crate::config::ConfigState;
-use crate::session_registry::{Activity, LiveSession, SessionRegistry};
+use crate::session_registry::{Activity, LiveSession, RecordKey, SessionRegistry};
 use crate::state::{AppState, SetInput, Status};
 use crate::terminals::TerminalSession;
 
@@ -146,9 +144,9 @@ pub struct Restorable {
     pub read: bool,
     /// When that status began, from the registry's own `statusUpdatedAt`.
     pub state_entered_at: i64,
-    /// The owning process, or `None` where the registry collapsed more than one
-    /// session into this row and naming an owner would be a guess.
-    pub pid: Option<u32>,
+    /// Every record the registry collapsed into this row, which become its
+    /// members.
+    pub members: Vec<RecordKey>,
 }
 
 /// Whether any live session lacks a row — the whole gate on spending a
@@ -243,9 +241,7 @@ pub fn plan(
             // letting a caller weigh how old a reading is — and the notifier's
             // time-in-state.
             state_entered_at: s.activity_age_ms.map_or(now_ms, |age| now_ms - age),
-            // Ambiguity is refused rather than resolved: see the module note on
-            // why the speaker's pid is not the row's owner when two collapse.
-            pid: (s.sessions == 1).then_some(s.pid),
+            members: s.records.clone(),
         });
     }
     out
@@ -403,27 +399,29 @@ fn tick(app: &AppHandle, adapter: &dyn crate::terminals::TerminalAdapter) -> Pas
         // to it exactly as it does on the hook path.
         let persisted = history.as_ref().and_then(|h| h.get(&r.id));
         let dialog_entries = persisted.as_ref().map_or(0, |p| p.dialog.len());
+        // The row and its members land as a unit against a hook event for it.
+        let row_lock = app.try_state::<crate::commands::RowLocks>().map(|locks| locks.row(&r.id));
+        let _row_guard = row_lock.as_deref().map(crate::commands::RowLocks::hold);
         if !state.restore_row(input, r.read, r.state_entered_at, now, persisted) {
             continue; // a hook event created it between the snapshot and here
         }
-        if let Some(pid) = r.pid {
-            // Give the reaper the owning pid it would otherwise never learn for
-            // this row. Without it a restored row is the one thing the reaper
-            // exists to prevent: a session that exits without a `SessionEnd`,
-            // stranded forever — and worse than the hook case, because a restored
-            // row also has no owner in `ChatIdRegistry`, so nothing removes it.
-            if let Some(pids) = app.try_state::<crate::liveness::AgentPids>() {
-                pids.set(&r.id, pid, None);
-            }
-            // And give `terminal_title` a console candidate, so the blank it
-            // writes when a row goes away can still reach the tab. Its own
-            // resolver prefers the registry and only falls back to this chain,
-            // which is exactly the case that matters here: once the process is
-            // gone the registry has no answer, and without a candidate the tab
-            // would keep the last glyph this dashboard wrote — the stale-title
-            // state this whole module exists to read, left behind by it.
+        // Give the reaper the pids it would otherwise never learn for this row.
+        // Without them a restored row is the one thing the reaper exists to
+        // prevent: a session that exits without a `SessionEnd`, stranded forever.
+        if let Some(members) = app.try_state::<crate::membership::Members>() {
+            members.seed(&r.id, &r.members, now);
+        }
+        // And give `terminal_title` a console candidate, so the blank it writes
+        // when a row goes away can still reach the tab. Its own resolver prefers
+        // the registry and only falls back to this chain, which is exactly the
+        // case that matters here: once the process is gone the registry has no
+        // answer, and without a candidate the tab would keep the last glyph this
+        // dashboard wrote — the stale-title state this whole module exists to
+        // read, left behind by it. Only for a row with one session behind it,
+        // since with two this pid's tab may be the other conversation's.
+        if let [only] = r.members.as_slice() {
             if let Some(titles) = app.try_state::<crate::terminal_title::TerminalTitles>() {
-                titles.register(&r.id, &[pid]);
+                titles.register(&r.id, &[only.pid]);
             }
         }
         restored += 1;
@@ -433,7 +431,7 @@ fn tick(app: &AppHandle, adapter: &dyn crate::terminals::TerminalAdapter) -> Pas
             terminal,
             status = ?r.status,
             age_ms = now - r.state_entered_at,
-            pid = ?r.pid,
+            members = r.members.len(),
             dialog_entries,
             reason = "a live session with no row; status read back from the tab title this dashboard last wrote",
             "decision"
@@ -466,15 +464,13 @@ fn tick(app: &AppHandle, adapter: &dyn crate::terminals::TerminalAdapter) -> Pas
 mod tests {
     use super::*;
 
-    fn live(chat_id: &str, activity: Activity, age_ms: Option<i64>, sessions: usize) -> LiveSession {
+    fn live(chat_id: &str, activity: Activity, age_ms: Option<i64>) -> LiveSession {
         LiveSession {
             chat_id: chat_id.into(),
             name: Some(chat_id.into()),
             activity,
             activity_age_ms: age_ms,
-            sessions,
-            session_ids: vec![format!("sid-{chat_id}")],
-            pid: 4_242,
+            records: vec![RecordKey { pid: 4_242, session_id: Some(format!("sid-{chat_id}")) }],
         }
     }
 
@@ -505,17 +501,17 @@ mod tests {
     fn a_live_session_with_no_row_is_restored_at_the_status_its_tab_holds() {
         // The motivating case: an agent parked on a question, invisible in the
         // widget because a row is only ever created by a hook event.
-        let out = planned(&[live("what-is-next", Activity::Idle, Some(3_000), 1)], &[tab("/p/what-is-next", Some("✋ what-is-next"))], &[]);
+        let out = planned(&[live("what-is-next", Activity::Idle, Some(3_000))], &[tab("/p/what-is-next", Some("✋ what-is-next"))], &[]);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].id, "what-is-next");
         assert_eq!(out[0].status, Status::Blocked);
         assert_eq!(out[0].state_entered_at, 7_000, "the registry's own stamp, not now");
-        assert_eq!(out[0].pid, Some(4_242));
+        assert_eq!(out[0].members, vec![RecordKey { pid: 4_242, session_id: Some("sid-what-is-next".into()) }]);
     }
 
     #[test]
     fn a_session_that_already_has_a_row_is_left_alone() {
-        let out = planned(&[live("dash", Activity::Busy, Some(10), 1)], &[tab("/p/dash", Some("🔵 dash"))], &["dash".to_string()]);
+        let out = planned(&[live("dash", Activity::Busy, Some(10))], &[tab("/p/dash", Some("🔵 dash"))], &["dash".to_string()]);
         assert!(out.is_empty());
     }
 
@@ -526,7 +522,7 @@ mod tests {
         // went, and a restore that fell back to a default status would undo every
         // `/clear` and every reap.
         for title in [None, Some(""), Some("~/p/dash — zsh"), Some("dash")] {
-            assert!(planned(&[live("dash", Activity::Idle, Some(10), 1)], &[tab("/p/dash", title)], &[]).is_empty(), "{title:?}");
+            assert!(planned(&[live("dash", Activity::Idle, Some(10))], &[tab("/p/dash", title)], &[]).is_empty(), "{title:?}");
         }
     }
 
@@ -535,7 +531,7 @@ mod tests {
         // Verified live: one interactive session had no agterm tab. Nothing about
         // it is known beyond "alive", and `Idle` for an agent that may be blocked
         // is a wrong claim rather than a missing one.
-        assert!(planned(&[live("headless", Activity::Idle, Some(10), 1)], &[], &[]).is_empty());
+        assert!(planned(&[live("headless", Activity::Idle, Some(10))], &[], &[]).is_empty());
     }
 
     #[test]
@@ -569,7 +565,7 @@ mod tests {
         for activity in [Activity::Idle, Activity::Busy, Activity::Unknown] {
             assert_eq!(restored_status(Status::Idle, activity), None, "{activity:?}");
         }
-        assert!(planned(&[live("scratch", Activity::Idle, Some(10), 1)], &[tab("/p/scratch", Some("⚫ scratch"))], &[]).is_empty());
+        assert!(planned(&[live("scratch", Activity::Idle, Some(10))], &[tab("/p/scratch", Some("⚫ scratch"))], &[]).is_empty());
     }
 
     #[test]
@@ -577,9 +573,9 @@ mod tests {
         // The round-trip that makes `attended_at` not need persisting: titles are
         // written from `display_snapshot`, i.e. after `stamp_read`, so which of
         // the two glyphs the tab is holding already answers it.
-        let out = planned(&[live("agterm", Activity::Idle, Some(10), 1)], &[tab("/p/agterm", Some("🟢 agterm"))], &[]);
+        let out = planned(&[live("agterm", Activity::Idle, Some(10))], &[tab("/p/agterm", Some("🟢 agterm"))], &[]);
         assert_eq!((out[0].status, out[0].read), (Status::Done, false), "unread");
-        let out = planned(&[live("printlab", Activity::Idle, Some(10), 1)], &[tab("/p/printlab", Some("⚪ printlab"))], &[]);
+        let out = planned(&[live("printlab", Activity::Idle, Some(10))], &[tab("/p/printlab", Some("⚪ printlab"))], &[]);
         assert_eq!((out[0].status, out[0].read), (Status::Done, true), "read before the restart");
     }
 
@@ -588,7 +584,7 @@ mod tests {
         // A split showing one session twice can disagree about the read half just
         // as it can about the status. Taking the read one would hide work, so a
         // disagreement is refused exactly as a status disagreement is.
-        let split = |a, b| planned(&[live("dash", Activity::Idle, Some(10), 1)], &[tab("/p/dash", Some(a)), tab("/p/dash", Some(b))], &[]);
+        let split = |a, b| planned(&[live("dash", Activity::Idle, Some(10))], &[tab("/p/dash", Some(a)), tab("/p/dash", Some(b))], &[]);
         assert!(split("🟢 dash", "⚪ dash").is_empty());
     }
 
@@ -600,32 +596,34 @@ mod tests {
         // never ran — under an id a live local session may already hold, since
         // the same project is routinely checked out on both.
         let badged = format!("{} 🟢 dash", crate::terminal_title::REMOTE_BADGE);
-        assert!(planned(&[live("dash", Activity::Idle, Some(10), 1)], &[tab("/p/dash", Some(&badged))], &[]).is_empty());
+        assert!(planned(&[live("dash", Activity::Idle, Some(10))], &[tab("/p/dash", Some(&badged))], &[]).is_empty());
         // And it cannot be rescued by a sibling tab that *is* ours: the badged
         // reading is dropped, so the local tab answers alone.
-        let out = planned(&[live("dash", Activity::Idle, Some(10), 1)], &[tab("/p/dash", Some(&badged)), tab("/p/dash", Some("⚪ dash"))], &[]);
+        let out = planned(&[live("dash", Activity::Idle, Some(10))], &[tab("/p/dash", Some(&badged)), tab("/p/dash", Some("⚪ dash"))], &[]);
         assert_eq!(out.len(), 1);
         assert!(out[0].read, "the local tab is the only reading, and it stands");
     }
 
     #[test]
     fn a_title_carrying_context_and_drift_suffixes_still_reads_its_status() {
-        let out = planned(&[live("dash", Activity::Idle, Some(10), 1)], &[tab("/p/dash", Some("✋ dash [62%] ⚠"))], &[]);
+        let out = planned(&[live("dash", Activity::Idle, Some(10))], &[tab("/p/dash", Some("✋ dash [62%] ⚠"))], &[]);
         assert_eq!(out[0].status, Status::Blocked);
     }
 
     #[test]
-    fn a_collapsed_row_is_restored_without_an_owning_pid() {
+    fn a_collapsed_row_is_restored_with_every_record_as_a_member() {
         // Two sessions in one directory (a `--fork-session --resume` migration).
-        // The speaker is merely the freshest, so calling its pid the row's owner
-        // would let the sibling's death reap a row the other still holds.
-        let out = planned(&[live("what-is-next", Activity::Idle, Some(10), 2)], &[tab("/p/what-is-next", Some("✋ what-is-next"))], &[]);
-        assert_eq!(out[0].pid, None);
+        // Both become members, so either one's death is judged on its own; which
+        // of them is main is `membership::RowMembers::seed`'s to decide (none).
+        let mut s = live("what-is-next", Activity::Idle, Some(10));
+        s.records.push(RecordKey { pid: 5_151, session_id: Some("sid-fork".into()) });
+        let out = planned(&[s], &[tab("/p/what-is-next", Some("✋ what-is-next"))], &[]);
+        assert_eq!(out[0].members.iter().map(|r| r.pid).collect::<Vec<_>>(), vec![4_242, 5_151]);
     }
 
     #[test]
     fn two_tabs_on_one_session_are_trusted_only_when_they_agree() {
-        let both = |a, b| planned(&[live("dash", Activity::Idle, Some(10), 1)], &[tab("/p/dash", Some(a)), tab("/p/dash", Some(b))], &[]);
+        let both = |a, b| planned(&[live("dash", Activity::Idle, Some(10))], &[tab("/p/dash", Some(a)), tab("/p/dash", Some(b))], &[]);
         assert_eq!(both("🟢 dash", "🟢 dash")[0].status, Status::Done, "a split shows one session twice");
         assert!(both("🟢 dash", "✋ dash").is_empty(), "two statuses, and picking one would be arbitrary");
     }
@@ -633,12 +631,13 @@ mod tests {
     #[test]
     fn an_anchored_session_rejoins_its_own_row_rather_than_forking_a_second() {
         // A session that has `cd`-ed derives another row's id from its cwd. Under
-        // the raw derivation this would create a row its next hook event declines
-        // to use — an orphan with no owning pid and no owner.
+        // the raw derivation this would create a second row for the conversation
+        // and seed the session's pid there, and its next hook event would follow
+        // that pid, splitting the conversation across two rows.
         let anchored = |sid: &str| (sid == "sid-src-tauri").then(|| "dash".to_string());
-        let out = plan(&[live("src-tauri", Activity::Idle, Some(10), 1)], &[tab("/p/src-tauri", Some("🟢 dash"))], &[], 10_000, &derive, &anchored);
+        let out = plan(&[live("src-tauri", Activity::Idle, Some(10))], &[tab("/p/src-tauri", Some("🟢 dash"))], &[], 10_000, &derive, &anchored);
         assert_eq!(out[0].id, "dash");
-        let none = plan(&[live("src-tauri", Activity::Idle, Some(10), 1)], &[tab("/p/src-tauri", Some("🟢 dash"))], &["dash".to_string()], 10_000, &derive, &anchored);
+        let none = plan(&[live("src-tauri", Activity::Idle, Some(10))], &[tab("/p/src-tauri", Some("🟢 dash"))], &["dash".to_string()], 10_000, &derive, &anchored);
         assert!(none.is_empty(), "and it is then seen to already have one");
     }
 
@@ -646,14 +645,14 @@ mod tests {
     fn a_session_with_no_status_stamp_is_credited_to_now() {
         // Not backdated to the epoch, which would read as an infinitely old
         // status and trip every age-based reader at once.
-        let out = planned(&[live("dash", Activity::Idle, None, 1)], &[tab("/p/dash", Some("🟢 dash"))], &[]);
+        let out = planned(&[live("dash", Activity::Idle, None)], &[tab("/p/dash", Some("🟢 dash"))], &[]);
         assert_eq!(out[0].state_entered_at, 10_000);
     }
 
     #[test]
     fn nothing_is_asked_of_the_terminal_while_every_live_session_has_a_row() {
         // The steady state, and what the machine looks like for most of the day.
-        let live = vec![live("a", Activity::Idle, Some(10), 1), live("b", Activity::Busy, Some(10), 1)];
+        let live = vec![live("a", Activity::Idle, Some(10)), live("b", Activity::Busy, Some(10))];
         assert!(!gap_exists(&live, &["a".to_string(), "b".to_string()], &seen));
         assert!(gap_exists(&live, &["a".to_string()], &seen));
         assert!(!gap_exists(&[], &[], &seen), "nothing running");
@@ -677,7 +676,7 @@ mod tests {
         // Both sources answered and the plan is empty, because the only live
         // session has no title we wrote. Waiting cannot change that: a title
         // appears only when the dashboard writes one, and writing one needs a row.
-        let live = [live("dash", Activity::Idle, Some(10), 1)];
+        let live = [live("dash", Activity::Idle, Some(10))];
         assert!(planned(&live, &[tab("/p/dash", None)], &[]).is_empty());
         // And the gap is still open, so a design that retried "until the gap
         // closes" rather than "until both answered" would never stop here.
@@ -692,7 +691,7 @@ mod tests {
         // asked — and it is the *only* case where the tab's status and the live
         // session are unrelated, because a session we have seen is one we titled
         // that tab for.
-        let live = [live("dash", Activity::Idle, Some(10), 1)];
+        let live = [live("dash", Activity::Idle, Some(10))];
         let tabs = [tab("/p/dash", Some("✋ dash"))];
         assert!(plan(&live, &tabs, &[], 10_000, &derive, &no_anchor).is_empty());
         // And the gate agrees, so an unknown session does not keep the terminal
@@ -708,8 +707,8 @@ mod tests {
         // Measured live: a fork migration left two sessions in one directory, one
         // of them never seen by this dashboard. The row is still ours.
         let only_second = |sid: &str| (sid == "sid-b").then(|| "what-is-next".to_string());
-        let mut s = live("what-is-next", Activity::Idle, Some(10), 2);
-        s.session_ids = vec!["sid-unknown".into(), "sid-b".into()];
+        let mut s = live("what-is-next", Activity::Idle, Some(10));
+        s.records = vec![RecordKey { pid: 1, session_id: Some("sid-unknown".into()) }, RecordKey { pid: 2, session_id: Some("sid-b".into()) }];
         assert!(s.known_to(&only_second));
         assert_eq!(plan(&[s], &[tab("/p/what-is-next", Some("✋ what-is-next"))], &[], 10_000, &derive, &only_second).len(), 1);
     }
@@ -719,6 +718,6 @@ mod tests {
         // Otherwise a `cd`-ed session with a perfectly good row would look missing
         // on every tick, and the terminal would be asked forever.
         let anchored = |sid: &str| (sid == "sid-src-tauri").then(|| "dash".to_string());
-        assert!(!gap_exists(&[live("src-tauri", Activity::Idle, Some(10), 1)], &["dash".to_string()], &anchored));
+        assert!(!gap_exists(&[live("src-tauri", Activity::Idle, Some(10))], &["dash".to_string()], &anchored));
     }
 }

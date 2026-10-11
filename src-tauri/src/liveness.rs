@@ -10,11 +10,11 @@
 //! The dashboard can't be handed the owning process id — no hook payload field
 //! or env var exposes it — so the hook resolves it itself: it walks its own
 //! ancestor chain and reports the nearest ancestor whose image is `claude`
-//! (`claude.exe` on Windows) as `agent_pid`, fresh on every event. [`AgentPids`]
-//! stores the latest per chat_id (overwrite, so a same-cwd restart's new pid
-//! replaces the old one before the reaper can act on the stale one).
-//! [`crate::liveness_reaper`] then watches those pids: once one is positively
-//! confirmed gone, it removes the row exactly as a SessionEnd would.
+//! (`claude.exe` on Windows) as `agent_pid`, fresh on every event.
+//! [`crate::membership`] keys each session in a row by that pid, and
+//! [`crate::liveness_reaper`] watches every member's pid: once one is positively
+//! confirmed gone, the member is dropped, and a row whose last member went is
+//! removed exactly as a SessionEnd would remove it.
 //!
 //! Liveness is **image-confirmed**, not bare existence: a pid counts as alive
 //! only if it is present in a full process enumeration AND still carries a
@@ -30,53 +30,6 @@
 //! `claude` binaries (the current default) are covered.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
-
-/// Latest owning Claude pid per chat_id, as reported by the hook on each event,
-/// with the `session_id` of the event that reported it.
-/// Overwrite semantics (not the intersection [`crate::terminal_title`] uses):
-/// each event carries the *current* pid, so a session restarted in the same cwd
-/// replaces a now-dead pid before the reaper can act on the stale one.
-///
-/// The session is kept because the pid is not written on every event — the hook
-/// reports none when its process walk fails — so the session that last wrote a
-/// row (`ChatIdRegistry::owner_of`) need not be the one whose pid is held here.
-/// A reader asking "is this pid the owner's?" has to compare both.
-#[derive(Default)]
-pub struct AgentPids {
-    map: Mutex<HashMap<String, RecordedPid>>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RecordedPid {
-    pub pid: u32,
-    /// `None` where the pid came from somewhere other than a hook event
-    /// (`session_restore`), which names no session.
-    pub session_id: Option<String>,
-}
-
-impl AgentPids {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn set(&self, chat_id: &str, pid: u32, session_id: Option<&str>) {
-        let recorded = RecordedPid { pid, session_id: session_id.map(str::to_string) };
-        self.map.lock().unwrap().insert(chat_id.to_string(), recorded);
-    }
-
-    pub fn get(&self, chat_id: &str) -> Option<u32> {
-        self.map.lock().unwrap().get(chat_id).map(|r| r.pid)
-    }
-
-    pub fn recorded(&self, chat_id: &str) -> Option<RecordedPid> {
-        self.map.lock().unwrap().get(chat_id).cloned()
-    }
-
-    pub fn forget(&self, chat_id: &str) {
-        self.map.lock().unwrap().remove(chat_id);
-    }
-}
 
 /// True if `image` names the Claude Code executable: basename, case-insensitive,
 /// stem (sans `.exe`) equal to `claude`. Matches `claude.exe` / `claude` and a
@@ -86,6 +39,13 @@ pub fn is_claude_image(image: &str) -> bool {
     let base = lower.rsplit(['/', '\\']).next().unwrap_or(&lower);
     let stem = base.strip_suffix(".exe").unwrap_or(base);
     stem == "claude"
+}
+
+/// Whether `pid` is a live Claude Code process in a [`process_images`]
+/// snapshot. A pid absent from a full snapshot is gone, and one present under
+/// another image is a reused pid.
+pub fn is_live_claude(images: &HashMap<u32, String>, pid: u32) -> bool {
+    images.get(&pid).is_some_and(|img| is_claude_image(img))
 }
 
 /// A snapshot of running process ids → image name, or `None` if the OS
@@ -183,16 +143,5 @@ mod tests {
         let me = std::process::id();
         assert!(map.contains_key(&me), "our own pid is in the snapshot");
         assert!(!map.get(&me).unwrap().is_empty(), "with a non-empty image name");
-    }
-
-    #[test]
-    fn agent_pids_keeps_only_the_latest() {
-        let p = AgentPids::new();
-        p.set("a", 100, Some("s1"));
-        assert_eq!(p.get("a"), Some(100));
-        p.set("a", 200, Some("s2")); // a same-cwd restart reports the new pid
-        assert_eq!(p.get("a"), Some(200));
-        p.forget("a");
-        assert_eq!(p.get("a"), None);
     }
 }

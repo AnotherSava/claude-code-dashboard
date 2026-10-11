@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use crate::config::{Config, ConfigState};
 use crate::custom_names::CustomNamesStore;
 use crate::log_watcher::WatcherRegistry;
+use crate::membership::{Left, Members, Membership};
 use crate::prompt_history::PromptHistoryStore;
 use crate::setup;
 use crate::state::{AgentSession, AppState, Attention, BoundaryKind, Canary};
@@ -105,7 +106,7 @@ fn stamp_name_sharing(app: &AppHandle, sessions: &mut [AgentSession]) {
     // counting under the raw derivation files it against a row it is not in.
     let mut per_row: HashMap<String, usize> = HashMap::new();
     for s in &live {
-        *per_row.entry(s.row_id(&anchored)).or_default() += s.sessions;
+        *per_row.entry(s.row_id(&anchored)).or_default() += s.sessions();
     }
     let per_name = name_counts(sessions, &per_row);
     for s in sessions.iter_mut().filter(|s| s.origin.is_none()) {
@@ -1060,28 +1061,29 @@ pub fn set_chat_name(chat_id: String, name: String, app: AppHandle) {
 }
 
 /// One lock per row id, taken by every writer that sets up or tears down a
-/// row's per-session state as a unit: the hook handler for each event, and the
-/// liveness reaper around its removal.
+/// row's per-session state as a unit: the hook handler for each event, the
+/// session-clean route, the liveness reaper around each row it judges, the
+/// startup restore and a project rename.
 ///
-/// A row's state is spread over several stores (`AppState`, `AgentPids`, the
-/// watcher, `NonceStore`, `ChatIdRegistry`), each with its own lock, so no single
-/// lock orders a teardown against a setup. `/clear` is where that bites: Claude
-/// Code fires `SessionEnd` and `SessionStart` as async hooks, two processes
-/// racing to this server, and the `SessionEnd` teardown runs a 12MB
-/// `prompt_history.json` write between dropping the row and forgetting its pid.
-/// A `SessionStart` landing in that write would recreate the row and record the
-/// pid, and the late forget would then delete it, leaving a row the reaper can
-/// never judge, which outlives its closed terminal indefinitely. Holding this lock for
-/// the whole of each handler makes each event's effects land as a unit. It does
-/// not order the two events: when `SessionStart` wins the race outright it does
-/// the teardown itself (`http_server::clear_overtook_its_end`) and
-/// `clear_permitted` then refuses the late end.
+/// A row's state is spread over several stores (`AppState`, `membership::Members`,
+/// the watcher, `NonceStore`, `ChatIdRegistry`), each with its own lock, so no
+/// single lock orders a teardown against a setup. `/clear` is where that bites:
+/// Claude Code fires `SessionEnd` and `SessionStart` as async hooks, two
+/// processes racing to this server, and the `SessionEnd` teardown runs a 12MB
+/// `prompt_history.json` write. A `SessionStart` landing in that write would
+/// recreate the row halfway through its removal. Holding this lock for the whole
+/// of each handler makes each event's effects land as a unit. It does not order
+/// the two events: `membership` does, by keeping the member through the gap and
+/// recognising whichever of the two arrives second.
+///
+/// It is also what keeps a reap from removing a member that joined after the
+/// reaper's last read, since `Members::drop_dead` runs under it.
 ///
 /// A blocking mutex, taken off the async runtime: the hook handler runs on the
 /// blocking pool so that waiting here cannot become a point where a dropped
 /// request cancels it. Never taken on the main thread or inside
 /// `emit_sessions_updated`, which blocks on the main thread; never held across
-/// two ids.
+/// two ids except by a project rename, which takes its set in sorted order.
 /// Entries are not pruned — there is one per project ever tracked in this
 /// process.
 #[derive(Default)]
@@ -1104,16 +1106,9 @@ impl RowLocks {
 
 /// Remove a local session row exactly as a `SessionEnd` would — append a
 /// history separator, persist the final dialog, drop the in-memory row, stop its
-/// transcript watcher and owning-pid tracking, and emit. Shared by the
-/// `SessionEnd` Clear branch and the `/clear` `SessionStart` that overtook its
-/// end ([`crate::http_server`]), and by the liveness reaper
-/// ([`crate::liveness_reaper`]), so the removal paths can't drift apart.
-///
-/// `expect_updated`, when `Some`, makes the removal abort (returns `false`) if
-/// the row received a new event since it was observed — the reaper passes the
-/// row's last-seen `updated` to close the reap-vs-restart race; the two hook
-/// paths pass `None` (they are reacting to an authoritative event). Returns whether a
-/// row was actually removed.
+/// transcript watcher, and emit. Shared by every removal path (the `SessionEnd`
+/// arm, the `/clear` start that overtook its end, [`apply_departure`] and a
+/// project rename) so they can't drift apart. Returns whether a row was removed.
 ///
 /// `kind` tags the separator this appends, and the callers disagree about it on
 /// purpose: only a `/clear` wiped the context, so only its `SessionEnd`, or the
@@ -1121,11 +1116,21 @@ impl RowLocks {
 /// ordinary exit pass [`BoundaryKind::Ended`] — their transcripts are still on
 /// disk, and `--continue` brings the conversation back, so the row that returns
 /// must not claim there is nothing to come back to.
-pub fn remove_session(app: &AppHandle, id: &str, expect_updated: Option<i64>, kind: BoundaryKind, now: i64) -> bool {
+///
+/// `membership` is [`Membership::Keep`] only for a `/clear`, whose process is
+/// about to start again and has to be recognised as the same member when it
+/// does. Forgetting happens whether or not a row was present, since inside a
+/// `/clear` gap the members outlive the row.
+pub fn remove_session(app: &AppHandle, id: &str, kind: BoundaryKind, now: i64, membership: Membership) -> bool {
+    if membership == Membership::Forget {
+        if let Some(members) = app.try_state::<Members>() {
+            members.forget_row(id);
+        }
+    }
     let Some(state) = app.try_state::<AppState>() else {
         return false;
     };
-    let Some(removed) = state.take_session(id, expect_updated, kind, now) else {
+    let Some(removed) = state.take_session(id, kind, now) else {
         return false;
     };
     // Persist the final dialog (now ending in a separator) so the next
@@ -1138,11 +1143,107 @@ pub fn remove_session(app: &AppHandle, id: &str, expect_updated: Option<i64>, ki
     if let Some(reg) = app.try_state::<WatcherRegistry>() {
         reg.stop(id);
     }
-    if let Some(pids) = app.try_state::<crate::liveness::AgentPids>() {
-        pids.forget(id);
-    }
     emit_sessions_updated(app);
     true
+}
+
+/// Save one live row to prompt history and write the file, releasing the
+/// sessions lock before the disk write so every other reader of `AppState` is
+/// not held behind it.
+pub fn persist_row(app: &AppHandle, state: &AppState, id: &str) {
+    let Some(h) = app.try_state::<PromptHistoryStore>() else { return };
+    if let Some(s) = state.sessions.lock().unwrap().iter().find(|s| s.id == id) {
+        h.save_session(s);
+    }
+    h.save_to_disk();
+}
+
+/// How a member left its row, for [`apply_departure`].
+pub enum LeaveVia<'a> {
+    /// Its `SessionEnd`, tagging the separator a last-member removal appends.
+    SessionEnd { kind: BoundaryKind },
+    /// The reaper read these pids dead on consecutive ticks. `remove_row` is
+    /// `reap_exited_sessions`, which gates only removing a row whose last member
+    /// died: the dead members are dropped either way, so the next event founds a
+    /// main rather than finding a dead one in charge.
+    Reaped { pids: &'a [u32], remove_row: bool },
+}
+
+/// Act on members leaving a row. Shared by the `SessionEnd` arm and the reaper,
+/// so a session that announced its exit and one that did not are handled alike.
+///
+/// The last member gone removes the row. Otherwise the row hands over
+/// ([`AppState::hand_over`]) when the session whose state it shows leaves (the
+/// main, or the last writer while there is no main, see [`Left::hands_over`]):
+/// what it showed was the departed session's, so it settles `Done` behind an
+/// `Ended` separator. A main change moves the watcher to the new main's
+/// transcript or stops it, and unconfirms the canary, since the new main has not
+/// been seen to emit the marker. Anyone else leaving changes nothing the row
+/// shows.
+pub fn apply_departure(app: &AppHandle, id: &str, left: &Left, via: LeaveVia, now: i64) {
+    let (via_slug, pids) = match &via {
+        LeaveVia::SessionEnd { .. } => ("session_end", None),
+        LeaveVia::Reaped { pids, .. } => ("reaped", Some(*pids)),
+    };
+    // `prior_status` is present exactly where a hand-over settled the row, which
+    // is what the `investigate` skill reads as the row turning DONE.
+    let log_leave = |prior_status: Option<crate::state::Status>| tracing::debug!(chat_id = %id, decision = "member_leave", via = via_slug, pids = ?pids, was_main = left.was_main, drove_last = left.drove_last, remaining = left.remaining, prior_status = prior_status.map(|s| format!("{s:?}")).as_deref(), "a session left its row");
+    let Some(state) = app.try_state::<AppState>() else { return };
+    if left.remaining == 0 {
+        log_leave(None);
+        match via {
+            LeaveVia::SessionEnd { kind } => {
+                tracing::debug!(chat_id = %id, decision = "session_clear", reason = "session ended; row removed", "event -> clear");
+                remove_session(app, id, kind, now, Membership::Forget);
+            }
+            LeaveVia::Reaped { pids, remove_row: true } => {
+                let prior_status = state.sessions.lock().unwrap().iter().find(|s| s.id == id).map(|s| s.status);
+                // `Ended`, never `Clear`: a reaped session exited without
+                // announcing itself, so its transcript is intact on disk and the
+                // `--continue` that brings it back brings the whole conversation.
+                if remove_session(app, id, BoundaryKind::Ended, now, Membership::Forget) {
+                    tracing::debug!(
+                        chat_id = %id,
+                        decision = "reap_exited",
+                        pids = ?pids,
+                        prior_status = ?prior_status,
+                        reason = "the row's last Claude process exited without a SessionEnd (exit / Ctrl-D / terminal close); row removed",
+                        "decision"
+                    );
+                }
+            }
+            LeaveVia::Reaped { remove_row: false, .. } => {}
+        }
+        return;
+    }
+    let handed = if left.hands_over() { state.hand_over(id, now) } else { None };
+    log_leave(handed.as_ref().map(|h| h.prior));
+    if let Some(o) = handed.as_ref().and_then(|h| h.prompts.as_ref()) {
+        crate::subagent_gate::log_prompt_settled(id, o, crate::subagent_gate::SettledVia::HandedOver, None, now);
+    }
+    if let Some(change) = &left.main_change {
+        crate::membership::log_main_change(id, change);
+        if let Some(ns) = app.try_state::<crate::nonce_store::NonceStore>() {
+            ns.unconfirm(id);
+        }
+        follow_main(app, id);
+    }
+    if handed.is_some() {
+        persist_row(app, &state, id);
+        emit_sessions_updated(app);
+    }
+}
+
+/// Point the row's transcript watcher at its main's transcript, grafting
+/// nothing, or stop it where the main has reported none (or there is no main):
+/// a watcher left on another session's transcript would write that session's
+/// replies into the row.
+pub fn follow_main(app: &AppHandle, id: &str) {
+    let Some(reg) = app.try_state::<WatcherRegistry>() else { return };
+    match app.try_state::<Members>().and_then(|m| m.main_transcript(id)) {
+        Some(path) => reg.start(app.clone(), id.to_string(), path, crate::log_watcher::Graft::Never),
+        None => reg.stop(id),
+    }
 }
 
 pub fn now_ms() -> i64 {

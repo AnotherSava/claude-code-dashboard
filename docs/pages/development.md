@@ -68,7 +68,7 @@ The dev profile carries line tables rather than full DWARF (`[profile.dev]` in `
 
 The app pairs a Rust backend (Tauri v2) with a Svelte 5 + Vite frontend rendered in the system webview (WebView2 on Windows, WKWebView on macOS). The Rust side owns all state and external I/O; the frontend is a pure view that subscribes to Tauri events and issues invoke-style commands for window control. External tools integrate via an embedded `axum` HTTP server on `127.0.0.1:9077`, bypassing the frontend entirely.
 
-The source-of-truth `AgentSession` state lives behind a `Mutex` in Rust. Hook events reach it through `state::apply_set`, which enforces the sticky-label rules, the working-time accumulator and the task boundary in one place whatever the origin. The other writers each own one narrow transition and never choose a label: the transcript watcher's promotion to working and its Esc-cancel revert, the WAIT backstop, the liveness reaper's row removal, a restart's restore, and a subagent's permission prompt. Sessions running on another device arrive pre-enriched over sync and live in a separate map; `commands::resolved_snapshot` is the one place the two sets combine.
+The source-of-truth `AgentSession` state lives behind a `Mutex` in Rust. Hook events reach it through `state::apply_set`, which enforces the sticky-label rules, the working-time accumulator and the task boundary in one place whatever the origin. The other writers each own one narrow transition and never choose a label: the transcript watcher's promotion to working and its Esc-cancel revert, the WAIT backstop, the liveness reaper's member drop and row removal, the hand-over that settles a row to done when its main session leaves, a restart's restore, and a subagent's permission prompt. Sessions running on another device arrive pre-enriched over sync and live in a separate map; `commands::resolved_snapshot` is the one place the two sets combine.
 
 ## Project structure
 
@@ -111,8 +111,9 @@ Under the repo root `claude-code-dashboard/`:
     - `session_restore.rs` — giving a live session its row back after a restart
     - `project_rename.rs` — carrying a project's history, anchors, name and start grant over to the id its renamed folder derives, and announcing the rename to peers
     - `log_watcher.rs` — per-session transcript tailing + infer_state + assistant text upsert
-    - `liveness.rs` — process-liveness primitives and the per-row owning-pid store
-    - `liveness_reaper.rs` — removes a row whose Claude process exited without a `SessionEnd`
+    - `membership.rs` — which live sessions belong to a row and which one (its main) drives it
+    - `liveness.rs` — process-liveness primitives
+    - `liveness_reaper.rs` — drops row members whose Claude process exited without a `SessionEnd`, and removes a row once its last member is gone
     - `waiting_settle.rs` — settles a `waiting` row to `done` once its killed background task can no longer report
     - `subagent_gate.rs` — the subagent permission-prompt overlay, and finding the gated call's result that releases it
     - `prompt_origin.rs` — what a row shows for a task another agent began

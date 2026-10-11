@@ -287,16 +287,20 @@ fn check_moved(old_path: &str, new_path: &str) -> Result<(), RenameRefusal> {
 }
 
 /// Whether a row's session is known to be running: Claude Code's live-session
-/// list names it, or the process this dashboard recorded for it is still a
-/// Claude Code process. A list that could not be read counts as running.
+/// list names it, or one of the row's members is still a Claude Code process. A
+/// list that could not be read counts as running; a member with no pid cannot
+/// be checked and does not.
 fn row_is_live(app: &AppHandle, id: &str, live_ids: Option<&[String]>) -> bool {
     let Some(live_ids) = live_ids else { return true };
     if live_ids.iter().any(|l| l == id) {
         return true;
     }
-    let Some(pid) = app.try_state::<crate::liveness::AgentPids>().and_then(|p| p.get(id)) else { return false };
+    let pids = app.try_state::<crate::membership::Members>().map(|m| m.pids(id)).unwrap_or_default();
+    if pids.is_empty() {
+        return false;
+    }
     match crate::liveness::process_images() {
-        Some(images) => images.get(&pid).is_some_and(|img| crate::liveness::is_claude_image(img)),
+        Some(images) => pids.iter().any(|&pid| crate::liveness::is_live_claude(&images, pid)),
         None => true,
     }
 }
@@ -381,7 +385,7 @@ pub fn rename_project(app: &AppHandle, old_path: &str, new_path: &str, now: i64)
     }
 
     for id in &present {
-        if crate::commands::remove_session(app, id, None, crate::state::BoundaryKind::Ended, now) {
+        if crate::commands::remove_session(app, id, crate::state::BoundaryKind::Ended, now, crate::membership::Membership::Forget) {
             tracing::info!(chat_id = %id, decision = "rename_cleared_row", "a project rename removed a row whose session had ended without telling the dashboard");
         }
     }

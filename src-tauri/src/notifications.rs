@@ -7,6 +7,7 @@ use tauri::{AppHandle, Manager};
 
 use crate::config::{ConfigState, StateNotify};
 use crate::custom_names::CustomNamesStore;
+use crate::membership::Members;
 use crate::state::{AgentSession, AppState, Attention, DialogRole, Status};
 use crate::telegram::{SyncOutcome, TelegramNotifier};
 use crate::usage_limits::{UsageLimitsState, UsageStatus};
@@ -170,10 +171,7 @@ pub fn build_drift_message(session: &AgentSession, device: &str) -> String {
 /// before a phone buzzes about it. It is `reaction_window_ms`'s idea applied to a
 /// condition rather than a status.
 pub fn stale_reconcile<'a>(delay_ms: Option<u64>, sessions: &'a [AgentSession], outstanding: &HashMap<String, String>, now: i64) -> (Vec<String>, Vec<&'a AgentSession>) {
-    let is_flagged = |s: &AgentSession| match (delay_ms.filter(|d| *d > 0), s.terminal_stale_at) {
-        (Some(delay), Some(at)) => now - at >= delay as i64,
-        _ => false,
-    };
+    let is_flagged = |s: &AgentSession| delay_elapsed(delay_ms, s.terminal_stale_at, now);
     let flagged_ids: HashSet<&str> = sessions.iter().filter(|s| is_flagged(s)).map(|s| s.id.as_str()).collect();
     let to_dismiss: Vec<String> = outstanding.keys().filter(|id| !flagged_ids.contains(id.as_str())).cloned().collect();
     let to_send: Vec<&AgentSession> = sessions.iter().filter(|s| is_flagged(s) && !outstanding.contains_key(&s.id)).collect();
@@ -199,6 +197,99 @@ pub fn build_stale_tab_message(session: &AgentSession, device: &str, remedy: &st
     format!("⚠ {} its terminal tab is showing a stale status: {}.", session_tag(session, device), remedy)
 }
 
+/// Reconcile shared-row alerts, mirroring [`stale_reconcile`]: an alert is *sent*
+/// once a row has had two or more Claude Code sessions in its folder for
+/// `delay_ms`, and *dismissed* once it is back to one, its members leave, or the
+/// option is turned off (`null` or `0`, which dismisses everything outstanding).
+/// `shared_since` is `membership::Members::shared_since`, the one record of when
+/// each row became shared. Returns `(to_dismiss, to_send)`.
+///
+/// Whether an alert should exist is read from `shared_since` alone, never from
+/// whether the row is present: a `/clear` removes the row until its start while
+/// its members stay, and a tick landing in that gap would otherwise delete the
+/// message and send it again a second later for a fault that never cleared. A
+/// row that is really gone has its members forgotten, which drops it from
+/// `shared_since`. Sending still needs the row, for the message text.
+///
+/// A separate reconciler with its own outstanding map, for the reason
+/// `stale_reconcile` is one: the conditions are independent, and one clearing
+/// must not delete another's message. The delay is what lets a short-lived second
+/// session, a probe or a quick check run in the folder, come and go unreported.
+pub fn shared_reconcile<'a>(delay_ms: Option<u64>, sessions: &'a [AgentSession], shared_since: &HashMap<String, i64>, outstanding: &HashMap<String, String>, now: i64) -> (Vec<String>, Vec<&'a AgentSession>) {
+    let flagged = |id: &str| shared_flagged(delay_ms, shared_since, id, now);
+    let to_dismiss: Vec<String> = outstanding.keys().filter(|id| !flagged(id.as_str())).cloned().collect();
+    let to_send: Vec<&AgentSession> = sessions.iter().filter(|s| flagged(s.id.as_str()) && !outstanding.contains_key(&s.id)).collect();
+    (to_dismiss, to_send)
+}
+
+/// Whether row `id` has been shared for longer than the alert delay.
+fn shared_flagged(delay_ms: Option<u64>, shared_since: &HashMap<String, i64>, id: &str, now: i64) -> bool {
+    delay_elapsed(delay_ms, shared_since.get(id).copied(), now)
+}
+
+/// A delayed alert's delay, `None` where it is off: `null` and `0` both disable
+/// it, the value doubling as the switch.
+fn alert_delay(delay_ms: Option<u64>) -> Option<u64> {
+    delay_ms.filter(|d| *d > 0)
+}
+
+/// Whether a delayed alert's condition, holding since `since`, has outlasted
+/// `delay_ms`. Shared by the stale-tab and shared-row alerts.
+fn delay_elapsed(delay_ms: Option<u64>, since: Option<i64>, now: i64) -> bool {
+    match (alert_delay(delay_ms), since) {
+        (Some(delay), Some(at)) => now - at >= delay as i64,
+        _ => false,
+    }
+}
+
+/// The shared-row alert's text.
+pub fn build_shared_row_message(session: &AgentSession, device: &str) -> String {
+    format!("⚠ {} two or more Claude Code sessions are running in its folder; close the ones you are not using, since the row can follow only one of them.", session_tag(session, device))
+}
+
+/// Whether a maybe-delivered hold (see [`UNCERTAIN_RETRY_BACKOFF_MS`]) still
+/// blocks re-sending one alert.
+fn on_hold(holds: &HashMap<String, i64>, id: &str, now: i64) -> bool {
+    holds.get(id).is_some_and(|until| now < *until)
+}
+
+/// Drop the holds that have expired or whose alert condition no longer holds
+/// (`live`), so a condition that clears and re-arms inside the window alerts
+/// again instead of being suppressed by the hold it left behind. Shared by every
+/// per-session raw-send alert, which differ only in `live`.
+fn prune_holds(holds: &mut HashMap<String, i64>, now: i64, live: impl Fn(&str) -> bool) {
+    holds.retain(|id, until| now < *until && live(id));
+}
+
+/// Send one per-session raw alert unless a maybe-delivered hold blocks it, and
+/// record the outcome: the handle in `outstanding` on success, a hold in `holds`
+/// on a maybe-delivered failure, and neither on a definite failure, so the next
+/// tick retries. `text` is built only once the hold has been checked. Returns
+/// whether the alert went out; the success log is the caller's, since its fields
+/// differ per alert and tracing field names must be static.
+async fn send_tracked_alert(telegram: &TelegramNotifier, outstanding: &mut HashMap<String, String>, holds: &mut HashMap<String, i64>, id: &str, now: i64, decision: &'static str, what: &str, text: impl FnOnce() -> String) -> bool {
+    if on_hold(holds, id, now) {
+        return false;
+    }
+    match telegram.send_raw_tracked(&text()).await {
+        Ok(handle) => {
+            outstanding.insert(id.to_string(), handle);
+            holds.remove(id);
+            true
+        }
+        Err(SendError { maybe_delivered: true, source }) => {
+            holds.insert(id.to_string(), now + UNCERTAIN_RETRY_BACKOFF_MS);
+            tracing::warn!(channel = "telegram", id = %id, decision, backoff_ms = UNCERTAIN_RETRY_BACKOFF_MS, error = %source, "{what} may have been delivered; backing off retry");
+            false
+        }
+        Err(SendError { maybe_delivered: false, source }) => {
+            holds.remove(id);
+            tracing::warn!(channel = "telegram", id = %id, decision, error = %source, "{what} send failed; will retry");
+            false
+        }
+    }
+}
+
 /// Reconcile context-usage alerts against the currently-over set, mirroring the
 /// per-state notification lifecycle: an alert is *sent* when a session first
 /// crosses `threshold_percent` of its context window, and *dismissed* (the
@@ -215,11 +306,17 @@ pub fn context_reconcile<'a>(
     window_tokens: &HashMap<String, u64>,
     outstanding: &HashMap<String, String>,
 ) -> (Vec<String>, Vec<&'a AgentSession>) {
-    let is_over = |s: &AgentSession| threshold_percent > 0.0 && context_percent(s, window_tokens).is_some_and(|p| p >= threshold_percent);
+    let is_over = |s: &AgentSession| context_over(s, threshold_percent, window_tokens);
     let over_ids: HashSet<&str> = sessions.iter().filter(|s| is_over(s)).map(|s| s.id.as_str()).collect();
     let to_dismiss: Vec<String> = outstanding.keys().filter(|id| !over_ids.contains(id.as_str())).cloned().collect();
     let to_send: Vec<&AgentSession> = sessions.iter().filter(|s| is_over(s) && !outstanding.contains_key(&s.id)).collect();
     (to_dismiss, to_send)
+}
+
+/// Whether a session's context usage is at or past `threshold_percent` of its
+/// window, the condition a context alert exists for. `<= 0` is off.
+fn context_over(s: &AgentSession, threshold_percent: f32, window_tokens: &HashMap<String, u64>) -> bool {
+    threshold_percent > 0.0 && context_percent(s, window_tokens).is_some_and(|p| p >= threshold_percent)
 }
 
 /// Reconcile instruction-drift alerts, mirroring [`context_reconcile`]: an alert
@@ -233,11 +330,16 @@ pub fn drift_reconcile<'a>(
     sessions: &'a [AgentSession],
     outstanding: &HashMap<String, String>,
 ) -> (Vec<String>, Vec<&'a AgentSession>) {
-    let is_flagged = |s: &AgentSession| enabled && s.instruction_drift;
+    let is_flagged = |s: &AgentSession| drift_flagged(enabled, s);
     let flagged_ids: HashSet<&str> = sessions.iter().filter(|s| is_flagged(s)).map(|s| s.id.as_str()).collect();
     let to_dismiss: Vec<String> = outstanding.keys().filter(|id| !flagged_ids.contains(id.as_str())).cloned().collect();
     let to_send: Vec<&AgentSession> = sessions.iter().filter(|s| is_flagged(s) && !outstanding.contains_key(&s.id)).collect();
     (to_dismiss, to_send)
+}
+
+/// Whether a session warrants an instruction-drift alert.
+fn drift_flagged(enabled: bool, s: &AgentSession) -> bool {
+    enabled && s.instruction_drift
 }
 
 /// The on-screen text whose length sets how long the user needs to *read* before
@@ -706,6 +808,10 @@ impl NotificationManager {
             // handle, deleted once the tab starts following the row again.
             let mut stale_outstanding: HashMap<String, String> = HashMap::new();
             let mut stale_backoff: HashMap<String, i64> = HashMap::new();
+            // Live shared-row alerts: session id -> Telegram message handle,
+            // deleted once the row is back to one session in its folder.
+            let mut shared_outstanding: HashMap<String, String> = HashMap::new();
+            let mut shared_backoff: HashMap<String, i64> = HashMap::new();
             // Maybe-delivered (read-timeout) backoff for the raw-send alerts, so a
             // sustained outage can't re-send a possibly-delivered alert every tick
             // (mirrors `retry_backoff` for the per-state pings). Per-session for the
@@ -760,7 +866,7 @@ impl NotificationManager {
 
                 let outcome = telegram.sync_config(tg_cfg, &cfg.sync.device_name);
                 if matches!(outcome, SyncOutcome::CredsChanged | SyncOutcome::Disabled) {
-                    if !outstanding.is_empty() || !context_outstanding.is_empty() || !drift_outstanding.is_empty() || !stale_outstanding.is_empty() {
+                    if !outstanding.is_empty() || !context_outstanding.is_empty() || !drift_outstanding.is_empty() || !stale_outstanding.is_empty() || !shared_outstanding.is_empty() {
                         tracing::warn!(
                             channel = "telegram",
                             reason = ?outcome,
@@ -768,12 +874,14 @@ impl NotificationManager {
                             context_count = context_outstanding.len(),
                             drift_count = drift_outstanding.len(),
                             stale_count = stale_outstanding.len(),
+                            shared_count = shared_outstanding.len(),
                             "credentials changed or disabled; dropping outstanding maps without deleting"
                         );
                         outstanding.clear();
                         context_outstanding.clear();
                         drift_outstanding.clear();
                         stale_outstanding.clear();
+                        shared_outstanding.clear();
                     }
                     // Retry holds are handle-free (nothing to delete), but they
                     // predate the new credentials, so drop them too — a ping held
@@ -782,6 +890,7 @@ impl NotificationManager {
                     context_backoff.clear();
                     drift_backoff.clear();
                     stale_backoff.clear();
+                    shared_backoff.clear();
                     reset_backoff.clear();
                     // Re-seed the reset detector so a window that reset while
                     // creds were absent doesn't fire a stale / frozen-peak ping
@@ -817,8 +926,8 @@ impl NotificationManager {
                     // `for_status` scoping).
                     let now = now_ms();
                     let threshold = tg_cfg.and_then(|c| c.context_alert_percent).unwrap_or(0.0);
-                    context_backoff.retain(|id, until| now < *until && sessions.iter().any(|s| &s.id == id && threshold > 0.0 && context_percent(s, &cfg.context_window_tokens).is_some_and(|p| p >= threshold)));
-                    drift_backoff.retain(|id, until| now < *until && cfg.instruction_canary_enabled && sessions.iter().any(|s| &s.id == id && s.instruction_drift));
+                    prune_holds(&mut context_backoff, now, |id| sessions.iter().any(|s| s.id == id && context_over(s, threshold, &cfg.context_window_tokens)));
+                    prune_holds(&mut drift_backoff, now, |id| sessions.iter().any(|s| s.id == id && drift_flagged(cfg.instruction_canary_enabled, s)));
                     reset_backoff.retain(|_, until| now < *until);
                     let (to_dismiss, to_send) = context_reconcile(threshold, &sessions, &cfg.context_window_tokens, &context_outstanding);
                     // Delete alerts whose session dropped back below the threshold
@@ -843,36 +952,16 @@ impl NotificationManager {
                     dismiss_and_forget(telegram.as_ref() as &dyn Notifier, &mut context_outstanding, to_dismiss, |h| h.as_str()).await;
                     for s in to_send {
                         let Some(text) = build_context_message(s, &cfg.sync.device_name, &cfg.context_window_tokens) else { continue };
-                        // Skip while a maybe-delivered hold is active (don't re-send a
-                        // possibly-delivered alert every tick).
-                        if context_backoff.get(&s.id).is_some_and(|until| now < *until) {
-                            continue;
-                        }
-                        match telegram.send_raw_tracked(&text).await {
-                            // Track the handle so we can delete it when usage drops.
-                            Ok(handle) => {
-                                tracing::debug!(
-                                    channel = "telegram",
-                                    id = %s.id,
-                                    decision = "context_alert",
-                                    percent = context_percent(s, &cfg.context_window_tokens).unwrap_or(0.0),
-                                    threshold,
-                                    reason = "context usage crossed alert threshold",
-                                    "context alert sent"
-                                );
-                                context_outstanding.insert(s.id.clone(), handle);
-                                context_backoff.remove(&s.id);
-                            }
-                            // A maybe-delivered read timeout backs off; a definite
-                            // failure clears the hold and retries on the next tick.
-                            Err(SendError { maybe_delivered: true, source }) => {
-                                context_backoff.insert(s.id.clone(), now + UNCERTAIN_RETRY_BACKOFF_MS);
-                                tracing::warn!(channel = "telegram", id = %s.id, decision = "context_alert", backoff_ms = UNCERTAIN_RETRY_BACKOFF_MS, error = %source, "context alert may have been delivered; backing off retry");
-                            }
-                            Err(SendError { maybe_delivered: false, source }) => {
-                                context_backoff.remove(&s.id);
-                                tracing::warn!(channel = "telegram", id = %s.id, error = %source, "context alert send failed");
-                            }
+                        if send_tracked_alert(&telegram, &mut context_outstanding, &mut context_backoff, &s.id, now, "context_alert", "context alert", || text).await {
+                            tracing::debug!(
+                                channel = "telegram",
+                                id = %s.id,
+                                decision = "context_alert",
+                                percent = context_percent(s, &cfg.context_window_tokens).unwrap_or(0.0),
+                                threshold,
+                                reason = "context usage crossed alert threshold",
+                                "context alert sent"
+                            );
                         }
                     }
 
@@ -892,34 +981,43 @@ impl NotificationManager {
                     }
                     dismiss_and_forget(telegram.as_ref() as &dyn Notifier, &mut stale_outstanding, stale_dismiss, |h| h.as_str()).await;
                     for s in stale_send {
-                        if stale_backoff.get(&s.id).is_some_and(|until| now < *until) {
-                            continue;
-                        }
-                        // Resolved here rather than once per tick. This loop is
-                        // empty on all but a handful of ticks in a process's life,
-                        // and hoisting the lookup above it built an adapter every
+                        // The remedy is resolved inside the send, after the hold
+                        // check, rather than once per tick. This loop is empty on
+                        // all but a handful of ticks in a process's life, and
+                        // hoisting the lookup above it built an adapter every
                         // second, forever, to fetch a string that depends only on
                         // the platform. Every other caller builds one adapter and
                         // keeps it; nothing in the trait promises a constructor
                         // stays free.
-                        let remedy = crate::terminals::for_platform(&app).map_or(crate::terminals::FALLBACK_STALE_REMEDY, |a| a.stale_remedy());
-                        match telegram.send_raw_tracked(&build_stale_tab_message(s, &cfg.sync.device_name, remedy)).await {
-                            Ok(handle) => {
-                                tracing::debug!(channel = "telegram", id = %s.id, decision = "stale_tab_alert", reason = "the terminal tab stopped following this row", "stale-tab alert sent");
-                                stale_outstanding.insert(s.id.clone(), handle);
-                                stale_backoff.remove(&s.id);
-                            }
-                            Err(SendError { maybe_delivered: true, source }) => {
-                                stale_backoff.insert(s.id.clone(), now + UNCERTAIN_RETRY_BACKOFF_MS);
-                                tracing::warn!(channel = "telegram", id = %s.id, decision = "stale_tab_alert", backoff_ms = UNCERTAIN_RETRY_BACKOFF_MS, error = %source, "stale-tab alert may have been delivered; backing off retry");
-                            }
-                            Err(SendError { maybe_delivered: false, source }) => {
-                                stale_backoff.remove(&s.id);
-                                tracing::warn!(channel = "telegram", id = %s.id, decision = "stale_tab_alert", error = %source, "stale-tab alert failed; will retry");
-                            }
+                        let text = || build_stale_tab_message(s, &cfg.sync.device_name, crate::terminals::for_platform(&app).map_or(crate::terminals::FALLBACK_STALE_REMEDY, |a| a.stale_remedy()));
+                        if send_tracked_alert(&telegram, &mut stale_outstanding, &mut stale_backoff, &s.id, now, "stale_tab_alert", "stale-tab alert", text).await {
+                            tracing::debug!(channel = "telegram", id = %s.id, decision = "stale_tab_alert", reason = "the terminal tab stopped following this row", "stale-tab alert sent");
                         }
                     }
-                    stale_backoff.retain(|id, until| now < *until && sessions.iter().any(|s| &s.id == id && s.terminal_stale_at.is_some()));
+                    prune_holds(&mut stale_backoff, now, |id| sessions.iter().any(|s| s.id == id && s.terminal_stale_at.is_some()));
+
+                    // Two or more Claude Code sessions in one row's folder. The
+                    // row can follow only one, and one per folder is the norm, so
+                    // a second that outlasts the delay is reported as a fault.
+                    let shared_delay = tg_cfg.and_then(|c| c.shared_row_alert_ms);
+                    let shared_since = app.try_state::<Members>().map(|m| m.shared_since()).unwrap_or_default();
+                    let (shared_dismiss, shared_send) = shared_reconcile(shared_delay, &sessions, &shared_since, &shared_outstanding, now);
+                    for id in &shared_dismiss {
+                        tracing::debug!(
+                            channel = "telegram",
+                            id = %id,
+                            decision = "shared_row_dismiss",
+                            reason = if alert_delay(shared_delay).is_some() { "the row is back to one session in its folder, or its sessions ended" } else { "the option was turned off" },
+                            "shared-row alert dismissed"
+                        );
+                    }
+                    dismiss_and_forget(telegram.as_ref() as &dyn Notifier, &mut shared_outstanding, shared_dismiss, |h| h.as_str()).await;
+                    for s in shared_send {
+                        if send_tracked_alert(&telegram, &mut shared_outstanding, &mut shared_backoff, &s.id, now, "shared_row_alert", "shared-row alert", || build_shared_row_message(s, &cfg.sync.device_name)).await {
+                            tracing::debug!(channel = "telegram", id = %s.id, decision = "shared_row_alert", shared_since = shared_since.get(&s.id).copied(), reason = "two or more Claude Code sessions have been running in this row's folder past the alert delay", "shared-row alert sent");
+                        }
+                    }
+                    prune_holds(&mut shared_backoff, now, |id| alert_delay(shared_delay).is_some() && shared_since.contains_key(id));
 
                     // Instruction-drift alerts (the adherence canary) — same
                     // send / track / dismiss lifecycle as the context-usage alert,
@@ -942,31 +1040,14 @@ impl NotificationManager {
                     }
                     dismiss_and_forget(telegram.as_ref() as &dyn Notifier, &mut drift_outstanding, drift_dismiss, |h| h.as_str()).await;
                     for s in drift_send {
-                        // Skip while a maybe-delivered hold is active (don't re-send a
-                        // possibly-delivered alert every tick).
-                        if drift_backoff.get(&s.id).is_some_and(|until| now < *until) {
-                            continue;
-                        }
-                        match telegram.send_raw_tracked(&build_drift_message(s, &cfg.sync.device_name)).await {
-                            Ok(handle) => {
-                                tracing::debug!(
-                                    channel = "telegram",
-                                    id = %s.id,
-                                    decision = "drift_alert",
-                                    reason = "final message dropped the session adherence marker",
-                                    "instruction-drift alert sent"
-                                );
-                                drift_outstanding.insert(s.id.clone(), handle);
-                                drift_backoff.remove(&s.id);
-                            }
-                            Err(SendError { maybe_delivered: true, source }) => {
-                                drift_backoff.insert(s.id.clone(), now + UNCERTAIN_RETRY_BACKOFF_MS);
-                                tracing::warn!(channel = "telegram", id = %s.id, decision = "drift_alert", backoff_ms = UNCERTAIN_RETRY_BACKOFF_MS, error = %source, "instruction-drift alert may have been delivered; backing off retry");
-                            }
-                            Err(SendError { maybe_delivered: false, source }) => {
-                                drift_backoff.remove(&s.id);
-                                tracing::warn!(channel = "telegram", id = %s.id, error = %source, "instruction-drift alert send failed");
-                            }
+                        if send_tracked_alert(&telegram, &mut drift_outstanding, &mut drift_backoff, &s.id, now, "drift_alert", "instruction-drift alert", || build_drift_message(s, &cfg.sync.device_name)).await {
+                            tracing::debug!(
+                                channel = "telegram",
+                                id = %s.id,
+                                decision = "drift_alert",
+                                reason = "final message dropped the session adherence marker",
+                                "instruction-drift alert sent"
+                            );
                         }
                     }
 
@@ -1693,6 +1774,7 @@ mod tests {
         assert_eq!(build_message_text(&s, "  "), "[proj] done");
         assert!(build_drift_message(&s, "AIR").starts_with("⚠ [proj:air] instruction drift"));
         assert!(build_stale_tab_message(&s, "AIR", "x").starts_with("⚠ [proj:air] its terminal tab"));
+        assert!(build_shared_row_message(&s, "AIR").starts_with("⚠ [proj:air] two or more Claude Code sessions"));
         let w = windows();
         assert_eq!(build_context_message(&ctx_session("proj", "m", 144_000), "AIR", &w).as_deref(), Some("[proj:air] context 72% (144k/200k)"));
     }
@@ -2015,6 +2097,123 @@ mod tests {
         // Only the stale one is outstanding; the drift reconciler must not dismiss it.
         let stale_out: HashMap<String, String> = [("s".to_string(), "h".to_string())].into_iter().collect();
         assert!(drift_reconcile(true, &rows, &stale_out).0.is_empty(), "drift dismisses only its own");
+    }
+
+    const SHARED_DELAY: u64 = 60_000;
+
+    fn shared(rows: &[(&str, i64)]) -> HashMap<String, i64> {
+        rows.iter().map(|(id, at)| (id.to_string(), *at)).collect()
+    }
+
+    #[test]
+    fn a_shared_row_is_not_alerted_until_the_delay_has_run() {
+        // A probe started in the folder lived 13s; it must come and go unreported.
+        let out = HashMap::new();
+        let rows = vec![session("s", Status::Working, 0)];
+        let since = shared(&[("s", 1_000)]);
+        let (_, send) = shared_reconcile(Some(SHARED_DELAY), &rows, &since, &out, 1_000 + SHARED_DELAY as i64 - 1);
+        assert!(send.is_empty(), "still inside the window");
+        let (_, send) = shared_reconcile(Some(SHARED_DELAY), &rows, &since, &out, 1_000 + SHARED_DELAY as i64);
+        assert_eq!(sent_ids(&send), vec!["s".to_string()]);
+    }
+
+    #[test]
+    fn a_row_with_one_session_is_never_alerted() {
+        let rows = vec![session("s", Status::Working, 0)];
+        let (dismiss, send) = shared_reconcile(Some(SHARED_DELAY), &rows, &HashMap::new(), &HashMap::new(), 10_000_000);
+        assert!(send.is_empty() && dismiss.is_empty());
+    }
+
+    #[test]
+    fn shared_row_alert_fires_once_then_dismisses_when_back_to_one_session() {
+        let mut out = HashMap::new();
+        let rows = vec![session("s", Status::Working, 0)];
+        let since = shared(&[("s", 0)]);
+        let now = SHARED_DELAY as i64;
+        let (dismiss, send) = shared_reconcile(Some(SHARED_DELAY), &rows, &since, &out, now);
+        assert_eq!(sent_ids(&send), vec!["s".to_string()]);
+        assert!(dismiss.is_empty());
+        apply(&mut out, dismiss, send);
+        let (dismiss, send) = shared_reconcile(Some(SHARED_DELAY), &rows, &since, &out, now + 1_000);
+        assert!(send.is_empty() && dismiss.is_empty(), "one message per overlap");
+        let (dismiss, send) = shared_reconcile(Some(SHARED_DELAY), &rows, &HashMap::new(), &out, now + 2_000);
+        assert_eq!(dismiss, vec!["s".to_string()], "the second session left");
+        assert!(send.is_empty());
+    }
+
+    #[test]
+    fn a_shared_row_absent_inside_a_clear_gap_keeps_its_alert() {
+        // The `/clear` removed the row until its start; its members stay shared.
+        let mut out: HashMap<String, String> = [("s".to_string(), "h".to_string())].into_iter().collect();
+        let since = shared(&[("s", 0)]);
+        let (dismiss, send) = shared_reconcile(Some(SHARED_DELAY), &[], &since, &out, 10_000_000);
+        assert!(dismiss.is_empty() && send.is_empty(), "no delete during the gap");
+        let rows = vec![session("s", Status::Idle, 0)];
+        let (dismiss, send) = shared_reconcile(Some(SHARED_DELAY), &rows, &since, &out, 10_001_000);
+        assert!(dismiss.is_empty() && send.is_empty(), "and no second buzz when the row is back");
+        out.clear();
+        let (_, send) = shared_reconcile(Some(SHARED_DELAY), &[], &since, &out, 10_002_000);
+        assert!(send.is_empty(), "nothing to name a message after while the row is absent");
+    }
+
+    #[test]
+    fn a_shared_row_whose_members_are_forgotten_has_its_alert_dismissed() {
+        let out: HashMap<String, String> = [("gone".to_string(), "h".to_string())].into_iter().collect();
+        let (dismiss, send) = shared_reconcile(Some(SHARED_DELAY), &[], &HashMap::new(), &out, 10_000_000);
+        assert_eq!(dismiss, vec!["gone".to_string()]);
+        assert!(send.is_empty());
+    }
+
+    #[test]
+    fn a_null_or_zero_shared_delay_turns_the_alert_off_and_dismisses_outstanding() {
+        let out: HashMap<String, String> = [("s".to_string(), "h-s".to_string())].into_iter().collect();
+        let rows = vec![session("s", Status::Working, 0)];
+        let since = shared(&[("s", 0)]);
+        for off in [None, Some(0)] {
+            let (dismiss, send) = shared_reconcile(off, &rows, &since, &out, 10_000_000);
+            assert_eq!(dismiss, vec!["s".to_string()], "{off:?}");
+            assert!(send.is_empty(), "{off:?}");
+        }
+    }
+
+    #[test]
+    fn shared_and_stale_alerts_do_not_cancel_each_other() {
+        // One row with both messages out; the second session leaves. Only the
+        // shared-row message goes, since the tab is still stale.
+        let rows = vec![stale_row("s", 0)];
+        let now = STALE_DELAY as i64;
+        let out: HashMap<String, String> = [("s".to_string(), "h".to_string())].into_iter().collect();
+        assert_eq!(shared_reconcile(Some(SHARED_DELAY), &rows, &HashMap::new(), &out, now).0, vec!["s".to_string()]);
+        assert!(stale_reconcile(Some(STALE_DELAY), &rows, &out, now).0.is_empty());
+    }
+
+    #[test]
+    fn a_maybe_delivered_hold_blocks_the_resend_until_it_expires() {
+        let holds: HashMap<String, i64> = [("s".to_string(), 1_000 + UNCERTAIN_RETRY_BACKOFF_MS)].into_iter().collect();
+        assert!(on_hold(&holds, "s", 1_000));
+        assert!(on_hold(&holds, "s", 1_000 + UNCERTAIN_RETRY_BACKOFF_MS - 1));
+        assert!(!on_hold(&holds, "s", 1_000 + UNCERTAIN_RETRY_BACKOFF_MS));
+        assert!(!on_hold(&holds, "other", 1_000));
+    }
+
+    #[test]
+    fn a_hold_is_dropped_when_it_expires_or_its_condition_clears() {
+        // A row back to one session and shared again inside the backoff window
+        // must alert for the new overlap rather than wait out the old hold.
+        let until = 1_000 + UNCERTAIN_RETRY_BACKOFF_MS;
+        let mut holds: HashMap<String, i64> = [("live".to_string(), until), ("cleared".to_string(), until)].into_iter().collect();
+        prune_holds(&mut holds, 2_000, |id| id == "live");
+        assert_eq!(holds.keys().collect::<Vec<_>>(), vec!["live"]);
+        prune_holds(&mut holds, until, |_| true);
+        assert!(holds.is_empty(), "expired");
+    }
+
+    #[test]
+    fn shared_row_message_format() {
+        assert_eq!(
+            build_shared_row_message(&session("proj", Status::Working, 0), ""),
+            "⚠ [proj] two or more Claude Code sessions are running in its folder; close the ones you are not using, since the row can follow only one of them."
+        );
     }
 
     #[test]

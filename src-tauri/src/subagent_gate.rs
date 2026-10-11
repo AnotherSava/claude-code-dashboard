@@ -114,6 +114,9 @@ pub(crate) enum SettledVia {
     SubagentStop,
     /// A main `Stop` reported no background work in flight.
     StopNoBackground,
+    /// The session whose state the row showed left while others remain, and the
+    /// prompts went with its state (`AppState::hand_over`).
+    HandedOver,
 }
 
 impl SettledVia {
@@ -122,6 +125,7 @@ impl SettledVia {
             SettledVia::ToolResult => "tool_result",
             SettledVia::SubagentStop => "subagent_stop",
             SettledVia::StopNoBackground => "stop_no_background",
+            SettledVia::HandedOver => "handed_over",
         }
     }
 
@@ -130,6 +134,7 @@ impl SettledVia {
             SettledVia::ToolResult => "the subagent's transcript recorded the gated call's result, so its dialog has closed",
             SettledVia::SubagentStop => "the subagent ended, so none of its dialogs can still be open",
             SettledVia::StopNoBackground => "the session's main turn ended with no background work in flight, so none of its subagents can still be prompting",
+            SettledVia::HandedOver => "the session whose state the row showed left, so its subagent prompts went with that state",
         }
     }
 }

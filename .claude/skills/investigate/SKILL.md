@@ -55,7 +55,8 @@ Each decision line carries `"decision":"<code>"`, the resolved agent (`chat_id`
 or `id`), and a `reason`:
 
 - `classify` — a hook event set the row's status (fields: `event`, `status`,
-  `label`, `reason`, `agent_id`). For a `Stop` the reason spells out the question
+  `label`, `reason`, `agent_id`, `member`). Logged only for events from the
+  session that drives the row; another session's events are `member_event`. For a `Stop` the reason spells out the question
   verdict: `turn ended on a question [<rule>]: "<snippet>"` or `… is not a question: "<snippet>"`;
   a `Stop` with background work still running lands on WAIT. `agent_id` names
   the subagent on a `PermissionRequest` (and `PreToolUse`) a subagent raised, and
@@ -81,7 +82,9 @@ or `id`), and a `reason`:
   `tool`, `pending`, `base_status`).
 - `subagent_prompt_settled` — one or more of those prompts closed. `via` is
   `tool_result` (the agent's transcript recorded the call's result; also
-  carries `is_error`, `matched_on`), `subagent_stop` or `stop_no_background`.
+  carries `is_error`, `matched_on`), `subagent_stop`, `stop_no_background` or
+  `handed_over` (the session whose state the row showed left, taking its
+  prompts with it).
   `status` is what the row shows afterwards; `released: false` means other
   prompts still hold the BLOCK.
 - `subagent_prompt_unmatched` — diagnosis only, once per prompt: the gate could
@@ -91,8 +94,8 @@ or `id`), and a `reason`:
   can still settle the prompt `via=tool_result`.
 - `pull_claim` — a `/pull` run reported leaving nothing worth coming back to.
   `outcome` is `recorded`, `no_row` (no row here for that session), or
-  `not_owner` (a live sibling in the same directory holds the row, so this
-  instance may not speak for it). Moves nothing on its own; a `recorded` claim is
+  `not_owner` (another session in the same directory drives the row, so this
+  one may not speak for it). Moves nothing on its own; a `recorded` claim is
   what the turn's `Stop` then weighs.
 - `pull_clean` — the `Stop` that weighed such a claim. With no `outcome` it
   settled the row CLEAN instead of DONE. With one it refused, and the `outcome`
@@ -106,7 +109,39 @@ or `id`), and a `reason`:
   A `recorded` `pull_claim` with no `pull_clean` at all means a later prompt
   revoked the claim before any `Stop` came.
 - `session_clear` / `compact_boundary` — session removed / context-compaction
-  separator inserted.
+  separator inserted. A `/clear` whose `SessionStart` arrived before its
+  `SessionEnd` logs `session_clear` from the start; its late end then logs
+  `clear_superseded` and does nothing.
+- Row membership. Every Claude Code process in one folder addresses the same
+  row; the row keeps them as *members* and follows one, its *main*:
+  - `member_join` — a session joined the row (`member` is `pid:N` or
+    `session:ID`, `main` whether it drives the row).
+  - `member_rekey` — a known member is now keyed differently: its pid arrived,
+    or a `--continue` resumed its session in a new process.
+  - `main_change` — the row follows another session (`from`, `to`, `via`):
+    `founding` (first session seen), `succession` (the main left and one
+    session remains), `sole_member` (no main, and one session a process backs
+    is left or has just joined),
+    `departed_no_successor` (the main left and several remain; each drives the
+    row until only one is left). A prompt never moves the main, so a second
+    session typed into stays a `member_event` source. Only sessions with a known
+    pid count toward succession on a row that has ever had one.
+  - `member_event` — an event from a session that does not drive the row,
+    recorded and not applied (`status` is what it would have set). A run of
+    these next to a live main is a second `claude` in the folder, not a stuck row.
+  - `member_leave` — a member left (`via` `session_end` or `reaped`,
+    `was_main`, `drove_last`, `remaining`). With `prior_status` present, the row
+    was handed over: it settled DONE behind an `Ended` separator, because what it
+    showed was the departed session's (the main's, or the last writer's while
+    there was no main), and `prior_status` is what it showed. Without it the
+    leave changed nothing the row shows.
+  - `end_unmatched` — a `SessionEnd` from a session that is not a member of a
+    row that has members; refused.
+  - `shared_row_alert` / `shared_row_dismiss` — the row has had two or more
+    members for longer than `notifications.telegram.shared_row_alert_ms`, so a
+    Telegram message asked the user to close one (`shared_since` is when the
+    second joined); dismissed once the row is back to one member, goes away, or
+    the alert is turned off. Moves no status.
 - `settle_waiting` — the backstop settled a WAIT held by a background shell
   task to Done once it sat unchanged past the window (`waited_ms`,
   `window_ms`): a task the user killed ends silently, so no later `Stop` comes.
@@ -115,16 +150,20 @@ or `id`), and a `reason`:
   or WAIT glyph is only as fresh as the downtime, so it is kept only where the
   session registry independently reports a turn running and degrades to DONE
   otherwise; a CLEAN tab restores no row at all.
-- `reap_exited` — the liveness reaper removed the row because its owning Claude
+- `reap_exited` — the liveness reaper removed the row because its last Claude
   process exited without a `SessionEnd` (e.g. you typed `exit` / closed the
-  terminal). Carries the dead `pid` and the `prior_status` the row last held.
+  terminal). Carries the dead `pids` and the `prior_status` the row last held.
+  A dead member that was not the last logs only `member_leave` with
+  `via=reaped`.
   This is a terminal decision: if it's the newest line, the row is gone on
   purpose, not stuck.
 
 Historical, only in logs written by older builds: `enter_waiting` (WAIT now
 comes from `classify` of a `Stop`), and `correct_to_blocked` /
 `correct_to_done` (the watcher's re-judging of a too-early `Stop`, removed
-once `Stop` carried its final message). The log is append-only, so it also
+once `Stop` carried its final message), and `clear_ignored` (an end signal
+refused because another session had written the row last, before rows kept
+members; `end_unmatched` and `member_leave` replaced it). The log is append-only, so it also
 holds lines from builds where `Idle` was the catch-all for anything
 unestablished: an old IDLE in a trail is not the CLEAN claim above, and only
 lines after the deploy that changed it can be read that way.
