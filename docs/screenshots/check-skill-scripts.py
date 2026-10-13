@@ -2,7 +2,7 @@
 """Every shared capture script the figures depend on still resolves on this machine.
 
 The capture libs do not carry their own screenshot machinery. Taking the picture,
-listing windows and stroking an edge belong to the docs-relevance skill in the
+listing windows and stroking an edge belong to the screenshot skill in the
 dotfiles, so a fix reaches every project at once — and the price of that split is
 a path this repo hardcodes and the dotfiles can rename out from under it.
 

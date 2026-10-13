@@ -33,9 +33,9 @@ which desaturates every stored number and stopped `check-figures.py` recognising
 macOS window chrome; that checker cannot rule on this frame either way, the
 widget being undecorated ("no window chrome to read"), so what the hero gets out
 of the conversion is only that its pixels are measured in the same space as every
-other frame. Run it from a terminal holding Screen Recording permission: without
-it `screencapture` quietly photographs the wallpaper, and the size check inside
-the lib's `capture_window` is what catches that.
+other frame. The picture is taken by DocShot, which must hold Screen Recording
+permission: without it `screencapture` quietly photographs the wallpaper, and the
+size check inside the lib's `capture_window` is what catches that.
 
 WHAT THIS SCRIPT CANNOT DO is put the widget into the state the frame has to
 show: one row blocked on its user, one working, one finished. Those are real

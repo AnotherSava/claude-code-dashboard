@@ -3,7 +3,7 @@
 
 Import it: `sys.path.insert(0, str(Path(__file__).parent / "lib"))` then
 `import dashboard as dash`. The macOS counterpart of `lib/dashboard.ps1` plus
-the docs-relevance skill's `window-shot.ps1` and `windows-capture.ps1`, which
+the screenshot skill's `window-shot.ps1` and `windows-capture.ps1`, which
 are one file here because macOS needs almost none of what the Windows capture
 needs.
 
@@ -18,11 +18,14 @@ solves the per-pixel alpha. macOS has one call that does all of it —
 `screencapture -l<id> -o` writes the window at device resolution with real
 per-pixel alpha and no shadow. The remaining work is finding the id.
 
-RUN THESE FROM A TERMINAL THAT HOLDS SCREEN RECORDING PERMISSION. Both halves
-need it: without it `screencapture` writes a picture of the desktop wallpaper
-rather than the window, and CoreGraphics blanks every window title so the match
-fails first. The failure is loud in the second case and silent in the first,
-which is why `capture_window` checks the size it got back.
+SCREEN RECORDING IS DOCSHOT'S, NOT THE TERMINAL'S. Listing windows and taking
+the picture both run inside the screenshot skill's DocShot.app, launched
+through LaunchServices so TCC attributes them to it. A terminal's grant does not
+hold: agterm is rebuilt ad-hoc signed, and each rebuild leaves its switch on in
+System Settings while the running build is no longer covered, so titles came back
+blank with the grant visibly on. Without the grant CoreGraphics blanks every
+window title and `screencapture` writes the wallpaper; `list_windows` refuses on
+the first and `capture_window` checks the size it got back for the second.
 
 THE ORIGIN HEADER IS OMITTED DELIBERATELY on every request below. `/api/window`
 and `/api/agents` run the CSRF guard, which accepts a request carrying no Origin
@@ -63,7 +66,7 @@ class CaptureError(RuntimeError):
     """Anything that should stop a capture rather than commit a wrong picture."""
 
 
-# Shared capture machinery lives in the docs-relevance skill, not here.
+# Shared capture machinery lives in the screenshot skill, not here.
 #
 # The split is: anything a different project would want unchanged — taking the
 # picture, listing windows, trimming a halo, stroking an edge — belongs to the
@@ -72,17 +75,18 @@ class CaptureError(RuntimeError):
 # knows: which window, which state to stage, which sessions may appear in frame.
 # A `~`-relative path is not machine-specific — it resolves the same wherever
 # those dotfiles are installed, which is the same condition under which a capture
-# runs at all. The skill was named `documentation` until the dotfiles renamed it
-# on 2026-09-17; the old path lived on here for three days, and every re-shoot on
-# either platform would have thrown `hairline.py is missing` until it was fixed.
-SKILL_SCRIPTS = Path.home() / ".claude" / "skills" / "docs-relevance" / "scripts"
+# runs at all. The scripts have moved skill twice — `documentation` to
+# `docs-relevance` on 2026-09-17, and on to `screenshot` on 2026-10-13 — and the
+# first time the old path lived on here for three days, so every re-shoot would
+# have thrown `hairline.py is missing`; `check-skill-scripts.py` now catches it.
+SKILL_SCRIPTS = Path.home() / ".claude" / "skills" / "screenshot" / "scripts"
 
 
 def skill_script(name: str) -> Path:
-    """A script from the docs-relevance skill, or a refusal that says how to get it."""
+    """A script from the screenshot skill, or a refusal that says how to get it."""
     p = SKILL_SCRIPTS / name
     if not p.exists():
-        raise CaptureError(f"{name} is missing from {SKILL_SCRIPTS}. The capture scripts call the docs-relevance skill's shared tooling; install the dotfiles (see their README) and run this again.")
+        raise CaptureError(f"{name} is missing from {SKILL_SCRIPTS}. The capture scripts call the screenshot skill's shared tooling; install the dotfiles (see their README) and run this again.")
     return p
 
 
@@ -167,17 +171,44 @@ def probe_path(name: str) -> Path:
 
 # ------------------------------------------------------------------- the window
 
-def list_windows() -> list[dict]:
-    """Every on-screen top-level window, via the docs-relevance skill's `window_list.swift`."""
+DOCSHOT = Path.home() / "Applications" / "DocShot.app"
+
+
+def docshot(*args: str, out: Path) -> None:
+    """Run DocShot with `args`, its answer written to `out`.
+
+    Launched with `open` so LaunchServices makes DocShot the responsible process
+    and its own Screen Recording grant applies; run directly, TCC would charge the
+    calling terminal. That launch has no stdout to hand back, so every mode writes
+    to `--out`, and `open` does not pass on DocShot's exit status, so the caller
+    judges the file. `-g` keeps it from taking focus from the window being shot.
+    """
+    if not DOCSHOT.exists():
+        raise CaptureError(f"{DOCSHOT} is missing. Build it once with the screenshot skill's build-docshot.sh and grant it Screen Recording.")
+    out.unlink(missing_ok=True)
     try:
-        r = subprocess.run(["swift", str(skill_script("window_list.swift"))], capture_output=True, timeout=60)
-    except FileNotFoundError as e:
-        raise CaptureError("`swift` is not on PATH. Install the Xcode Command Line Tools (`xcode-select --install`).") from e
+        subprocess.run(["open", "-g", "-n", "-W", "-a", str(DOCSHOT), "--args", *args, "--out", str(out)], check=True, capture_output=True, timeout=60)
     except subprocess.TimeoutExpired as e:
-        raise CaptureError("window_list.swift did not finish within 60s") from e
-    if r.returncode != 0:
-        raise CaptureError(f"window_list.swift failed: {r.stderr.decode('utf-8', 'replace').strip()}")
-    return json.loads(r.stdout.decode("utf-8"))
+        raise CaptureError("DocShot did not finish within 60s") from e
+    except subprocess.CalledProcessError as e:
+        raise CaptureError(f"could not launch DocShot: {e.stderr.decode('utf-8', 'replace').strip()}") from e
+
+
+def list_windows() -> list[dict]:
+    """Every on-screen window, via DocShot's `--list`."""
+    out = probe_path("docshot-list").with_suffix(".json")
+    docshot("--list", out=out)
+    try:
+        rows = json.loads(out.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError) as e:
+        raise CaptureError(f"DocShot --list wrote no readable answer to {out}") from e
+    finally:
+        out.unlink(missing_ok=True)
+    # The grant probe DocShot itself uses: only a foreign, ordinary window's title
+    # is gated, since Window Server's own surfaces report titles ungranted.
+    if not any(r["layer"] == 0 and r["owner"] != "Window Server" and r["title"] for r in rows):
+        raise CaptureError("Every window title came back blank, so DocShot does not hold Screen Recording. Grant it in System Settings > Privacy & Security > Screen Recording and run this again.")
+    return [{"id": r["id"], "owner": r["owner"], "title": r["title"], "layer": r["layer"], "x": r["x"], "y": r["y"], "w": r["width"], "h": r["height"]} for r in rows]
 
 
 def find_window(owner: str, title: str | None = None, title_contains: str | None = None) -> dict:
@@ -225,9 +256,9 @@ def capture_window(win: dict, out: Path, trim: bool = True) -> Path:
     out.parent.mkdir(parents=True, exist_ok=True)
     if out.exists():
         out.unlink()
-    r = subprocess.run(["screencapture", f"-l{win['id']}", "-o", "-x", "-t", "png", str(out)], capture_output=True, timeout=60)
-    if r.returncode != 0 or not out.exists():
-        raise CaptureError(f"screencapture failed for window {win['id']} ({win['title']!r}): {r.stderr.decode('utf-8', 'replace').strip()}")
+    docshot("--id", str(win["id"]), out=out)
+    if not out.exists():
+        raise CaptureError(f"DocShot wrote nothing for window {win['id']} ({win['title']!r})")
 
     # Screen Recording denied does not fail: screencapture writes a picture of
     # the desktop instead, at the display's size rather than the window's. So the
@@ -239,7 +270,7 @@ def capture_window(win: dict, out: Path, trim: bool = True) -> Path:
     if scale not in (1, 2) or abs(h - win["h"] * scale) > 2 * scale:
         raise CaptureError(
             f"{out.name} is {w}x{h}, which is not window {win['id']} ({int(win['w'])}x{int(win['h'])} logical) at 1x or 2x. "
-            "The usual cause is Screen Recording permission: grant it to this terminal in "
+            "The usual cause is Screen Recording permission: grant it to DocShot in "
             "System Settings > Privacy & Security > Screen Recording, then run it again."
         )
 

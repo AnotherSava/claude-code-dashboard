@@ -67,9 +67,9 @@ something whose answer folds, then capture — rather than a taller window.
 
 WHAT THE OPERATOR STAGES BY HAND: deploy the current build, so the frame shows
 the working tree rather than the installed release; read the session's tail
-first, per the requirements above; and run this from a terminal that holds
-Screen Recording permission, without which `screencapture` writes a picture of
-the wallpaper instead of the window (the lib checks the size it got back and
+first, per the requirements above; and make sure DocShot holds Screen Recording
+permission, without which `screencapture` writes a picture of the wallpaper
+instead of the window (the lib checks the size it got back and
 refuses, so this fails loudly rather than committing a desktop).
 
 Probe with --probe until the frame is right, then pass the height you settled on

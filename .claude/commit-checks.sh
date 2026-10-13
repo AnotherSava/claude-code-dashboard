@@ -102,7 +102,7 @@ python docs/screenshots/check-skill-scripts.py
 case "$OSTYPE" in
   msys*|cygwin*)
     echo "==> pwsh check-capture-scripts.ps1"
-    pwsh -NoProfile -NonInteractive -File ~/.claude/skills/docs-relevance/scripts/check-capture-scripts.ps1 ;;
+    pwsh -NoProfile -NonInteractive -File ~/.claude/skills/screenshot/scripts/check-capture-scripts.ps1 ;;
   *) echo "==> check-capture-scripts.ps1: NOT COVERED on $OSTYPE — the Windows capture scripts' names are checked on Windows only" ;;
 esac
 

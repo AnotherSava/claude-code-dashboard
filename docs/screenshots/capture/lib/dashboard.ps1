@@ -37,13 +37,13 @@
 
   The shutter (window-shot.ps1) and the helpers any project needs unchanged --
   the frame step, pointer placement, finding a process's windows -- come from
-  the docs-relevance skill's windows-capture.ps1, dot-sourced below, which every
+  the screenshot skill's windows-capture.ps1, dot-sourced below, which every
   project's Windows capture scripts share so a fix to one reaches all of them.
   What stays here is what only this app needs, such as its loopback API and
   getting its always-on-top widget out of the frame.
 #>
 
-$sharedCapture = Join-Path $env:USERPROFILE '.claude\skills\docs-relevance\scripts\windows-capture.ps1'
+$sharedCapture = Join-Path $env:USERPROFILE '.claude\skills\screenshot\scripts\windows-capture.ps1'
 if (-not (Test-Path $sharedCapture)) { throw "$sharedCapture is missing, and it holds the shutter every capture here uses. Install or pull the dotfiles and re-run. If the skill was renamed there, update this path and SKILL_SCRIPTS in lib/dashboard.py to match. Nothing was staged." }
 . $sharedCapture
 
