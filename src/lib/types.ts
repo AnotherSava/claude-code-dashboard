@@ -107,6 +107,8 @@ export interface Config {
   auto_resize: AutoResize
   history_font_size: HistoryFontSize
   intensity_axis_max_tokens: number | null
+  intensity_halving_drop: number | null
+  intensity_doubling_drop: number | null
   intensity_min_week_tokens: number | null
   // Compact view: hide each row's current prompt and time-in-state, and
   // collapse the usage bars down to their bare percentage. Toggled from the
@@ -176,6 +178,9 @@ export interface TokenWeekChart {
   // Half-height value for one 10-min bar. A stated reference, not a derived
   // one: tokens have no quota to be a fraction of.
   axis_max_tokens: number
+  // The scale's steepness below and above the reference; see heightFraction.
+  halving_drop: number
+  doubling_drop: number
 }
 
 export const stateLabel: Record<Status, string> = {

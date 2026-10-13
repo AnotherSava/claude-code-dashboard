@@ -322,6 +322,17 @@ fn merged_token_records(app: &AppHandle) -> Vec<crate::token_history::TokenRecor
     crate::token_history::reduce_by_id(&all)
 }
 
+/// The chart's steepness below and above its reference, each falling back to
+/// its default when unset or outside `(0, 1)`.
+fn token_scale_drops(app: &AppHandle) -> (f64, f64) {
+    let cfg = app.try_state::<ConfigState>().map(|c| c.snapshot());
+    let valid = |v: Option<f64>, default: f64| v.filter(|v| *v > 0.0 && *v < 1.0).unwrap_or(default);
+    (
+        valid(cfg.as_ref().and_then(|c| c.intensity_halving_drop), crate::token_history::DEFAULT_HALVING_DROP),
+        valid(cfg.as_ref().and_then(|c| c.intensity_doubling_drop), crate::token_history::DEFAULT_DOUBLING_DROP),
+    )
+}
+
 /// Half-height value for one 10-minute token bar, from config.
 fn token_axis_max(app: &AppHandle) -> f64 {
     app.try_state::<ConfigState>()
@@ -392,6 +403,7 @@ fn scanned_until(app: &AppHandle) -> Option<i64> {
 #[tauri::command]
 pub fn get_intensity_week(week_offset: i32, app: AppHandle) -> Result<crate::token_history::TokenWeekChart, String> {
     let week_start_ms = local_week_start_ms(week_offset)?;
+    let (halving_drop, doubling_drop) = token_scale_drops(&app);
     let records = merged_token_records(&app);
     let usage = merged_usage_records(&app);
     let quota = crate::usage_history::build_weekly_quota(&usage, week_start_ms);
@@ -400,6 +412,8 @@ pub fn get_intensity_week(week_offset: i32, app: AppHandle) -> Result<crate::tok
         &records,
         week_start_ms,
         token_axis_max(&app),
+        halving_drop,
+        doubling_drop,
         &quota,
         &limit,
         intensity_floor_ms(&records, min_week_tokens(&app))?,
@@ -419,13 +433,14 @@ pub fn get_intensity_weeks(app: AppHandle) -> Result<Vec<crate::token_history::T
         return Ok(Vec::new());
     };
     let axis_max = token_axis_max(&app);
+    let (halving_drop, doubling_drop) = token_scale_drops(&app);
     let scanned = scanned_until(&app);
     Ok(week_starts_back_to(data_min)?
         .into_iter()
         .map(|week_start_ms| {
             let quota = crate::usage_history::build_weekly_quota(&usage, week_start_ms);
             let limit = crate::usage_history::build_bucket_limit_pct(&usage, week_start_ms);
-            crate::token_history::build_token_week_chart(&records, week_start_ms, axis_max, &quota, &limit, Some(data_min), scanned)
+            crate::token_history::build_token_week_chart(&records, week_start_ms, axis_max, halving_drop, doubling_drop, &quota, &limit, Some(data_min), scanned)
         })
         .collect())
 }

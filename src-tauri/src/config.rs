@@ -107,14 +107,25 @@ pub struct Config {
     /// all. Same percentage as the token counter (`notifications::context_percent`).
     pub terminal_title_context_percent: Option<f32>,
     /// Half-height value for one 10-minute bar of the Work intensity chart,
-    /// whose scale is symmetric around it: each doubling halves the distance
-    /// left to the top and each halving halves the height, so nothing clips.
+    /// with taller and shorter bars following `intensity_doubling_drop` and
+    /// `intensity_halving_drop`, so nothing clips.
     /// Tokens have no quota to be a fraction of, so this is a stated reference
     /// rather than a derived one (measured p50 77k, p90 666k, p99 1517k per
     /// active bucket). The Weeks view sums groups of three buckets and scales
     /// this by the same factor, so a half-height bar means the same rate in
     /// both views. `null` or `0` falls back to the default.
     pub intensity_axis_max_tokens: Option<f64>,
+    /// How steep the Work intensity chart's scale is below
+    /// `intensity_axis_max_tokens`: the share of its height a bar loses each
+    /// time its value halves. `0.5` halves the height per halving; smaller
+    /// values lift small bars. Anything outside `(0, 1)`, or `null`, falls back
+    /// to [`crate::token_history::DEFAULT_HALVING_DROP`].
+    pub intensity_halving_drop: Option<f64>,
+    /// The same above the reference: the share of the remaining distance to
+    /// the top a bar closes each time its value doubles. Smaller values lower
+    /// tall bars. Anything outside `(0, 1)`, or `null`, falls back to
+    /// [`crate::token_history::DEFAULT_DOUBLING_DROP`].
+    pub intensity_doubling_drop: Option<f64>,
     /// Work tokens a week must hold for the Work intensity chart's history to
     /// start there. Only *leading* weeks are trimmed — the scanner's reach into
     /// Claude Code's transcripts begins as a trickle, a session or two whose
@@ -708,6 +719,8 @@ impl Default for Config {
             terminal_titles: true,
             terminal_title_context_percent: Some(50.0),
             intensity_axis_max_tokens: Some(crate::token_history::DEFAULT_AXIS_MAX_TOKENS),
+            intensity_halving_drop: Some(crate::token_history::DEFAULT_HALVING_DROP),
+            intensity_doubling_drop: Some(crate::token_history::DEFAULT_DOUBLING_DROP),
             intensity_min_week_tokens: Some(crate::token_history::MIN_WEEK_TOKENS),
             detect_cancelled_turns: true,
             reap_exited_sessions: true,

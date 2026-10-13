@@ -48,6 +48,8 @@ Every field is optional — omit one and the built-in default applies. A complet
   "always_on_top": true,
   "history_font_size": "regular",
   "intensity_axis_max_tokens": 1000000,
+  "intensity_halving_drop": 0.25,
+  "intensity_doubling_drop": 0.5,
   "intensity_min_week_tokens": 1000000,
   "auto_resize": "none",
   "compact_mode": false,
@@ -127,7 +129,9 @@ Set autostart through the tray's **On system start** submenu — it writes both 
 
 - `always_on_top` — keep the widget above other windows.
 - `history_font_size` — history-window text size, one of `"smallest"`, `"small"`, `"regular"`, `"large"`, `"largest"`.
-- `intensity_axis_max_tokens` — how many tokens in a 10-minute slice make a half-height bar in the [Work intensity](features#work-intensity) chart. Each doubling above it closes half the remaining gap to the top (twice the value is three-quarters height) and each halving halves the height, so no bar ever runs off the top. Lower it to give ordinary work more of the height; raise it to spread the peaks further apart. `null` or `0` restores the default.
+- `intensity_axis_max_tokens` — how many tokens in a 10-minute slice make a half-height bar in the [Work intensity](features#work-intensity) chart. Shorter and taller bars follow `intensity_halving_drop` and `intensity_doubling_drop`, and no bar ever runs off the top. Lower it to give ordinary work more of the height; raise it to spread the peaks further apart. `null` or `0` restores the default.
+- `intensity_halving_drop` — how steep that chart's scale is below the half-height value: the share of its height a bar loses each time its token count halves. At `0.5` half the tokens draw half as tall; smaller values make quiet slices stand out more. Anything not strictly between 0 and 1, or `null`, restores the default.
+- `intensity_doubling_drop` — the same above it: the share of the remaining gap to the top a bar closes each time its token count doubles. Smaller values keep busy slices further from the top. Anything not strictly between 0 and 1, or `null`, restores the default.
 - `intensity_min_week_tokens` — how much work a week must hold for the chart's history to start there. The oldest weeks it can reach are usually a trickle — a session or two, drawing as an empty row — so they're left out, and the history begins at the first week with real work in it. Only those leading weeks are skipped: a quiet week between two busy ones always shows. `null` restores the default; `0` shows every week there is any record of.
 - `auto_resize` — fit the window height to its content: `"up"` grows from a fixed bottom edge, `"down"` from a fixed top edge, `"none"` leaves the window manually sized. Under `"up"` and `"down"` the height stops being draggable; the width doesn't.
 - `save_window_position` — remember each window's position and size on close. The saved geometry lives in `window_position`, `history_window_position`, and `history_window_maximized`, which the widget manages for you — no need to edit them by hand. If the monitor a window was saved on is later disconnected or rearranged, the widget pulls it back onto a visible screen so it can't get stranded off-screen.

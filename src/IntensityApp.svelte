@@ -185,13 +185,16 @@
     return { active: activeAvg, pct, tokens }
   })
 
-  // Drawn height (0..1 of the row) for value / scaleMax. The reference value
-  // fills half the row, and every doubling halves the distance left to the top
-  // (2x -> 75%, 4x -> 87.5%) while every halving halves the height (0.5x -> 25%),
-  // so the scale never clips and f(x) + f(1/x) = 1 around the reference.
-  function heightFraction(ratio: number): number {
-    if (ratio <= 0) return 0
-    return ratio <= 1 ? ratio / 2 : 1 - 1 / (2 * ratio)
+  type Scale = { max: number; halvingDrop: number; doublingDrop: number }
+
+  // Drawn height (0..1 of the row) for a value. The reference value fills half
+  // the row; each halving below it loses `halvingDrop` of the height, and each
+  // doubling above it closes `doublingDrop` of the distance left to the top, so
+  // the scale never clips.
+  function heightFraction(value: number, scale: Scale): number {
+    if (value <= 0) return 0
+    const ratio = value / scale.max
+    return ratio <= 1 ? ratio ** -Math.log2(1 - scale.halvingDrop) / 2 : 1 - ratio ** Math.log2(1 - scale.doublingDrop) / 2
   }
 
   // Bar colour from the weekly limit left during its slot, blended through
@@ -328,7 +331,7 @@
     return `${Math.round(n)}`
   }
 
-  function drawBars(ctx: CanvasRenderingContext2D, bars: Bar[], offset: number, count: number, plotLeft: number, plotW: number, rowTop: number, rowH: number, scaleMax: number, hatch: CanvasPattern | null) {
+  function drawBars(ctx: CanvasRenderingContext2D, bars: Bar[], offset: number, count: number, plotLeft: number, plotW: number, rowTop: number, rowH: number, scale: Scale, hatch: CanvasPattern | null) {
     const colW = plotW / count
     const rowBottom = rowTop + rowH
     for (let s = 0; s < count; s++) {
@@ -343,7 +346,7 @@
         continue
       }
       if (b.value <= 0) continue // idle: baseline only
-      const h = heightFraction(b.value / scaleMax)
+      const h = heightFraction(b.value, scale)
       const barH = Math.max(1, h * rowH)
       ctx.fillStyle = barColor(b.limit_pct)
       ctx.fillRect(x + 0.3, rowBottom - barH, Math.max(0.6, colW - 0.6), barH)
@@ -395,7 +398,7 @@
     const { gutterLeft, rowGap, plotLeft, plotTop, plotBottom, plotW, plotH, rowH, colW } =
       computeLayout(cssW, cssH)
     if (plotW <= 0 || plotH <= 0) return
-    const scaleMax = week.axis_max_tokens
+    const scale: Scale = { max: week.axis_max_tokens, halvingDrop: week.halving_drop, doublingDrop: week.doubling_drop }
     const bars = barsOf(week)
     const hatch = ensureHatch(ctx)
     ctx.textBaseline = 'middle'
@@ -434,7 +437,7 @@
       ctx.fillStyle = '#b6b6ba'
       ctx.fillText(dayDate.toLocaleDateString(undefined, { month: 'short', day: 'numeric' }), lx, midY + 9)
 
-      drawBars(ctx, bars, d * SLOTS_PER_DAY, SLOTS_PER_DAY, plotLeft, plotW, rowTop, rowH, scaleMax, hatch)
+      drawBars(ctx, bars, d * SLOTS_PER_DAY, SLOTS_PER_DAY, plotLeft, plotW, rowTop, rowH, scale, hatch)
 
       // The day's share of a *daily* quota is its share of the 7-day one × 7,
       // so a day that spent a seventh of the week reads 100%, and a heavy day
@@ -452,7 +455,7 @@
   // data at all stays a gap.
   //
   // The group is summed, which makes a week bar read as the volume of the whole
-  // group; its scaleMax is multiplied by the same factor, so a half-height bar
+  // group; its scale.max is multiplied by the same factor, so a half-height bar
   // means the same rate in both views. Its limit is the highest of the group,
   // the counter only rising inside a window.
   function downsample(bars: Bar[], factor: number): Bar[] {
@@ -490,7 +493,7 @@
     if (plotW <= 0 || plotH <= 0) return
     // Summed groups need a proportionally larger reference, so a half-height week
     // bar means the same rate as a half-height day bar.
-    const scaleMax = win.all[0].axis_max_tokens * WEEK_GROUP
+    const scale: Scale = { max: win.all[0].axis_max_tokens * WEEK_GROUP, halvingDrop: win.all[0].halving_drop, doublingDrop: win.all[0].doubling_drop }
     const hatch = ensureHatch(ctx)
     ctx.textBaseline = 'middle'
 
@@ -535,7 +538,7 @@
       ctx.fillText(endStr, lx, midY + 14)
 
       const slots = downsample(barsOf(week), WEEK_GROUP)
-      drawBars(ctx, slots, 0, slots.length, plotLeft, plotW, rowTop, rowH, scaleMax, hatch)
+      drawBars(ctx, slots, 0, slots.length, plotLeft, plotW, rowTop, rowH, scale, hatch)
 
       // Faint day separators over the dense bars, to keep the week readable.
       for (let d = 1; d < 7; d++) {
