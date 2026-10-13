@@ -164,11 +164,11 @@ When the badge is on, the tray icon also flags the moment any session's context 
 
 A separate window — opened from the tray's **Work intensity** item — charts how hard your agents have been working over time. Each bar covers a short slice of time and grows taller the busier that slice was, while its colour shows how much of the weekly limit was left at the time — green with plenty to spare, turning yellow and then red as it runs out. A **Days** view lays out one week as seven rows, one per day; a **Weeks** view gives one row per week and scrolls back through your history. With [multi-device sync](#multi-device-sync) configured, the chart covers your other devices too, so it shows the work done on the account as a whole rather than just here.
 
-{% include figure.html id="work-intensity" alt="The Work intensity chart in its Days view — one row per day, ten-minute bars, and each row's active time, tokens and share of the weekly quota in the right margin" %}
+{% include figure.html id="work-intensity" alt="The Work intensity chart in its Days view — one row per day, ten-minute bars, and each row's active time, tokens and share of a day's quota in the right margin" %}
 
 The bars count the work itself, from Claude Code's own records: because that isn't a share of anything, it stays comparable when your quota changes — switching plans or a promotional bump leaves it alone. It reaches back as far as Claude Code's stored history — beginning at the first week with real work in it, because the oldest weeks it can reach are usually a session or two and draw as an empty row — and slices with nothing recorded are marked as unknown rather than shown as idle.
 
-Beside each row are its numbers: how long your agents were busy, how much work that came to, and what it cost of your weekly limit. The last of those comes from the usage counter rather than from the records behind the bars, so it's there for days the bars can say nothing about.
+Beside each row are its numbers: how long your agents were busy, how much work that came to, and what it cost of your weekly limit. In the **Days** view that cost is measured against a day's even share of the week, so a heavy day reads past 100%. The last of those comes from the usage counter rather than from the records behind the bars, so it's there for days the bars can say nothing about.
 
 ## Multi-device sync
 
