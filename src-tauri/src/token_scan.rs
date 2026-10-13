@@ -19,6 +19,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -34,6 +35,26 @@ const POLL: Duration = Duration::from_secs(60);
 /// block the runtime for an unbounded time. The cursor makes the remainder
 /// simply arrive on the next tick.
 const MAX_RECORDS_PER_PASS: usize = 20_000;
+
+/// When the newest pass that read every transcript to its end began, in ms
+/// since epoch. Up to that instant this machine's transcripts are fully in the
+/// store, so a slot after the newest record but before it is known idle rather
+/// than unknown. The pass's start rather than its end, since a line written
+/// while the pass ran may have been missed. In memory only: until the first
+/// pass after a start, coverage ends at the newest record.
+#[derive(Default)]
+pub struct ScanClock(Mutex<Option<i64>>);
+
+impl ScanClock {
+    pub fn covered_until(&self) -> Option<i64> {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn stamp(&self, started_ms: i64) {
+        let mut at = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        *at = Some(at.map_or(started_ms, |prev| prev.max(started_ms)));
+    }
+}
 
 /// How far each transcript has been consumed, keyed by absolute path.
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -149,12 +170,13 @@ fn scan_file(path: &Path, consumed: u64) -> Option<(Vec<TokenRecord>, u64)> {
 
 /// One read-only pass over the tree: prune cursors for rotated files, then
 /// parse whatever each transcript has gained. Returns the file count, the
-/// parsed records, and the cursor positions those records justify.
+/// parsed records, the cursor positions those records justify, and whether
+/// every file was read to its end (a pass stopped by the record cap was not).
 ///
 /// Pure file work with no app state, so it runs on a blocking thread; the
 /// caller owns the append and only then commits `positions`, which keeps a
 /// failed write retryable instead of silently skipped.
-fn collect_once(root: &Path, cursor: &mut ScanCursor) -> (usize, Vec<TokenRecord>, Vec<(String, u64)>) {
+fn collect_once(root: &Path, cursor: &mut ScanCursor) -> (usize, Vec<TokenRecord>, Vec<(String, u64)>, bool) {
     let files = transcript_files(root);
     let seen: std::collections::HashSet<String> = files.iter().map(|p| p.display().to_string()).collect();
     // Drop cursors for transcripts Claude Code has rotated away, so the map
@@ -163,8 +185,10 @@ fn collect_once(root: &Path, cursor: &mut ScanCursor) -> (usize, Vec<TokenRecord
 
     let mut batch: Vec<TokenRecord> = Vec::new();
     let mut positions: Vec<(String, u64)> = Vec::new();
+    let mut complete = true;
     for path in files.iter() {
         if batch.len() >= MAX_RECORDS_PER_PASS {
+            complete = false;
             break;
         }
         let key = path.display().to_string();
@@ -173,7 +197,7 @@ fn collect_once(root: &Path, cursor: &mut ScanCursor) -> (usize, Vec<TokenRecord
         batch.extend(records);
         positions.push((key, next));
     }
-    (files.len(), batch, positions)
+    (files.len(), batch, positions, complete)
 }
 
 /// Apply the positions a successful append has earned.
@@ -211,6 +235,7 @@ pub fn spawn(app: AppHandle) {
         loop {
             ticker.tick().await;
 
+            let started_ms = chrono::Utc::now().timestamp_millis();
             let scan_root = root.clone();
             let scan_cursor_file = cursor_file.clone();
             // Blocking file work off the async runtime: the first pass parses the
@@ -220,21 +245,28 @@ pub fn spawn(app: AppHandle) {
             let scanned = tauri::async_runtime::spawn_blocking(move || {
                 let started = std::time::Instant::now();
                 let mut cursor = load_cursor(&scan_cursor_file);
-                let (files, batch, positions) = collect_once(&scan_root, &mut cursor);
-                (files, batch, positions, cursor, started.elapsed().as_millis() as u64)
+                let (files, batch, positions, complete) = collect_once(&scan_root, &mut cursor);
+                (files, batch, positions, complete, cursor, started.elapsed().as_millis() as u64)
             })
             .await;
 
-            let Ok((files, batch, positions, mut cursor, took_ms)) = scanned else { continue };
+            let Ok((files, batch, positions, complete, mut cursor, took_ms)) = scanned else { continue };
             let mut appended = 0;
+            let mut stored = batch.is_empty();
             if batch.is_empty() {
                 // No new records, but the prune above still needs persisting.
                 save_cursor(&cursor_file, &cursor);
             } else if let Some(store) = app.try_state::<TokenHistoryStore>() {
                 if store.append_batch(&batch).is_some() {
                     appended = batch.len();
+                    stored = true;
                     commit(&mut cursor, positions);
                     save_cursor(&cursor_file, &cursor);
+                }
+            }
+            if complete && stored && files > 0 {
+                if let Some(clock) = app.try_state::<ScanClock>() {
+                    clock.stamp(started_ms);
                 }
             }
             if files == 0 {

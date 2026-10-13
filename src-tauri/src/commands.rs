@@ -322,7 +322,7 @@ fn merged_token_records(app: &AppHandle) -> Vec<crate::token_history::TokenRecor
     crate::token_history::reduce_by_id(&all)
 }
 
-/// Full-height value for one 10-minute token bar, from config.
+/// Half-height value for one 10-minute token bar, from config.
 fn token_axis_max(app: &AppHandle) -> f64 {
     app.try_state::<ConfigState>()
         .and_then(|c| c.snapshot().intensity_axis_max_tokens)
@@ -382,21 +382,28 @@ fn min_week_tokens(app: &AppHandle) -> f64 {
         .unwrap_or(crate::token_history::MIN_WEEK_TOKENS)
 }
 
+fn scanned_until(app: &AppHandle) -> Option<i64> {
+    app.try_state::<crate::token_scan::ScanClock>().and_then(|c| c.covered_until())
+}
+
 /// Build the work intensity chart for one week (see `local_week_start_ms`):
 /// token bars from the transcript scan, plus each day's share of the 7-day
-/// quota from the usage poller.
+/// quota and each bar's colouring limit percentage from the usage poller.
 #[tauri::command]
 pub fn get_intensity_week(week_offset: i32, app: AppHandle) -> Result<crate::token_history::TokenWeekChart, String> {
     let week_start_ms = local_week_start_ms(week_offset)?;
     let records = merged_token_records(&app);
     let usage = merged_usage_records(&app);
     let quota = crate::usage_history::build_weekly_quota(&usage, week_start_ms);
+    let limit = crate::usage_history::build_bucket_limit_pct(&usage, week_start_ms);
     Ok(crate::token_history::build_token_week_chart(
         &records,
         week_start_ms,
         token_axis_max(&app),
         &quota,
+        &limit,
         intensity_floor_ms(&records, min_week_tokens(&app))?,
+        scanned_until(&app),
     ))
 }
 
@@ -412,11 +419,13 @@ pub fn get_intensity_weeks(app: AppHandle) -> Result<Vec<crate::token_history::T
         return Ok(Vec::new());
     };
     let axis_max = token_axis_max(&app);
+    let scanned = scanned_until(&app);
     Ok(week_starts_back_to(data_min)?
         .into_iter()
         .map(|week_start_ms| {
             let quota = crate::usage_history::build_weekly_quota(&usage, week_start_ms);
-            crate::token_history::build_token_week_chart(&records, week_start_ms, axis_max, &quota, Some(data_min))
+            let limit = crate::usage_history::build_bucket_limit_pct(&usage, week_start_ms);
+            crate::token_history::build_token_week_chart(&records, week_start_ms, axis_max, &quota, &limit, Some(data_min), scanned)
         })
         .collect())
 }

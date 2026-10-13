@@ -144,12 +144,15 @@ export interface SetupState {
 // `TokenBucket` / `TokenDaySummary` / `TokenWeekChart`. `tokens` is input +
 // cache creation + output — cache reads are stored but excluded, being 97% of
 // the raw sum and a measure of conversation length rather than work. `has_data`
-// means "inside the span we hold token records for", not whether the dashboard
+// means "inside the span we hold token records for, or that this machine's
+// latest complete transcript scan has covered", not whether the dashboard
 // was running: transcripts are written by Claude Code itself and the scanner
 // catches up afterwards.
 export interface TokenBucket {
   tokens: number
   has_data: boolean
+  // The 7-day limit percentage in force during this slot; colours the bar.
+  limit_pct: number | null
 }
 
 // Per-day roll-up shown to the right of each day row. `active_minutes` counts
@@ -170,8 +173,8 @@ export interface TokenWeekChart {
   // Oldest record either source holds, so "prev" can be disabled at the end of
   // the history. Wider than the span `has_data` is marked from.
   data_min_ms: number | null
-  // Full-height value for one 10-min bar. A stated ceiling, not a derived one:
-  // tokens have no quota to be a fraction of.
+  // Half-height value for one 10-min bar. A stated reference, not a derived
+  // one: tokens have no quota to be a fraction of.
   axis_max_tokens: number
 }
 

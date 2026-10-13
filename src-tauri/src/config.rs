@@ -106,15 +106,14 @@ pub struct Config {
     /// Read by `terminal_title::sync`; needs `terminal_titles` on to appear at
     /// all. Same percentage as the token counter (`notifications::context_percent`).
     pub terminal_title_context_percent: Option<f32>,
-    /// Full-height value for one 10-minute bar of the Work intensity chart.
-    /// Tokens have no quota to be a fraction of, so this is a stated ceiling
-    /// rather than a derived one: bars at or above it clip. The default clips
-    /// 4.5% of active buckets (measured p50
-    /// 77k, p90 666k, p99 1517k) — raise it to flatten the chart, lower it for
-    /// more resolution on ordinary work, at the cost of clipping more of a busy
-    /// day. The Weeks view sums groups of three buckets
-    /// and scales this by the same factor, so a full-height bar means the same
-    /// rate in both views. `null` or `0` falls back to the default.
+    /// Half-height value for one 10-minute bar of the Work intensity chart,
+    /// whose scale is symmetric around it: each doubling halves the distance
+    /// left to the top and each halving halves the height, so nothing clips.
+    /// Tokens have no quota to be a fraction of, so this is a stated reference
+    /// rather than a derived one (measured p50 77k, p90 666k, p99 1517k per
+    /// active bucket). The Weeks view sums groups of three buckets and scales
+    /// this by the same factor, so a half-height bar means the same rate in
+    /// both views. `null` or `0` falls back to the default.
     pub intensity_axis_max_tokens: Option<f64>,
     /// Work tokens a week must hold for the Work intensity chart's history to
     /// start there. Only *leading* weeks are trimmed — the scanner's reach into

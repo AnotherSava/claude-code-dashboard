@@ -199,6 +199,10 @@ pub struct TokenBucket {
     /// Whether this slot is inside the range we have token data for. `false`
     /// renders as unknown rather than idle.
     pub has_data: bool,
+    /// The 7-day limit percentage in force during this slot, from
+    /// [`crate::usage_history::build_bucket_limit_pct`]; colours the bar.
+    /// `None` where no usage sample applies.
+    pub limit_pct: Option<f32>,
 }
 
 /// Per-day roll-up shown to the right of each day row.
@@ -235,20 +239,17 @@ pub struct TokenWeekChart {
     /// any transcript it still holds, and those weeks have a real `weekly_pct`
     /// to show even though every bar in them is hatched.
     pub data_min_ms: Option<i64>,
-    /// Full-height value for a bar, so the frontend needs no quota knowledge.
-    /// A *stated* ceiling rather than a reference line: a rolling median of the
+    /// Half-height value for a bar, so the frontend needs no quota knowledge.
+    /// A *stated* reference rather than a derived one: a rolling median of the
     /// user's own history would drift 2.1x across four weeks with no change in
     /// behaviour, so identical work would cross it purely from baseline movement
     /// while reading as an absolute marker.
     pub axis_max_tokens: f64,
 }
 
-/// Default full-height value for a 10-minute bucket. Clips 4.5% of active
-/// buckets against a measured p50 of 77k, p90 of 666k and p99 of 1517k — about
-/// the same share the percent chart it replaced clipped at its 2x-pace
-/// threshold. Halving
-/// it to 500k was tried and reverted: it clipped 15.6% across all history and
-/// 25.8% of a recent busy week, flattening the top quarter of a working day.
+/// Default half-height value for a 10-minute bucket, against a measured p50 of
+/// 77k, p90 of 666k and p99 of 1517k per active bucket. The chart's scale
+/// approaches the top of the row asymptotically above it, so nothing clips.
 /// Overridable via `config.intensity_axis_max_tokens`.
 pub const DEFAULT_AXIS_MAX_TOKENS: f64 = 1_000_000.0;
 
@@ -297,8 +298,10 @@ pub fn oldest_week_with_work(records: &[TokenRecord], week_starts: &[i64], min_t
 /// no inter-observation gap to exclude — unlike the per-day `weekly_quota` the
 /// caller passes in, which is built from the usage poller's cumulative counter.
 ///
-/// `has_data` is simply "inside the range we hold token data for". A bucket
-/// there with no records is genuine idle: transcripts are written by Claude Code
+/// `has_data` is "inside the range we hold token data for": from the oldest
+/// record to the newer of the newest record and `scanned_until_ms`, the start
+/// of this machine's latest complete transcript scan, past which nothing local
+/// can be missing. A bucket there with no records is genuine idle: transcripts are written by Claude Code
 /// itself, so unlike the usage poller, the dashboard being closed loses nothing
 /// — the scanner catches up afterwards. The one thing this cannot see is a
 /// *device* whose records have not reached this machine; those buckets read as
@@ -311,14 +314,18 @@ pub fn build_token_week_chart(
     week_start_ms: i64,
     axis_max_tokens: f64,
     weekly_quota: &[f32; 7],
+    bucket_limit_pct: &[Option<f32>],
     data_min_ms: Option<i64>,
+    scanned_until_ms: Option<i64>,
 ) -> TokenWeekChart {
     use crate::usage_history::{BUCKETS_PER_DAY, BUCKETS_PER_WEEK, BUCKET_MS, WEEK_MS};
 
     let week_end_ms = week_start_ms + WEEK_MS;
-    let mut buckets = vec![TokenBucket { tokens: 0.0, has_data: false }; BUCKETS_PER_WEEK];
+    let mut buckets: Vec<TokenBucket> = (0..BUCKETS_PER_WEEK)
+        .map(|idx| TokenBucket { tokens: 0.0, has_data: false, limit_pct: bucket_limit_pct.get(idx).copied().flatten() })
+        .collect();
     let token_min_ms = records.iter().map(|r| r.ts).min();
-    let token_max_ms = records.iter().map(|r| r.ts).max();
+    let token_max_ms = records.iter().map(|r| r.ts).max().map(|max| scanned_until_ms.map_or(max, |s| max.max(s)));
 
     // Mark the covered span first, so a slot inside the token era with no work
     // reads as idle while everything outside it stays unknown. This is the
@@ -476,7 +483,7 @@ mod tests {
     const WEEK: i64 = 1_000_000_000_000;
 
     fn chart(records: &[TokenRecord]) -> TokenWeekChart {
-        build_token_week_chart(records, WEEK, DEFAULT_AXIS_MAX_TOKENS, &[0.0; 7], records.iter().map(|r| r.ts).min())
+        build_token_week_chart(records, WEEK, DEFAULT_AXIS_MAX_TOKENS, &[0.0; 7], &[], records.iter().map(|r| r.ts).min(), None)
     }
 
     #[test]
@@ -543,7 +550,7 @@ mod tests {
 
     #[test]
     fn axis_max_is_carried_through_for_the_frontend() {
-        assert_eq!(build_token_week_chart(&[], WEEK, 250_000.0, &[0.0; 7], None).axis_max_tokens, 250_000.0);
+        assert_eq!(build_token_week_chart(&[], WEEK, 250_000.0, &[0.0; 7], &[], None, None).axis_max_tokens, 250_000.0);
     }
 
     #[test]
@@ -553,7 +560,7 @@ mod tests {
         // the poller covered but the token scanner has no records for still
         // shows what the account spent.
         let quota = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0];
-        let c = build_token_week_chart(&[], WEEK, DEFAULT_AXIS_MAX_TOKENS, &quota, Some(WEEK));
+        let c = build_token_week_chart(&[], WEEK, DEFAULT_AXIS_MAX_TOKENS, &quota, &[], Some(WEEK), None);
         assert_eq!(c.days.iter().map(|d| d.weekly_pct).collect::<Vec<_>>(), quota.to_vec());
         assert!(c.days.iter().all(|d| d.tokens == 0.0));
     }
@@ -588,9 +595,21 @@ mod tests {
         // unknown, and the quota numbers are all the week has to say.
         let quota = [4.0; 7];
         let older = WEEK - 70 * DAY_MS;
-        let c = build_token_week_chart(&[], WEEK, DEFAULT_AXIS_MAX_TOKENS, &quota, Some(older));
+        let c = build_token_week_chart(&[], WEEK, DEFAULT_AXIS_MAX_TOKENS, &quota, &[], Some(older), None);
         assert_eq!(c.data_min_ms, Some(older));
         assert!(c.buckets.iter().all(|b| !b.has_data));
         assert!(c.days.iter().all(|d| d.active_minutes == 0 && d.weekly_pct == 4.0));
     }
+    #[test]
+    fn a_completed_scan_extends_coverage_past_the_newest_record() {
+        // Work in bucket 0; a scan that began at bucket 3 proves buckets 1..=3
+        // idle, while bucket 4 is still unknown.
+        let recs = [record("a", WEEK + 1, 10, 0, 0, 0)];
+        let c = build_token_week_chart(&recs, WEEK, DEFAULT_AXIS_MAX_TOKENS, &[0.0; 7], &[], None, Some(WEEK + 3 * BUCKET_MS));
+        assert!(c.buckets[1..=3].iter().all(|b| b.has_data && b.tokens == 0.0));
+        assert!(!c.buckets[4].has_data);
+        let unscanned = build_token_week_chart(&recs, WEEK, DEFAULT_AXIS_MAX_TOKENS, &[0.0; 7], &[], None, None);
+        assert!(!unscanned.buckets[1].has_data);
+    }
+
 }

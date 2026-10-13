@@ -144,6 +144,39 @@ pub fn build_weekly_quota(records: &[UsageHistoryRecord], week_start_ms: i64) ->
     weekly
 }
 
+/// The 7-day limit percentage in force during each 10-minute bucket of the
+/// week starting at `week_start_ms`, which colours that bucket's bar. Records
+/// are assumed sorted ascending by `ts`.
+///
+/// A bucket holding samples takes the highest of them. A bucket holding none
+/// takes the last sample before it, because `seven_day_pct` only rises inside a
+/// window, so the carried value is a lower bound and never overstates how close
+/// the limit was. The carry stops at that sample's own `seven_day_resets_at`:
+/// past it the window has rolled over and the old figure says nothing about the
+/// new one. That timestamp jitters by about a minute, which here can mis-colour
+/// at most the one bucket the reset falls in. `None` where nothing applies.
+pub fn build_bucket_limit_pct(records: &[UsageHistoryRecord], week_start_ms: i64) -> Vec<Option<f32>> {
+    let mut out = vec![None; BUCKETS_PER_WEEK];
+    let mut i = records.partition_point(|r| r.ts < week_start_ms);
+    let mut carry = records[..i].iter().rev().find(|r| r.seven_day_pct.is_some());
+    for (idx, slot) in out.iter_mut().enumerate() {
+        let b_start = week_start_ms + idx as i64 * BUCKET_MS;
+        let b_end = b_start + BUCKET_MS;
+        let mut inside: Option<f32> = None;
+        while i < records.len() && records[i].ts < b_end {
+            if let Some(pct) = records[i].seven_day_pct {
+                inside = Some(inside.map_or(pct, |m| m.max(pct)));
+                carry = Some(&records[i]);
+            }
+            i += 1;
+        }
+        *slot = inside.or_else(|| {
+            carry.filter(|c| c.seven_day_resets_at.is_none_or(|reset| b_start < reset)).and_then(|c| c.seven_day_pct)
+        });
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -350,4 +383,28 @@ mod tests {
         // Both pairs touch the None record, so nothing is attributed.
         assert!(build_weekly_quota(&recs, WK).iter().all(|&p| p == 0.0));
     }
+    #[test]
+    fn bucket_limit_takes_the_highest_sample_inside_a_bucket() {
+        let recs = vec![full_rec(WK + 1_000, 0.0, 81.0, WK + WEEK_MS), full_rec(WK + 2_000, 0.0, 83.0, WK + WEEK_MS)];
+        assert_eq!(build_bucket_limit_pct(&recs, WK)[0], Some(83.0));
+    }
+
+    #[test]
+    fn bucket_limit_carries_the_last_sample_until_its_reset() {
+        // Sampled before the week, resetting three buckets in: the first three
+        // buckets carry it, the rest have no reading.
+        let recs = vec![full_rec(WK - BUCKET_MS, 0.0, 95.0, WK + 3 * BUCKET_MS)];
+        let out = build_bucket_limit_pct(&recs, WK);
+        assert_eq!(&out[..4], &[Some(95.0), Some(95.0), Some(95.0), None]);
+    }
+
+    #[test]
+    fn bucket_limit_is_none_before_any_sample() {
+        let recs = vec![full_rec(WK + 5 * BUCKET_MS, 0.0, 40.0, WK + WEEK_MS)];
+        let out = build_bucket_limit_pct(&recs, WK);
+        assert_eq!(out[4], None);
+        assert_eq!(out[5], Some(40.0));
+        assert_eq!(out[6], Some(40.0));
+    }
+
 }

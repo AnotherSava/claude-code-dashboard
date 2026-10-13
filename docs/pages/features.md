@@ -162,9 +162,9 @@ When the badge is on, the tray icon also flags the moment any session's context 
 
 ## Work intensity
 
-A separate window — opened from the tray's **Work intensity** item — charts how hard your agents have been working over time. Each bar covers a short slice of time and grows taller and warmer the busier that slice was. A **Days** view lays out one week as seven rows, one per day; a **Weeks** view gives one row per week and scrolls back through your history. With [multi-device sync](#multi-device-sync) configured, the chart covers your other devices too, so it shows the work done on the account as a whole rather than just here.
+A separate window — opened from the tray's **Work intensity** item — charts how hard your agents have been working over time. Each bar covers a short slice of time and grows taller the busier that slice was, while its colour shows how much of the weekly limit was left at the time — green with plenty to spare, turning yellow and then red as it runs out. A **Days** view lays out one week as seven rows, one per day; a **Weeks** view gives one row per week and scrolls back through your history. With [multi-device sync](#multi-device-sync) configured, the chart covers your other devices too, so it shows the work done on the account as a whole rather than just here.
 
-{% include figure.html id="work-intensity" alt="The Work intensity chart in its Days view — one row per day, ten-minute bars, red where a bar reaches the top of the scale, and each row's active time, tokens and share of the weekly quota in the right margin" %}
+{% include figure.html id="work-intensity" alt="The Work intensity chart in its Days view — one row per day, ten-minute bars, and each row's active time, tokens and share of the weekly quota in the right margin" %}
 
 The bars count the work itself, from Claude Code's own records: because that isn't a share of anything, it stays comparable when your quota changes — switching plans or a promotional bump leaves it alone. It reaches back as far as Claude Code's stored history — beginning at the first week with real work in it, because the oldest weeks it can reach are usually a session or two and draw as an empty row — and slices with nothing recorded are marked as unknown rather than shown as idle.
 

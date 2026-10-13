@@ -208,7 +208,7 @@
           "FRAME: drawn by Add-WindowFrame, which runs the docs-relevance skill's `winframe.py`: everything outside the content Windows clips 2px in is drawn from DWM's own model (12px corners at 144 DPI flattened into 8 chords as Direct2D does, a 1px antialiasing ramp, a 2px border at 144 DPI), with a lighter uniform ring, rgba(146,146,146,0.69), and no shadow, chosen on 2026-09-24 so the edge reads 180 on a white page and 105 on a dark one on every side. A captured Windows border is the border mixed with the drop shadow behind it, which is why its bottom reads darker than its top; the model draws the border alone. The capture records its DPI in the PNG and the frame is sized from it. The untouched capture is committed beside it, in docs/screenshots/raw/ under the same name."
         ]
       },
-      "verifiedAt": "at-capture"
+      "verifiedAt": "41d41a1"
     },
     {
       "id": "work-intensity-macos",
@@ -234,7 +234,7 @@
           "FRAME: `dash.add_hairline` runs the docs-relevance skill's `hairline.py --require`, which strokes the edge in place. The capture as it stands just before that step — after the halo trim and the sRGB conversion — is committed beside the frame, in docs/screenshots/raw/ under the same name; a --probe run keeps none."
         ]
       },
-      "verifiedAt": "68c3525"
+      "verifiedAt": "41d41a1"
     },
     {
       "id": "tray-menu-windows",

@@ -185,31 +185,41 @@
     return { active: activeAvg, pct, tokens }
   })
 
-  // Bars at or above the top of the scale are clipped and painted this red.
-  const CLIP_RED = '#e0443a'
+  // Drawn height (0..1 of the row) for value / scaleMax. The reference value
+  // fills half the row, and every doubling halves the distance left to the top
+  // (2x -> 75%, 4x -> 87.5%) while every halving halves the height (0.5x -> 25%),
+  // so the scale never clips and f(x) + f(1/x) = 1 around the reference.
+  function heightFraction(ratio: number): number {
+    if (ratio <= 0) return 0
+    return ratio <= 1 ? ratio / 2 : 1 - 1 / (2 * ratio)
+  }
 
-  // green → gold → amber, keyed on value / scaleMax (0..1). Red is reserved for
-  // clipped bars so "red" unambiguously means "at or over the top of the scale".
-  // Expressed against the scale rather than against any quota pace: tokens have
-  // nothing to be a fraction of, so the ramp describes the drawn height and
-  // nothing more.
-  function barColor(ratio: number): string {
-    const stops: [number, [number, number, number]][] = [
-      [0, [58, 124, 74]],     // green
-      [0.5, [214, 161, 58]],  // gold at half scale
-      [1, [216, 132, 58]],    // deep amber at the top of the scale
-    ]
-    const r = Math.max(0, Math.min(1, ratio))
-    for (let i = 0; i < stops.length - 1; i++) {
-      const [pa, ca] = stops[i]
-      const [pb, cb] = stops[i + 1]
-      if (r >= pa && r <= pb) {
-        const t = (r - pa) / (pb - pa)
-        const c = ca.map((v, k) => Math.round(v + (cb[k] - v) * t))
-        return `rgb(${c[0]}, ${c[1]}, ${c[2]})`
+  // Bar colour from the weekly limit left during its slot, blended through
+  // HSL so the hue sweeps green -> yellow -> red without a muddy midpoint.
+  // Stops are [limit left %, [hue, saturation %, lightness %]]: green down to
+  // 25% left, yellow at 12%, red from 2% left.
+  const LIMIT_STOPS: [number, [number, number, number]][] = [
+    [25, [130, 45, 42]],
+    [12, [48, 80, 52]],
+    [2, [4, 72, 52]],
+  ]
+  // A slot no usage sample covers.
+  const NO_LIMIT_COLOR = 'rgb(90, 90, 96)'
+
+  function barColor(limitPct: number | null): string {
+    if (limitPct === null) return NO_LIMIT_COLOR
+    const left = 100 - limitPct
+    const hsl = ([h, sat, l]: number[]) => `hsl(${h}, ${sat}%, ${l}%)`
+    if (left >= LIMIT_STOPS[0][0]) return hsl(LIMIT_STOPS[0][1])
+    for (let i = 0; i < LIMIT_STOPS.length - 1; i++) {
+      const [a, ca] = LIMIT_STOPS[i]
+      const [b, cb] = LIMIT_STOPS[i + 1]
+      if (left >= b) {
+        const t = (a - left) / (a - b)
+        return hsl(ca.map((v, k) => v + (cb[k] - v) * t))
       }
     }
-    return 'rgb(216, 132, 58)'
+    return hsl(LIMIT_STOPS[LIMIT_STOPS.length - 1][1])
   }
 
   let hatchPattern: CanvasPattern | null = null
@@ -295,8 +305,7 @@
   }
 
   // Shared per-row drawing — used by both the day-row and week-row layouts so
-  // the bar shape, the clip at the top of the scale and its red flag can't
-  // diverge.
+  // the bar shape and the height scale can't diverge.
 
   function drawRowBand(ctx: CanvasRenderingContext2D, cssW: number, rowTop: number, rowH: number) {
     // The band fill plus the dark gap to the next band separates days; no
@@ -307,9 +316,9 @@
 
   // A bar is just a value and whether we have data for its slot. `Bar[]` is what
   // each view maps a week's buckets down to.
-  type Bar = { value: number; has_data: boolean }
+  type Bar = { value: number; has_data: boolean; limit_pct: number | null }
 
-  const barsOf = (c: TokenWeekChart): Bar[] => c.buckets.map((b) => ({ value: b.tokens, has_data: b.has_data }))
+  const barsOf = (c: TokenWeekChart): Bar[] => c.buckets.map((b) => ({ value: b.tokens, has_data: b.has_data, limit_pct: b.limit_pct }))
 
   // Compact token counts: 1.2M / 1M / 340k / 900. A whole number of millions
   // drops the trailing ".0" — "1M" rather than "1.0M".
@@ -334,9 +343,9 @@
         continue
       }
       if (b.value <= 0) continue // idle: baseline only
-      const clipped = b.value >= scaleMax
-      const barH = Math.max(1, Math.min(rowH, (b.value / scaleMax) * rowH))
-      ctx.fillStyle = clipped ? CLIP_RED : barColor(b.value / scaleMax)
+      const h = heightFraction(b.value / scaleMax)
+      const barH = Math.max(1, h * rowH)
+      ctx.fillStyle = barColor(b.limit_pct)
       ctx.fillRect(x + 0.3, rowBottom - barH, Math.max(0.6, colW - 0.6), barH)
     }
   }
@@ -443,20 +452,24 @@
   // data at all stays a gap.
   //
   // The group is summed, which makes a week bar read as the volume of the whole
-  // group; its scaleMax is multiplied by the same factor, so a full-height bar
-  // means the same rate in both views.
+  // group; its scaleMax is multiplied by the same factor, so a half-height bar
+  // means the same rate in both views. Its limit is the highest of the group,
+  // the counter only rising inside a window.
   function downsample(bars: Bar[], factor: number): Bar[] {
     const out: Bar[] = []
     for (let i = 0; i < bars.length; i += factor) {
       let sum = 0
       let n = 0
+      let limit: number | null = null
       for (let j = i; j < i + factor && j < bars.length; j++) {
+        const l = bars[j].limit_pct
+        if (l !== null) limit = limit === null ? l : Math.max(limit, l)
         if (bars[j].has_data) {
           sum += bars[j].value
           n += 1
         }
       }
-      out.push({ value: n > 0 ? sum : 0, has_data: n > 0 })
+      out.push({ value: n > 0 ? sum : 0, has_data: n > 0, limit_pct: limit })
     }
     return out
   }
@@ -475,8 +488,8 @@
     const { gutterLeft, rowGap, plotLeft, plotTop, plotBottom, plotW, plotH, rowH } =
       computeLayout(cssW, s.cssH, win.count)
     if (plotW <= 0 || plotH <= 0) return
-    // Summed groups need a proportionally taller scale, so a full-height week bar
-    // means the same rate as a full-height day bar.
+    // Summed groups need a proportionally larger reference, so a half-height week
+    // bar means the same rate as a half-height day bar.
     const scaleMax = win.all[0].axis_max_tokens * WEEK_GROUP
     const hatch = ensureHatch(ctx)
     ctx.textBaseline = 'middle'
@@ -554,8 +567,14 @@
     const when = `${start.toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' })} ${hhmm(start)}–${hhmm(end)}`
     // "no data" is deliberately distinct from "idle": outside the range we hold
     // records for, we don't know that nothing happened.
-    const what = !b.has_data ? 'no data' : b.value <= 0 ? 'idle' : `${fmtTokens(b.value)} tokens`
-    return `${when} · ${what}`
+    // Fields are padded to their widest form ("120M tokens", "100%") so the
+    // monospace tooltip keeps each word in one column as the numbers change;
+    // "idle" and "no data" sit centred in the token field's width.
+    const WHAT_W = 11
+    const centred = (t: string) => t.padStart(t.length + Math.floor((WHAT_W - t.length) / 2)).padEnd(WHAT_W)
+    const what = !b.has_data ? centred('no data') : b.value <= 0 ? centred('idle') : `${fmtTokens(b.value).padStart(4)} tokens`
+    if (b.limit_pct === null) return `${when} · ${what.trimEnd()}`
+    return `${when} · ${what} · ${`${Math.round(b.limit_pct)}%`.padStart(4)} used`
   }
 
   function onMouseMove(e: MouseEvent) {
@@ -966,7 +985,8 @@
     padding: 4px 9px;
     font-size: 13px;
     color: #e8e8ea;
-    white-space: nowrap;
+    /* pre, not nowrap: the text is space-padded into columns. */
+    white-space: pre;
     font-family: ui-monospace, Consolas, monospace;
   }
 </style>

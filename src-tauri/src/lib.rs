@@ -489,6 +489,7 @@ pub fn run() {
     app.manage(token_history::TokenHistoryStore::new(
         app_data.join("token_history.jsonl"),
     ));
+    app.manage(token_scan::ScanClock::default());
     app.manage(remote_usage::RemoteUsageStore::new(
         app_data.join("remote_usage"),
     ));
