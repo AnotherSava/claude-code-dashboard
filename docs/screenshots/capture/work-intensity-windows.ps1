@@ -4,8 +4,9 @@
   Opens the Work intensity window on a chosen week, sizes it wide enough that the
   header stays on one line, and captures it with its native title bar.
 
-  THE SUBJECT IS A WEEK, AND IT IS PINNED BY DATE: Aug 31 - Sep 6, 2026, the week
-  this figure has always shown. A re-shoot keeps it. The chart is the one figure
+  THE SUBJECT IS A WEEK, AND IT IS PINNED BY DATE: Oct 5 - 11, 2026, the week
+  work-intensity-macos shows too, chosen because the weekly limit ran past 90%
+  during it, so the bars' colour reaches yellow and red. A re-shoot keeps it. The chart is the one figure
   here whose content is a moving window over live data, so re-running this script
   next month with the same arguments would quietly photograph a different week --
   and the prose beside the figure, which talks about the bars and the per-row
@@ -31,7 +32,7 @@
 #>
 [CmdletBinding()]
 param(
-    [string]$WeekStart = '2026-08-31',
+    [string]$WeekStart = '2026-10-05',
     [int]$Offset,
     [int]$Width = 1520,
     [int]$Height = 700,

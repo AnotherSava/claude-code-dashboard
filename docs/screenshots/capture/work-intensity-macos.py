@@ -4,11 +4,12 @@
 Opens the Work intensity window on a chosen week, sizes it wide enough that the
 header stays on one line, and photographs it with its title bar.
 
-THE SUBJECT IS A WEEK, AND IT IS PINNED BY DATE: Aug 31 - Sep 6, 2026. That is
-the week work-intensity-windows shows, and the week this script's 2026-09-11
-re-shoot put in docs/screenshots/work-intensity-macos.png. A paired figure is
-read as two pictures of one thing, so two different weeks make it a puzzle
-instead of a comparison.
+THE SUBJECT IS A WEEK, AND IT IS PINNED BY DATE: Oct 5 - 11, 2026, the week
+work-intensity-windows shows too. It is pinned there because the weekly limit
+ran past 90% during it, so the bars' colour sweeps from green through yellow to
+red; a week that stayed under 75% draws every bar green and shows nothing of the
+colouring. A paired figure is read as two pictures of one thing, so two
+different weeks make it a puzzle instead of a comparison.
 
 That is why the week is a DATE and not the offset the window's API actually
 takes. An offset counts weeks back from whenever the script runs, so it names a
@@ -41,19 +42,23 @@ WHAT THE OPERATOR STAGES BY HAND, since no argument here can do it:
 
   * Deploy the current build. The frame documents what ships, and this script
     photographs whatever binary is running.
-  * Leave the mouse pointer off the chart window. Hovering a bar raises a
-    tooltip, which then sits in the committed frame. The Windows half parks the
-    pointer clear of the window; this one only LOOKS -- moving the pointer is
-    taking the machine over, which a capture script should not do to a user who
-    asked for a screenshot -- and refuses when the pointer is inside the window's
-    rect at the moment of the shutter. Pointer-outside is a sound test for "no
-    tooltip": the tooltip is raised on the canvas's mousemove and cleared on its
-    mouseleave. The one hole is a resize that moves the window out from under a
-    pointer that never moves, where whether WebKit synthesizes the mouseleave is
-    not established either way. And if the pointer cannot be read at all the run
-    says so on stderr and goes ahead UNCHECKED, rather than passing silently.
+  * Agree to the run first. It takes the machine over for about ten seconds:
+    it opens and resizes a window and moves the pointer, so whoever starts it --
+    a person or an agent -- asks the user immediately before each run.
+
+THE POINTER IS PARKED, as the Windows half parks it: moved BEFORE the window
+opens to the primary display's bottom-right, `PARK_INSET` points in from the
+corner, and put back where it was in the `finally`. Hovering a bar raises a
+tooltip that would sit in the committed frame, and a window that opens under a
+resting pointer is the case moving it off afterwards does not reliably clear.
+Inset rather than on the corner because a corner can be a Hot Corner: this
+machine's bottom-right opens Quick Note, which a pointer parked there would
+trigger. The window opens wherever the user left it, so the park cannot be
+guaranteed clear of it, and the check before the shutter still refuses when the
+pointer is inside the window's rect. If the pointer cannot be read at all the run
+says so on stderr and goes ahead UNCHECKED, rather than passing silently.
 There is deliberately no --force. Each refusal has a one-action remedy (move the
-pointer; add --probe), so an override could only ever defeat a guard that was
+window; add --probe), so an override could only ever defeat a guard that was
 right. The pointer guard also runs for a --probe: a probe that skips it is not a
 rehearsal of the shot.
 
@@ -86,6 +91,8 @@ import ctypes
 import ctypes.util
 import sys
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -97,6 +104,7 @@ TITLE = "Work intensity"        # the intensity window's title, from tauri.conf.
 OPEN_SETTLE_S = 0.8             # the window comes up, then fetches and draws the week
 RESIZE_SETTLE_S = 2.5           # bars animate in, and the header only re-decides its layout once the window has settled
 FOCUS_SETTLE_S = 0.6            # let the raise finish before the shutter; see the block that spends it
+PARK_INSET = 40                 # points in from the bottom-right corner, clear of a Hot Corner
 
 
 def resolve_offset(week_start: str) -> int:
@@ -128,13 +136,54 @@ class _CGPoint(ctypes.Structure):
     _fields_ = [("x", ctypes.c_double), ("y", ctypes.c_double)]
 
 
+class _CGSize(ctypes.Structure):
+    _fields_ = [("width", ctypes.c_double), ("height", ctypes.c_double)]
+
+
+class _CGRect(ctypes.Structure):
+    _fields_ = [("origin", _CGPoint), ("size", _CGSize)]
+
+
+def _core_graphics() -> ctypes.CDLL | None:
+    path = ctypes.util.find_library("ApplicationServices")
+    return ctypes.cdll.LoadLibrary(path) if path else None
+
+
+def move_pointer(x: float, y: float) -> bool:
+    """Warp the pointer to (x, y) in top-left-origin global points; False when it could not be moved.
+
+    `CGWarpMouseCursorPosition` moves the cursor without posting an event, so it
+    needs no Accessibility grant and clicks nothing.
+    """
+    try:
+        cg = _core_graphics()
+        if cg is None:
+            return False
+        cg.CGWarpMouseCursorPosition.restype, cg.CGWarpMouseCursorPosition.argtypes = ctypes.c_int32, [_CGPoint]
+        return cg.CGWarpMouseCursorPosition(_CGPoint(x, y)) == 0
+    except (OSError, AttributeError):
+        return False
+
+
+def park_point() -> tuple[float, float] | None:
+    """The primary display's bottom-right, `PARK_INSET` points in, or None if the display cannot be read."""
+    try:
+        cg = _core_graphics()
+        if cg is None:
+            return None
+        cg.CGMainDisplayID.restype = ctypes.c_uint32
+        cg.CGDisplayBounds.restype, cg.CGDisplayBounds.argtypes = _CGRect, [ctypes.c_uint32]
+        b = cg.CGDisplayBounds(cg.CGMainDisplayID())
+        return (b.origin.x + b.size.width - PARK_INSET, b.origin.y + b.size.height - PARK_INSET)
+    except (OSError, AttributeError):
+        return None
+
+
 def pointer_location() -> tuple[float, float] | None:
-    """Where the pointer is, in the top-left-origin global points `window_list.swift` reports, or None if it cannot be read.
+    """Where the pointer is, in the top-left-origin global points DocShot's `--list` reports, or None if it cannot be read.
 
     Calling `CGEventCreate(NULL)` snapshots the current event state, the pointer
-    included. It reads and never writes, so it needs no Accessibility grant and
-    takes nothing over: this script looks at the pointer and leaves it exactly
-    where the operator put it.
+    included. It reads and never writes, so it needs no Accessibility grant.
 
     ctypes rather than pyobjc because ctypes is in the standard library, and a
     guard is not worth a dependency. CGPoint is two doubles and comes back in the
@@ -142,10 +191,9 @@ def pointer_location() -> tuple[float, float] | None:
     or it is truncated to an int.
     """
     try:
-        path = ctypes.util.find_library("ApplicationServices")
-        if not path:
+        cg = _core_graphics()
+        if cg is None:
             return None
-        cg = ctypes.cdll.LoadLibrary(path)
         cg.CGEventCreate.restype, cg.CGEventCreate.argtypes = ctypes.c_void_p, [ctypes.c_void_p]
         cg.CGEventGetLocation.restype, cg.CGEventGetLocation.argtypes = _CGPoint, [ctypes.c_void_p]
         cg.CFRelease.argtypes = [ctypes.c_void_p]
@@ -161,6 +209,20 @@ def pointer_location() -> tuple[float, float] | None:
         return None
 
 
+@contextmanager
+def pointer_parked() -> Iterator[None]:
+    """Park the pointer at `park_point` for the run and put it back where it was afterwards."""
+    was = pointer_location()
+    at = park_point()
+    if at is None or not move_pointer(*at):
+        print("WARNING: the pointer could not be parked; the check before the shutter still refuses if it sits over the window.", file=sys.stderr)
+    try:
+        yield
+    finally:
+        if was is not None:
+            move_pointer(*was)
+
+
 def assert_pointer_clear(win: dict) -> None:
     """Refuse when the pointer sits over the window about to be photographed."""
     at = pointer_location()
@@ -169,7 +231,7 @@ def assert_pointer_clear(win: dict) -> None:
         return
     x, y = at
     if win["x"] <= x <= win["x"] + win["w"] and win["y"] <= y <= win["y"] + win["h"]:
-        raise dash.CaptureError(f"The pointer is at ({x:.0f}, {y:.0f}), inside the chart window at ({int(win['x'])}, {int(win['y'])}) {int(win['w'])}x{int(win['h'])}. Hovering a bar raises a tooltip that would be in the frame. Move the pointer off the window and run this again.")
+        raise dash.CaptureError(f"The pointer is at ({x:.0f}, {y:.0f}), inside the chart window at ({int(win['x'])}, {int(win['y'])}) {int(win['w'])}x{int(win['h'])}, after parking. Hovering a bar raises a tooltip that would be in the frame. Move the chart window away from the bottom-right of the main display and run this again.")
 
 
 def restore_size(before: dict, asked_height: int) -> None:
@@ -217,7 +279,7 @@ def reset_week() -> None:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Capture the Work intensity figure on macOS.", allow_abbrev=False)
-    ap.add_argument("--week-start", default="2026-08-31", help="Monday of the week to photograph, YYYY-MM-DD (default: the week the Windows variant shows)")
+    ap.add_argument("--week-start", default="2026-10-05", help="Monday of the week to photograph, YYYY-MM-DD (default: the week the Windows variant shows)")
     ap.add_argument("--offset", type=int, help="weeks back from this one, overriding --week-start; for looking around, so it requires --probe. A positive value is refused by the window API as future_week")
     ap.add_argument("--width", type=int, default=1520, help="content width in logical px (default: 1520, measured here to keep the header on one line)")
     ap.add_argument("--height", type=int, default=700, help="content height in logical px (default: 700, the Windows variant's)")
@@ -235,7 +297,7 @@ def main() -> int:
 
     out = dash.probe_path("work-intensity-probe") if args.probe else dash.shot_path(FIGURE)
 
-    with dash.widget_hidden():
+    with pointer_parked(), dash.widget_hidden():
         # `before` is bound ahead of the try so the `finally` can tell "never
         # measured" from "measured": the size is only restorable once it has been
         # read back, and a failure before that must still reset the week.
