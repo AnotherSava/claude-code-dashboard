@@ -145,7 +145,7 @@ pub(crate) fn display_snapshot(app: &AppHandle) -> Vec<AgentSession> {
 }
 
 /// [`display_snapshot`] carrying the [`resolved_snapshot_versioned`] ticket.
-fn display_snapshot_versioned(app: &AppHandle) -> (u64, Vec<AgentSession>) {
+pub(crate) fn display_snapshot_versioned(app: &AppHandle) -> (u64, Vec<AgentSession>) {
     let (seq, mut sessions) = resolved_snapshot_versioned(app);
     // `attention_tracking` is a *display* preference — "show me which finished
     // rows I have been through" — so both arms of it are decided here, which is

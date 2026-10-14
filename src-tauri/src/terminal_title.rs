@@ -26,7 +26,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
-use std::sync::Mutex;
+use std::sync::{Condvar, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use tauri::{AppHandle, Manager};
 
@@ -95,9 +96,9 @@ pub struct TerminalTitles {
     /// attention sensor reading that title would name the row again when a new
     /// session recreates it. So the blank goes to the landing first.
     ///
-    /// An entry outlives its row until the blank lands, and the next sync retries
-    /// one that reached the console and failed to write. Taken after `last` and
-    /// released with it.
+    /// An entry outlives its row until the blank lands, and a blank that reached
+    /// the console and failed to write is sent again on the retry pass
+    /// [`next_retry`] schedules. Taken after `last` and released with it.
     landings: Mutex<HashMap<String, Landing>>,
     /// The newest `AppState::snapshot_versioned` ticket [`sync`] has written from.
     ///
@@ -110,6 +111,10 @@ pub struct TerminalTitles {
     /// it compares a title against the one it last wrote, never against when the
     /// row behind it was read.
     applied: Mutex<u64>,
+    /// Consecutive failed writes per row — no console would attach, or one did
+    /// and refused the title — which decides when [`sync`] asks for a retry pass
+    /// and when it stops asking. Taken after `landings`.
+    failures: Mutex<HashMap<String, u32>>,
 }
 
 impl TerminalTitles {
@@ -258,17 +263,28 @@ const ATTACH_PARENT_PROCESS: u32 = u32::MAX;
 /// Iteration stops at the first console successfully attached, not at the first
 /// `Some`: attaching is what identifies the right console, and what `f` then makes
 /// of it is `f`'s business.
+///
+/// `Err` when no candidate attached, carrying each refusal, so a caller can say
+/// why rather than fail silently: a refused attach is otherwise indistinguishable
+/// from a write that was never attempted.
 #[cfg(windows)]
-fn with_console<T>(candidates: impl IntoIterator<Item = u32>, f: impl Fn(u32) -> Option<T>) -> Option<T> {
+fn with_console<T>(candidates: impl IntoIterator<Item = u32>, f: impl Fn(u32) -> Option<T>) -> Result<Option<T>, Vec<AttachRefusal>> {
     let _guard = ATTACH_LOCK.lock().unwrap();
     unsafe {
         let had_console = GetConsoleWindow() != 0;
-        let mut out = None;
+        let mut out = Err(Vec::new());
         for pid in candidates {
             FreeConsole();
             if AttachConsole(pid) != 0 {
-                out = f(pid);
+                out = Ok(f(pid));
                 break;
+            }
+            // Read before any other call can overwrite it. Unlike the
+            // `GetConsoleTitleW` note above, this follows a call that *failed*,
+            // which is when `AttachConsole` is documented to set it.
+            let error = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            if let Err(refusals) = &mut out {
+                refusals.push(AttachRefusal { pid, error });
             }
         }
         FreeConsole();
@@ -279,6 +295,15 @@ fn with_console<T>(candidates: impl IntoIterator<Item = u32>, f: impl Fn(u32) ->
         }
         out
     }
+}
+
+/// A candidate whose console [`with_console`] could not attach to, with the
+/// Win32 error `AttachConsole` set.
+#[cfg(windows)]
+#[derive(Debug)]
+struct AttachRefusal {
+    pid: u32,
+    error: i32,
 }
 
 /// The title currently on `pid`'s console, or `None` when it has none, refuses
@@ -304,6 +329,12 @@ pub fn read_title(pid: u32) -> Option<String> {
         // row, which is the safe direction.
         let len = (unsafe { GetConsoleTitleW(buf.as_mut_ptr(), buf.len() as u32) } as usize).min(buf.len());
         (len > 0).then(|| String::from_utf16_lossy(&buf[..len]))
+    })
+    .unwrap_or_else(|refusals| {
+        for r in refusals {
+            tracing::debug!(pid = r.pid, error = r.error, "console attach refused; title not read");
+        }
+        None
     })
 }
 
@@ -962,23 +993,29 @@ pub fn sync(app: &AppHandle, sessions: &[AgentSession], seq: u64) {
     // The blank goes first to where the row's last title landed, which is the tab
     // showing it, and only then to the candidates; see `TerminalTitles::landings`.
     let mut landings = titles.landings.lock().unwrap();
-    let blank = |chat_id: &str, last: &mut HashMap<String, (String, i64, i64)>, landings: &mut HashMap<String, Landing>| {
+    let blank = |chat_id: &str, last: &mut HashMap<String, (String, i64, i64)>, landings: &mut HashMap<String, Landing>| -> bool {
         last.remove(chat_id);
-        let pushed = push_title(adapter, landings.get(chat_id), &resolve(chat_id, pids.get(chat_id).map_or(&[][..], Vec::as_slice)), "");
-        if blank_settled(pushed.as_ref().map(|p| p.ok)) {
+        let pushed = push_title(chat_id, adapter, landings.get(chat_id), &resolve(chat_id, pids.get(chat_id).map_or(&[][..], Vec::as_slice)), "");
+        let settled = blank_settled(pushed.as_ref().map(|p| p.ok));
+        if settled {
             landings.remove(chat_id);
         } else {
-            tracing::debug!(chat_id, "a blank title reached its console and did not land; retried on the next sync");
+            tracing::debug!(chat_id, "a blank title reached its console and did not land; retried");
         }
+        settled
     };
     let written = titled_rows(&last, &landings);
+    let mut outcomes: Vec<(String, bool)> = Vec::new();
 
     if !enabled {
         // Toggled off: blank every title we have written, keep the pid map so
         // re-enabling resumes without waiting for the next hook event.
         for chat_id in &written {
-            blank(chat_id, &mut last, &mut landings);
+            let settled = blank(chat_id, &mut last, &mut landings);
+            outcomes.push((chat_id.clone(), settled));
         }
+        let mut failures = titles.failures.lock().unwrap();
+        schedule_retry(app, next_retry(&mut failures, &outcomes, |id| landings.contains_key(id)));
         // With nothing being written there is nothing a tab can disagree with,
         // so a standing stale-tab warning would outlive its evidence. `hosts`
         // goes with them: an HWND is recycled, so an attribution left behind can
@@ -994,7 +1031,8 @@ pub fn sync(app: &AppHandle, sessions: &[AgentSession], seq: u64) {
 
     let live: HashSet<&str> = sessions.iter().map(|s| s.id.as_str()).collect();
     for chat_id in written.iter().filter(|id| !live.contains(id.as_str())) {
-        blank(chat_id, &mut last, &mut landings);
+        let settled = blank(chat_id, &mut last, &mut landings);
+        outcomes.push((chat_id.clone(), settled));
     }
     pids.retain(|chat_id, _| live.contains(chat_id.as_str()));
     // The same pruning the two maps above get. Without it every chat_id this
@@ -1015,7 +1053,8 @@ pub fn sync(app: &AppHandle, sessions: &[AgentSession], seq: u64) {
         }
         let changed = last.get(&s.id).is_none_or(|(prev, _, _)| prev != &title);
         // A write goes to the candidates alone; see the module doc.
-        let pushed = push_title(adapter, None, &candidates, &title);
+        let pushed = push_title(&s.id, adapter, None, &candidates, &title);
+        outcomes.push((s.id.clone(), pushed.as_ref().is_some_and(|p| p.ok)));
         if let Some(p) = pushed.as_ref().filter(|p| p.ok) {
             let changed_at = if changed { now } else { last.get(&s.id).map_or(now, |(_, _, c)| *c) };
             last.insert(s.id.clone(), (title, now, changed_at));
@@ -1074,10 +1113,99 @@ pub fn sync(app: &AppHandle, sessions: &[AgentSession], seq: u64) {
         }
     }
 
+    let mut failures = titles.failures.lock().unwrap();
+    schedule_retry(app, next_retry(&mut failures, &outcomes, |id| live.contains(id) || landings.contains_key(id)));
+    drop(failures);
+
     // A terminal's own session labels, after the seq gate so the worker only ever
     // holds the newest snapshot's labels, and reached for every row, including
     // one no console pid resolves for, which the loop skips.
     crate::terminals::labels::request(seq, desired_labels(true, sessions));
+}
+
+/// How many failed writes in a row a row is retried for before only the next
+/// state change retries it, so a console that will never attach stops costing
+/// a pass. With [`retry_delay`] this spans about five minutes.
+const MAX_RETRIES: u32 = 10;
+
+/// The wait before the retry that follows a row's `attempts`-th consecutive
+/// failure: doubling from one second, capped at a minute.
+fn retry_delay(attempts: u32) -> Duration {
+    Duration::from_secs((1u64 << attempts.saturating_sub(1).min(6)).min(60))
+}
+
+/// Record a pass's per-row outcomes (`true` = the write landed) in `failures`,
+/// drop rows `keep` no longer names, and answer how long until a retry pass is
+/// due, or `None` when no row still has retries left.
+///
+/// [`sync`] reports a title no console would attach for ([`push_title`]'s
+/// `None`) as failed, and a blank in that state as landed ([`blank_settled`]).
+///
+/// Without the retry pass a failed write waits for the next local `emit_sessions_updated`,
+/// which for an idle session can be hours: a tab started beside another was
+/// left on the console's default title for over an hour on 2026-10-14.
+fn next_retry(failures: &mut HashMap<String, u32>, outcomes: &[(String, bool)], keep: impl Fn(&str) -> bool) -> Option<Duration> {
+    for (id, landed) in outcomes {
+        if *landed {
+            failures.remove(id);
+            continue;
+        }
+        let n = failures.entry(id.clone()).or_default();
+        *n += 1;
+        if *n == MAX_RETRIES + 1 {
+            tracing::warn!(chat_id = %id, attempts = MAX_RETRIES, "terminal title write kept failing; retried again only on the next state change");
+        }
+    }
+    failures.retain(|id, _| keep(id));
+    failures.values().filter(|&&n| n <= MAX_RETRIES).min().map(|&n| retry_delay(n))
+}
+
+/// The retry pass's due instant, `None` when none is wanted. Latest wins: every
+/// `sync` recomputes it from the current failures, so the newest is the truth.
+/// A leaf lock — the worker never holds it across the pass it runs.
+static RETRY: OnceLock<(Mutex<Option<Instant>>, Condvar)> = OnceLock::new();
+static RETRY_WORKER: OnceLock<()> = OnceLock::new();
+
+fn schedule_retry(app: &AppHandle, delay: Option<Duration>) {
+    let (lock, cv) = RETRY.get_or_init(Default::default);
+    *lock.lock().unwrap() = delay.map(|d| Instant::now() + d);
+    cv.notify_one();
+    if delay.is_some() && RETRY_WORKER.set(()).is_ok() {
+        let app = app.clone();
+        std::thread::spawn(move || retry_worker(&app));
+    }
+}
+
+/// Wait for a due retry and run it as a bare [`sync`] over a fresh snapshot.
+///
+/// A fresh ticket rather than a re-run of the failed pass's rows, so the retry
+/// is ordered against every emit by the same `seq` gate as any other sync and
+/// can never write an older snapshot over a newer one. A bare `sync` rather than a
+/// whole `emit_sessions_updated`, which would also repaint the frontend and push
+/// to every sync peer for a change that is not one. Its own thread, so nothing
+/// here waits on the Tauri main thread.
+fn retry_worker(app: &AppHandle) {
+    let (lock, cv) = RETRY.get_or_init(Default::default);
+    loop {
+        let mut due = lock.lock().unwrap();
+        loop {
+            match *due {
+                None => due = cv.wait(due).unwrap(),
+                Some(at) => {
+                    let now = Instant::now();
+                    if now >= at {
+                        break;
+                    }
+                    due = cv.wait_timeout(due, at - now).unwrap().0;
+                }
+            }
+        }
+        *due = None;
+        drop(due);
+        let (seq, sessions) = crate::commands::display_snapshot_versioned(app);
+        tracing::debug!(seq, "retrying failed terminal title writes");
+        sync(app, &crate::commands::local_rows(&sessions), seq);
+    }
 }
 
 /// Every row this process has titled and not yet blanked: those holding a title
@@ -1120,12 +1248,13 @@ fn last_change_in(last: &HashMap<String, (String, i64, i64)>, caption: &str) -> 
 ///
 /// `None` means nothing would attach, so nothing was written and nothing was
 /// learned. `Some` means a console was reached: `ok` says whether the title
-/// actually went in (false leaves the `last` cache untouched so the next sync
-/// retries), `host` is what the adapter made of that console — `None` there
-/// being *do not know*, never "not in a terminal we recognize" — and `landing`
-/// is every other process attached to it.
+/// actually went in (false leaves the `last` cache untouched), `host` is what
+/// the adapter made of that console — `None` there being *do not know*, never
+/// "not in a terminal we recognize" — and `landing` is every other process
+/// attached to it. A title write answering `None` or `ok: false` is retried
+/// by the pass [`next_retry`] schedules.
 #[cfg(windows)]
-fn push_title(adapter: Option<&dyn TerminalAdapter>, landing: Option<&Landing>, candidates: &[u32], title: &str) -> Option<Pushed> {
+fn push_title(chat_id: &str, adapter: Option<&dyn TerminalAdapter>, landing: Option<&Landing>, candidates: &[u32], title: &str) -> Option<Pushed> {
     let wide: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
     let own = std::process::id();
     // Far-to-near: the hook reports candidates ordered nearest-first (its own
@@ -1153,8 +1282,14 @@ fn push_title(adapter: Option<&dyn TerminalAdapter>, landing: Option<&Landing>, 
         // unfalsifiable from where it is written and false for the second
         // implementor.
         let host = adapter.and_then(|a| a.attached_surface(pid));
-        tracing::debug!(pid, ok, title, host = host.as_deref().unwrap_or(""), "terminal title written");
+        tracing::debug!(chat_id, pid, ok, title, host = host.as_deref().unwrap_or(""), "terminal title written");
         Some(Pushed { ok, host, landing: console_members().into_iter().filter(|&p| p != own).collect() })
+    })
+    .unwrap_or_else(|refusals| {
+        for r in refusals {
+            tracing::debug!(chat_id, pid = r.pid, error = r.error, title, "console attach refused; title not written");
+        }
+        None
     })
 }
 
@@ -1210,9 +1345,9 @@ struct Pushed {
 /// title written there names no pid to ask an adapter about, so its host is
 /// unknown.
 #[cfg(not(windows))]
-fn push_title(adapter: Option<&dyn TerminalAdapter>, landing: Option<&Landing>, candidates: &[u32], title: &str) -> Option<Pushed> {
+fn push_title(chat_id: &str, adapter: Option<&dyn TerminalAdapter>, landing: Option<&Landing>, candidates: &[u32], title: &str) -> Option<Pushed> {
     if let Some(tty) = landing.filter(|tty| write_tty(tty, title)) {
-        tracing::debug!(tty, title, "terminal title written");
+        tracing::debug!(chat_id, tty, title, "terminal title written");
         return Some(Pushed { ok: true, host: None, landing: tty.clone() });
     }
     for &pid in candidates {
@@ -1224,7 +1359,7 @@ fn push_title(adapter: Option<&dyn TerminalAdapter>, landing: Option<&Landing>, 
         }
         if write_tty(tty, title) {
             let host = adapter.and_then(|a| a.attached_surface(pid));
-            tracing::debug!(pid, tty, title, host = host.as_deref().unwrap_or(""), "terminal title written");
+            tracing::debug!(chat_id, pid, tty, title, host = host.as_deref().unwrap_or(""), "terminal title written");
             return Some(Pushed { ok: true, host, landing: tty.to_string() });
         }
     }
@@ -1816,6 +1951,35 @@ mod tests {
         assert!(blank_settled(Some(true)), "landed");
         assert!(blank_settled(None), "nothing would take it: the console or tab is gone");
         assert!(!blank_settled(Some(false)), "reached and refused");
+    }
+
+    #[test]
+    fn a_failed_write_is_retried_on_a_doubling_backoff_until_it_lands() {
+        let mut failures = HashMap::new();
+        let failed = [("claude".to_string(), false)];
+        assert_eq!(next_retry(&mut failures, &failed, |_| true), Some(Duration::from_secs(1)));
+        assert_eq!(next_retry(&mut failures, &failed, |_| true), Some(Duration::from_secs(2)));
+        assert_eq!(next_retry(&mut failures, &failed, |_| true), Some(Duration::from_secs(4)));
+        assert_eq!(next_retry(&mut failures, &[("claude".to_string(), true)], |_| true), None, "a landed write clears the count");
+        assert!(failures.is_empty());
+    }
+
+    #[test]
+    fn retries_stop_after_the_bound_and_never_wait_past_a_minute() {
+        let mut failures = HashMap::new();
+        let failed = [("claude".to_string(), false)];
+        let delays: Vec<_> = (0..MAX_RETRIES + 2).map(|_| next_retry(&mut failures, &failed, |_| true)).collect();
+        assert!(delays[..MAX_RETRIES as usize].iter().all(|d| d.is_some_and(|d| d <= Duration::from_secs(60))));
+        assert_eq!(delays[MAX_RETRIES as usize], None, "a console that never attaches stops asking for passes");
+        assert_eq!(delays[MAX_RETRIES as usize + 1], None);
+    }
+
+    #[test]
+    fn the_soonest_retry_wins_and_a_departed_row_is_forgotten() {
+        let mut failures = HashMap::from([("old".to_string(), 5)]);
+        assert_eq!(next_retry(&mut failures, &[("new".to_string(), false)], |_| true), Some(Duration::from_secs(1)));
+        assert_eq!(next_retry(&mut failures, &[], |id| id == "old"), Some(retry_delay(5)), "the row that went no longer holds a retry");
+        assert!(!failures.contains_key("new"));
     }
 
     #[test]
