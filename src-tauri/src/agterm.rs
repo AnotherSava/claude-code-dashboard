@@ -3,7 +3,7 @@
 //! Transport only — the binary lookup, the kill timeout, and the JSON envelope.
 //! Two callers share it: `session_launcher`, which creates a session for a
 //! project that has none, and `terminals::agterm`, which asks which session the
-//! user is sitting in. They must not each own a copy: the binary lookup has to
+//! user is sitting in, writes context lines and closes sessions. They must not each own a copy: the binary lookup has to
 //! keep working from a GUI app that inherits no shell profile, and the timeout is
 //! what stops a wedged terminal from holding a dashboard thread forever.
 //!
@@ -38,29 +38,67 @@ fn agterm_bin() -> Option<PathBuf> {
     candidates.iter().map(PathBuf::from).find(|p| p.exists())
 }
 
-/// Run one `agtermctl` command and parse its JSON answer, or `None` if it could
-/// not be run, timed out, failed, or answered `ok: false`.
+/// Why one `agtermctl` run produced no output to read.
 #[cfg(target_os = "macos")]
-pub(crate) fn agtermctl(args: &[&str]) -> Option<serde_json::Value> {
+enum RunFailure {
+    /// It could not be found, started or waited on; the text says which.
+    NotRun(String),
+    /// It outlived its deadline and was killed.
+    TimedOut,
+}
+
+/// Run one `agtermctl` command to completion or `timeout`, whichever is first.
+///
+/// The one copy of the spawn-and-wait every caller below shares. Both pipes are
+/// drained on threads while the child runs, because a child writing more than
+/// the pipe buffer blocks until someone reads — which, with the reads deferred
+/// to after the exit, is until the kill.
+#[cfg(target_os = "macos")]
+fn run(args: &[&str], timeout: std::time::Duration) -> Result<std::process::Output, RunFailure> {
+    use std::io::Read;
     use std::process::{Command, Stdio};
 
-    let bin = agterm_bin()?;
-    let mut child = Command::new(&bin).args(args).stdout(Stdio::piped()).stderr(Stdio::null()).stdin(Stdio::null()).spawn().ok()?;
-    let deadline = std::time::Instant::now() + AGTERMCTL_TIMEOUT;
-    loop {
+    let bin = agterm_bin().ok_or_else(|| RunFailure::NotRun("agtermctl not found".to_string()))?;
+    let mut child = Command::new(&bin).args(args).stdout(Stdio::piped()).stderr(Stdio::piped()).stdin(Stdio::null()).spawn().map_err(|e| RunFailure::NotRun(format!("could not run agtermctl: {e}")))?;
+    let drain = |pipe: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut p) = pipe {
+                let _ = p.read_to_end(&mut buf);
+            }
+            buf
+        })
+    };
+    let stdout = drain(child.stdout.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
+    let stderr = drain(child.stderr.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
         match child.try_wait() {
-            Ok(Some(_)) => break,
+            Ok(Some(status)) => break status,
             Ok(None) if std::time::Instant::now() < deadline => std::thread::sleep(std::time::Duration::from_millis(20)),
             Ok(None) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                tracing::warn!(?args, "agtermctl timed out");
-                return None;
+                return Err(RunFailure::TimedOut);
             }
-            Err(_) => return None,
+            Err(e) => return Err(RunFailure::NotRun(format!("could not wait for agtermctl: {e}"))),
         }
-    }
-    let out = child.wait_with_output().ok()?;
+    };
+    Ok(std::process::Output { status, stdout: stdout.join().unwrap_or_default(), stderr: stderr.join().unwrap_or_default() })
+}
+
+/// Run one `agtermctl` command and parse its JSON answer, or `None` if it could
+/// not be run, timed out, failed, or answered `ok: false`.
+#[cfg(target_os = "macos")]
+pub(crate) fn agtermctl(args: &[&str]) -> Option<serde_json::Value> {
+    let out = match run(args, AGTERMCTL_TIMEOUT) {
+        Ok(out) => out,
+        Err(RunFailure::TimedOut) => {
+            tracing::warn!(?args, "agtermctl timed out");
+            return None;
+        }
+        Err(RunFailure::NotRun(_)) => return None,
+    };
     if !out.status.success() {
         return None;
     }
@@ -75,40 +113,21 @@ pub(crate) fn agtermctl(args: &[&str]) -> Option<serde_json::Value> {
 ///
 /// [`agtermctl`] collapses a spawn failure, the kill, a non-zero exit and an
 /// explicit `ok: false` into one `None`, and discards stderr. That is the right
-/// shape for the two callers that act on an answer or give up, and the wrong one
-/// for `TerminalAdapter::write_label`, whose `Err` is printed on the
-/// `label_write` log line: a context agterm refused — over 256 UTF-8 bytes, a
-/// control character, an ambiguous target — would otherwise be logged as a
-/// failure with nothing saying which. agterm's own `error` string is served
+/// shape for the callers that act on an answer or give up, and the wrong one
+/// for `TerminalAdapter::write_label` and `close_session`, whose `Err` is
+/// printed on the `label_write` and `idle_close` log lines: a context agterm
+/// refused — over 256 UTF-8 bytes, a control character, an ambiguous target —
+/// would otherwise be logged as a failure with nothing saying which. agterm's own `error` string is served
 /// verbatim because it is already specific (`context must be at most 256 UTF-8
 /// bytes`), and inventing a wording here would mean maintaining a second copy of
 /// agterm's rules.
 #[cfg(target_os = "macos")]
 pub(crate) fn agtermctl_checked(args: &[&str]) -> Result<serde_json::Value, String> {
-    use std::process::{Command, Stdio};
-
-    let bin = agterm_bin().ok_or("agtermctl not found")?;
-    let mut child = Command::new(&bin)
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .stdin(Stdio::null())
-        .spawn()
-        .map_err(|e| format!("could not run agtermctl: {e}"))?;
-    let deadline = std::time::Instant::now() + AGTERMCTL_TIMEOUT;
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if std::time::Instant::now() < deadline => std::thread::sleep(std::time::Duration::from_millis(20)),
-            Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err("agtermctl timed out".to_string());
-            }
-            Err(e) => return Err(format!("could not wait for agtermctl: {e}")),
-        }
-    }
-    let out = child.wait_with_output().map_err(|e| format!("could not read agtermctl: {e}"))?;
+    let out = match run(args, AGTERMCTL_TIMEOUT) {
+        Ok(out) => out,
+        Err(RunFailure::TimedOut) => return Err("agtermctl timed out".to_string()),
+        Err(RunFailure::NotRun(reason)) => return Err(reason),
+    };
     let parsed: Option<serde_json::Value> = serde_json::from_slice(&out.stdout).ok();
     // agterm answers a refusal as `{"ok":false,"error":"…"}` on stdout with exit
     // 0, so the envelope is read before the exit status is judged.
@@ -122,7 +141,9 @@ pub(crate) fn agtermctl_checked(args: &[&str]) -> Result<serde_json::Value, Stri
     }
     let code = out.status.code().map_or_else(|| "signal".to_string(), |c| c.to_string());
     let stderr = String::from_utf8_lossy(&out.stderr);
-    Err(format!("agtermctl exit {code}: {}", stderr.lines().next().unwrap_or("no output").trim()))
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let said = stderr.lines().chain(stdout.lines()).map(str::trim).find(|l| !l.is_empty()).unwrap_or("no output");
+    Err(format!("agtermctl exit {code}: {said}"))
 }
 
 /// The ids of every *open* window in a `window list --json` answer.
