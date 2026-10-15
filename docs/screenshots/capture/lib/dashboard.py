@@ -191,6 +191,11 @@ def docshot(*args: str, out: Path) -> None:
     except subprocess.TimeoutExpired as e:
         raise CaptureError("DocShot did not finish within 60s") from e
     except subprocess.CalledProcessError as e:
+        # `open -W` cannot block on a DocShot that has already exited ("Unable to
+        # block on application"), which a fast mode like `--list` can do; the file
+        # it wrote is the verdict, as for every other run.
+        if out.exists():
+            return
         raise CaptureError(f"could not launch DocShot: {e.stderr.decode('utf-8', 'replace').strip()}") from e
 
 
