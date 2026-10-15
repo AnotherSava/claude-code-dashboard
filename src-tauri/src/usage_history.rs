@@ -96,9 +96,9 @@ pub const WEEK_MS: i64 = BUCKET_MS * BUCKETS_PER_WEEK as i64;
 ///
 /// A weekly-window reset is a pct drop that clamps to 0, so a reset day still
 /// totals only the genuine consumption on either side of the reset, never a
-/// negative. `seven_day_resets_at` is deliberately not consulted: it jitters by
-/// ±1 min between polls with no real reset, which would mis-attribute the
-/// absolute percentage on every step.
+/// negative. `seven_day_resets_at` is deliberately not consulted: it jitters
+/// between polls with no real reset (see [`RESET_JITTER_MS`]), which would
+/// mis-attribute the absolute percentage on every step.
 ///
 /// Inter-observation gaps are **not** excluded, and that is why these numbers
 /// outlived the percent *bars* they used to be shown beside. `seven_day_pct` is
@@ -151,11 +151,19 @@ pub fn build_weekly_quota(records: &[UsageHistoryRecord], week_start_ms: i64) ->
 /// A bucket holding samples takes the highest of them. A bucket holding none
 /// takes the last sample before it, because `seven_day_pct` only rises inside a
 /// window, so the carried value is a lower bound and never overstates how close
-/// the limit was. The carry stops at that sample's own `seven_day_resets_at`:
-/// past it the window has rolled over and the old figure says nothing about the
-/// new one. That timestamp jitters by about a minute, which here can mis-colour
-/// at most the one bucket the reset falls in. `None` where nothing applies.
+/// the limit was. A mid-window reset leaves `seven_day_resets_at` unchanged, so
+/// the bucket it falls in keeps the spent window's readings and takes their
+/// highest; the Weeks view's grouping skips that bucket for this reason.
+///
+/// A sample counts for a bucket only while its own window is still open at the
+/// bucket's start, judged against `seven_day_resets_at` with a minute of
+/// slack for that timestamp's jitter. That ends the carry at the reset, and it
+/// keeps out the poll that lands in the first bucket of a new window still
+/// reporting the old one (observed 53 ms after a reset, at 100%), which would
+/// otherwise colour that bucket with the spent window. `None` where nothing
+/// applies.
 pub fn build_bucket_limit_pct(records: &[UsageHistoryRecord], week_start_ms: i64) -> Vec<Option<f32>> {
+    let open_at = |r: &UsageHistoryRecord, b_start: i64| r.seven_day_resets_at.is_none_or(|reset| b_start + RESET_JITTER_MS < reset);
     let mut out = vec![None; BUCKETS_PER_WEEK];
     let mut i = records.partition_point(|r| r.ts < week_start_ms);
     let mut carry = records[..i].iter().rev().find(|r| r.seven_day_pct.is_some());
@@ -164,15 +172,79 @@ pub fn build_bucket_limit_pct(records: &[UsageHistoryRecord], week_start_ms: i64
         let b_end = b_start + BUCKET_MS;
         let mut inside: Option<f32> = None;
         while i < records.len() && records[i].ts < b_end {
-            if let Some(pct) = records[i].seven_day_pct {
+            if let Some(pct) = records[i].seven_day_pct.filter(|_| open_at(&records[i], b_start)) {
                 inside = Some(inside.map_or(pct, |m| m.max(pct)));
                 carry = Some(&records[i]);
             }
             i += 1;
         }
-        *slot = inside.or_else(|| {
-            carry.filter(|c| c.seven_day_resets_at.is_none_or(|reset| b_start < reset)).and_then(|c| c.seven_day_pct)
-        });
+        *slot = inside.or_else(|| carry.filter(|c| open_at(c, b_start)).and_then(|c| c.seven_day_pct));
+    }
+    out
+}
+
+/// Slack for the jitter `seven_day_resets_at` shows between polls of one
+/// window, measured at under 3 s across June–October 2026.
+const RESET_JITTER_MS: i64 = 60 * 1000;
+
+/// How far `seven_day_resets_at` must move to count as another window rather
+/// than [`RESET_JITTER_MS`]'s jitter. Also the span inside which two sightings
+/// of a reset are taken to be one.
+const RESET_JUMP_MS: i64 = 60 * 60 * 1000;
+
+/// A `seven_day_pct` reading at or below this, at least [`RESET_DROP_PCT`]
+/// under the one before it, is a reset.
+const RESET_FLOOR_PCT: f32 = 5.0;
+const RESET_DROP_PCT: f32 = 10.0;
+
+/// Every 7-day window reset the samples witnessed, ascending, in ms. Records
+/// are assumed sorted by `ts`. Two signals, because neither sees every reset:
+///
+/// - `seven_day_resets_at` moving forward. The window it moved away from ended
+///   at its own scheduled time, or at the sample that saw the new one if that
+///   came first. This is the only trace of a scheduled reset after a week with
+///   nothing used, where the percentage has nowhere to drop from.
+/// - `seven_day_pct` falling to near zero. The account's weekly usage is also
+///   reset mid-window, leaving `seven_day_resets_at` where it was — ten times
+///   between June and October 2026. The first such reading often carries a
+///   null `seven_day_resets_at`; it is still the reset, since in every case on
+///   record the percentage stayed low afterwards.
+///
+/// A scheduled reset usually trips both, so sightings within [`RESET_JUMP_MS`]
+/// of each other are one reset at the earlier instant. Only witnessed resets
+/// are reported: one inside a stretch with no samples leaves no trace and is
+/// not extrapolated from the weekly schedule. A `seven_day_resets_at` that
+/// moves backwards is a peer still carrying the old window, and the whole
+/// record is ignored, its percentage included.
+pub fn seven_day_resets(records: &[UsageHistoryRecord]) -> Vec<i64> {
+    let mut seen = Vec::new();
+    let mut window_end: Option<i64> = None;
+    let mut last_pct: Option<f32> = None;
+    for r in records {
+        if let Some(at) = r.seven_day_resets_at {
+            match window_end {
+                Some(prev) if at > prev + RESET_JUMP_MS => {
+                    seen.push(prev.min(r.ts));
+                    window_end = Some(at);
+                }
+                Some(prev) if at + RESET_JUMP_MS < prev => continue,
+                Some(_) => {}
+                None => window_end = Some(at),
+            }
+        }
+        if let Some(pct) = r.seven_day_pct {
+            if last_pct.is_some_and(|last| pct <= RESET_FLOOR_PCT && pct + RESET_DROP_PCT <= last) {
+                seen.push(r.ts);
+            }
+            last_pct = Some(pct);
+        }
+    }
+    seen.sort_unstable();
+    let mut out: Vec<i64> = Vec::new();
+    for t in seen {
+        if out.last().is_none_or(|&prev| t > prev + RESET_JUMP_MS) {
+            out.push(t);
+        }
     }
     out
 }
@@ -407,4 +479,81 @@ mod tests {
         assert_eq!(out[6], Some(40.0));
     }
 
+    #[test]
+    fn a_reset_is_the_window_end_the_samples_moved_past() {
+        let end = WK + DAY_MS;
+        let recs = vec![
+            full_rec(WK, 0.0, 50.0, end),
+            full_rec(WK + BUCKET_MS, 0.0, 51.0, end + 30_000), // jitter, same window
+            full_rec(end + BUCKET_MS, 0.0, 0.0, end + WEEK_MS),
+        ];
+        assert_eq!(seven_day_resets(&recs), vec![end]);
+    }
+
+    #[test]
+    fn an_early_rollover_resets_at_the_sample_that_saw_it() {
+        let recs = vec![full_rec(WK, 0.0, 50.0, WK + WEEK_MS), full_rec(WK + DAY_MS, 0.0, 0.0, WK + DAY_MS + WEEK_MS)];
+        assert_eq!(seven_day_resets(&recs), vec![WK + DAY_MS]);
+    }
+
+    #[test]
+    fn a_mid_window_drop_to_zero_is_a_reset() {
+        let end = WK + WEEK_MS;
+        let recs = vec![
+            full_rec(WK, 0.0, 100.0, end),
+            UsageHistoryRecord { seven_day_resets_at: None, ..full_rec(WK + DAY_MS, 0.0, 0.0, 0) },
+            full_rec(WK + DAY_MS + BUCKET_MS, 0.0, 1.0, end),
+        ];
+        assert_eq!(seven_day_resets(&recs), vec![WK + DAY_MS]);
+    }
+
+    #[test]
+    fn a_small_dip_is_not_a_reset() {
+        let end = WK + WEEK_MS;
+        let recs = vec![full_rec(WK, 0.0, 34.0, end), full_rec(WK + BUCKET_MS, 0.0, 23.0, end)];
+        assert!(seven_day_resets(&recs).is_empty());
+    }
+
+    #[test]
+    fn a_drop_into_the_floor_from_close_above_it_is_not_a_reset() {
+        let end = WK + WEEK_MS;
+        let recs = vec![full_rec(WK, 0.0, 8.0, end), full_rec(WK + DAY_MS, 0.0, 0.0, end)];
+        assert!(seven_day_resets(&recs).is_empty());
+    }
+
+    #[test]
+    fn a_scheduled_reset_seen_by_both_signals_is_one_reset() {
+        let end = WK + DAY_MS;
+        let recs = vec![
+            full_rec(WK, 0.0, 80.0, end),
+            UsageHistoryRecord { seven_day_resets_at: None, ..full_rec(end + 500, 0.0, 0.0, 0) },
+            full_rec(end + 20 * 60 * 1000, 0.0, 0.0, end + WEEK_MS),
+        ];
+        assert_eq!(seven_day_resets(&recs), vec![end]);
+    }
+
+    #[test]
+    fn a_stale_window_and_the_current_one_are_not_resets() {
+        let end = WK + DAY_MS;
+        let recs = vec![
+            full_rec(WK, 0.0, 50.0, end),
+            full_rec(end + 1_000, 0.0, 0.0, end + WEEK_MS),
+            // A peer still on the old window, past the hour that would merge it.
+            full_rec(end + 2 * RESET_JUMP_MS, 0.0, 50.0, end),
+            full_rec(end + 2 * RESET_JUMP_MS + 1_000, 0.0, 1.0, end + WEEK_MS),
+        ];
+        assert_eq!(seven_day_resets(&recs), vec![end]);
+    }
+
+    #[test]
+    fn a_poll_still_reporting_the_spent_window_does_not_colour_the_next_bucket() {
+        let reset = WK + 3 * BUCKET_MS;
+        let recs = vec![
+            full_rec(reset - BUCKET_MS + 1_000, 0.0, 100.0, reset - 500),
+            full_rec(reset + 53, 0.0, 100.0, reset + 367),
+            full_rec(reset + 6_000, 0.0, 0.0, reset + WEEK_MS),
+        ];
+        let out = build_bucket_limit_pct(&recs, WK);
+        assert_eq!(&out[2..4], &[Some(100.0), Some(0.0)]);
+    }
 }

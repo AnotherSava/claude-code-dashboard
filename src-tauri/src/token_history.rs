@@ -249,6 +249,9 @@ pub struct TokenWeekChart {
     /// `config.intensity_halving_drop` and `config.intensity_doubling_drop`.
     pub halving_drop: f64,
     pub doubling_drop: f64,
+    /// The 7-day limit resets that fall inside this week, ascending, in ms;
+    /// from [`crate::usage_history::seven_day_resets`].
+    pub limit_resets_ms: Vec<i64>,
 }
 
 /// Default half-height value for a 10-minute bucket, against a measured p50 of
@@ -331,6 +334,7 @@ pub fn build_token_week_chart(
     bucket_limit_pct: &[Option<f32>],
     data_min_ms: Option<i64>,
     scanned_until_ms: Option<i64>,
+    limit_resets_ms: &[i64],
 ) -> TokenWeekChart {
     use crate::usage_history::{BUCKETS_PER_DAY, BUCKETS_PER_WEEK, BUCKET_MS, WEEK_MS};
 
@@ -374,7 +378,8 @@ pub fn build_token_week_chart(
         })
         .collect();
 
-    TokenWeekChart { week_start_ms, week_end_ms, buckets, days, data_min_ms, axis_max_tokens, halving_drop, doubling_drop }
+    let limit_resets_ms = limit_resets_ms.iter().copied().filter(|t| (week_start_ms..week_end_ms).contains(t)).collect();
+    TokenWeekChart { week_start_ms, week_end_ms, buckets, days, data_min_ms, axis_max_tokens, halving_drop, doubling_drop, limit_resets_ms }
 }
 
 #[cfg(test)]
@@ -497,7 +502,7 @@ mod tests {
     const WEEK: i64 = 1_000_000_000_000;
 
     fn chart(records: &[TokenRecord]) -> TokenWeekChart {
-        build_token_week_chart(records, WEEK, DEFAULT_AXIS_MAX_TOKENS, DEFAULT_HALVING_DROP, DEFAULT_DOUBLING_DROP, &[0.0; 7], &[], records.iter().map(|r| r.ts).min(), None)
+        build_token_week_chart(records, WEEK, DEFAULT_AXIS_MAX_TOKENS, DEFAULT_HALVING_DROP, DEFAULT_DOUBLING_DROP, &[0.0; 7], &[], records.iter().map(|r| r.ts).min(), None, &[])
     }
 
     #[test]
@@ -564,7 +569,7 @@ mod tests {
 
     #[test]
     fn axis_max_is_carried_through_for_the_frontend() {
-        assert_eq!(build_token_week_chart(&[], WEEK, 250_000.0, DEFAULT_HALVING_DROP, DEFAULT_DOUBLING_DROP, &[0.0; 7], &[], None, None).axis_max_tokens, 250_000.0);
+        assert_eq!(build_token_week_chart(&[], WEEK, 250_000.0, DEFAULT_HALVING_DROP, DEFAULT_DOUBLING_DROP, &[0.0; 7], &[], None, None, &[]).axis_max_tokens, 250_000.0);
     }
 
     #[test]
@@ -574,7 +579,7 @@ mod tests {
         // the poller covered but the token scanner has no records for still
         // shows what the account spent.
         let quota = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0];
-        let c = build_token_week_chart(&[], WEEK, DEFAULT_AXIS_MAX_TOKENS, DEFAULT_HALVING_DROP, DEFAULT_DOUBLING_DROP, &quota, &[], Some(WEEK), None);
+        let c = build_token_week_chart(&[], WEEK, DEFAULT_AXIS_MAX_TOKENS, DEFAULT_HALVING_DROP, DEFAULT_DOUBLING_DROP, &quota, &[], Some(WEEK), None, &[]);
         assert_eq!(c.days.iter().map(|d| d.weekly_pct).collect::<Vec<_>>(), quota.to_vec());
         assert!(c.days.iter().all(|d| d.tokens == 0.0));
     }
@@ -609,7 +614,7 @@ mod tests {
         // unknown, and the quota numbers are all the week has to say.
         let quota = [4.0; 7];
         let older = WEEK - 70 * DAY_MS;
-        let c = build_token_week_chart(&[], WEEK, DEFAULT_AXIS_MAX_TOKENS, DEFAULT_HALVING_DROP, DEFAULT_DOUBLING_DROP, &quota, &[], Some(older), None);
+        let c = build_token_week_chart(&[], WEEK, DEFAULT_AXIS_MAX_TOKENS, DEFAULT_HALVING_DROP, DEFAULT_DOUBLING_DROP, &quota, &[], Some(older), None, &[]);
         assert_eq!(c.data_min_ms, Some(older));
         assert!(c.buckets.iter().all(|b| !b.has_data));
         assert!(c.days.iter().all(|d| d.active_minutes == 0 && d.weekly_pct == 4.0));
@@ -619,10 +624,10 @@ mod tests {
         // Work in bucket 0; a scan that began at bucket 3 proves buckets 1..=3
         // idle, while bucket 4 is still unknown.
         let recs = [record("a", WEEK + 1, 10, 0, 0, 0)];
-        let c = build_token_week_chart(&recs, WEEK, DEFAULT_AXIS_MAX_TOKENS, DEFAULT_HALVING_DROP, DEFAULT_DOUBLING_DROP, &[0.0; 7], &[], None, Some(WEEK + 3 * BUCKET_MS));
+        let c = build_token_week_chart(&recs, WEEK, DEFAULT_AXIS_MAX_TOKENS, DEFAULT_HALVING_DROP, DEFAULT_DOUBLING_DROP, &[0.0; 7], &[], None, Some(WEEK + 3 * BUCKET_MS), &[]);
         assert!(c.buckets[1..=3].iter().all(|b| b.has_data && b.tokens == 0.0));
         assert!(!c.buckets[4].has_data);
-        let unscanned = build_token_week_chart(&recs, WEEK, DEFAULT_AXIS_MAX_TOKENS, DEFAULT_HALVING_DROP, DEFAULT_DOUBLING_DROP, &[0.0; 7], &[], None, None);
+        let unscanned = build_token_week_chart(&recs, WEEK, DEFAULT_AXIS_MAX_TOKENS, DEFAULT_HALVING_DROP, DEFAULT_DOUBLING_DROP, &[0.0; 7], &[], None, None, &[]);
         assert!(!unscanned.buckets[1].has_data);
     }
 

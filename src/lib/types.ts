@@ -181,6 +181,8 @@ export interface TokenWeekChart {
   // The scale's steepness below and above the reference; see heightFraction.
   halving_drop: number
   doubling_drop: number
+  // The 7-day limit resets inside this week, ascending, in ms.
+  limit_resets_ms: number[]
 }
 
 export const stateLabel: Record<Status, string> = {

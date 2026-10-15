@@ -353,6 +353,22 @@
     }
   }
 
+  // A thin line across one row at the instant the 7-day limit reset, drawn over
+  // the bars. `spanStart`/`spanMs` are the stretch of time the row covers.
+  const RESET_LINE_COLOR = 'rgba(130, 190, 255, 0.85)'
+  function drawResetLines(ctx: CanvasRenderingContext2D, resets: number[], spanStart: number, spanMs: number, plotLeft: number, plotW: number, rowTop: number, rowH: number) {
+    ctx.strokeStyle = RESET_LINE_COLOR
+    ctx.lineWidth = 1
+    for (const t of resets) {
+      if (t < spanStart || t >= spanStart + spanMs) continue
+      const x = Math.round(plotLeft + ((t - spanStart) / spanMs) * plotW) + 0.5
+      ctx.beginPath()
+      ctx.moveTo(x, rowTop)
+      ctx.lineTo(x, rowTop + rowH)
+      ctx.stroke()
+    }
+  }
+
   // Right-gutter stats for one row, centred on it: the first line is the row's
   // headline (active time) and the rest are its totals. Takes a list rather
   // than fixed lines because a row can legitimately have only some of them —
@@ -438,6 +454,7 @@
       ctx.fillText(dayDate.toLocaleDateString(undefined, { month: 'short', day: 'numeric' }), lx, midY + 9)
 
       drawBars(ctx, bars, d * SLOTS_PER_DAY, SLOTS_PER_DAY, plotLeft, plotW, rowTop, rowH, scale, hatch)
+      drawResetLines(ctx, week.limit_resets_ms, week.week_start_ms + d * DAY_MS, DAY_MS, plotLeft, plotW, rowTop, rowH)
 
       // The day's share of a *daily* quota is its share of the 7-day one × 7,
       // so a day that spent a seventh of the week reads 100%, and a heavy day
@@ -450,23 +467,31 @@
     }
   }
 
-  // Coarsen a bar series by combining each group of `factor` bars, over the
+  // Coarsen a week's bars by combining each group of `factor` bars, over the
   // present (non-gap) bars only — so a gap dilutes nothing and a group with no
   // data at all stays a gap.
   //
   // The group is summed, which makes a week bar read as the volume of the whole
   // group; its scale.max is multiplied by the same factor, so a half-height bar
   // means the same rate in both views. Its limit is the highest of the group,
-  // the counter only rising inside a window.
-  function downsample(bars: Bar[], factor: number): Bar[] {
+  // the counter only rising inside a window. A group a reset line crosses is
+  // coloured by the window it ends in, so its limit counts only the bars after
+  // the one holding the reset: that bar can hold readings from both windows
+  // and takes their highest, the spent one's. Where the reset is in the group's
+  // last bar, that bar is all the group has to go on.
+  function downsample(week: TokenWeekChart, factor: number): Bar[] {
+    const bars = barsOf(week)
+    const resetBars = week.limit_resets_ms.map((t) => Math.floor((t - week.week_start_ms) / BUCKET_MS))
     const out: Bar[] = []
     for (let i = 0; i < bars.length; i += factor) {
       let sum = 0
       let n = 0
       let limit: number | null = null
+      const last = Math.min(i + factor, bars.length) - 1
+      const from = Math.max(i, ...resetBars.filter((r) => r <= last).map((r) => Math.min(r + 1, last)))
       for (let j = i; j < i + factor && j < bars.length; j++) {
         const l = bars[j].limit_pct
-        if (l !== null) limit = limit === null ? l : Math.max(limit, l)
+        if (l !== null && j >= from) limit = limit === null ? l : Math.max(limit, l)
         if (bars[j].has_data) {
           sum += bars[j].value
           n += 1
@@ -537,7 +562,7 @@
       ctx.fillStyle = '#b6b6ba'
       ctx.fillText(endStr, lx, midY + 14)
 
-      const slots = downsample(barsOf(week), WEEK_GROUP)
+      const slots = downsample(week, WEEK_GROUP)
       drawBars(ctx, slots, 0, slots.length, plotLeft, plotW, rowTop, rowH, scale, hatch)
 
       // Faint day separators over the dense bars, to keep the week readable.
@@ -550,6 +575,7 @@
         ctx.lineTo(Math.round(x) + 0.5, rowTop + rowH)
         ctx.stroke()
       }
+      drawResetLines(ctx, week.limit_resets_ms, week.week_start_ms, DAYS * DAY_MS, plotLeft, plotW, rowTop, rowH)
 
       const lines = rowStats(
         week.days.reduce((a, d) => a + d.active_minutes, 0),
@@ -610,7 +636,7 @@
         return
       }
       const week = win.all[win.offset + (win.count - 1 - r)]
-      const grouped = downsample(barsOf(week), WEEK_GROUP)
+      const grouped = downsample(week, WEEK_GROUP)
       const s = Math.floor((mx - plotLeft) / (plotW / grouped.length))
       if (s < 0 || s >= grouped.length) {
         hover = null

@@ -162,7 +162,7 @@ When the badge is on, the tray icon also flags the moment any session's context 
 
 ## Work intensity
 
-A separate window — opened from the tray's **Work intensity** item — charts how hard your agents have been working over time. Each bar covers a short slice of time and grows taller the busier that slice was, while its colour shows how much of the weekly limit was left at the time — green with plenty to spare, turning yellow and then red as it runs out. A **Days** view lays out one week as seven rows, one per day; a **Weeks** view gives one row per week and scrolls back through your history. With [multi-device sync](#multi-device-sync) configured, the chart covers your other devices too, so it shows the work done on the account as a whole rather than just here.
+A separate window — opened from the tray's **Work intensity** item — charts how hard your agents have been working over time. Each bar covers a short slice of time and grows taller the busier that slice was, while its colour shows how much of the weekly limit was left at the time — green with plenty to spare, turning yellow and then red as it runs out. A thin blue line marks each moment the weekly limit reset. A **Days** view lays out one week as seven rows, one per day; a **Weeks** view gives one row per week and scrolls back through your history. With [multi-device sync](#multi-device-sync) configured, the chart covers your other devices too, so it shows the work done on the account as a whole rather than just here.
 
 {% include figure.html id="work-intensity" alt="The Work intensity chart in its Days view — one row per day, ten-minute bars, and each row's active time, tokens and share of a day's quota in the right margin" %}
 
