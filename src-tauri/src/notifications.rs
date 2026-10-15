@@ -508,11 +508,10 @@ pub struct LimitReset {
 pub const RESET_JUMP_MARGIN_MS: i64 = 10 * 60 * 1000;
 
 /// Slack around a window's scheduled `resets_at` within which the reset counts as
-/// *arrived*. On a genuine reset the reset poll lands right at (or just after) the
-/// scheduled time, while collateral zeroing (the sibling bucket cratering this one
-/// when *it* resets) strikes while this window's `resets_at` is still hours or
-/// days ahead — so a couple of minutes of slack (covering poll cadence + the ±1min
-/// `resets_at` jitter) cleanly separates the two.
+/// *arrived*. On a scheduled reset the reset poll lands right at (or just after)
+/// the scheduled time, while a zeroing that comes with this window's `resets_at`
+/// still hours or days ahead is something else — so a couple of minutes of slack
+/// (covering poll cadence + the ±1min `resets_at` jitter) separates the two.
 pub const RESET_ARRIVAL_SLACK_MS: i64 = 2 * 60 * 1000;
 
 /// Per-window reset tracker. A reset is credited on the earlier of two signals:
@@ -521,13 +520,17 @@ pub const RESET_ARRIVAL_SLACK_MS: i64 = 2 * 60 * 1000;
 /// fallback path —
 /// `resets_at` jumping forward past the just-ended window (for coarse polls that
 /// skip the null transient, or early rollovers the arrival gate declines). The
-/// arrival gate is what makes the prompt path safe: a 5h reset transiently zeroes
-/// *both* buckets' percentages (and can null *both* `resets_at`s) for up to ~40min
-/// (observed in real data), so a bare null-drop can't tell a real reset from
-/// collateral — but the collateral bucket's own scheduled reset is still far in
-/// the future, so it fails the gate and falls through to the immune forward-jump
-/// path. `peak_pct` (a running max) rides out the transient dips so the pre-reset
-/// high-water mark is the value reported.
+/// arrival gate is what makes the prompt path safe: after a 7d reset, scheduled
+/// or mid-window, the endpoint has at times nulled the 7d `resets_at` and often
+/// the 5h one with it (observed in real data), so a bare null-drop can't tell
+/// which window reached its scheduled reset. One whose scheduled
+/// reset is still far in the future fails the gate and falls through to the
+/// forward-jump path. That knowingly includes a real mid-window 7d reset, which
+/// keeps its `resets_at` and so is never reported here (see
+/// `usage_history::seven_day_resets`, which does count it).
+/// `peak_pct` is a running max, so the reported "was N%" is the window's
+/// high-water mark. Across such a mid-window reset it holds the spent window's
+/// peak, so the next scheduled reset can report that rather than its own.
 #[derive(Default)]
 struct WindowReset {
     /// Last non-null `resets_at` seen (this window's scheduled boundary); `None`
@@ -563,7 +566,7 @@ impl WindowReset {
     ) -> Option<f32> {
         match resets_at {
             // `resets_at` cleared: this bucket is in a reset transient — either its
-            // own real reset, or collateral zeroing from the sibling window's reset.
+            // own scheduled reset, or a zeroing that arrived with the sibling's.
             None => {
                 if self.awaiting_recovery {
                     // Already reported this reset; keep tracking the new window.
@@ -573,9 +576,10 @@ impl WindowReset {
                 // Prompt path: a cleared `resets_at` at/after this window's *own*
                 // scheduled reset is itself the reset marker — fire whether the
                 // reset poll's percentage came back as 0 or as null (the API returns
-                // "0/null" in the transient). The arrival gate rejects collateral
-                // zeroing (sibling reset; our `resets_at` still far ahead) and early
-                // rollovers (deferred to the forward-jump path). Only a concrete
+                // "0/null" in the transient). The arrival gate rejects a zeroing
+                // whose scheduled reset is still far ahead (including a real
+                // mid-window 7d reset) and early rollovers (deferred to the
+                // forward-jump path). Only a concrete
                 // *positive* percentage contradicts a reset — fall through on that.
                 let arrived = self
                     .resets_at
@@ -586,7 +590,7 @@ impl WindowReset {
                     self.peak_pct = 0.0; // new window starts here
                     return Some(peak);
                 }
-                // Collateral / early / pre-seed null: just fold the percentage in.
+                // Unscheduled / early / pre-seed null: just fold the percentage in.
                 self.track_peak(pct);
                 None
             }
@@ -2328,11 +2332,12 @@ mod tests {
     }
 
     #[test]
-    fn window_reset_ignores_collateral_zeroing_via_arrival_gate() {
-        // Real early-5h-reset fixture (both buckets zeroed, both resets_at nulled
-        // for ~40min): only the 5h window has actually reached its scheduled reset.
-        // The 7d window's own reset is still ~4 days out, so the arrival gate
-        // rejects its null-drop as collateral and fires 5h only.
+    fn window_reset_arrival_gate_declines_an_unscheduled_zeroing() {
+        // Values from the 2026-07-01 record (both buckets zeroed, both resets_at
+        // nulled), with poll B placed at the 5h scheduled reset; the real 5h
+        // window rolled over about an hour early. The 7d window reset mid-window
+        // with its own scheduled reset still ~4 days out, so the arrival gate
+        // declines the 7d null-drop and fires 5h only.
         let five_sched = 1782944400185;
         let mut t = ResetTracker::default();
         // poll A: seed both windows, shortly before the 5h reset.
@@ -2345,15 +2350,16 @@ mod tests {
         // poll B: both zeroed, both resets_at null, at the 5h scheduled time.
         let resets = t.observe((Some(0.0), None), (Some(0.0), None), five_sched, MARGIN);
         assert_eq!(resets, vec![LimitReset { window: LimitWindow::FiveHour, peak_pct: 100.0 }],
-            "only the 5h window's reset has arrived; the 7d zeroing is collateral");
-        // poll C: 5h resets_at recovers (consumed silently); 7d jitters, no reset.
+            "only the 5h window's scheduled reset has arrived");
+        // poll C: 5h resets_at recovers (consumed silently); 7d resets_at comes
+        // back unchanged, so the real mid-window 7d reset goes unreported here.
         let resets = t.observe(
             (Some(10.0), Some(1782960599140)),
             (Some(1.0), Some(1783306799140)),
             1782960599140,
             MARGIN,
         );
-        assert!(resets.is_empty(), "recovery is silent; the 7d window never reset");
+        assert!(resets.is_empty(), "recovery is silent; the 7d mid-window reset is not this tracker's to report");
     }
 
     #[test]
