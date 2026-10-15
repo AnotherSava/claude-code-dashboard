@@ -215,7 +215,7 @@
       "files": [
         "work-intensity-macos.png"
       ],
-      "shows": "macOS. Work intensity window, Days view, one week of 10-minute token bars with each row's active time, tokens and share of a day's quota (a seventh of the weekly limit) in the right margin",
+      "shows": "macOS. Work intensity window, Days view, one week of 10-minute token bars coloured by the weekly limit left, a thin blue line at the Sunday weekly limit reset, and each row's active time, tokens and share of a day's quota (a seventh of the weekly limit) in the right margin",
       "policy": "confirm",
       "capture": {
         "command": "python3 docs/screenshots/capture/work-intensity-macos.py",
