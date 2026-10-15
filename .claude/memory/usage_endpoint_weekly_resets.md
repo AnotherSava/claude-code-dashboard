@@ -1,5 +1,5 @@
 ---
-name: usage_endpoint_zeros_after_5h_cap
+name: usage_endpoint_weekly_resets
 description: "The OAuth usage endpoint has at times reported resets_at:null for the 7d bucket (often the 5h too) after a 7d reset, though not since 2026-09-07; the null resets_at is the transient. A 7d drop to ~0 inside its window is a real mid-window reset, and most of those follow no 5h cap"
 metadata: 
   node_type: memory
