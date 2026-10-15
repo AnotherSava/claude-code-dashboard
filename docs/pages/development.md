@@ -115,6 +115,7 @@ Under the repo root `claude-code-dashboard/`:
     - `liveness.rs` — process-liveness primitives
     - `liveness_reaper.rs` — drops row members whose Claude process exited without a `SessionEnd`, and removes a row once its last member is gone
     - `waiting_settle.rs` — settles a `waiting` row to `done` once its killed background task can no longer report
+    - `idle_close.rs` — closes a session, and the terminal tab it runs in, once it has sat clean past `idle_close_ms`
     - `subagent_gate.rs` — the subagent permission-prompt overlay, and finding the gated call's result that releases it
     - `prompt_origin.rs` — what a row shows for a task another agent began
     - `nonce_store.rs` — per-session marker nonces for the instruction-adherence canary
@@ -143,7 +144,7 @@ Under the repo root `claude-code-dashboard/`:
     - `terminals/` — one adapter per terminal behind the `TerminalAdapter` seam, so nothing downstream names a terminal
       - `mod.rs` — the trait, the shared vocabulary, and the pure verdicts over it (`person_verdict`, `departure_stamp`, `read_front`)
       - `agterm.rs` / `agterm_facts.rs` — agterm's adapter, and the facts it reads from agterm and the system (macOS)
-      - `agterm_wire.rs` — agterm's `session context` protocol: the argv a write takes, the targets its tree reports, and the release that first served the verb (macOS)
+      - `agterm_wire.rs` — agterm's `session context` protocol (the argv a write takes, the targets its tree reports, and the release that first served the verb) and its `session close` argv with `close_refusal`, the rule that refuses a close (macOS)
       - `agwinterm.rs` / `agwinterm_state.rs` / `agwinterm_wire.rs` — agwinterm's control pipe, its per-window state files, and its protocol (Windows)
       - `windows.rs` / `wt_tabs.rs` — Windows Terminal and the Windows console, and the UI Automation read of what a tab really holds
       - `composite.rs` — presents several terminals on one platform as one adapter

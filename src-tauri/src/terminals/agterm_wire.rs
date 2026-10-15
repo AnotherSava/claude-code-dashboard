@@ -1,4 +1,5 @@
-//! agterm's `session context` protocol, as pure functions.
+//! agterm's `session context` protocol, and the `session close` argv with the
+//! rule that refuses a close ([`close_refusal`]), as pure functions.
 //!
 //! The mirror of [`super::agwinterm_wire`], and gated the same way — compiled on
 //! macOS and in a test build everywhere — so the argv building, the projection
@@ -120,6 +121,25 @@ pub(crate) fn clear_argv(window: &str, session: &str) -> Vec<String> {
     vec!["session".into(), "context".into(), "--clear".into(), "--target".into(), session.into(), "--window".into(), window.into(), "--json".into()]
 }
 
+/// The argv that closes `session` in `window`, ending whatever runs in it.
+pub(crate) fn close_argv(window: &str, session: &str) -> Vec<String> {
+    vec!["session".into(), "close".into(), "--target".into(), session.into(), "--window".into(), window.into(), "--json".into()]
+}
+
+/// Why this session must not be closed, or `None` when it may. `node` is the
+/// session's `tree --json` node.
+///
+/// The close was decided on the node's `title`, which agterm takes from the
+/// session's primary pane whichever pane has focus, and a shell left in a tab
+/// keeps its exited agent's title, so that pane — `foreground` — must still be
+/// running the agent. Everything else in the session — the other pane of a
+/// split, a scratch terminal, an overlay — ends with it on purpose: closing
+/// exists to free what an abandoned session holds, and a dev server left beside
+/// it is the largest part of that.
+pub(crate) fn close_refusal(node: &serde_json::Value) -> Option<String> {
+    (super::agterm_facts::occupant(Some(node)) != super::Occupant::Agent).then(|| "the pane the title belongs to is no longer running the agent".to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -181,5 +201,38 @@ mod tests {
         let v = serde_json::json!({"ok": true, "result": {"app": {"version": "0.34.0", "commit": "fe1948b9"}}});
         assert_eq!(app_version(&v), Some("0.34.0"));
         assert_eq!(app_version(&serde_json::json!({"ok": true, "result": {}})), None);
+    }
+
+    fn node(extra: serde_json::Value) -> serde_json::Value {
+        let mut n = serde_json::json!({
+            "id": "S", "hasSplit": true, "splitFocused": false, "foreground": ["claude", "--continue"],
+            "surfaces": [{ "kind": "left", "paneID": "L" }, { "kind": "right", "paneID": "R" }]
+        });
+        for (k, v) in extra.as_object().unwrap() {
+            n[k] = v.clone();
+        }
+        n
+    }
+
+    #[test]
+    fn whatever_runs_beside_the_agent_does_not_block_a_close() {
+        assert_eq!(close_refusal(&node(serde_json::json!({ "splitForeground": ["npm", "run", "dev"] }))), None);
+        assert_eq!(close_refusal(&node(serde_json::json!({ "scratch": true, "overlay": true }))), None);
+    }
+
+    #[test]
+    fn a_primary_pane_no_longer_running_the_agent_blocks_a_close() {
+        let shell = node(serde_json::json!({ "hasSplit": false, "foreground": null, "foregroundShell": "zsh" }));
+        assert_eq!(close_refusal(&shell).as_deref(), Some("the pane the title belongs to is no longer running the agent"));
+        let program = node(serde_json::json!({ "hasSplit": false, "foreground": ["npm", "run", "dev"] }));
+        assert_eq!(close_refusal(&program).as_deref(), Some("the pane the title belongs to is no longer running the agent"));
+    }
+
+    #[test]
+    fn focus_on_the_split_pane_does_not_change_which_pane_is_judged() {
+        // agterm's `title` is the primary pane's whichever pane has focus, so the
+        // agent there is what the close was decided on.
+        let focus_on_split = node(serde_json::json!({ "splitFocused": true, "splitForeground": ["npm", "run", "dev"] }));
+        assert_eq!(close_refusal(&focus_on_split), None);
     }
 }

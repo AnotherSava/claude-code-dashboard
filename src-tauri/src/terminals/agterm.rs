@@ -191,6 +191,26 @@ impl TerminalAdapter for AgtermAdapter {
         crate::agterm::agtermctl_checked(&args).map(|_| ())
     }
 
+    fn can_close(&self) -> bool {
+        true
+    }
+
+    /// Close one session. agterm ends every process in it, the agent included,
+    /// so nothing else has to be stopped first. A primary pane no longer running
+    /// the agent refuses the close ([`wire::close_refusal`]), read fresh because
+    /// it is a fact of the moment.
+    fn close_session(&self, key: &str) -> Result<(), String> {
+        let (window, session) = wire::split_key(key).ok_or_else(|| format!("not a key this adapter minted: {key}"))?;
+        let tree = crate::agterm::agtermctl_checked(&["tree", "--json", "--window", window])?;
+        let node = crate::agterm::session_node(&tree, session).ok_or_else(|| format!("session {session} is no longer in window {window}"))?;
+        if let Some(reason) = wire::close_refusal(node) {
+            return Err(reason);
+        }
+        let argv = wire::close_argv(window, session);
+        let args: Vec<&str> = argv.iter().map(String::as_str).collect();
+        crate::agterm::agtermctl_checked(&args).map(|_| ())
+    }
+
     /// Input to the session on screen in agterm's active window.
     ///
     /// Asked in an order that spends least where nothing could count: whether

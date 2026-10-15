@@ -11,12 +11,15 @@ pub enum Status {
     /// CLEAN: a confirmed claim that there is nothing here to come back to.
     ///
     /// **Settable only on positive evidence**, and that prohibition is the whole
-    /// point of the variant. The three sources are a `SessionStart` whose
+    /// point of the variant. The sources are a `SessionStart` whose
     /// `source` is `clear` or `startup` (`adapters::claude`), a `resume` whose
     /// restored dialog ends in a [`BoundaryKind::Clear`] separator
     /// (`http_server::resume_is_clean`), and a relayed peer pull that reported
     /// leaving nothing behind, on a row that was already clean when the request
-    /// arrived (`http_server::pull_declared_clean`). Nothing else may write it —
+    /// arrived (`http_server::pull_declared_clean`), plus `session_restore`
+    /// reading back the `⚫` this dashboard wrote before a restart, which it
+    /// keeps only where Claude Code's registry reports the session idle
+    /// (`session_restore::restored_status`). Nothing else may write it —
     /// above all not a
     /// degrade path, which is what five of them used to do back when this variant
     /// was also the "we know nothing" sink.
@@ -1859,6 +1862,13 @@ impl AppState {
         let at = s.content_at();
         s.attended_at = Some(s.attended_at.map_or(at, |prev| prev.max(at)));
         (s.attention() != before).then_some(at)
+    }
+
+    /// A row's status and when it began, read under the lock without copying
+    /// the row: what `idle_close` re-checks just before it closes a session.
+    pub fn status_since(&self, id: &str) -> Option<(Status, i64)> {
+        let sessions = self.sessions.lock().unwrap();
+        sessions.iter().find(|s| s.id == id).map(|s| (s.status, s.state_entered_at))
     }
 
     /// A local row's [`AgentSession::content_at`], or `None` when no such row

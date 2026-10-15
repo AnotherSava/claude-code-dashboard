@@ -35,14 +35,18 @@ meanings worth having in hand before reading a trail:
   answers "the agent finished" and "nothing here says otherwise" alike, and a
   DONE nobody expected is usually one of those landings rather than a `Stop`.
 - **IDLE** — CLEAN: a confirmed claim that there is nothing left in the session
-  to come back to. Three things set it. Two are a `SessionStart`: a `source` of
+  to come back to. Four things set it. Two are a `SessionStart`: a `source` of
   `clear` or `startup`, and a `resume` whose restored dialog ends at a `/clear`
   boundary. The third is a `Stop` on a turn a peer started to ask this session to
   pull, where the pull reported leaving nothing and the row was clean before the
-  request — see `pull_claim` / `pull_clean` below. No degrade path may set it, so
+  request — see `pull_claim` / `pull_clean` below. The fourth is `restore_row`
+  after a restart, reading back a `⚫` tab whose session the registry reports
+  idle. No degrade path may set it, so
   IDLE never means "we don't know".
   A CLEAN row also drops off the widget once it has sat there for
-  `clean_hide_after_ms`, so an agent listed here as IDLE may not be on screen.
+  `clean_hide_after_ms`, so an agent listed here as IDLE may not be on screen,
+  and once it has been clean for `idle_close_ms` its session and tab are closed,
+  logged `decision = "idle_close"`, after which the row ends like any exit.
 
 Whether the user has *read* a finished session is a separate flag on the row,
 not part of its status: both halves show DONE, in a brighter and a dimmer
@@ -149,10 +153,22 @@ or `id`), and a `reason`:
   back, its `status` read from the tab title the dashboard last wrote. A WORK
   or WAIT glyph is only as fresh as the downtime, so it is kept only where the
   session registry independently reports a turn running and degrades to DONE
-  otherwise; a CLEAN tab restores no row at all.
+  otherwise. A CLEAN tab comes back IDLE, so `idle_close` can still close it,
+  but only where the registry reports the session idle; otherwise it too
+  degrades to DONE.
+- `idle_close` — a local row sat CLEAN past `idle_close_ms`. `outcome=closed`
+  means the dashboard itself closed the session and its terminal tab
+  (`idle_ms`, `window_ms`); the row then ends through the `session_clear` or
+  `reap_exited` that follows, so a trail ending that way was not the user
+  quitting. Every other outcome closed nothing and is logged once per row:
+  `close_failed` (the terminal refused, with its `error`, such as a tab whose
+  pane no longer runs the agent), `no_session` (no tab's title names the row),
+  `tab_not_idle` (the tab shows another status, so it is not following the
+  row), `same_label` (another row carries the same label) or `shared_title`
+  (more than one tab's title names the row).
 - `reap_exited` — the liveness reaper removed the row because its last Claude
   process exited without a `SessionEnd` (e.g. you typed `exit` / closed the
-  terminal). Carries the dead `pids` and the `prior_status` the row last held.
+  terminal, or an `idle_close` just closed it). Carries the dead `pids` and the `prior_status` the row last held.
   A dead member that was not the last logs only `member_leave` with
   `via=reaped`.
   This is a terminal decision: if it's the newest line, the row is gone on

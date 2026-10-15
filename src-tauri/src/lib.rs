@@ -11,6 +11,7 @@ mod custom_names;
 mod http_server;
 mod idle;
 mod idle_awake;
+mod idle_close;
 mod label_policy;
 mod lid_awake;
 mod liveness;
@@ -292,6 +293,7 @@ pub fn run() {
             UsageLimitsPoller::spawn(app.handle().clone());
             liveness_reaper::spawn(app.handle().clone());
             waiting_settle::spawn(app.handle().clone());
+            idle_close::spawn(app.handle().clone());
             subagent_gate::spawn(app.handle().clone());
             token_scan::spawn(app.handle().clone());
             // Clear any `disablesleep` left set by a crash the deadman missed,
@@ -407,6 +409,7 @@ pub fn run() {
 
     let (log_guard, frontend_logger) = logging::init(&app_data);
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "widget starting");
+    config_state.snapshot().warn_on_conflicts();
 
     // Autostart: `config.autostart` records the *intent*, the OS entry is only
     // the mechanism. First run enables it by default; afterwards a missing OS

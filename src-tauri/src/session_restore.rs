@@ -36,21 +36,26 @@
 //! deliberate design, this machine's observation of this keyboard: the glyph the
 //! title is holding already answers it, so a `⚪` row comes back `Done` with its
 //! `read` flag set and a `🟢` one comes back `Done`, still asking, while a `⚫`
-//! one comes back not at all. A tab with no title we recognize is **skipped**,
-//! never guessed at, and
-//! that same rule is what stops a removed row from being resurrected — the blank
+//! one comes back `Idle` where the registry reports the session idle, so
+//! `idle_close` can still close it, and a read `Done` otherwise. A tab with no
+//! title we recognize is **skipped**, never guessed at, and that same rule is
+//! what stops a removed row from being resurrected — the blank
 //! `terminal_title::sync` writes on removal is exactly a title we do not
 //! recognize.
 //!
-//! **`Working` and `Waiting` are the two statuses a title cannot be trusted for**,
-//! and [`restored_status`] is where that is decided. They assert a turn is in
-//! flight *right now*, and the glyph's staleness is the dashboard's downtime,
-//! which is unbounded. So they alone are checked against the registry's coarse
-//! reading and degrade to `Done` without it. That is not a nicety: a phantom
-//! `Working` row holds off macOS sleep through `lid_awake` (a system-wide switch
-//! that also suppresses thermal-emergency sleep), reads blue forever on this
-//! screen and on the peer's, and a phantom `Waiting` can never be settled because
-//! `waiting_backstop_armed` does not survive a restart either.
+//! **Three glyphs are checked against the registry rather than taken at their
+//! word**, and [`restored_status`] is where that is decided. `Working` and
+//! `Waiting` assert a turn is in flight *right now*, and the glyph's staleness
+//! is the dashboard's downtime, which is unbounded. So they are checked against
+//! the registry's coarse reading and degrade to `Done` without it. That degrade
+//! is not a nicety: a phantom `Working` row holds off macOS sleep through
+//! `lid_awake` (a system-wide switch that also suppresses thermal-emergency
+//! sleep), reads blue forever on this screen and on the peer's, and a phantom
+//! `Waiting` can never be settled because `waiting_backstop_armed` does not
+//! survive a restart either. `Idle` is checked the other way round, for a
+//! different reason: it stands only where the registry reports the session
+//! idle, since a prompt sent while the dashboard was down leaves the glyph
+//! saying CLEAN.
 //!
 //! **A restored row is created outside every mechanism that exists to remove
 //! one** — `membership::Members` (the reaper, the end-signal match) and
@@ -137,12 +142,14 @@ pub struct Restorable {
     /// its current directory's derivation.
     pub id: String,
     pub status: Status,
-    /// Whether the tab said the user had already read this finished row (⚪
-    /// rather than 🟢). Restored because the tab is the only place it survives a
+    /// Whether the user had already read this finished row: a ⚪ tab rather than
+    /// 🟢, or a ⚫ tab degraded to `Done`, which held nothing unread. Restored because the tab is the only place it survives a
     /// restart — `attended_at` is never persisted — and dropping it would make
     /// every read row come back demanding attention after each deploy.
     pub read: bool,
-    /// When that status began, from the registry's own `statusUpdatedAt`.
+    /// When that status began, from the registry's own `statusUpdatedAt`, or for
+    /// an `Idle` row the later of that and `updatedAt`, since a `/clear` moves
+    /// only `updatedAt`.
     pub state_entered_at: i64,
     /// Every record the registry collapsed into this row, which become its
     /// members.
@@ -161,10 +168,10 @@ pub fn gap_exists(live: &[LiveSession], rows: &[String], anchored: &dyn Fn(&str)
 
 /// The status to restore, given what the tab says and what the registry sees.
 ///
-/// `Idle`, `Blocked`, `Done` and `Error` are settled states: they describe a turn
-/// that has already ended, they do not expire while the dashboard is down, and
-/// the registry cannot express them at all. The title is the only witness and it
-/// is taken at its word.
+/// `Blocked`, `Done` and `Error` are settled states: they describe a turn that
+/// has already ended, they do not expire while the dashboard is down, and the
+/// registry cannot express them at all. The title is the only witness and it is
+/// taken at its word.
 ///
 /// `Working` and `Waiting` are claims about *now*. The glyph for either is as
 /// stale as the downtime, and every way of being wrong about them is expensive —
@@ -176,16 +183,21 @@ pub fn gap_exists(live: &[LiveSession], rows: &[String], anchored: &dyn Fn(&str)
 ///
 /// The degrade is to `Done`, the evidence-free sink, which claims nothing beyond
 /// "a turn ended here" — whether the user has read it is carried separately by
-/// `read`, which a degraded row leaves `false`. `Idle` would be the opposite: a
+/// `read`, which a degraded `Working` or `Waiting` leaves `false`. `Idle` would be the opposite: a
 /// confirmed claim that there is nothing to come back to, which no stale glyph
-/// can support.
-///
-/// `None` means restore nothing. A CLEAN tab is the one reading that produces
-/// it: the row it describes has nothing in it worth putting back on the widget,
-/// and recreating it would undo the hiding it was given in the first place.
+/// can support. A `⚫` glyph is different: it is this dashboard's own record of
+/// a CLEAN claim it made on positive evidence, and the row it restores is what
+/// `idle_close` needs to see to close the session on schedule and what the
+/// widget's clean-hide delay counts from. It is kept only where the registry
+/// independently reports the session idle: anything else — a turn running, or
+/// a `waiting` the registry writes for a session parked on a question — means a
+/// prompt arrived that this dashboard never saw, and the row degrades to `Done`
+/// rather than claim CLEAN, which `idle_close` would act on. That row comes back
+/// read (`plan` sets `read`), since a CLEAN tab held nothing unread when the
+/// glyph was written.
 pub fn restored_status(from_title: Status, activity: Activity) -> Option<Status> {
     match from_title {
-        Status::Idle => None,
+        Status::Idle if activity != Activity::Idle => Some(Status::Done),
         Status::Working | Status::Waiting if activity != Activity::Busy => Some(Status::Done),
         s => Some(s),
     }
@@ -233,14 +245,21 @@ pub fn plan(
         out.push(Restorable {
             id,
             status,
-            read,
+            // A CLEAN tab degraded to `Done` held nothing unread when the glyph
+            // was written; claiming unread would raise attention after every
+            // restart for a session the user had cleared.
+            read: read || from_title == Status::Idle,
             // The registry stamps `statusUpdatedAt` when a turn settles, which is
             // the instant the status began. `now` would be a fabricated age, and
             // age is load-bearing in three places at once: the widget's elapsed
             // clock, `/api/agents`' `status_age_ms` — whose entire purpose is
             // letting a caller weigh how old a reading is — and the notifier's
             // time-in-state.
-            state_entered_at: s.activity_age_ms.map_or(now_ms, |age| now_ms - age),
+            // A CLEAN row is dated from the record's last write instead: a
+            // `/clear` rewrites the record without moving `statusUpdatedAt`,
+            // which would otherwise date it from the turn before the clear and
+            // let `idle_close` count its hour from there.
+            state_entered_at: if status == Status::Idle { s.record_age_ms } else { s.activity_age_ms }.map_or(now_ms, |age| now_ms - age),
             members: s.records.clone(),
         });
     }
@@ -470,6 +489,7 @@ mod tests {
             name: Some(chat_id.into()),
             activity,
             activity_age_ms: age_ms,
+            record_age_ms: age_ms,
             records: vec![RecordKey { pid: 4_242, session_id: Some(format!("sid-{chat_id}")) }],
         }
     }
@@ -558,14 +578,35 @@ mod tests {
     }
 
     #[test]
-    fn a_clean_tab_restores_nothing() {
-        // A CLEAN row holds nothing to come back to, and the widget hides it on a
-        // delay for exactly that reason. Recreating it on the next start would
-        // undo that, and would also re-assert a clean claim nobody re-checked.
-        for activity in [Activity::Idle, Activity::Busy, Activity::Unknown] {
-            assert_eq!(restored_status(Status::Idle, activity), None, "{activity:?}");
+    fn a_clean_row_is_dated_from_the_records_last_write_not_its_last_status_change() {
+        // A `/clear` an hour after the turn ended rewrites the record and leaves
+        // `statusUpdatedAt` at the turn's end; dating from that would let
+        // `idle_close` close a session cleared minutes ago.
+        let mut cleared = live("scratch", Activity::Idle, Some(3_600_000));
+        cleared.record_age_ms = Some(120_000);
+        let out = planned(&[cleared], &[tab("/p/scratch", Some("⚫ scratch"))], &[]);
+        assert_eq!(out[0].state_entered_at, 10_000 - 120_000);
+        // Every other status keeps the status stamp, which is when it began.
+        let mut done = live("web", Activity::Idle, Some(3_600_000));
+        done.record_age_ms = Some(120_000);
+        let out = planned(&[done], &[tab("/p/web", Some("⚪ web"))], &[]);
+        assert_eq!(out[0].state_entered_at, 10_000 - 3_600_000);
+    }
+
+    #[test]
+    fn a_clean_tab_comes_back_clean_only_where_the_registry_says_idle() {
+        // The row is what `idle_close` acts on, so a session left CLEAN across a
+        // restart must come back as one, or it would never be closed.
+        assert_eq!(restored_status(Status::Idle, Activity::Idle), Some(Status::Idle));
+        // A prompt submitted while the dashboard was down — running, or parked on
+        // a question (`waiting`, which parses as Unknown): claiming CLEAN would let
+        // `idle_close` end it.
+        for activity in [Activity::Busy, Activity::Unknown] {
+            assert_eq!(restored_status(Status::Idle, activity), Some(Status::Done), "{activity:?}");
         }
-        assert!(planned(&[live("scratch", Activity::Idle, Some(10))], &[tab("/p/scratch", Some("⚫ scratch"))], &[]).is_empty());
+        let out = planned(&[live("scratch", Activity::Busy, Some(10))], &[tab("/p/scratch", Some("⚫ scratch"))], &[]);
+        assert!(out[0].status == Status::Done && out[0].read, "a cleared session comes back read, not asking for attention");
+        assert_eq!(planned(&[live("scratch", Activity::Idle, Some(10))], &[tab("/p/scratch", Some("⚫ scratch"))], &[]).len(), 1);
     }
 
     #[test]

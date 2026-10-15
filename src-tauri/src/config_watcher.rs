@@ -74,6 +74,7 @@ pub fn spawn(app: AppHandle, path: PathBuf) {
                 continue; // no effective change (likely our own write)
             }
             state.with_mut(|c| *c = new_cfg.clone());
+            new_cfg.warn_on_conflicts();
             // If the adherence canary was turned off, clear any stranded drift
             // flags so the row badge + terminal-title ⚠ drop immediately (the
             // Telegram reconciler already dismisses its pings on the toggle). The

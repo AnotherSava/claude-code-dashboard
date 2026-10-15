@@ -10,7 +10,7 @@
 //! console object and UI Automation, and agwinterm from a control pipe and a
 //! state file.
 //!
-//! Five questions, five callers:
+//! Five questions and one action, six callers:
 //!
 //! - **Did the user look at this session?** [`TerminalAdapter::poll`] and
 //!   [`TerminalAdapter::watch`] answer it as a stream of [`Observation`]s.
@@ -37,11 +37,16 @@
 //!   [`TerminalAdapter::write_label`] writes one. `crate::terminals::labels`
 //!   consumes them for a terminal whose sessions carry a field of their own beside
 //!   the console title, writing a row's task there, decided from the live reading.
+//! - **End this session.** [`TerminalAdapter::close_session`] closes the session
+//!   behind a label key, agent and tab together. `crate::idle_close` calls it for
+//!   a row that has sat CLEAN past `idle_close_ms`, finding the session by the
+//!   labeller's own title join.
 //!
 //! They are different axes — the first is about a human, the second about a
 //! screen, the third about the gap between what a screen shows and what is behind
-//! it, the fourth and fifth about where and how this dashboard's own writing goes
-//! — and they share the seam because they share all of its vocabulary.
+//! it, the fourth and fifth about where and how this dashboard's own writing goes,
+//! the action about ending a session — and they share the seam because they share
+//! all of its vocabulary.
 //!
 //! **A new capability goes here too, not beside here.** Every terminal-specific
 //! fact this dashboard learns belongs behind this trait, however Windows-shaped
@@ -709,7 +714,7 @@ pub fn facts_at_switch(front: Front, last_input: LastInput, read_ms: i64, latest
 
 /// A terminal this dashboard can ask about.
 ///
-/// Five questions, all answered in the vocabulary above. *What did the user do*
+/// Five questions and one action, all in the vocabulary above. *What did the user do*
 /// ([`poll`](TerminalAdapter::poll) / [`watch`](TerminalAdapter::watch)), *what
 /// are you showing* ([`sessions`](TerminalAdapter::sessions)), *what are you
 /// displaying versus what is really in there*
@@ -717,9 +722,10 @@ pub fn facts_at_switch(front: Front, last_input: LastInput, read_ms: i64, latest
 /// write land* ([`attached_surface`](TerminalAdapter::attached_surface)), and
 /// *what should this session's context line say*
 /// ([`label_targets`](TerminalAdapter::label_targets) /
-/// [`write_label`](TerminalAdapter::write_label)). They are different axes — a
+/// [`write_label`](TerminalAdapter::write_label)), plus *end this session*
+/// ([`close_session`](TerminalAdapter::close_session)). They are different axes — a
 /// human, a screen, the gap between a screen and what is behind it, and where and
-/// how this dashboard's own writing goes — but they share the seam because they
+/// how this dashboard's own writing goes, plus ending a session — but they share the seam because they
 /// share its whole vocabulary: a session named by `cwd` and `title`, which is all
 /// any caller needs and all any terminal can be relied on to have.
 ///
@@ -922,6 +928,31 @@ pub trait TerminalAdapter: Send {
         let _ = (key, write);
         Err("this terminal cannot be labelled".to_string())
     }
+
+    /// End the session behind `key` — the agent in it and the tab that shows
+    /// it — or say why not. `key` is a [`LabelTarget::key`] this adapter minted:
+    /// a session is found for closing by the same title join it is labelled by,
+    /// so the label keys double as the address.
+    ///
+    /// What "end" takes is the terminal's business, and differs: agterm closes
+    /// the session and the agent goes with it, while a terminal whose tab only
+    /// attaches to an agent hosted elsewhere (agwinterm's tabs onto a WSL tmux
+    /// pane) has to end that agent too, or closing the tab detaches a client and
+    /// leaves the agent running unseen.
+    ///
+    /// **May block**, and is called only from `idle_close`'s worker thread. The
+    /// default refuses, which leaves a row this terminal cannot close standing.
+    fn close_session(&self, key: &str) -> Result<(), String> {
+        let _ = key;
+        Err("this terminal cannot close a session".to_string())
+    }
+
+    /// Whether [`close_session`](Self::close_session) can ever succeed here. A
+    /// fact about the adapter, answered without asking the terminal, so
+    /// `idle_close` starts no worker where every close would be refused.
+    fn can_close(&self) -> bool {
+        false
+    }
 }
 
 /// One labellable session, as [`TerminalAdapter::label_targets`] reports it.
@@ -934,11 +965,13 @@ pub trait TerminalAdapter: Send {
 pub struct LabelTarget {
     /// Which session this is, opaque to every caller, with the contract
     /// [`FrontReading::surface`] has: compare it, pass it back to
-    /// [`TerminalAdapter::write_label`], and do nothing else with it.
+    /// [`TerminalAdapter::write_label`] or [`TerminalAdapter::close_session`],
+    /// and do nothing else with it.
     pub key: String,
-    /// The program title of the session's focused pane, which for an agent is the
-    /// console title this dashboard writes, or `None` where it has none. What
-    /// joins the session to a row.
+    /// A pane's program title — agwinterm's focused pane, agterm's primary pane
+    /// whichever has focus — which for an agent is the console title this
+    /// dashboard writes, or `None` where it has none. What joins the session to
+    /// a row.
     pub title: Option<String>,
     /// The session's context line, or `None` where none is set.
     pub context: Option<String>,

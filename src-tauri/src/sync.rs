@@ -2708,6 +2708,7 @@ mod tests {
             name: Some("transcripts-87".into()),
             activity: crate::session_registry::Activity::Busy,
             activity_age_ms: Some(1_500),
+            record_age_ms: Some(1_500),
             records: vec![crate::session_registry::RecordKey { pid: 4_242, session_id: Some("abc".into()) }, crate::session_registry::RecordKey { pid: 4_243, session_id: Some("def".into()) }],
         }];
         let push = build_push("desktop", 9078, &[], 0, 0, Some(&regs), true, Vec::new());

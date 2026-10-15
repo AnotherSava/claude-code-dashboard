@@ -11,8 +11,8 @@
 //! unprefixed, because three readers already hold surface keys and compare them
 //! for equality, so each child must use its own prefix (Windows Terminal mints
 //! `hwnd:`, agwinterm mints none). A label key goes out as
-//! `"{child name}|{child key}"`, since only [`Composite::write_label`] reads it
-//! back and it needs to know whose it is. An [`Observation`] is passed on as the
+//! `"{child name}|{child key}"`, since [`Composite::write_label`] and
+//! [`Composite::close_session`] read it back and need to know whose it is. An [`Observation`] is passed on as the
 //! child made it, carrying that child's slug, so the decision log says which
 //! terminal saw what rather than naming the set.
 
@@ -26,6 +26,14 @@ pub struct Composite {
 }
 
 impl Composite {
+    /// The child that minted `key`, and the key as that child knows it: the
+    /// routing every key-addressed method shares.
+    fn child_for<'k>(&self, key: &'k str) -> Result<(&dyn TerminalAdapter, &'k str), String> {
+        let (child, inner) = route_key(key).ok_or_else(|| format!("key {key:?} names no terminal"))?;
+        let target = self.children.iter().find(|c| c.name() == child).ok_or_else(|| format!("no terminal named {child:?} is in this set"))?;
+        Ok((target.as_ref(), inner))
+    }
+
     /// `name` is the slug the decision log carries for the whole set. It is the
     /// caller's to choose so that wrapping an existing adapter keeps the slug its
     /// consumers already log under.
@@ -136,9 +144,20 @@ impl TerminalAdapter for Composite {
     }
 
     fn write_label(&self, key: &str, write: &LabelWrite) -> Result<(), String> {
-        let (child, inner) = route_key(key).ok_or_else(|| format!("label key {key:?} names no terminal"))?;
-        let target = self.children.iter().find(|c| c.name() == child).ok_or_else(|| format!("no terminal named {child:?} is in this set"))?;
+        let (target, inner) = self.child_for(key)?;
         target.write_label(inner, write)
+    }
+
+    /// Routed to the child that minted the key, as `write_label` is.
+    fn close_session(&self, key: &str) -> Result<(), String> {
+        let (target, inner) = self.child_for(key)?;
+        target.close_session(inner)
+    }
+
+    /// True when any child can close: a key from a child that cannot is
+    /// refused by that child's `close_session`.
+    fn can_close(&self) -> bool {
+        self.children.iter().any(|c| c.can_close())
     }
 }
 
@@ -159,6 +178,7 @@ mod tests {
         surface: Option<String>,
         targets: Option<Vec<LabelTarget>>,
         labels: bool,
+        closes: bool,
         writes: Arc<Mutex<Vec<(String, LabelWrite)>>>,
         watched: Arc<Mutex<u32>>,
     }
@@ -191,6 +211,13 @@ mod tests {
         }
         fn write_label(&self, key: &str, write: &LabelWrite) -> Result<(), String> {
             self.writes.lock().unwrap().push((key.to_string(), write.clone()));
+            Ok(())
+        }
+        fn can_close(&self) -> bool {
+            self.closes
+        }
+        fn close_session(&self, key: &str) -> Result<(), String> {
+            self.writes.lock().unwrap().push((format!("close {key}"), LabelWrite::ClearContext));
             Ok(())
         }
     }
@@ -238,6 +265,17 @@ mod tests {
         assert_eq!(targets.iter().map(|t| t.key.as_str()).collect::<Vec<_>>(), ["agwinterm|w1/p1"]);
         c.write_label(&targets[0].key, &LabelWrite::ClearContext).unwrap();
         assert_eq!(*writes.lock().unwrap(), vec![("w1/p1".to_string(), LabelWrite::ClearContext)], "the child gets back exactly the key it minted");
+    }
+
+    #[test]
+    fn a_close_reaches_the_child_that_minted_the_key_and_any_closing_child_makes_the_set_close() {
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let c = composite(vec![Fake { name: "windows", ..Fake::default() }, Fake { name: "agwinterm", closes: true, writes: writes.clone(), ..Fake::default() }]);
+        assert!(c.can_close());
+        c.close_session("agwinterm|w1/p1").unwrap();
+        assert_eq!(writes.lock().unwrap()[0].0, "close w1/p1");
+        assert!(c.close_session("kitty|w1/p1").is_err());
+        assert!(!composite(vec![Fake { name: "windows", ..Fake::default() }]).can_close());
     }
 
     #[test]

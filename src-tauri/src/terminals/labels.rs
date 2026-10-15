@@ -5,8 +5,9 @@
 //! two of them do: agwinterm on Windows draws a dim context line beside each
 //! session's name, in the sidebar and in the title bar, and agterm on macOS
 //! shows one in the title bar of its window's active session. The name needs no
-//! writing from here, because each terminal's own label follows the program
-//! title of the session's focused pane, which for an agent is the console title
+//! writing from here, because each terminal's own label follows a pane's program
+//! title — agwinterm's the focused pane's, agterm's the primary pane's whichever
+//! has focus — which for an agent is the console title
 //! `terminal_title::sync` already writes, glyph and suffix included. So the one
 //! field written is the context, and it carries the row's task
 //! (`AgentSession::shown_task`), what the session was asked to do. The status is
@@ -26,8 +27,9 @@
 //! read by the rule `crate::attention` names a session by
 //! ([`crate::terminal_title::title_names`]): the longest label wins, and a draw
 //! between identically labelled rows is refused. A row whose title two sessions
-//! carry is refused too. A session whose focused pane is not the agent, a shell
-//! beside it in a split for one, carries that pane's title and is not joined.
+//! carry is refused too. On agwinterm a session whose focused pane is not the
+//! agent, a shell beside it in a split for one, carries that pane's title and is
+//! not joined; agterm reports the primary pane's title whatever has focus.
 //!
 //! **The context of a session this dashboard labels is its own.** It is
 //! overwritten or cleared whatever it held, and the log keeps the value replaced.
@@ -478,7 +480,7 @@ pub struct Plan {
 }
 
 /// What one session's title says about it.
-enum Claim<'a> {
+pub(crate) enum Claim<'a> {
     /// The title is not one this dashboard wrote, or there is none.
     Foreign,
     /// One of this dashboard's titles, naming no row this session can carry.
@@ -493,37 +495,7 @@ enum Claim<'a> {
 /// what this process placed, by key.
 pub fn plan(rows: &[DesiredLabel], targets: &[LabelTarget], written: &HashMap<String, Placed>) -> Plan {
     let mut out = Plan::default();
-    let mut claims: Vec<Claim> = Vec::with_capacity(targets.len());
-    for t in targets {
-        // Local rows only: a context line is written *into* a session, so it is
-        // only ever about one this dashboard owns. A tab rendering another
-        // machine's session reads as foreign here and is left alone, which is
-        // also the only safe answer — the far machine owns that session's
-        // context line as surely as it owns its title.
-        let named = t.title.as_deref().and_then(|title| title_names(title, false, rows.iter().map(|r| (r, r.label.as_str()))));
-        claims.push(match named {
-            None => Claim::Foreign,
-            Some(Named::One(r)) => Claim::Row(r),
-            Some(Named::Nothing) => Claim::Ours,
-            Some(Named::Drawn(drawn)) => {
-                for r in &drawn {
-                    if !out.declined.iter().any(|d| d.row == r.row) {
-                        out.declined.push(Declined { row: r.row.clone(), reason: "same_label", n: drawn.len() });
-                    }
-                }
-                Claim::Ours
-            }
-        });
-    }
-    for r in rows {
-        let n = claims.iter().filter(|c| matches!(c, Claim::Row(x) if x.row == r.row)).count();
-        if n > 1 {
-            out.declined.push(Declined { row: r.row.clone(), reason: "shared_title", n });
-            for c in claims.iter_mut().filter(|c| matches!(c, Claim::Row(x) if x.row == r.row)) {
-                *c = Claim::Ours;
-            }
-        }
-    }
+    let claims = join(rows, targets, &mut out.declined);
 
     for (t, claim) in targets.iter().zip(&claims) {
         let ours = match claim {
@@ -546,6 +518,49 @@ pub fn plan(rows: &[DesiredLabel], targets: &[LabelTarget], written: &HashMap<St
         }
     }
     out
+}
+
+/// Which row each target's title names, one claim per target in `targets`'
+/// order, with every row the join refuses (`same_label`, `shared_title`) pushed
+/// onto `declined`. A row no title names is neither claimed nor declined.
+///
+/// The join the module doc describes, shared with `idle_close`, which closes the
+/// session a row is joined to: whatever this labels as a row's session is the
+/// session that closes, so the two can never disagree about which tab is whose.
+pub(crate) fn join<'a>(rows: &'a [DesiredLabel], targets: &[LabelTarget], declined: &mut Vec<Declined>) -> Vec<Claim<'a>> {
+    let mut claims: Vec<Claim> = Vec::with_capacity(targets.len());
+    for t in targets {
+        // Local rows only: a context line is written *into* a session, so it is
+        // only ever about one this dashboard owns. A tab rendering another
+        // machine's session reads as foreign here and is left alone, which is
+        // also the only safe answer — the far machine owns that session's
+        // context line as surely as it owns its title.
+        let named = t.title.as_deref().and_then(|title| title_names(title, false, rows.iter().map(|r| (r, r.label.as_str()))));
+        claims.push(match named {
+            None => Claim::Foreign,
+            Some(Named::One(r)) => Claim::Row(r),
+            Some(Named::Nothing) => Claim::Ours,
+            Some(Named::Drawn(drawn)) => {
+                for r in &drawn {
+                    if !declined.iter().any(|d| d.row == r.row) {
+                        declined.push(Declined { row: r.row.clone(), reason: "same_label", n: drawn.len() });
+                    }
+                }
+                Claim::Ours
+            }
+        });
+    }
+    for r in rows {
+        let n = claims.iter().filter(|c| matches!(c, Claim::Row(x) if x.row == r.row)).count();
+        if n > 1 {
+            declined.push(Declined { row: r.row.clone(), reason: "shared_title", n });
+            for c in claims.iter_mut().filter(|c| matches!(c, Claim::Row(x) if x.row == r.row)) {
+                *c = Claim::Ours;
+            }
+        }
+    }
+
+    claims
 }
 
 #[cfg(test)]

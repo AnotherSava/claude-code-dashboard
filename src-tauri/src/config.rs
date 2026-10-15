@@ -211,6 +211,17 @@ pub struct Config {
     /// shell tasks and subagents both cap ~9 min in practice) — is never reached;
     /// only a stuck, killed-task WAIT ages past it. `None`/`0` disables.
     pub waiting_settle_ms: Option<u64>,
+    /// How long (ms) a local session may sit in `Idle` — CLEAN, nothing left to
+    /// come back to — before `idle_close` ends it: the agent and the terminal
+    /// tab it runs in. Only `Idle` qualifies, never a `Done` however long it has
+    /// been read, because `Idle` is the one status set on positive evidence that
+    /// nothing is outstanding. The conversation survives on disk, and
+    /// `claude --continue` in that folder resumes it. `None`/`0` disables.
+    ///
+    /// The default depends on how the binary was built ([`built_for_release`]):
+    /// an hour in a build you deployed, off in the downloadable one, where
+    /// sessions closing on their own would be a surprise.
+    pub idle_close_ms: Option<u64>,
     /// Multi-device session sync (see `sync.rs`). Disabled by default:
     /// `listen=false` and empty `peers` make every sync task a no-op.
     pub sync: SyncConfig,
@@ -592,6 +603,10 @@ pub struct TelegramConfig {
 /// The stale-tab alert's delay wherever it is on by default.
 const STALE_TAB_ALERT_MS: u64 = 600_000;
 
+/// How long a session sits CLEAN before `idle_close` ends it, wherever that is
+/// on by default.
+const IDLE_CLOSE_MS: u64 = 3_600_000;
+
 /// The shared-row alert's default delay: several times the 13s a probe started
 /// in a working session's folder was measured to live.
 const SHARED_ROW_ALERT_MS: u64 = 60_000;
@@ -728,6 +743,7 @@ impl Default for Config {
             clean_hide_after_ms: default_clean_hide_after_ms(),
             restore_sessions: true,
             waiting_settle_ms: Some(600_000),
+            idle_close_ms: (!built_for_release()).then_some(IDLE_CLOSE_MS),
             sync: SyncConfig::default(),
             tray_badge: TrayBadge::None,
             tray_context_alert_enabled: true,
@@ -753,6 +769,26 @@ impl Config {
                 Config::default()
             }),
             Err(_) => Config::default(),
+        }
+    }
+
+    /// Whether a clean row is set to hide no sooner than its session closes,
+    /// with both on. Hiding exists for a CLEAN row that is still open, so a
+    /// hide delay at or past the close delay can only act on a row the close
+    /// failed to reach. Logged as a warning by [`Self::warn_on_conflicts`].
+    pub fn hide_outlasts_close(&self) -> bool {
+        match (self.clean_hide_after_ms, self.idle_close_ms) {
+            (Some(hide), Some(close)) if hide > 0 && close > 0 => hide as u64 >= close,
+            _ => false,
+        }
+    }
+
+    /// Log every combination of settings that contradicts itself. Called on
+    /// every load, startup and hot-reload alike, so an edit that introduces one
+    /// is reported when it is made.
+    pub fn warn_on_conflicts(&self) {
+        if self.hide_outlasts_close() {
+            tracing::warn!(clean_hide_after_ms = self.clean_hide_after_ms, idle_close_ms = self.idle_close_ms, "clean_hide_after_ms should be shorter than idle_close_ms: a clean session closes before its row would hide");
         }
     }
 
@@ -1026,6 +1062,28 @@ mod tests {
         assert_eq!(set.terminal_title_context_percent, Some(70.0));
         let off: Config = serde_json::from_str(r#"{ "terminal_title_context_percent": null }"#).unwrap();
         assert_eq!(off.terminal_title_context_percent, None);
+    }
+
+    #[test]
+    fn hide_must_come_before_close_when_both_are_on() {
+        let cfg = |hide: Option<i64>, close: Option<u64>| Config { clean_hide_after_ms: hide, idle_close_ms: close, ..Config::default() };
+        assert!(!cfg(Some(1_800_000), Some(3_600_000)).hide_outlasts_close(), "the defaults agree");
+        assert!(cfg(Some(3_600_000), Some(3_600_000)).hide_outlasts_close());
+        assert!(cfg(Some(7_200_000), Some(3_600_000)).hide_outlasts_close());
+        assert!(!cfg(Some(7_200_000), None).hide_outlasts_close(), "close off: nothing to conflict with");
+        assert!(!cfg(Some(7_200_000), Some(0)).hide_outlasts_close());
+        assert!(!cfg(None, Some(60_000)).hide_outlasts_close(), "hide off");
+        assert!(!cfg(Some(0), Some(60_000)).hide_outlasts_close());
+    }
+
+    #[test]
+    fn idle_close_ms_defaults_by_build_and_parses() {
+        let expected = if built_for_release() { None } else { Some(IDLE_CLOSE_MS) };
+        assert_eq!(Config::default().idle_close_ms, expected);
+        let set: Config = serde_json::from_str(r#"{ "idle_close_ms": 1234 }"#).unwrap();
+        assert_eq!(set.idle_close_ms, Some(1234));
+        let off: Config = serde_json::from_str(r#"{ "idle_close_ms": null }"#).unwrap();
+        assert_eq!(off.idle_close_ms, None);
     }
 
     #[test]

@@ -122,6 +122,10 @@ struct Record {
     /// registry is local-only, so this age carries no skew).
     #[serde(default, rename = "statusUpdatedAt")]
     status_updated_at: Option<i64>,
+    /// When the record was last written for any reason. A `/clear` moves this
+    /// and not `status_updated_at`, since the session goes idle to idle.
+    #[serde(default, rename = "updatedAt")]
+    updated_at: Option<i64>,
     /// Claude Code's own session id — the key `ChatIdRegistry` anchors a row's
     /// chat_id under. Carried so the roster can prefer the anchored id over a
     /// fresh cwd derivation; see `live_rows`.
@@ -195,6 +199,10 @@ pub struct LiveSession {
     /// Time since `status` was last written, or `None` when the record carries
     /// no stamp. Clamped at 0 like every other age in the roster.
     pub activity_age_ms: Option<i64>,
+    /// Time since the speaker's record was last written for any reason, never
+    /// older than `activity_age_ms`. What dates a session that went CLEAN by a
+    /// `/clear`, which rewrites the record without changing its status.
+    pub record_age_ms: Option<i64>,
     /// Every record collapsed into this row, so a caller can prefer an id
     /// already anchored in `ChatIdRegistry` over `chat_id`'s fresh cwd
     /// derivation, and can name each process behind the row rather than only
@@ -523,6 +531,7 @@ fn live_row(chat_id: String, recs: &[&Record], now: i64) -> Option<LiveSession> 
         name: speaker.name.clone(),
         activity: Activity::parse(speaker.status.as_deref()),
         activity_age_ms: speaker.status_updated_at.map(|t| (now - t).max(0)),
+        record_age_ms: speaker.updated_at.max(speaker.status_updated_at).map(|t| (now - t).max(0)),
         records: recs.iter().map(|r| RecordKey { pid: r.pid, session_id: r.session_id.clone() }).collect(),
     })
 }
@@ -585,7 +594,7 @@ mod tests {
     use super::*;
 
     fn rec(pid: u32, cwd: &str, kind: Option<&str>) -> Record {
-        Record { pid, cwd: cwd.to_string(), kind: kind.map(str::to_string), name: None, status: None, status_updated_at: None, session_id: None, messaging_socket_path: None }
+        Record { pid, cwd: cwd.to_string(), kind: kind.map(str::to_string), name: None, status: None, status_updated_at: None, updated_at: None, session_id: None, messaging_socket_path: None }
     }
 
     fn named(pid: u32, cwd: &str, name: &str, status: &str, status_updated_at: i64) -> Record {
@@ -596,6 +605,7 @@ mod tests {
             name: Some(name.to_string()),
             status: Some(status.to_string()),
             status_updated_at: Some(status_updated_at),
+            updated_at: None,
             session_id: None,
             messaging_socket_path: None,
         }
@@ -781,6 +791,17 @@ mod tests {
     fn an_activity_age_is_clamped_at_zero() {
         let recs = vec![named(93331, "/Users/x/Projects/printlab", "printlab", "idle", 5_000)];
         assert_eq!(rows(recs, Some("/Users/x/Projects"), None, 1_000)[0].activity_age_ms, Some(0));
+    }
+
+    #[test]
+    fn the_record_age_counts_from_the_later_of_its_two_stamps() {
+        let mut r = named(7, "/p/web", "web", "idle", 100);
+        r.updated_at = Some(900);
+        let row = live_row("web".into(), &[&r], 1_000).unwrap();
+        assert_eq!((row.activity_age_ms, row.record_age_ms), (Some(900), Some(100)));
+        r.updated_at = None;
+        let row = live_row("web".into(), &[&r], 1_000).unwrap();
+        assert_eq!(row.record_age_ms, Some(900), "no updatedAt falls back to the status stamp");
     }
 
     // -------- inbox_for --------
