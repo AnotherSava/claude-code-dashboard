@@ -192,7 +192,7 @@
       "files": [
         "work-intensity-windows.png"
       ],
-      "shows": "Windows. Work intensity window, Days view, one week of 10-minute token bars with each row's active time, tokens and share of a day's quota (a seventh of the weekly limit) in the right margin, under a native Windows title bar",
+      "shows": "Windows. Work intensity window, Days view, one week of 10-minute token bars with each row's active time, tokens and share of a day's quota (a seventh of the weekly limit) in the right margin, a thin blue line at the Sunday 8pm weekly limit reset, under a native Windows title bar",
       "policy": "confirm",
       "capture": {
         "command": "pwsh -File docs/screenshots/capture/work-intensity-windows.ps1",
