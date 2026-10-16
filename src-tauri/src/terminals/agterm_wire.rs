@@ -164,6 +164,11 @@ mod tests {
     }
 
     #[test]
+    fn a_close_names_its_session_in_its_window() {
+        assert_eq!(close_argv("W1", "S1"), ["session", "close", "--target", "S1", "--window", "W1", "--json"]);
+    }
+
+    #[test]
     fn targets_carry_the_byte_budget_and_the_window_scoped_key() {
         let sessions = vec![
             serde_json::json!({"id": "A57195F5", "title": "🔵 agterm", "context": "fix the gate"}),
