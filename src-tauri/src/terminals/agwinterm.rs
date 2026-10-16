@@ -1,7 +1,8 @@
 //! agwinterm: a Windows terminal whose sidebar names each session, reached over
 //! its control pipe.
 //!
-//! This adapter answers two questions, labelling and attention.
+//! This adapter answers two questions, labelling and attention, and takes one
+//! action, closing a session.
 //!
 //! **Labelling** reads every open window's `tree` for each session's title and
 //! context, and writes a row's task as the session's context with `session
@@ -96,9 +97,10 @@
 //! **State is held by the instance, not statics.** `terminal_title::sync` and the
 //! stale-tab alert build a throwaway adapter on every call, but they only ask
 //! `attached_surface` and `stale_remedy`, which this adapter leaves at their
-//! defaults; the only caller of `label_targets` and `write_label` is `labels`'
-//! one long-lived worker, and the only caller of `watch` and `poll` is
-//! `attention`'s. Constructing one does no I/O. The one static is the foreground
+//! defaults; `label_targets` is called by `labels`' long-lived worker and by
+//! `idle_close`'s, each on its own instance and connection, `write_label` only
+//! by the first and `close_session` only by the second, and the only caller of
+//! `watch` and `poll` is `attention`'s. Constructing one does no I/O. The one static is the foreground
 //! hook's, which a callback with no state of its own has to write somewhere.
 //!
 //! **Every read and write has a deadline.** agwinterm serves the pipe with no
@@ -107,6 +109,11 @@
 //! overlapped I/O, each read and write waits on its own event for what is left
 //! of the deadline, and an operation still pending then is cancelled and waited
 //! out before its buffer goes away.
+//!
+//! **Closing** types into the session rather than closing its tab, because the
+//! tab usually holds only a `wsl … tmux attach` client onto the agent's pane;
+//! [`super::agwinterm_wire::close_pane`] has the rules that keep the keystrokes
+//! off anything but a CLEAN agent's composer.
 
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -136,6 +143,19 @@ const WRITE_DEADLINE: Duration = Duration::from_secs(17);
 /// look is retried by the worker anyway, so this only stops a terminal that is
 /// not running from being probed more often than that.
 const BACKOFF: Duration = Duration::from_secs(10);
+
+/// The pause between the keystrokes of a close, long enough for Claude Code to
+/// take each as typing rather than as one paste.
+const KEY_PAUSE: Duration = Duration::from_millis(600);
+
+/// How long a close waits for the agent to exit after `/exit`, and how often it
+/// looks.
+const EXIT_WAIT: Duration = Duration::from_secs(30);
+const EXIT_POLL: Duration = Duration::from_millis(500);
+
+/// How many rows a close reads to find the composer: it sits above Claude
+/// Code's status lines, which run to a handful of rows.
+const COMPOSER_LINES: u32 = 30;
 
 /// How long a connect waits for a listening instance when every one is taken.
 /// agwinterm creates the next instance as soon as it accepts one, and its own
@@ -560,6 +580,63 @@ impl TerminalAdapter for AgwintermAdapter {
         };
         self.shared.pipe.lock().unwrap().call(&req, WRITE_DEADLINE).map(|_| ()).map_err(|f| f.reason())
     }
+
+    fn can_close(&self) -> bool {
+        true
+    }
+
+    /// End the agent with `/exit`, then close its tab once the pane is back at
+    /// a shell. Why typing rather than closing, and what refuses it, is
+    /// [`wire::close_pane`]'s doc, and the composer must be empty
+    /// ([`wire::composer_text`]): a draft there is someone typing, here or on
+    /// the Mac, and the close waits for a later tick rather than append to it.
+    ///
+    /// Enter is a separate write after a pause, because Claude Code reads a
+    /// burst of input as a paste, where Enter is a newline rather than a
+    /// submit, and it is pressed only once the composer holds exactly `/exit`;
+    /// anything else means someone typed in the meantime, and the `/exit` is
+    /// left unsent in their draft rather than submitted with it. A pane that has not
+    /// fallen back to a shell within [`EXIT_WAIT`] leaves its tab open and the
+    /// close reported as failed, since closing the tab then would detach a
+    /// client from an agent that is still running. A tree read that fails while
+    /// waiting is retried until then, since `/exit` has already been typed.
+    fn close_session(&self, key: &str) -> Result<(), String> {
+        let (window, session) = wire::split_key(key).ok_or_else(|| format!("label key {key:?} is not a window and a session"))?;
+        let call = |req: &str, deadline: Duration| self.shared.pipe.lock().unwrap().call(req, deadline).map_err(|f| f.reason());
+        let in_front = wire::active_window(&call(&wire::windows_req(), READ_DEADLINE)?).as_deref() == Some(window);
+        let tree = call(&wire::tree_req(window), READ_DEADLINE)?;
+        let node = wire::session_node(&tree, session).ok_or_else(|| format!("session {session} is no longer in window {window}"))?;
+        let pane = wire::close_pane(node, in_front)?;
+        let composer = || call(&wire::styled_text_req(window, &pane.id, COMPOSER_LINES), READ_DEADLINE).map(|t| wire::composer_text(&t));
+        match composer()? {
+            Some(draft) if draft.is_empty() => {}
+            Some(_) => return Err("the composer holds a draft, so someone may be typing into the session".to_string()),
+            None => return Err("no Claude Code composer is on screen in the session's pane".to_string()),
+        }
+        call(&wire::type_req(window, &pane.id, "/exit"), WRITE_DEADLINE)?;
+        std::thread::sleep(KEY_PAUSE);
+        if composer()?.as_deref() != Some("/exit") {
+            return Err("the composer changed while /exit was being typed, so Enter was not pressed".to_string());
+        }
+        call(&wire::type_req(window, &pane.id, "\r"), WRITE_DEADLINE)?;
+        let until = Instant::now() + EXIT_WAIT;
+        loop {
+            std::thread::sleep(EXIT_POLL);
+            let tree = match call(&wire::tree_req(window), READ_DEADLINE) {
+                Ok(tree) => tree,
+                Err(e) if Instant::now() >= until => return Err(format!("typed /exit, but agwinterm could not be read to see whether the agent exited: {e}")),
+                Err(_) => continue,
+            };
+            match wire::session_node(&tree, session) {
+                // Closed already, by its user or by its root exiting.
+                None => return Ok(()),
+                Some(node) if wire::agent_gone(node, pane.index) => break,
+                Some(_) if Instant::now() >= until => return Err(format!("typed /exit, but the pane was still not back at a shell after {}s; its tab is left open", EXIT_WAIT.as_secs())),
+                Some(_) => {}
+            }
+        }
+        call(&wire::close_req(window, session), WRITE_DEADLINE).map(|_| ())
+    }
 }
 
 /// Re-read the window files, and report every departure with the facts the
@@ -966,3 +1043,5 @@ mod tests {
         drop(s.join());
     }
 }
+
+

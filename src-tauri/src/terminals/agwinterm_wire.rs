@@ -57,6 +57,22 @@ pub fn clear_context_req(window: &str, target: &str) -> String {
     json!({ "cmd": "session.context", "target": target, "window": window, "args": { "clear": true } }).to_string()
 }
 
+/// `session type`: `text` written to the pane's input as keystrokes, a `\r`
+/// being Enter. agwinterm refuses any other control byte.
+pub fn type_req(window: &str, target: &str, text: &str) -> String {
+    json!({ "cmd": "session.type", "target": target, "window": window, "args": { "text": text } }).to_string()
+}
+
+/// `session close`: close the session's tab and everything in it.
+pub fn close_req(window: &str, target: &str) -> String {
+    json!({ "cmd": "session.close", "target": target, "window": window }).to_string()
+}
+
+/// `session text --styles` over the last `lines` rows of `target`.
+pub fn styled_text_req(window: &str, target: &str, lines: u32) -> String {
+    json!({ "cmd": "session.text", "target": target, "window": window, "args": { "styles": true, "lines": lines } }).to_string()
+}
+
 /// A reply's `result`, or its `error` text.
 pub fn parse_reply(line: &str) -> Result<Value, String> {
     let reply: Value = serde_json::from_str(line).map_err(|e| format!("unparseable reply: {e}"))?;
@@ -152,18 +168,122 @@ pub struct SessionView {
 /// title is `title`, the focused pane's program title, which agwinterm reports
 /// even while a custom name hides it and leaves out when the pane has none.
 pub fn view_of(result: &Value, id: &str) -> Option<SessionView> {
-    let workspaces = result.get("workspaces").and_then(Value::as_array).into_iter().flatten();
-    let mut sessions = workspaces.flat_map(|w| w.get("sessions").and_then(Value::as_array).into_iter().flatten());
-    let node = sessions.find(|s| s.get("id").and_then(Value::as_str) == Some(id))?;
+    let node = session_node(result, id)?;
     let shell = match node.get("foregroundShells").and_then(Value::as_array).map(Vec::as_slice) {
         None | Some([]) => Shell::Unknown,
         Some(panes) if panes.iter().all(Value::is_string) => Shell::Bare,
         Some(_) => Shell::Occupied,
     };
-    let pane_overlays = node.get("paneOverlays").and_then(Value::as_array).is_some_and(|o| !o.is_empty());
-    let covered = node.get("overlay").and_then(Value::as_bool) == Some(true) || pane_overlays;
+    let covered = covered(node);
     let title = node.get("title").and_then(Value::as_str).map(str::to_string);
     Some(SessionView { active: node.get("active").and_then(Value::as_bool) == Some(true), shell, covered, title })
+}
+
+/// Whether an overlay is open over session `node` or one of its panes.
+fn covered(node: &Value) -> bool {
+    node.get("overlay").and_then(Value::as_bool) == Some(true) || node.get("paneOverlays").and_then(Value::as_array).is_some_and(|o| !o.is_empty())
+}
+
+/// Session `id`'s node in a `tree` result.
+pub fn session_node<'a>(result: &'a Value, id: &str) -> Option<&'a Value> {
+    let workspaces = result.get("workspaces").and_then(Value::as_array).into_iter().flatten();
+    let mut sessions = workspaces.flat_map(|w| w.get("sessions").and_then(Value::as_array).into_iter().flatten());
+    sessions.find(|s| s.get("id").and_then(Value::as_str) == Some(id))
+}
+
+/// The pane a close types `/exit` into: the session's focused pane, the one its
+/// `title` is read from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClosePane {
+    /// The pane's id. agwinterm resolves a session id to the pane that carries
+    /// it, which in a split need not be the focused one, so a split names the
+    /// focused pane by its own id.
+    pub id: String,
+    /// The pane's place in `foregroundShells`, which is in pane order.
+    pub index: usize,
+}
+
+/// The pane to type into, or why session `node` must not be closed.
+///
+/// A close types into the agent rather than ending a process, because on this
+/// machine the agent often runs in a WSL tmux pane the tab only attaches to:
+/// closing the tab detaches the client and leaves the agent running, while a
+/// clean `/exit` ends the agent and lets tmux tear its session down. Typing is
+/// what makes these refusals necessary. It must reach the agent's composer: an
+/// overlay over the session takes its input, and a focused pane that is a bare
+/// shell is a prompt that would run the text as a command. It must not reach a
+/// person mid-sentence, so the selected session of agwinterm's frontmost window
+/// is left alone. And the title it was chosen by must still say CLEAN, since
+/// the agent may have moved on since the label read. A draft in the composer
+/// is checked separately, from the pane's text ([`composer_text`]), since the
+/// tree does not carry it.
+///
+/// The close then ends the whole session, so a split is closed only where its
+/// other pane is a bare shell: agwinterm closes a session without confirming,
+/// and whatever ran beside the agent would go with it.
+pub fn close_pane(node: &Value, in_front: bool) -> Result<ClosePane, String> {
+    if in_front && node.get("active").and_then(Value::as_bool) == Some(true) {
+        return Err("the session is on screen in agwinterm's frontmost window".to_string());
+    }
+    if covered(node) {
+        return Err("an overlay covers the session and would take the input".to_string());
+    }
+    let title = node.get("title").and_then(Value::as_str);
+    let idle = title.and_then(crate::terminal_title::parse_title).is_some_and(|r| r.status == crate::state::Status::Idle && !r.remote);
+    if !idle {
+        return Err("the session's title no longer shows it CLEAN".to_string());
+    }
+    let index = node.get("focusedPane").and_then(Value::as_u64).unwrap_or(0) as usize;
+    if agent_gone(node, index) {
+        return Err("the focused pane is a bare shell, so the agent is no longer running there".to_string());
+    }
+    let panes = node.get("paneIds").and_then(Value::as_array).map_or(1, Vec::len);
+    if (0..panes).any(|i| i != index && !agent_gone(node, i)) {
+        return Err("another pane in the session is running something the close would end".to_string());
+    }
+    let id = match node.get("paneIds").and_then(Value::as_array) {
+        Some(ids) => ids.get(index).and_then(Value::as_str).ok_or("the tree names no focused pane")?.to_string(),
+        None => node.get("id").and_then(Value::as_str).ok_or("the session has no id")?.to_string(),
+    };
+    Ok(ClosePane { id, index })
+}
+
+/// Whether pane `index` of session `node` has fallen back to a shell with no
+/// child process, which is what the pane shows once the agent has exited,
+/// tmux's client with it where there was one.
+pub fn agent_gone(node: &Value, index: usize) -> bool {
+    node.get("foregroundShells").and_then(Value::as_array).and_then(|panes| panes.get(index)).is_some_and(Value::is_string)
+}
+
+/// What Claude Code's composer holds, from a `session text --styles` result,
+/// or `None` when no composer is on screen.
+///
+/// A close types `/exit` only into an empty composer, and checks again that it
+/// holds exactly `/exit` before pressing Enter. Text there is a person's
+/// draft, and the pane is the one place it shows whichever machine it is typed
+/// from: tmux mirrors a client on the Mac into the same pane this tab draws,
+/// so reading the pane covers the Mac's `⇄` tab without asking tmux anything.
+///
+/// The composer is the last row that starts with the prompt glyph directly
+/// under a `─` rule, through the rows down to the next rule. Faint runs are
+/// left out, being the placeholder suggestions Claude Code draws in an empty
+/// composer, not text anyone typed.
+pub fn composer_text(styled: &Value) -> Option<String> {
+    let rows = styled.get("rows").and_then(Value::as_array)?;
+    let lines: Vec<String> = rows
+        .iter()
+        .map(|r| r.get("runs").and_then(Value::as_array).into_iter().flatten().filter(|run| run.get("faint").and_then(Value::as_bool) != Some(true)).filter_map(|run| run.get("text").and_then(Value::as_str)).collect())
+        .collect();
+    let is_rule = |l: &str| !l.trim().is_empty() && l.trim().chars().all(|c| c == '─');
+    let prompt = |l: &str| l.trim_start().strip_prefix(['>', '❯']).map(str::to_string);
+    let top = (1..lines.len()).rev().find(|&i| is_rule(&lines[i - 1]) && prompt(&lines[i]).is_some())?;
+    let bottom = (top + 1..lines.len()).find(|&i| is_rule(&lines[i]))?;
+    let mut text = prompt(&lines[top]).unwrap_or_default();
+    for line in &lines[top + 1..bottom] {
+        text.push('\n');
+        text.push_str(line);
+    }
+    Some(text.trim().to_string())
 }
 
 /// The label targets for one window's sessions. The key is
@@ -307,6 +427,105 @@ mod tests {
         // `args.clear`, never both.
         assert_eq!(v(context_req("w", "s", "Fix the build")), json!({ "cmd": "session.context", "target": "s", "window": "w", "args": { "context": "Fix the build" } }));
         assert_eq!(v(clear_context_req("w", "s")), json!({ "cmd": "session.context", "target": "s", "window": "w", "args": { "clear": true } }));
+        // `HandleType` reads `args.text`; `session.close` takes only its target.
+        assert_eq!(v(type_req("w", "p", "/exit")), json!({ "cmd": "session.type", "target": "p", "window": "w", "args": { "text": "/exit" } }));
+        assert_eq!(v(close_req("w", "s")), json!({ "cmd": "session.close", "target": "s", "window": "w" }));
+        // `HandleText` reads `args.styles` and `args.lines`.
+        assert_eq!(v(styled_text_req("w", "p", 30)), json!({ "cmd": "session.text", "target": "p", "window": "w", "args": { "styles": true, "lines": 30 } }));
         assert!(!ping_req().contains('\n'), "the caller frames each request with one newline");
+    }
+
+    /// A session node as `tree` shows a CLEAN agent under WSL and tmux: the
+    /// root shell has a child, so its `foregroundShells` entry is `null`.
+    fn clean_agent() -> Value {
+        json!({ "id": "S", "active": false, "title": "⚫ web", "foregroundShells": [null] })
+    }
+
+    #[test]
+    fn a_clean_agent_in_a_single_pane_is_typed_into_by_its_session_id() {
+        assert_eq!(close_pane(&clean_agent(), true), Ok(ClosePane { id: "S".into(), index: 0 }));
+    }
+
+    #[test]
+    fn a_split_names_its_focused_pane_by_its_own_id() {
+        let mut n = clean_agent();
+        n["paneIds"] = json!(["S", "P2"]);
+        n["focusedPane"] = json!(1);
+        n["foregroundShells"] = json!(["pwsh", null]);
+        assert_eq!(close_pane(&n, false), Ok(ClosePane { id: "P2".into(), index: 1 }));
+    }
+
+    #[test]
+    fn a_close_is_refused_wherever_the_keystrokes_could_land_somewhere_else() {
+        let refused = |edit: &dyn Fn(&mut Value), in_front: bool| {
+            let mut n = clean_agent();
+            edit(&mut n);
+            close_pane(&n, in_front).is_err()
+        };
+        assert!(refused(&|n| n["active"] = json!(true), true), "on screen in the frontmost window");
+        assert!(!refused(&|n| n["active"] = json!(true), false), "selected in a window behind another is not on screen");
+        assert!(refused(&|n| n["overlay"] = json!(true), false));
+        assert!(refused(&|n| n["paneOverlays"] = json!(["left"]), false));
+        assert!(refused(&|n| n["foregroundShells"] = json!(["pwsh"]), false), "a bare shell would run /exit as a command");
+        assert!(refused(&|n| n["title"] = json!("🔵 web"), false), "the title moved off CLEAN");
+        assert!(refused(&|n| n["title"] = json!("⇄ ⚫ web"), false), "a remote session is its own machine's to close");
+        assert!(refused(&|n| { n.as_object_mut().unwrap().remove("title"); }, false));
+        let split = |n: &mut Value, other: Value| {
+            n["paneIds"] = json!(["S", "P2"]);
+            n["focusedPane"] = json!(1);
+            n["foregroundShells"] = json!([other, null]);
+        };
+        assert!(refused(&|n| split(n, Value::Null), false), "the other pane runs something the close would end");
+        assert!(!refused(&|n| split(n, json!("pwsh")), false), "a bare shell beside the agent may go");
+    }
+
+    /// A `session text --styles` result from plain row texts, each one run;
+    /// a row given as `(text, true)` is faint.
+    fn styled(rows: &[(&str, bool)]) -> Value {
+        let rows: Vec<Value> = rows.iter().enumerate().map(|(i, (t, faint))| json!({ "row": i, "runs": [{ "col": 0, "text": t, "faint": faint }] })).collect();
+        json!({ "cols": 80, "rows": rows })
+    }
+
+    const RULE: &str = "────────────────";
+
+    #[test]
+    fn an_empty_composer_reads_empty() {
+        // The shape read off a live idle session on 2026-10-15: past output, the
+        // composer between two rules, then the status lines under it.
+        let s = styled(&[("> an earlier prompt", false), ("reply", false), (RULE, false), (">", false), (RULE, false), ("  ⏵⏵ auto mode on", false)]);
+        assert_eq!(composer_text(&s).as_deref(), Some(""));
+    }
+
+    #[test]
+    fn the_last_composer_on_screen_is_the_one_read() {
+        // A box shaped like the composer earlier in the output, such as one a
+        // reply quoted, is not the live composer under it.
+        let s = styled(&[(RULE, false), ("> quoted draft", false), (RULE, false), ("reply", false), (RULE, false), (">", false), (RULE, false)]);
+        assert_eq!(composer_text(&s).as_deref(), Some(""));
+    }
+
+    #[test]
+    fn a_draft_reads_back_whole_and_a_placeholder_does_not_count() {
+        let s = styled(&[(RULE, false), ("> fix the", false), ("  build", false), (RULE, false)]);
+        assert_eq!(composer_text(&s).as_deref(), Some("fix the\n  build"));
+        let placeholder = json!({ "rows": [{ "runs": [{ "text": RULE }] }, { "runs": [{ "text": "> " }, { "text": "Try \"refactor\"", "faint": true }] }, { "runs": [{ "text": RULE }] }] });
+        assert_eq!(composer_text(&placeholder).as_deref(), Some(""));
+        assert_eq!(composer_text(&styled(&[(RULE, false), ("❯ /exit", false), (RULE, false)])).as_deref(), Some("/exit"));
+    }
+
+    #[test]
+    fn no_composer_on_screen_reads_none() {
+        assert_eq!(composer_text(&styled(&[("PS C:\\> ", false)])), None);
+        assert_eq!(composer_text(&styled(&[("> an earlier prompt", false), ("reply", false)])), None, "a past prompt has no rule above it");
+        assert_eq!(composer_text(&styled(&[(RULE, false), ("> text", false)])), None, "no rule closes it");
+    }
+
+    #[test]
+    fn the_agent_is_gone_once_its_pane_is_a_bare_shell() {
+        let mut n = clean_agent();
+        assert!(!agent_gone(&n, 0));
+        n["foregroundShells"] = json!(["pwsh"]);
+        assert!(agent_gone(&n, 0));
+        assert!(!agent_gone(&n, 1), "a pane the tree does not list is not known to be a shell");
     }
 }

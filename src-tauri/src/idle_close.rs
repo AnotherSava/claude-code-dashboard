@@ -16,7 +16,8 @@
 //! re-read from this process's state just before the close, so a prompt that
 //! arrived while the terminal was being asked cancels it; and the adapter may
 //! refuse on a fresh reading of its own, as agterm does when the pane the title
-//! belongs to is no longer running the agent.
+//! belongs to is no longer running the agent, and agwinterm does when the
+//! keystrokes its close types could land anywhere but the agent's composer.
 //!
 //! What closing takes is the adapter's ([`TerminalAdapter::close_session`]).
 //! Removing the row is not done here: the agent exiting ends it through the
