@@ -8,5 +8,6 @@ Windows idle auto-close (agwinterm, commit 7b387a6, deployed 2026-10-15 ~21:13 l
 
 Check after the dashboard has been up over an hour with a CLEAN agwinterm session not on screen:
 - grep widget.jsonl (in %APPDATA%\com.anothersava.claude-code-dashboard) for '"decision":"idle_close"'. Expect outcome=closed with idle_ms >= window_ms, then a reap_exited for that chat_id (Claude Code sends no SessionEnd on /exit), the tmux session gone (wsl -d Ubuntu -- tmux list-sessions), and the agwinterm tab gone.
+- On the Mac, if that project had a `⇄` tab open in agterm, it should disappear as the tmux session ends: the claude repo's attach.sh closes its own tab on exit 0 (commit 1623f79), tested so far only with a stub ssh. A tab left at a press-any-key prompt, or showing `refused`, means that close did not fire.
 - For a refusal (session on screen in agwinterm's front window, or a draft in its composer): expect ONE close_failed line carrying the reason, no repeat each minute, and the session left alone with nothing typed.
 - Watch for the single-read recheck case review round 4 flagged (r1-1, declined as rare): '/exit' left typed in a composer, after which every tick refuses it as a draft. If it shows up, poll the post-typing composer read for a few seconds instead of reading it once.
