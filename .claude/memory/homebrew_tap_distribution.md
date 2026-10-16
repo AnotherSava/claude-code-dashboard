@@ -21,4 +21,6 @@ macOS has two install routes as of 2026-08-21: the DMG from Releases, and `brew 
 
 **Bump chain:** publishing a release fires `.github/workflows/notify-tap.yml` → `repository_dispatch` → the tap's `bump-cask.yml`, which resolves the DMG digest from the release API and commits via the Contents API. It needs the `TAP_DISPATCH_TOKEN` secret (fine-grained PAT, Contents write on the tap) because `GITHUB_TOKEN` cannot reach another repo. Both workflows accept a manual `workflow_dispatch` for backfills, and re-dispatching an existing version is a safe no-op. The whole chain was exercised end-to-end on 2026-08-21 against v1.8.0 — token authenticated, tap resolved the digest, diffed, and correctly declined to commit — so it does not need re-verifying; the first real release is what proves the `release: published` trigger specifically.
 
+**The bump can fail on a Homebrew rule change with no release defect.** v1.18.0's bump (2026-10-16) failed `brew style` on `Homebrew/OSDependsOn`: Homebrew's own floor had passed Big Sur, so `depends_on macos: :big_sur` became redundant; the tap fixed it in 335a435 (`depends_on :macos`) and a re-dispatch shipped. A failed bump leaves the cask on the previous version silently, so check the tap's `Bump cask` run after each release.
+
 Related: [[macos_signing_strategy]], [[project_config_wiped_on_deploy]]
