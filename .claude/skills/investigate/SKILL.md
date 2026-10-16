@@ -162,7 +162,9 @@ or `id`), and a `reason`:
   `reap_exited` that follows, so a trail ending that way was not the user
   quitting. Every other outcome closed nothing and is logged once per row:
   `close_failed` (the terminal refused, with its `error`, such as a tab whose
-  pane no longer runs the agent), `no_session` (no tab's title names the row),
+  pane no longer runs the agent, or in agwinterm a session on screen in its
+  front window or with a draft in its composer; the close is retried every
+  tick, so a later `closed` can follow), `no_session` (no tab's title names the row),
   `tab_not_idle` (the tab shows another status, so it is not following the
   row), `same_label` (another row carries the same label) or `shared_title`
   (more than one tab's title names the row).

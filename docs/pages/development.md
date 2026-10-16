@@ -145,7 +145,7 @@ Under the repo root `claude-code-dashboard/`:
       - `mod.rs` — the trait, the shared vocabulary, and the pure verdicts over it (`person_verdict`, `departure_stamp`, `read_front`)
       - `agterm.rs` / `agterm_facts.rs` — agterm's adapter, and the facts it reads from agterm and the system (macOS)
       - `agterm_wire.rs` — agterm's `session context` protocol (the argv a write takes, the targets its tree reports, and the release that first served the verb) and its `session close` argv with `close_refusal`, the rule that refuses a close (macOS)
-      - `agwinterm.rs` / `agwinterm_state.rs` / `agwinterm_wire.rs` — agwinterm's control pipe, its per-window state files, and its protocol (Windows)
+      - `agwinterm.rs` / `agwinterm_state.rs` / `agwinterm_wire.rs` — agwinterm's control pipe, its per-window state files, and its protocol, including `close_pane` and `composer_text`, the rules that refuse a close (Windows)
       - `windows.rs` / `wt_tabs.rs` — Windows Terminal and the Windows console, and the UI Automation read of what a tab really holds
       - `composite.rs` — presents several terminals on one platform as one adapter
       - `labels.rs` — writes each row's task into a terminal's own per-session context line
