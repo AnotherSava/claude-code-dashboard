@@ -255,6 +255,17 @@ pub fn agent_gone(node: &Value, index: usize) -> bool {
     node.get("foregroundShells").and_then(Value::as_array).and_then(|panes| panes.get(index)).is_some_and(Value::is_string)
 }
 
+/// A row with the edge and fill tmux draws beyond a window smaller than the
+/// client cut off. The edge is cut only where fill followed it, since a row
+/// with no fill is the window's own, and its last column is content.
+fn without_tmux_fill(row: &str) -> &str {
+    let unfilled = row.trim_end_matches('·');
+    if unfilled.len() == row.len() {
+        return row;
+    }
+    unfilled.strip_suffix(['│', '┘']).unwrap_or(unfilled)
+}
+
 /// What Claude Code's composer holds, from a `session text --styles` result,
 /// or `None` when no composer is on screen.
 ///
@@ -267,12 +278,17 @@ pub fn agent_gone(node: &Value, index: usize) -> bool {
 /// The composer is the last row that starts with the prompt glyph directly
 /// under a `─` rule, through the rows down to the next rule. Faint runs are
 /// left out, being the placeholder suggestions Claude Code draws in an empty
-/// composer, not text anyone typed.
+/// composer, not text anyone typed. tmux draws its window at the size of its
+/// smallest client, edges it with `│` (`┘` at the corner) and fills the rest of
+/// a larger client with `·`, so while the Mac is attached to a session too,
+/// every row this tab shows of it, the rules included, ends in that edge and
+/// fill; [`without_tmux_fill`] cuts both first.
 pub fn composer_text(styled: &Value) -> Option<String> {
     let rows = styled.get("rows").and_then(Value::as_array)?;
     let lines: Vec<String> = rows
         .iter()
-        .map(|r| r.get("runs").and_then(Value::as_array).into_iter().flatten().filter(|run| run.get("faint").and_then(Value::as_bool) != Some(true)).filter_map(|run| run.get("text").and_then(Value::as_str)).collect())
+        .map(|r| r.get("runs").and_then(Value::as_array).into_iter().flatten().filter(|run| run.get("faint").and_then(Value::as_bool) != Some(true)).filter_map(|run| run.get("text").and_then(Value::as_str)).collect::<String>())
+        .map(|l| without_tmux_fill(&l).to_string())
         .collect();
     let is_rule = |l: &str| !l.trim().is_empty() && l.trim().chars().all(|c| c == '─');
     let prompt = |l: &str| l.trim_start().strip_prefix(['>', '❯']).map(str::to_string);
@@ -511,6 +527,21 @@ mod tests {
         let placeholder = json!({ "rows": [{ "runs": [{ "text": RULE }] }, { "runs": [{ "text": "> " }, { "text": "Try \"refactor\"", "faint": true }] }, { "runs": [{ "text": RULE }] }] });
         assert_eq!(composer_text(&placeholder).as_deref(), Some(""));
         assert_eq!(composer_text(&styled(&[(RULE, false), ("❯ /exit", false), (RULE, false)])).as_deref(), Some("/exit"));
+    }
+
+    #[test]
+    fn tmux_fill_beyond_a_smaller_window_is_not_text() {
+        // The shape read off a live session on 2026-10-16 that the Mac was also
+        // attached to: tmux drew the window at the Mac's width, edged it, and
+        // filled the rest of each row, and the rows under the window, with `·`.
+        let fill = "·".repeat(20);
+        let rule = format!("{RULE}│{fill}");
+        let s = styled(&[(&rule, false), (&format!(">\u{a0}   │{fill}"), false), (&rule, false), (&format!("  Memos (43)  │{fill}"), false), (&format!("{RULE}┘{fill}"), false), (&fill, false)]);
+        assert_eq!(composer_text(&s).as_deref(), Some(""));
+        let s = styled(&[(&rule, false), (&format!("> /exit   │{fill}"), false), (&rule, false)]);
+        assert_eq!(composer_text(&s).as_deref(), Some("/exit"));
+        let s = styled(&[(RULE, false), ("> a draft ending │", false), (RULE, false)]);
+        assert_eq!(composer_text(&s).as_deref(), Some("a draft ending │"), "an edge with no fill after it is the draft's own");
     }
 
     #[test]
