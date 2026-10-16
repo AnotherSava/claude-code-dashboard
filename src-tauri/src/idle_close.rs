@@ -24,8 +24,8 @@
 //!
 //! A tab mirroring another machine's session (the `⇄` tabs) is never closed
 //! from this side, because the join refuses a remote title. When the machine
-//! that owns the session ends it, the tab's `attach.sh` exits and agterm holds
-//! the tab at a press-any-key prompt, so it stays until it is closed by hand.
+//! that owns the session ends it, the tab's `attach.sh` exits and closes its
+//! own tab.
 
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
