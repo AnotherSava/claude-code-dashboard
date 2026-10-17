@@ -2236,7 +2236,7 @@ mod tests {
 
     fn live(chat_id: &str, activity: Activity, sessions: usize) -> LiveSession {
         let records = (0..sessions).map(|i| crate::session_registry::RecordKey { pid: 4_242 + i as u32, session_id: None }).collect();
-        LiveSession { chat_id: chat_id.to_string(), name: Some(chat_id.to_string()), activity, activity_age_ms: Some(600), record_age_ms: Some(600), records }
+        LiveSession { chat_id: chat_id.to_string(), name: Some(chat_id.to_string()), activity, activity_age_ms: Some(600), record_age_ms: Some(600), records, newest_start_ms: None }
     }
 
     fn reg_sync(chat_id: &str, activity: Activity, activity_age_ms: Option<i64>, sessions: usize) -> crate::sync::RegistrySync {

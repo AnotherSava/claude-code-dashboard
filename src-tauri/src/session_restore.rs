@@ -38,7 +38,8 @@
 //! `read` flag set and a `🟢` one comes back `Done`, still asking, while a `⚫`
 //! one comes back `Idle` where the registry reports the session idle, so
 //! `idle_close` can still close it, and a read `Done` otherwise. A tab with no
-//! title we recognize is **skipped**, never guessed at, and that same rule is
+//! title we recognize is **skipped**, never guessed at (a missed start being
+//! the one session that needs none), and that same rule is
 //! what stops a removed row from being resurrected — the blank
 //! `terminal_title::sync` writes on removal is exactly a title we do not
 //! recognize.
@@ -103,6 +104,15 @@
 //! stale at any sane tick — so every wake paid a directory read and a full
 //! process enumeration to rediscover the same nothing.
 //!
+//! **A session that started while the dashboard was down needs no title.** Its
+//! `SessionStart` was sent to nothing, so nothing could have removed its row and
+//! the blank-title guard has nothing to guard. Where the registry's `startedAt`
+//! is later than the previous run's last heartbeat ([`crate::alive_stamp`]), the
+//! row is created as that event would have created it ([`replayed_status`]),
+//! whatever the tab shows. This is the only restore that works after a Windows
+//! reboot: the titles lived on console objects the reboot destroyed, and the
+//! terminal reopens its tabs and starts their sessions before this app is up.
+//!
 //! Consequence, and it matches how this app treats its other start-only settings
 //! (`sync.listen`, `listen_port`, `bind_scope`): turning `restore_sessions` or
 //! `terminal_titles` on at runtime takes effect at the next start, not
@@ -154,6 +164,23 @@ pub struct Restorable {
     /// Every record the registry collapsed into this row, which become its
     /// members.
     pub members: Vec<RecordKey>,
+    pub evidence: Evidence,
+}
+
+/// What a restore was decided from, for the log line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Evidence {
+    /// The status this dashboard last wrote onto the session's tab.
+    TabTitle,
+    /// The session started while the dashboard was down, so its `SessionStart`
+    /// was missed and is replayed.
+    MissedStart,
+}
+
+/// Whether `s` started after `down_since`, the previous run's last heartbeat.
+/// Unknown on either side is `false`: a guessed instant would mint rows on a guess.
+fn missed_start(s: &LiveSession, down_since: Option<i64>) -> bool {
+    matches!((s.newest_start_ms, down_since), (Some(start), Some(since)) if start > since)
 }
 
 /// Whether any live session lacks a row — the whole gate on spending a
@@ -162,8 +189,8 @@ pub struct Restorable {
 /// Pure, so the steady-state cost is pinned by a test rather than measured. The
 /// common case is every live session already having a row, which is what the
 /// machine looks like within moments of a restart and for the rest of the day.
-pub fn gap_exists(live: &[LiveSession], rows: &[String], anchored: &dyn Fn(&str) -> Option<String>) -> bool {
-    live.iter().filter(|s| s.known_to(anchored)).any(|s| !rows.iter().any(|id| *id == s.row_id(anchored)))
+pub fn gap_exists(live: &[LiveSession], rows: &[String], anchored: &dyn Fn(&str) -> Option<String>, down_since: Option<i64>) -> bool {
+    live.iter().filter(|s| s.known_to(anchored) || missed_start(s, down_since)).any(|s| !rows.iter().any(|id| *id == s.row_id(anchored)))
 }
 
 /// The status to restore, given what the tab says and what the registry sees.
@@ -203,18 +230,41 @@ pub fn restored_status(from_title: Status, activity: Activity) -> Option<Status>
     }
 }
 
+/// The status a missed `SessionStart` would have left, given what the registry
+/// has seen since.
+///
+/// The hook path settles a `startup` or a `/clear` CLEAN and a `resume` `Done`
+/// unless its dialog ends at a `/clear` (`http_server::resume_is_clean`). Which
+/// source fired is not recorded anywhere this can read, so `clean` stands in for
+/// it: a session id this dashboard never saw is a fresh conversation, and a seen
+/// one is a resume, clean where its persisted dialog ends at a `/clear`. A
+/// session the registry reports busy took a prompt since, and one reporting
+/// anything else may be parked on a question, which a CLEAN claim would let
+/// `idle_close` end.
+pub fn replayed_status(activity: Activity, clean: bool) -> Status {
+    match activity {
+        Activity::Busy => Status::Working,
+        Activity::Idle if clean => Status::Idle,
+        _ => Status::Done,
+    }
+}
+
 /// Match each live session to the tab showing it, and decide what to restore.
 ///
 /// Pure: the whole judgment, testable without a terminal, a registry or an
 /// `AppHandle`. `derive` is the caller's `derive_chat_id` closure (it needs
-/// `projects_root`), and `anchored` its `ChatIdRegistry` lookup.
+/// `projects_root`), `anchored` its `ChatIdRegistry` lookup, `down_since` the
+/// previous run's last heartbeat and `ends_clean` whether a row's persisted
+/// dialog ends at a `/clear`.
 ///
 /// A live session is skipped, rather than restored with a fallback, when its tab
 /// carries no title this dashboard recognizes — a tab we blanked when the row was
 /// removed, one running something other than an agent, one from before this
 /// dashboard ever ran. Skipping is what keeps the removal paths and this one from
 /// fighting: `terminal_title::sync` blanks the tab of a row that goes away, so the
-/// blank is the record that it went.
+/// blank is the record that it went. A session that started after `down_since`
+/// is the exception: its `SessionStart` reached no listener, so no row of it was
+/// ever removed, and it is replayed whatever its tab shows.
 ///
 /// Two tabs deriving one session are only trusted when they agree. They normally
 /// do — a split shows the same session twice — but a genuine disagreement means
@@ -227,17 +277,31 @@ pub fn plan(
     now_ms: i64,
     derive: &dyn Fn(&str) -> String,
     anchored: &dyn Fn(&str) -> Option<String>,
+    down_since: Option<i64>,
+    ends_clean: &dyn Fn(&str) -> bool,
 ) -> Vec<Restorable> {
     let mut out = Vec::new();
     for s in live {
+        let id = s.row_id(anchored);
+        if rows.iter().any(|r| *r == id) {
+            continue;
+        }
+        if missed_start(s, down_since) {
+            let status = replayed_status(s.activity, !s.known_to(anchored) || ends_clean(&id));
+            out.push(Restorable {
+                id,
+                status,
+                read: false,
+                state_entered_at: entered_at(s, status, now_ms),
+                members: s.records.clone(),
+                evidence: Evidence::MissedStart,
+            });
+            continue;
+        }
         // A session this dashboard has never processed an event for is one whose
         // tab it never titled, so the glyph sitting there describes some earlier
         // conversation. See `LiveSession::known_to`.
         if !s.known_to(anchored) {
-            continue;
-        }
-        let id = s.row_id(anchored);
-        if rows.iter().any(|r| *r == id) {
             continue;
         }
         let Some((from_title, read)) = title_status(&s.chat_id, tabs, derive) else { continue };
@@ -249,21 +313,26 @@ pub fn plan(
             // was written; claiming unread would raise attention after every
             // restart for a session the user had cleared.
             read: read || from_title == Status::Idle,
-            // The registry stamps `statusUpdatedAt` when a turn settles, which is
-            // the instant the status began. `now` would be a fabricated age, and
-            // age is load-bearing in three places at once: the widget's elapsed
-            // clock, `/api/agents`' `status_age_ms` — whose entire purpose is
-            // letting a caller weigh how old a reading is — and the notifier's
-            // time-in-state.
-            // A CLEAN row is dated from the record's last write instead: a
-            // `/clear` rewrites the record without moving `statusUpdatedAt`,
-            // which would otherwise date it from the turn before the clear and
-            // let `idle_close` count its hour from there.
-            state_entered_at: if status == Status::Idle { s.record_age_ms } else { s.activity_age_ms }.map_or(now_ms, |age| now_ms - age),
+            state_entered_at: entered_at(s, status, now_ms),
             members: s.records.clone(),
+            evidence: Evidence::TabTitle,
         });
     }
     out
+}
+
+/// When the restored status began.
+///
+/// The registry stamps `statusUpdatedAt` when a turn settles, which is the
+/// instant the status began. `now` would be a fabricated age, and age is read in
+/// three places at once: the widget's elapsed clock, `/api/agents`'
+/// `status_age_ms`, whose purpose is letting a caller weigh how old a reading
+/// is, and the notifier's time-in-state. A CLEAN row is dated from the record's
+/// last write instead: a `/clear` rewrites the record without moving
+/// `statusUpdatedAt`, which would otherwise date it from the turn before the
+/// clear and let `idle_close` count its hour from there.
+fn entered_at(s: &LiveSession, status: Status, now_ms: i64) -> i64 {
+    if status == Status::Idle { s.record_age_ms } else { s.activity_age_ms }.map_or(now_ms, |age| now_ms - age)
 }
 
 /// The status the tabs showing `chat_id` agree on, and whether they agree it was
@@ -355,14 +424,7 @@ fn tick(app: &AppHandle, adapter: &dyn crate::terminals::TerminalAdapter) -> Pas
     let terminal = adapter.name();
     let Some(cfg_state) = app.try_state::<ConfigState>() else { return Pass::Unanswered };
     let cfg = cfg_state.snapshot();
-    // Both halves of the gate, because the second is not merely a related
-    // setting: the tab title is where a row's status survives this process, so
-    // with titling off nothing has been writing them — and, worse, nothing is
-    // *blanking* them either, since `terminal_title::sync` returns before its
-    // removal sweep. The glyphs then freeze at whatever was last written while it
-    // was on, and restoring from them would resurrect a status that is arbitrarily
-    // old and a row that may have been deliberately removed.
-    if !cfg.restore_sessions || !cfg.terminal_titles {
+    if !cfg.restore_sessions {
         return Pass::Skip;
     }
     let (Some(state), Some(registry)) = (app.try_state::<AppState>(), app.try_state::<SessionRegistry>()) else { return Pass::Unanswered };
@@ -371,6 +433,9 @@ fn tick(app: &AppHandle, adapter: &dyn crate::terminals::TerminalAdapter) -> Pas
     let anchor_store = app.try_state::<crate::chat_id_registry::ChatIdRegistry>();
     let anchored = |sid: &str| anchor_store.as_ref().and_then(|r| r.anchored(sid));
     let derive = |cwd: &str| crate::adapters::claude::derive_chat_id(Some(cwd), root.as_deref());
+    let down_since = app.try_state::<crate::alive_stamp::AliveStamp>().and_then(|a| a.previous());
+    let history = app.try_state::<crate::prompt_history::PromptHistoryStore>();
+    let ends_clean = |id: &str| history.as_ref().and_then(|h| h.get(id)).is_some_and(|p| crate::state::ends_with_clear_boundary(&p.dialog));
 
     // Unreadable is not empty. `None` here means the registry directory could not
     // be read, which says nothing about what is running; treating it as "nothing
@@ -380,19 +445,26 @@ fn tick(app: &AppHandle, adapter: &dyn crate::terminals::TerminalAdapter) -> Pas
         return Pass::Unanswered;
     };
     let rows: Vec<String> = state.snapshot().into_iter().map(|s| s.id).collect();
-    if !gap_exists(&live, &rows, &anchored) {
+    if !gap_exists(&live, &rows, &anchored, down_since) {
         // A complete answer, not a deferral: every live session this dashboard
         // knows already has a row, so there is nothing a later attempt could add.
         tracing::debug!(decision = "restore_scan", terminal, outcome = "no_gap", live = live.len(), rows = rows.len(), "every live session already has a row");
         return Pass::Answered;
     }
-    let Some(tabs) = adapter.sessions() else {
+    // With titling off the tabs are not read at all, because the tab title is
+    // where a row's status survives this process: nothing has been writing them
+    // and, worse, nothing is *blanking* them either, since `terminal_title::sync`
+    // returns before its removal sweep. The glyphs then freeze at whatever was
+    // last written while it was on, and restoring from them would resurrect a
+    // status that is arbitrarily old and a row that may have been deliberately
+    // removed. A missed start needs no title, so it is restored either way, and
+    // before the terminal answers, which a retry then waits for.
+    let tabs = if cfg.terminal_titles { adapter.sessions() } else { Some(Vec::new()) };
+    if tabs.is_none() {
         tracing::debug!(decision = "restore_scan", terminal, outcome = "no_answer", live = live.len(), rows = rows.len(), "the terminal could not be asked what it is showing");
-        return Pass::Unanswered;
-    };
+    }
 
-    let plan = plan(&live, &tabs, &rows, now, &derive, &anchored);
-    let history = app.try_state::<crate::prompt_history::PromptHistoryStore>();
+    let plan = plan(&live, tabs.as_deref().unwrap_or_default(), &rows, now, &derive, &anchored, down_since, &ends_clean);
     let mut restored = 0;
     for r in &plan {
         let input = SetInput {
@@ -452,7 +524,10 @@ fn tick(app: &AppHandle, adapter: &dyn crate::terminals::TerminalAdapter) -> Pas
             age_ms = now - r.state_entered_at,
             members = r.members.len(),
             dialog_entries,
-            reason = "a live session with no row; status read back from the tab title this dashboard last wrote",
+            reason = match r.evidence {
+                Evidence::TabTitle => "a live session with no row; status read back from the tab title this dashboard last wrote",
+                Evidence::MissedStart => "a live session with no row that started while the dashboard was down; its SessionStart is replayed",
+            },
             "decision"
         );
     }
@@ -465,13 +540,16 @@ fn tick(app: &AppHandle, adapter: &dyn crate::terminals::TerminalAdapter) -> Pas
         outcome = if restored > 0 { "restored" } else { "nothing_restorable" },
         live = live.len(),
         rows = rows.len(),
-        tabs = tabs.len(),
+        tabs = tabs.as_ref().map_or(0, Vec::len),
         planned = plan.len(),
         restored,
         "session restore pass"
     );
     if restored > 0 {
         crate::commands::emit_sessions_updated(app);
+    }
+    if tabs.is_none() {
+        return Pass::Unanswered;
     }
     // Both sources answered, so this run is over even when nothing was
     // restorable: the reasons a session is skipped — no title we recognize, never
@@ -491,6 +569,7 @@ mod tests {
             activity_age_ms: age_ms,
             record_age_ms: age_ms,
             records: vec![RecordKey { pid: 4_242, session_id: Some(format!("sid-{chat_id}")) }],
+            newest_start_ms: Some(1_000),
         }
     }
 
@@ -513,8 +592,21 @@ mod tests {
         None
     }
 
+    /// The previous run's last heartbeat. Later than every fixture's start, so
+    /// only a test that moves a start past it exercises the missed-start path.
+    const STAMP: i64 = 5_000;
+
+    fn never_clean(_: &str) -> bool {
+        false
+    }
+
+    /// A session whose process started after [`STAMP`], while the dashboard was down.
+    fn started_while_down(chat_id: &str, activity: Activity) -> LiveSession {
+        LiveSession { newest_start_ms: Some(STAMP + 1), ..live(chat_id, activity, Some(10)) }
+    }
+
     fn planned(live: &[LiveSession], tabs: &[TerminalSession], rows: &[String]) -> Vec<Restorable> {
-        plan(live, tabs, rows, 10_000, &derive, &seen)
+        plan(live, tabs, rows, 10_000, &derive, &seen, Some(STAMP), &never_clean)
     }
 
     #[test]
@@ -676,9 +768,9 @@ mod tests {
         // and seed the session's pid there, and its next hook event would follow
         // that pid, splitting the conversation across two rows.
         let anchored = |sid: &str| (sid == "sid-src-tauri").then(|| "dash".to_string());
-        let out = plan(&[live("src-tauri", Activity::Idle, Some(10))], &[tab("/p/src-tauri", Some("🟢 dash"))], &[], 10_000, &derive, &anchored);
+        let out = plan(&[live("src-tauri", Activity::Idle, Some(10))], &[tab("/p/src-tauri", Some("🟢 dash"))], &[], 10_000, &derive, &anchored, Some(STAMP), &never_clean);
         assert_eq!(out[0].id, "dash");
-        let none = plan(&[live("src-tauri", Activity::Idle, Some(10))], &[tab("/p/src-tauri", Some("🟢 dash"))], &["dash".to_string()], 10_000, &derive, &anchored);
+        let none = plan(&[live("src-tauri", Activity::Idle, Some(10))], &[tab("/p/src-tauri", Some("🟢 dash"))], &["dash".to_string()], 10_000, &derive, &anchored, Some(STAMP), &never_clean);
         assert!(none.is_empty(), "and it is then seen to already have one");
     }
 
@@ -694,10 +786,10 @@ mod tests {
     fn nothing_is_asked_of_the_terminal_while_every_live_session_has_a_row() {
         // The steady state, and what the machine looks like for most of the day.
         let live = vec![live("a", Activity::Idle, Some(10)), live("b", Activity::Busy, Some(10))];
-        assert!(!gap_exists(&live, &["a".to_string(), "b".to_string()], &seen));
-        assert!(gap_exists(&live, &["a".to_string()], &seen));
-        assert!(!gap_exists(&[], &[], &seen), "nothing running");
-        assert!(!gap_exists(&[], &["stale".to_string()], &seen), "a row with no live session is not this module's business");
+        assert!(!gap_exists(&live, &["a".to_string(), "b".to_string()], &seen, Some(STAMP)));
+        assert!(gap_exists(&live, &["a".to_string()], &seen, Some(STAMP)));
+        assert!(!gap_exists(&[], &[], &seen, Some(STAMP)), "nothing running");
+        assert!(!gap_exists(&[], &["stale".to_string()], &seen, Some(STAMP)), "a row with no live session is not this module's business");
     }
 
     #[test]
@@ -721,7 +813,7 @@ mod tests {
         assert!(planned(&live, &[tab("/p/dash", None)], &[]).is_empty());
         // And the gap is still open, so a design that retried "until the gap
         // closes" rather than "until both answered" would never stop here.
-        assert!(gap_exists(&live, &[], &seen));
+        assert!(gap_exists(&live, &[], &seen, Some(STAMP)));
     }
 
     #[test]
@@ -734,13 +826,13 @@ mod tests {
         // that tab for.
         let live = [live("dash", Activity::Idle, Some(10))];
         let tabs = [tab("/p/dash", Some("✋ dash"))];
-        assert!(plan(&live, &tabs, &[], 10_000, &derive, &no_anchor).is_empty());
+        assert!(plan(&live, &tabs, &[], 10_000, &derive, &no_anchor, Some(STAMP), &never_clean).is_empty());
         // And the gate agrees, so an unknown session does not keep the terminal
         // being asked every tick for something that will never be restored.
-        assert!(!gap_exists(&live, &[], &no_anchor));
+        assert!(!gap_exists(&live, &[], &no_anchor, Some(STAMP)));
         // The same session, once seen, restores normally.
         assert_eq!(planned(&live, &tabs, &[])[0].status, Status::Blocked);
-        assert!(gap_exists(&live, &[], &seen));
+        assert!(gap_exists(&live, &[], &seen, Some(STAMP)));
     }
 
     #[test]
@@ -751,7 +843,59 @@ mod tests {
         let mut s = live("what-is-next", Activity::Idle, Some(10));
         s.records = vec![RecordKey { pid: 1, session_id: Some("sid-unknown".into()) }, RecordKey { pid: 2, session_id: Some("sid-b".into()) }];
         assert!(s.known_to(&only_second));
-        assert_eq!(plan(&[s], &[tab("/p/what-is-next", Some("✋ what-is-next"))], &[], 10_000, &derive, &only_second).len(), 1);
+        assert_eq!(plan(&[s], &[tab("/p/what-is-next", Some("✋ what-is-next"))], &[], 10_000, &derive, &only_second, Some(STAMP), &never_clean).len(), 1);
+    }
+
+    #[test]
+    fn a_session_started_while_the_dashboard_was_down_is_restored_without_a_title() {
+        // Measured after a Windows reboot: every console, and every title on it,
+        // was gone, and the terminal started four sessions a minute before the
+        // dashboard came up.
+        let out = planned(&[started_while_down("toolbox", Activity::Idle)], &[tab("/p/toolbox", None)], &[]);
+        assert_eq!(out.len(), 1);
+        assert_eq!((out[0].status, out[0].read, out[0].evidence), (Status::Done, false, Evidence::MissedStart), "a resume settles Done, as the hook path does");
+        // No tab at all is the same: the title is not the evidence here.
+        assert_eq!(planned(&[started_while_down("toolbox", Activity::Idle)], &[], &[]).len(), 1);
+    }
+
+    #[test]
+    fn a_missed_start_outranks_the_glyph_an_earlier_process_left() {
+        // The glyph describes the process that ran before the downtime; the
+        // missed `SessionStart` would have replaced it.
+        let out = planned(&[started_while_down("dash", Activity::Idle)], &[tab("/p/dash", Some("✋ dash"))], &[]);
+        assert_eq!(out[0].status, Status::Done);
+    }
+
+    #[test]
+    fn a_replayed_start_is_clean_only_where_the_hook_path_would_say_so() {
+        assert_eq!(replayed_status(Activity::Idle, true), Status::Idle);
+        assert_eq!(replayed_status(Activity::Idle, false), Status::Done);
+        assert_eq!(replayed_status(Activity::Busy, true), Status::Working, "a prompt arrived since");
+        assert_eq!(replayed_status(Activity::Unknown, true), Status::Done, "possibly parked on a question");
+        // A seen session whose dialog ends at a `/clear` resumes clean.
+        let out = plan(&[started_while_down("dash", Activity::Idle)], &[], &[], 10_000, &derive, &seen, Some(STAMP), &|id| id == "dash");
+        assert_eq!(out[0].status, Status::Idle);
+        // A session id never seen is a fresh conversation, which `startup` settles clean.
+        let out = plan(&[started_while_down("dash", Activity::Idle)], &[], &[], 10_000, &derive, &no_anchor, Some(STAMP), &never_clean);
+        assert_eq!(out[0].status, Status::Idle);
+    }
+
+    #[test]
+    fn a_missed_start_needs_both_instants() {
+        // Without the previous run's stamp, or without the record's start, the
+        // downtime cannot be placed, and the title rule alone applies.
+        let s = started_while_down("dash", Activity::Idle);
+        assert!(plan(&[s.clone()], &[], &[], 10_000, &derive, &seen, None, &never_clean).is_empty());
+        let unstamped = LiveSession { newest_start_ms: None, ..s };
+        assert!(planned(&[unstamped], &[], &[]).is_empty());
+    }
+
+    #[test]
+    fn a_missed_start_opens_the_gap_even_for_a_session_never_seen() {
+        let s = [started_while_down("fresh", Activity::Idle)];
+        assert!(gap_exists(&s, &[], &no_anchor, Some(STAMP)));
+        assert!(!gap_exists(&s, &["fresh".to_string()], &no_anchor, Some(STAMP)), "and closes once it has a row");
+        assert!(planned(&s, &[], &["fresh".to_string()]).is_empty());
     }
 
     #[test]
@@ -759,6 +903,6 @@ mod tests {
         // Otherwise a `cd`-ed session with a perfectly good row would look missing
         // on every tick, and the terminal would be asked forever.
         let anchored = |sid: &str| (sid == "sid-src-tauri").then(|| "dash".to_string());
-        assert!(!gap_exists(&[live("src-tauri", Activity::Idle, Some(10))], &["dash".to_string()], &anchored));
+        assert!(!gap_exists(&[live("src-tauri", Activity::Idle, Some(10))], &["dash".to_string()], &anchored, Some(STAMP)));
     }
 }

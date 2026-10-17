@@ -41,7 +41,7 @@
 - [idle_probe retired](idle_probe_screen_criteria_tui_sensitive.md) — screen-scrape removed 2026-07-01; instant Esc-cancels DO write the interrupt marker (verified), so the marker path is authoritative
 - [Diagnose state via widget.jsonl](debug_state_transitions_via_widget_jsonl.md) — run /investigate <agent> to reconstruct state + decision chain; or grep the "decision"-tagged lines; don't theorize
 - [Tray badge deferred work](tray_badge_deferred.md) — macOS contrast on number modes + live DPI re-render not done; config.tray_badge set in config/local.json
-- [Startup session restore](startup_session_restore.md) — rejected 2026-06-21, built 2026-09-02 (`session_restore.rs`); registry vouches for liveness, the tab title for status; bar for any third source
+- [Startup session restore](startup_session_restore.md) — rejected 2026-06-21, built 2026-09-02 (`session_restore.rs`); registry vouches liveness, tab title status, alive stamp a missed start; bar for more sources
 - [Preview tray rendering via PNG test](debug_preview_tray_rendering.md) — throwaway #[ignore] test + png dev-dep renders tray_badge fns to scratchpad PNGs; view, then remove
 - [Verify macOS window geometry via AX](verify_macos_window_geometry_via_ax.md) — project-specific gotchas only now (setupOverride, auto_resize default); general AX-testing technique moved to the global macos-ax-window-testing learning
 - [Verify cfg-gated platform branches](verify_cfg_gated_platform_branches.md) — macOS skips the #[cfg(not(macos))] arm; no cross-compile — scratch copy to build it, flip a cfg!() predicate to run it

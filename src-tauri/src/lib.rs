@@ -1,5 +1,6 @@
 mod adapters;
 mod agterm;
+mod alive_stamp;
 mod attention;
 mod auto_resize;
 mod auto_start_store;
@@ -307,6 +308,7 @@ pub fn run() {
             idle_awake::spawn(app.handle().clone());
             attention::spawn(app.handle().clone());
             session_restore::spawn(app.handle().clone());
+            app.state::<alive_stamp::AliveStamp>().spawn_heartbeat();
             // Neither worker is gated by the platform or by `terminal_titles`, and
             // both choices are deliberate. Each `spawn` returns early where
             // `for_platform` has no adapter, so a `#[cfg]` here would assert in a third place what the
@@ -482,6 +484,9 @@ pub fn run() {
     ));
     app.manage(auto_start_store::AutoStartStore::new(
         app_data.join(auto_start_store::FILE_NAME),
+    ));
+    app.manage(alive_stamp::AliveStamp::new(
+        app_data.join("alive_stamp.json"),
     ));
     app.manage(usage_cache::UsageCacheStore::new(
         app_data.join("usage_cache.json"),

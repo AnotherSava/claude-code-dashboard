@@ -147,6 +147,9 @@ struct Record {
     /// address of a live agent's IPC channel is not a fact a roster reader needs.
     #[serde(default, rename = "messagingSocketPath")]
     messaging_socket_path: Option<String>,
+    /// When the process started, epoch ms on this machine's clock.
+    #[serde(default, rename = "startedAt")]
+    started_at: Option<i64>,
 }
 
 /// What the registry says a session is doing — its own two words, unedited.
@@ -208,6 +211,10 @@ pub struct LiveSession {
     /// derivation, and can name each process behind the row rather than only
     /// the speaker.
     pub records: Vec<RecordKey>,
+    /// The latest `startedAt` among those records, epoch ms; `None` when none
+    /// carries one. What tells `session_restore` a session started while the
+    /// dashboard was down.
+    pub newest_start_ms: Option<i64>,
 }
 
 /// One registry record behind a [`LiveSession`]: its process and, where the
@@ -533,6 +540,7 @@ fn live_row(chat_id: String, recs: &[&Record], now: i64) -> Option<LiveSession> 
         activity_age_ms: speaker.status_updated_at.map(|t| (now - t).max(0)),
         record_age_ms: speaker.updated_at.max(speaker.status_updated_at).map(|t| (now - t).max(0)),
         records: recs.iter().map(|r| RecordKey { pid: r.pid, session_id: r.session_id.clone() }).collect(),
+        newest_start_ms: recs.iter().filter_map(|r| r.started_at).max(),
     })
 }
 
@@ -594,7 +602,7 @@ mod tests {
     use super::*;
 
     fn rec(pid: u32, cwd: &str, kind: Option<&str>) -> Record {
-        Record { pid, cwd: cwd.to_string(), kind: kind.map(str::to_string), name: None, status: None, status_updated_at: None, updated_at: None, session_id: None, messaging_socket_path: None }
+        Record { pid, cwd: cwd.to_string(), kind: kind.map(str::to_string), name: None, status: None, status_updated_at: None, updated_at: None, session_id: None, messaging_socket_path: None, started_at: None }
     }
 
     fn named(pid: u32, cwd: &str, name: &str, status: &str, status_updated_at: i64) -> Record {
@@ -608,6 +616,7 @@ mod tests {
             updated_at: None,
             session_id: None,
             messaging_socket_path: None,
+            started_at: None,
         }
     }
 

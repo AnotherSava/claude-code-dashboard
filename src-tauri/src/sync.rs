@@ -2710,6 +2710,7 @@ mod tests {
             activity_age_ms: Some(1_500),
             record_age_ms: Some(1_500),
             records: vec![crate::session_registry::RecordKey { pid: 4_242, session_id: Some("abc".into()) }, crate::session_registry::RecordKey { pid: 4_243, session_id: Some("def".into()) }],
+            newest_start_ms: None,
         }];
         let push = build_push("desktop", 9078, &[], 0, 0, Some(&regs), true, Vec::new());
         let rows = push.registry_sessions.expect("registry rows ride the push");

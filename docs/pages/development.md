@@ -109,6 +109,7 @@ Under the repo root `claude-code-dashboard/`:
     - `session_launcher.rs` — starting a terminal session for a project that has none
     - `auto_start_store.rs` — the `chat_id → absolute path` grants that permit those starts, in `auto_start.json`
     - `session_restore.rs` — giving a live session its row back after a restart
+    - `alive_stamp.rs` — the previous run's last heartbeat, which tells `session_restore` a session started while the dashboard was down
     - `project_rename.rs` — carrying a project's history, anchors, name and start grant over to the id its renamed folder derives, and announcing the rename to peers
     - `log_watcher.rs` — per-session transcript tailing + infer_state + assistant text upsert
     - `membership.rs` — which live sessions belong to a row and which one (its main) drives it
