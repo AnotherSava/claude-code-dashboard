@@ -35,21 +35,21 @@ PRUNED = {".git", "node_modules", "dist", "build", "target", "__pycache__", ".ve
 OPEN_TIMEOUT_S = 30
 
 
-def notify(body: str) -> None:
+def _notify(body: str) -> None:
     subprocess.run(["agtermctl", "notify", body, "--title", "Local session"], capture_output=True)
 
 
-def fail(message: str) -> int:
+def _fail(message: str) -> int:
     sys.stderr.write(f"pick-local-session: {message}\n")
-    notify(message)
+    _notify(message)
     return 1
 
 
-def agtermctl(*args: str) -> subprocess.CompletedProcess:
+def _agtermctl(*args: str) -> subprocess.CompletedProcess:
     return subprocess.run(["agtermctl", *args], capture_output=True, text=True)
 
 
-def directories() -> "list[str]":
+def _directories() -> "list[str]":
     """Git roots below the root, at most two levels down, that also hold a `.claude` directory.
 
     `.git` is tested with `exists` because a worktree or a submodule carries it as a file.
@@ -63,7 +63,7 @@ def directories() -> "list[str]":
     return sorted(found)
 
 
-def agent_tabs() -> "dict[str, tuple[str, str, str]]":
+def _agent_tabs() -> "dict[str, tuple[str, str, str]]":
     """Window id, session id and workspace name per working directory with an agent tab.
 
     Asked of the dashboard, whose walk covers every open window and whose test for an agent is the one
@@ -81,7 +81,7 @@ def agent_tabs() -> "dict[str, tuple[str, str, str]]":
     return tabs
 
 
-def pick(rows: "list[dict]") -> "str | None":
+def _pick(rows: "list[dict]") -> "str | None":
     result = subprocess.run(
         ["agtermctl", "pick", "open", "--prompt", "Local project", "--allow-custom"],
         input=json.dumps(rows),
@@ -98,7 +98,7 @@ def pick(rows: "list[dict]") -> "str | None":
     return answer.get("id")
 
 
-def open_session(directory: str) -> dict:
+def _open_session(directory: str) -> dict:
     request = urllib.request.Request(
         f"{DASHBOARD}/api/session/open",
         data=json.dumps({"dir": directory}).encode(),
@@ -112,44 +112,44 @@ def open_session(directory: str) -> dict:
         return json.load(error)
 
 
-def raise_tab(window: str, session: str) -> None:
+def _raise_tab(window: str, session: str) -> None:
     # `session select` takes its id only through --target, `window select` only positionally.
     for command in (("session", "select", "--target", session), ("window", "select", window)):
-        result = agtermctl(*command)
+        result = _agtermctl(*command)
         if result.returncode != 0:
             raise RuntimeError(f"could not bring up the tab: {result.stderr.strip()}")
 
 
 def main() -> int:
     try:
-        tabs = agent_tabs()
+        tabs = _agent_tabs()
         rows = []
-        for relative in directories():
+        for relative in _directories():
             tab = tabs.get(os.path.join(PROJECTS_ROOT, relative))
             rows.append({"id": relative, "label": relative, "subtitle": f"open in {tab[2]}" if tab else "not running"})
-        chosen = pick(rows)
+        chosen = _pick(rows)
         if chosen is None:
             return 0
         directory = os.path.normpath(os.path.join(PROJECTS_ROOT, os.path.expanduser(chosen)))
         tab = tabs.get(directory)
         if tab:
-            raise_tab(tab[0], tab[1])
+            _raise_tab(tab[0], tab[1])
             return 0
-        answer = open_session(directory)
+        answer = _open_session(directory)
     except (RuntimeError, ValueError, KeyError, OSError) as error:
-        return fail(str(error))
+        return _fail(str(error))
 
     if answer.get("outcome") == "running":
         try:
-            tab = agent_tabs().get(directory)
+            tab = _agent_tabs().get(directory)
             if not tab:
-                return fail(f"{chosen} already has a session running, outside agterm")
-            raise_tab(tab[0], tab[1])
+                return _fail(f"{chosen} already has a session running, outside agterm")
+            _raise_tab(tab[0], tab[1])
         except (RuntimeError, ValueError, KeyError, OSError) as error:
-            return fail(str(error))
+            return _fail(str(error))
         return 0
     if answer.get("outcome") != "started":
-        return fail(f"could not open {chosen}: {answer.get('detail') or answer.get('reason') or 'unknown error'}")
+        return _fail(f"could not open {chosen}: {answer.get('detail') or answer.get('reason') or 'unknown error'}")
     return 0
 
 
