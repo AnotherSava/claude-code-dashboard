@@ -19,6 +19,7 @@ A desktop app for Windows and macOS — a compact always-on-top widget that list
 - **Finished, and not yet read** — every finished agent shows DONE, brightly until you've looked at it and dimmed once you have, and any Telegram ping about it is deleted, so the bright rows are exactly what's still waiting for you. Read one on a synced machine and it dims on the others too. A session you've cleared has nothing left in it, and drops off the list on its own.
 - **Sessions survive a restart** — update or reboot the widget and your agents are still listed, each at the status it was on, so a session parked on a question isn't invisible until you happen to go looking.
 - **Multi-device sync** — track sessions running on your other devices the same way as local ones, and let your agents message each other across machines — starting a session on the other side, with your approval, if nothing is running there.
+- **Open a project from agterm** (macOS) — bind a chord to a picker of your projects; the one you pick opens in the agterm workspace it was in last time, or its tab comes to the front if it is already running.
 - **Keep awake while working** (macOS) — the Mac won't fall asleep out from under a running agent, so stepping away mid-task doesn't kill it. On by default.
 - **Keep awake with the lid closed** (macOS) — carry the laptop to another room mid-task without the Mac sleeping and stopping the agent, for a bounded window you set.
 - **Focus on the task** — once Claude resumes after a question, the row shows your original request, not the *yes* you typed.
