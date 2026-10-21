@@ -144,7 +144,8 @@ pub mod window_files;
 #[cfg(any(target_os = "macos", test))]
 pub mod agterm_facts;
 /// agterm's `session context` protocol as pure functions: the argv it takes, the
-/// targets its tree reports, and the release that first served the verb.
+/// targets its tree reports, and the release that first served the verb; and
+/// where a started session is placed, from the workspace each agent sits in.
 /// Compiled for tests everywhere, like the agwinterm wire module.
 #[cfg(any(target_os = "macos", test))]
 pub mod agterm_wire;
@@ -1548,8 +1549,9 @@ pub(crate) mod verdict_tests {
 pub fn for_platform(app: &tauri::AppHandle) -> Option<Box<dyn TerminalAdapter>> {
     #[cfg(target_os = "macos")]
     {
-        let _ = app;
-        Some(Box::new(agterm::AgtermAdapter::default()))
+        use tauri::Manager;
+        let memory = app.try_state::<std::sync::Arc<crate::workspace_memory::WorkspaceMemory>>().map(|m| m.inner().clone());
+        Some(Box::new(agterm::AgtermAdapter::new(memory)))
     }
     // A composite, because several terminals can host a session here and each
     // knows only its own: Windows Terminal answers restore and the stale check,

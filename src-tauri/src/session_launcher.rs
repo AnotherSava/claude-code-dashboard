@@ -36,6 +36,8 @@ use crate::adapters::claude::derive_chat_id;
 use crate::agterm::agtermctl;
 #[cfg(target_os = "macos")]
 use crate::agterm::session_node;
+#[cfg(target_os = "macos")]
+use crate::terminals::agterm_wire as wire;
 use crate::session_registry::InboxLookup;
 
 /// How long a claimed start blocks another for. A start normally releases in
@@ -428,12 +430,59 @@ pub async fn start_and_wait(
     projects_root: Option<&str>,
     registry: &crate::session_registry::SessionRegistry,
     guard: &StartGuard,
+    memory: Option<&crate::workspace_memory::WorkspaceMemory>,
     now: i64,
 ) -> StartResult {
     let dir = match check_startable(project, auto_start, projects_root) {
         Ok(dir) => dir,
         Err(refusal) => return StartResult::Refused(refusal),
     };
+    start_in(project, &dir, projects_root, registry, guard, memory, false, now).await
+}
+
+/// Open a session for the project in `dir` because the user asked for one
+/// here, from the local picker (`integrations/pick-local-session.py`), and
+/// wait for it as [`start_and_wait`] does.
+///
+/// Two of that function's checks are for a start nobody is watching, and are
+/// skipped here: the `auto_start.json` grant, since the person asking is the
+/// owner, and Claude Code's trust prompt, which they are in front of to
+/// answer. The session is selected rather than started in the background,
+/// since it is the thing they asked to see. A project already running answers
+/// `Settled { started: false }`, which the picker answers by raising its tab.
+pub async fn open_and_wait(
+    dir: &Path,
+    projects_root: Option<&str>,
+    registry: &crate::session_registry::SessionRegistry,
+    guard: &StartGuard,
+    memory: Option<&crate::workspace_memory::WorkspaceMemory>,
+    now: i64,
+) -> (String, StartResult) {
+    let project = derive_chat_id(Some(&dir.to_string_lossy()), projects_root);
+    if !dir.is_absolute() || !dir.is_dir() {
+        return (project, StartResult::Refused(StartRefusal::NoSuchDirectory));
+    }
+    if !can_launch() {
+        return (project, StartResult::Refused(StartRefusal::NoLauncher));
+    }
+    let result = start_in(&project, dir, projects_root, registry, guard, memory, true, now).await;
+    (project, result)
+}
+
+/// The sequence [`start_and_wait`] documents, once `dir` is known to be
+/// startable. `select` puts the new session in front instead of starting it
+/// in the background.
+#[allow(clippy::too_many_arguments)]
+async fn start_in(
+    project: &str,
+    dir: &Path,
+    projects_root: Option<&str>,
+    registry: &crate::session_registry::SessionRegistry,
+    guard: &StartGuard,
+    memory: Option<&crate::workspace_memory::WorkspaceMemory>,
+    select: bool,
+    now: i64,
+) -> StartResult {
     if !guard.claim(project, now) {
         return StartResult::Refused(StartRefusal::AlreadyStarting);
     }
@@ -452,8 +501,9 @@ pub async fn start_and_wait(
     // Started before the launch, so a slow `agtermctl` spends the same budget
     // the poll would have and the total stays inside the caller's hop.
     let deadline = crate::commands::now_ms() + START_DEADLINE_MS;
-    let launch_dir = dir.clone();
-    let launched = tokio::task::spawn_blocking(move || launch(&launch_dir)).await.unwrap_or(Err(StartRefusal::NoLauncher));
+    let launch_dir = dir.to_path_buf();
+    let last = memory.and_then(|m| m.get(&dir.to_string_lossy()));
+    let launched = tokio::task::spawn_blocking(move || launch(&launch_dir, last.as_ref(), select)).await.unwrap_or(Err(StartRefusal::NoLauncher));
     let handle = match launched {
         Ok(handle) => handle,
         Err(refusal) => {
@@ -524,13 +574,19 @@ async fn await_inbox(registry: &crate::session_registry::SessionRegistry, projec
 ///   prompt; neither leaves something to walk up to. Exec'ing an interactive
 ///   shell means quitting claude drops to a live prompt in the project
 ///   directory, exactly as a hand-started session does.
-/// - `--no-select`, so a message never steals focus from whoever is at the
-///   machine. Verified not to cost anything: a `--no-select` session is
-///   realized immediately, pty and all.
+/// - `--no-select` for a start a message caused, so it never steals focus
+///   from whoever is at the machine. Verified not to cost anything: a
+///   `--no-select` session is realized immediately, pty and all. A session the
+///   user opened from the picker is selected instead.
 /// - no `--name`. agterm's `--name` sets a `customName` that permanently
 ///   outranks the OSC title, which would make that row dark for the dashboard's
 ///   own status writes forever. The user's `claude` function passes its own
 ///   `--name` to *claude*, which is a different thing and is preserved.
+///
+/// - `--window`/`--workspace` from [`crate::workspace_memory`], so the session
+///   opens in the workspace the project's agent was last seen in. A workspace
+///   deleted since is recreated under its old name; see
+///   [`crate::terminals::agterm_wire::placement`] for the order the two are tried in.
 ///
 /// Windows is not wired up yet and refuses [`StartRefusal::NoLauncher`]. The
 /// launch mechanism there is known — a plain `Command::new` from this
@@ -539,14 +595,14 @@ async fn await_inbox(registry: &crate::session_registry::SessionRegistry, projec
 /// suppresses for `tailscale whois`) — but which shell wrapper leaves a live
 /// prompt when claude exits depends on how that machine starts claude, and is
 /// not yet established.
-fn launch(dir: &Path) -> Result<LaunchHandle, StartRefusal> {
+fn launch(dir: &Path, last: Option<&crate::workspace_memory::LastWorkspace>, select: bool) -> Result<LaunchHandle, StartRefusal> {
     #[cfg(target_os = "macos")]
     {
-        launch_macos(dir)
+        launch_macos(dir, last, select)
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = dir;
+        let _ = (dir, last, select);
         Err(StartRefusal::NoLauncher)
     }
 }
@@ -614,9 +670,17 @@ impl LaunchHandle {
 const AGTERM_COMMAND: &str = "zsh -ilc 'claude; exec zsh -i'";
 
 #[cfg(target_os = "macos")]
-fn launch_macos(dir: &Path) -> Result<LaunchHandle, StartRefusal> {
-    let answer = agtermctl(&["session", "new", "--cwd", &dir.to_string_lossy(), "--no-select", "--json", "--command", AGTERM_COMMAND])
-        .ok_or(StartRefusal::NoLauncher)?;
+fn launch_macos(dir: &Path, last: Option<&crate::workspace_memory::LastWorkspace>, select: bool) -> Result<LaunchHandle, StartRefusal> {
+    let placement = placement_now(last);
+    tracing::info!(dir = %dir.display(), placement = ?placement, select, "placing the started session");
+    let dir = dir.to_string_lossy();
+    let mut argv = vec!["session", "new", "--cwd", &dir, "--json", "--command", AGTERM_COMMAND];
+    if !select {
+        argv.push("--no-select");
+    }
+    let placed = wire::placement_argv(&placement);
+    argv.extend(placed.iter().map(String::as_str));
+    let answer = agtermctl(&argv).ok_or(StartRefusal::NoLauncher)?;
     // The id is what makes the session addressable afterwards. Its absence is
     // not fatal — the session was created — but it costs the realized check and
     // the cleanup, so it is worth a line in the log.
@@ -625,6 +689,16 @@ fn launch_macos(dir: &Path) -> Result<LaunchHandle, StartRefusal> {
         tracing::warn!("agterm created a session but returned no id; it cannot be checked or cleaned up");
     }
     Ok(LaunchHandle { session_id })
+}
+
+/// [`wire::placement`] over what agterm holds now: whether the recorded window
+/// is open, and which workspaces it has.
+#[cfg(target_os = "macos")]
+fn placement_now(last: Option<&crate::workspace_memory::LastWorkspace>) -> wire::Placement {
+    let Some(last) = last else { return wire::Placement::Current };
+    let open = agtermctl(&["window", "list", "--json"]).is_some_and(|list| crate::agterm::open_window_ids(&list).contains(&last.window));
+    let ids = open.then(|| agtermctl(&["tree", "--json", "--window", &last.window])).flatten().map(|tree| wire::workspace_ids(&tree));
+    wire::placement(Some(last), open, ids.as_deref())
 }
 
 #[cfg(test)]
@@ -750,7 +824,7 @@ mod tests {
         {
             assert!(!can_launch());
             assert!(
-                matches!(launch(Path::new("/zz-no-such-dir-4f2a")), Err(StartRefusal::NoLauncher)),
+                matches!(launch(Path::new("/zz-no-such-dir-4f2a"), None, false), Err(StartRefusal::NoLauncher)),
                 "the predicate must not promise a launch this platform refuses"
             );
         }

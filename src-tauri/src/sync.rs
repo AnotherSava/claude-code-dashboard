@@ -1016,7 +1016,8 @@ async fn post_message(
         let Some(guard) = app.try_state::<crate::session_launcher::StartGuard>() else {
             return (StatusCode::INTERNAL_SERVER_ERROR, Json(receipt(Outcome::Refused).because("state_unavailable")));
         };
-        match crate::session_launcher::start_and_wait(&env.target_project, &startable, cfg.projects_root.as_deref(), &registry, &guard, now).await {
+        let memory = app.try_state::<std::sync::Arc<crate::workspace_memory::WorkspaceMemory>>();
+        match crate::session_launcher::start_and_wait(&env.target_project, &startable, cfg.projects_root.as_deref(), &registry, &guard, memory.as_ref().map(|m| m.as_ref()), now).await {
             crate::session_launcher::StartResult::Refused(refusal) => return refuse_start(refusal),
             crate::session_launcher::StartResult::Settled { inbox: settled, started } => {
                 inbox = settled;

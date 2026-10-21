@@ -138,16 +138,14 @@ pub(crate) fn session_node<'a>(tree: &'a serde_json::Value, id: &str) -> Option<
     session_nodes(tree).find(|s| s.get("id").and_then(serde_json::Value::as_str) == Some(id))
 }
 
+/// The workspace nodes in one window's `tree --json` answer.
+pub(crate) fn workspace_nodes(tree: &serde_json::Value) -> impl Iterator<Item = &serde_json::Value> {
+    tree.get("result").and_then(|r| r.get("tree")).and_then(|t| t.get("workspaces")).and_then(serde_json::Value::as_array).into_iter().flatten()
+}
+
 /// Every session node in a `tree --json` answer, flattened across workspaces.
 pub(crate) fn session_nodes(tree: &serde_json::Value) -> impl Iterator<Item = &serde_json::Value> {
-    tree.get("result")
-        .and_then(|r| r.get("tree"))
-        .and_then(|t| t.get("workspaces"))
-        .and_then(serde_json::Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|w| w.get("sessions").and_then(serde_json::Value::as_array))
-        .flatten()
+    workspace_nodes(tree).filter_map(|w| w.get("sessions").and_then(serde_json::Value::as_array)).flatten()
 }
 
 #[cfg(test)]

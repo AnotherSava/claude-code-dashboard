@@ -26,6 +26,7 @@
 #![cfg(any(target_os = "macos", test))]
 
 use super::{LabelBudget, LabelTarget};
+use crate::workspace_memory::LastWorkspace;
 
 /// The longest context agterm accepts, in UTF-8 bytes (`Session.contextByteLimit`).
 ///
@@ -140,9 +141,139 @@ pub(crate) fn close_refusal(node: &serde_json::Value) -> Option<String> {
     (super::agterm_facts::occupant(Some(node)) != super::Occupant::Agent).then(|| "the pane the title belongs to is no longer running the agent".to_string())
 }
 
+/// One agterm tab running the agent: its working directory, agterm's id for the
+/// session, and the workspace it sits in.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct AgentTab {
+    pub cwd: String,
+    pub session: String,
+    #[serde(flatten)]
+    pub at: LastWorkspace,
+}
+
+/// Every session in `window`'s tree that runs the agent, for
+/// [`crate::workspace_memory`] and for the local picker's
+/// `GET /api/session/tabs`, which reads this rather than keeping its own agent
+/// test.
+///
+/// The agent alone, because what is remembered is where the project's agent
+/// lived: a plain shell opened in the project's directory from some other
+/// workspace says nothing about that.
+pub(crate) fn agent_tabs(window: &str, tree: &serde_json::Value) -> Vec<AgentTab> {
+    let mut out = Vec::new();
+    for ws in crate::agterm::workspace_nodes(tree) {
+        let Some(id) = ws.get("id").and_then(serde_json::Value::as_str) else { continue };
+        let name = ws.get("name").and_then(serde_json::Value::as_str).unwrap_or_default();
+        for node in ws.get("sessions").and_then(serde_json::Value::as_array).into_iter().flatten() {
+            let (Some(cwd), Some(session)) = (node.get("cwd").and_then(serde_json::Value::as_str), node.get("id").and_then(serde_json::Value::as_str)) else { continue };
+            if super::agterm_facts::occupant(Some(node)) == super::Occupant::Agent {
+                out.push(AgentTab { cwd: cwd.into(), session: session.into(), at: LastWorkspace { window: window.into(), workspace: id.into(), name: name.into() } });
+            }
+        }
+    }
+    out
+}
+
+/// Every workspace id in one window's `tree --json` answer.
+pub(crate) fn workspace_ids(tree: &serde_json::Value) -> Vec<String> {
+    crate::agterm::workspace_nodes(tree).filter_map(|w| w.get("id").and_then(serde_json::Value::as_str)).map(str::to_string).collect()
+}
+
+/// Where a started session goes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Placement {
+    /// agterm's current workspace in its frontmost window: nothing is recorded,
+    /// or what is recorded can be found neither by id nor by name.
+    Current,
+    /// The recorded workspace, still there.
+    Workspace { window: String, workspace: String },
+    /// A workspace of the recorded name, created if there is none. `window` is
+    /// `None` when the recorded window is closed, which leaves the choice to
+    /// agterm's frontmost window.
+    Named { window: Option<String>, name: String },
+}
+
+/// Where a session for a project last seen at `last` should be started.
+///
+/// `ids` is the recorded window's workspace ids, `None` when that window is not
+/// open or could not be read. The id comes first because it survives a rename;
+/// the name is the fallback for a workspace since deleted, recreated under the
+/// name it had. A blank name cannot be recreated (agterm refuses one).
+pub(crate) fn placement(last: Option<&LastWorkspace>, window_open: bool, ids: Option<&[String]>) -> Placement {
+    let Some(last) = last else { return Placement::Current };
+    if ids.is_some_and(|ids| ids.contains(&last.workspace)) {
+        return Placement::Workspace { window: last.window.clone(), workspace: last.workspace.clone() };
+    }
+    if last.name.trim().is_empty() {
+        return Placement::Current;
+    }
+    Placement::Named { window: window_open.then(|| last.window.clone()), name: last.name.clone() }
+}
+
+/// The `session new` options [`placement`]'s answer adds.
+pub(crate) fn placement_argv(placement: &Placement) -> Vec<String> {
+    match placement {
+        Placement::Current => Vec::new(),
+        Placement::Workspace { window, workspace } => vec!["--window".into(), window.clone(), "--workspace".into(), workspace.clone()],
+        Placement::Named { window, name } => {
+            let mut argv: Vec<String> = window.iter().flat_map(|w| ["--window".to_string(), w.clone()]).collect();
+            argv.extend(["--workspace-name".into(), name.clone(), "--create-workspace".into()]);
+            argv
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn last(name: &str) -> LastWorkspace {
+        LastWorkspace { window: "W".into(), workspace: "S1".into(), name: name.into() }
+    }
+
+    #[test]
+    fn nothing_recorded_starts_in_the_current_workspace() {
+        assert_eq!(placement(None, true, Some(&["S1".into()])), Placement::Current);
+        assert!(placement_argv(&Placement::Current).is_empty());
+    }
+
+    #[test]
+    fn a_workspace_still_there_is_addressed_by_id_in_its_window() {
+        let p = placement(Some(&last("web")), true, Some(&["S0".into(), "S1".into()]));
+        assert_eq!(placement_argv(&p), ["--window", "W", "--workspace", "S1"]);
+    }
+
+    #[test]
+    fn a_deleted_workspace_is_recreated_by_name_in_its_window() {
+        let p = placement(Some(&last("web")), true, Some(&["S0".into()]));
+        assert_eq!(placement_argv(&p), ["--window", "W", "--workspace-name", "web", "--create-workspace"]);
+    }
+
+    #[test]
+    fn a_closed_window_leaves_the_name_to_the_frontmost_one() {
+        let p = placement(Some(&last("web")), false, None);
+        assert_eq!(placement_argv(&p), ["--workspace-name", "web", "--create-workspace"]);
+    }
+
+    #[test]
+    fn a_blank_name_that_cannot_be_found_falls_back_to_the_current_workspace() {
+        assert_eq!(placement(Some(&last("  ")), true, Some(&[])), Placement::Current);
+    }
+
+    #[test]
+    fn only_agent_sessions_are_remembered_with_their_workspace() {
+        let tree = serde_json::json!({"ok": true, "result": {"tree": {"workspaces": [
+            {"id": "S1", "name": "web", "sessions": [
+                {"id": "a", "cwd": "/p/agent", "foreground": ["claude"]},
+                {"id": "b", "cwd": "/p/shell", "foreground": ["-zsh"]},
+            ]},
+            {"id": "S2", "name": "apps", "sessions": [{"id": "c", "cwd": "/p/other", "foreground": ["node", "/usr/local/bin/claude"]}]},
+        ]}}});
+        let seen = agent_tabs("W", &tree);
+        let dirs: Vec<(&str, &str, &str)> = seen.iter().map(|t| (t.cwd.as_str(), t.session.as_str(), t.at.name.as_str())).collect();
+        assert_eq!(dirs, [("/p/agent", "a", "web"), ("/p/other", "c", "apps")]);
+        assert_eq!(workspace_ids(&tree), ["S1", "S2"]);
+    }
 
     #[test]
     fn the_text_is_the_last_argument_after_a_terminator() {

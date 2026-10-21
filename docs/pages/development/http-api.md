@@ -5,7 +5,7 @@ parent: Development
 nav_order: 4
 ---
 
-The widget listens on `http://127.0.0.1:9077` (default) for lifecycle events from external agents. One write endpoint, one envelope shape, adapter-dispatched on the server side — plus a read-only [agent roster](#agent-roster) an agent can query to see what is running, here and on the user's other machines, a [message relay](#cross-machine-messaging) for reaching one of those agents on another machine, [a route a local skill posts to](#post-apisession-clean) to report that its run left nothing to come back to, and [one that carries a project's data over](#post-apiprojectrename) when its folder is renamed.
+The widget listens on `http://127.0.0.1:9077` (default) for lifecycle events from external agents. One write endpoint, one envelope shape, adapter-dispatched on the server side — plus a read-only [agent roster](#agent-roster) an agent can query to see what is running, here and on the user's other machines, a [message relay](#cross-machine-messaging) for reaching one of those agents on another machine, [a route a local skill posts to](#post-apisession-clean) to report that its run left nothing to come back to, and [one that carries a project's data over](#post-apiprojectrename) when its folder is renamed, and two the local picker uses: [one that opens a project's session](#post-apisessionopen) and [one that lists the agterm tabs running Claude](#get-apisessiontabs).
 
 A second, separate listener serves the [multi-device sync](#sync-api) API when enabled — the hook API below stays loopback-only and unauthenticated regardless.
 
@@ -387,6 +387,34 @@ Carries the loopback `Host` gate on top of the `Origin` check, like the session-
 | `409`  | `{"ok": false, "detail": …}` | one of the refusals above; `detail` says which, and what clears it |
 
 Logged as `decision = "project_rename"` under each new id, with `from` naming the old one, and `decision = "rename_cleared_row"` for each ended session's row it removed. Earlier decision lines stay under the old id. A refused call logs `decision = "project_rename"` with no chat_id and an `outcome` naming the refusal.
+
+## `POST /api/session/open`
+
+Opens a Claude session for a local project because its user asked for one, from the local picker (`integrations/pick-local-session.py`). The start runs the same sequence as a [start for a relayed message](#starting-a-session-that-is-not-running): the session opens in the agterm workspace the project's agent was last seen in, and a fresh read of Claude Code's session list makes sure the folder has no session already. It differs in three ways, since the person asking is at the machine: it needs no `auto_start.json` grant, Claude Code's trust prompt is left for them to answer, and the new session is selected rather than started in the background.
+
+```json
+{ "dir": "/Users/you/Projects/my-app" }
+```
+
+Carries the loopback `Host` gate on top of the `Origin` check. macOS only.
+
+| Status | `outcome` | Meaning |
+|---     |---        |---      |
+| `200`  | `started` | a session was started; `detail` says whether it has registered yet |
+| `200`  | `running` | a session is already running in that folder, so nothing was started |
+| `409`  | `refused` | `reason` is the start refusal's slug, such as `start_no_directory` or `start_already_running` |
+
+Every answer also carries the `project` id the folder derives. Logged as `decision = "session_open"` with that id and the `outcome`.
+
+## `GET /api/session/tabs`
+
+Lists every agterm tab running Claude, across every open window, for the local picker: it marks the projects that are already running and raises a running project's tab instead of starting another. The picker asks here rather than walking agterm itself, so it counts a tab as Claude's by the same rule the dashboard uses to remember each project's workspace.
+
+```json
+{ "tabs": [ { "cwd": "/Users/you/Projects/my-app", "session": "…", "window": "…", "workspace": "…", "name": "web" } ] }
+```
+
+`tabs` is `null` when agterm could not be asked, and always on Windows. Carries the loopback `Host` gate on top of the `Origin` check. Not logged.
 
 ## Sync API
 

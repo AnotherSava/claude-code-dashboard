@@ -84,6 +84,14 @@ Two things stay quiet on purpose. A session that was mid-task when the widget we
 
 On macOS with agterm, and on Windows. On by default; see [Settings](settings#behavior).
 
+## Open a project from agterm
+
+On a Mac with agterm you can bind a chord to a picker of your projects: the folders under `~/Projects`, at most two levels down, that are git repositories and have a `.claude` folder in them. Any other folder can still be opened by typing its path. Pick one and its session opens in the agterm workspace it was in last time, or if it's already running, its tab comes to the front. To set it up, add a line like this to agterm's `keymap.conf`, with `/path/to/claude-code-dashboard` replaced by where your clone is:
+
+```
+command "Local session"  cmd+shift+o  /usr/bin/env python3 /path/to/claude-code-dashboard/integrations/pick-local-session.py
+```
+
 ## Focus on the task
 
 While Claude is blocked on you (BLOCK), the row shows the question or approval request, so you know what it needs. Once you answer and Claude resumes (WORK), the row goes back to showing your **original request** rather than the *yes* you typed — so a quick approval or a *continue* never replaces your task on screen. The work timer pauses during BLOCK — replaced by a timer counting how long Claude has been blocked on you — and resumes once the agent continues working on the task. A new top-level prompt starts a fresh task from any resting state.

@@ -80,12 +80,15 @@ type Files = Arc<Mutex<WindowFiles<Seen>>>;
 pub struct AgtermAdapter {
     selections: Selections,
     files: Files,
+    /// Where each project's agent was last seen, written on every `tree` walk.
+    /// `None` only when the store is not managed, which nothing ships.
+    memory: Option<Arc<crate::workspace_memory::WorkspaceMemory>>,
 }
 
 #[cfg(target_os = "macos")]
-impl Default for AgtermAdapter {
-    fn default() -> Self {
-        Self { selections: Arc::default(), files: Arc::new(Mutex::new(WindowFiles::new(NAME))) }
+impl AgtermAdapter {
+    pub fn new(memory: Option<Arc<crate::workspace_memory::WorkspaceMemory>>) -> Self {
+        Self { selections: Arc::default(), files: Arc::new(Mutex::new(WindowFiles::new(NAME))), memory }
     }
 }
 
@@ -136,7 +139,7 @@ impl TerminalAdapter for AgtermAdapter {
     /// reserved for having been unable to ask agterm at all, which is the only
     /// case the caller must not read as "there are no tabs".
     fn sessions(&self) -> Option<Vec<TerminalSession>> {
-        walk_windows("restorable", |_, nodes| nodes.iter().map(session_from_node).collect())
+        walk_windows(self.memory.as_deref(), "restorable", |_, tree| crate::agterm::session_nodes(tree).map(session_from_node).collect())
     }
 
     /// Whether this agterm serves a `session context` verb at all.
@@ -170,7 +173,7 @@ impl TerminalAdapter for AgtermAdapter {
     /// not having reached agterm at all, which the caller retries rather than
     /// reading as a terminal with nothing in it.
     fn label_targets(&self) -> Option<Vec<LabelTarget>> {
-        walk_windows("labellable", wire::targets_from)
+        walk_windows(self.memory.as_deref(), "labellable", |window, tree| wire::targets_from(window, &crate::agterm::session_nodes(tree).cloned().collect::<Vec<_>>()))
     }
 
     /// Write or clear one session's context.
@@ -515,11 +518,19 @@ fn input_observation(reading: &Reading, front: Front, front_since: Since, select
     Observation { terminal: NAME, session: reading.selected.clone(), at_ms, kind: ObservationKind::Input(facts), occupant: reading.occupant, naming: Naming::OwnTitle }
 }
 
+/// Every agterm tab running the agent, across every open window, for the
+/// local picker (`GET /api/session/tabs`). `None` when agterm could not be
+/// asked at all.
+#[cfg(target_os = "macos")]
+pub(crate) fn agent_tabs(memory: Option<&crate::workspace_memory::WorkspaceMemory>) -> Option<Vec<wire::AgentTab>> {
+    walk_windows(memory, "listed as agent tabs", wire::agent_tabs)
+}
+
 /// Ask every open window for its tree and collect what `map` makes of each
-/// window's session nodes.
+/// window's answer.
 ///
-/// The walk is shared because its three rules are a contract two callers must
-/// not state differently, and both of them answer an `Option` whose `None` the
+/// The walk is shared because its three rules are a contract its callers must
+/// not state differently, and each of them answers an `Option` whose `None` the
 /// caller acts on:
 ///
 /// * **Per-window, never a bare `tree`**, which projects only the frontmost
@@ -532,22 +543,35 @@ fn input_observation(reading: &Reading, front: Front, front_since: Since, select
 ///   that did answer are still worth returning.
 /// * **`None` means agterm could not be asked at all**, which is the one case a
 ///   caller must not read as "there are no sessions" — `sessions` would tell
-///   `session_restore` every tab had gone, and `label_targets` would have
-///   `labels::plan` withdraw every context.
+///   `session_restore` every tab had gone, `label_targets` would have
+///   `labels::plan` withdraw every context, and `agent_tabs` would tell the
+///   local picker that no project is running.
 ///
 /// `what` names the subject in the skipped-window log line, the only part that
 /// legitimately differs between callers.
+///
+/// Every walk also records which workspace each agent sits in, into `memory`
+/// ([`crate::workspace_memory`]), which `session_launcher` reads to start a
+/// project's next session where its last one was. Restore, the label pass,
+/// idle close (through `label_targets`) and the picker's tab list all walk; the
+/// label pass is the periodic one, every 15s, but it runs only on an agterm with
+/// a context line (0.26.0 or newer), and without it the record is as fresh as
+/// the last of the others.
 #[cfg(target_os = "macos")]
-fn walk_windows<T>(what: &str, map: impl Fn(&str, &[Value]) -> Vec<T>) -> Option<Vec<T>> {
+fn walk_windows<T>(memory: Option<&crate::workspace_memory::WorkspaceMemory>, what: &str, map: impl Fn(&str, &Value) -> Vec<T>) -> Option<Vec<T>> {
     let list = crate::agterm::agtermctl(&["window", "list", "--json"])?;
     let mut out = Vec::new();
+    let mut sightings = Vec::new();
     for window in crate::agterm::open_window_ids(&list) {
         let Some(tree) = crate::agterm::agtermctl(&["tree", "--json", "--window", &window]) else {
             tracing::debug!(terminal = NAME, window = %window, "no tree for this window; its sessions are not {what} this pass");
             continue;
         };
-        let nodes: Vec<Value> = crate::agterm::session_nodes(&tree).cloned().collect();
-        out.extend(map(&window, &nodes));
+        sightings.extend(wire::agent_tabs(&window, &tree).into_iter().map(|tab| (tab.cwd, tab.at)));
+        out.extend(map(&window, &tree));
+    }
+    if let Some(memory) = memory {
+        memory.observe(sightings);
     }
     Some(out)
 }

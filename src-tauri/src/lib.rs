@@ -50,6 +50,7 @@ mod usage_cache;
 mod usage_history;
 mod usage_limits;
 mod waiting_settle;
+mod workspace_memory;
 
 use config::ConfigState;
 use log_watcher::WatcherRegistry;
@@ -486,6 +487,9 @@ pub fn run() {
     app.manage(auto_start_store::AutoStartStore::new(
         app_data.join(auto_start_store::FILE_NAME),
     ));
+    app.manage(std::sync::Arc::new(workspace_memory::WorkspaceMemory::new(
+        app_data.join(workspace_memory::FILE_NAME),
+    )));
     app.manage(alive_stamp::AliveStamp::new(
         app_data.join("alive_stamp.json"),
     ));

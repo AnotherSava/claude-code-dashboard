@@ -43,6 +43,8 @@ pub async fn run(app: AppHandle, port: u16) {
         .route("/api/window", post(post_window))
         .route("/api/session-clean", post(post_session_clean))
         .route("/api/project/rename", post(post_project_rename))
+        .route("/api/session/open", post(post_session_open))
+        .route("/api/session/tabs", get(get_session_tabs))
         .with_state(app);
 
     if let Err(e) = axum::serve(listener, router).await {
@@ -179,6 +181,70 @@ async fn post_project_rename(State(app): State<AppHandle>, headers: HeaderMap, J
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
+}
+
+/// What `POST /api/session/open` is told: the folder to open a session in.
+#[derive(Deserialize)]
+struct SessionOpenRequest {
+    #[serde(default)]
+    dir: String,
+}
+
+/// Open a session for a local project because its user asked, from the local
+/// picker bound in agterm (`integrations/pick-local-session.py`). The start
+/// itself is [`session_launcher::open_and_wait`], the sequence a relayed
+/// message's start runs, so the placement in the project's last workspace and
+/// the guard against two agents in one folder are the same for both.
+///
+/// Answers `outcome` of `started`, `running` (a session was already there, so
+/// the picker raises its tab) or `refused` with the refusal's `reason`. Loopback
+/// `Host` required: it starts a process.
+async fn post_session_open(State(app): State<AppHandle>, headers: HeaderMap, Json(req): Json<SessionOpenRequest>) -> Response {
+    if let Some(detail) = csrf_refusal(&headers, true) {
+        return csrf_refused(detail).into_response();
+    }
+    let answer = |status: StatusCode, outcome: &str, project: &str, reason: &str, detail: &str| (status, Json(serde_json::json!({"outcome": outcome, "project": project, "reason": reason, "detail": detail}))).into_response();
+    let (Some(guard), Some(registry), Some(cfg)) = (app.try_state::<session_launcher::StartGuard>(), app.try_state::<SessionRegistry>(), app.try_state::<ConfigState>()) else {
+        return answer(StatusCode::INTERNAL_SERVER_ERROR, "refused", "", "state_unavailable", "the dashboard is still starting");
+    };
+    let cfg = cfg.snapshot();
+    let memory = app.try_state::<std::sync::Arc<crate::workspace_memory::WorkspaceMemory>>();
+    let dir = std::path::PathBuf::from(req.dir.trim());
+    let (project, result) = session_launcher::open_and_wait(&dir, cfg.projects_root.as_deref(), &registry, &guard, memory.as_ref().map(|m| m.as_ref()), now_ms()).await;
+    let (status, outcome, reason, detail) = match &result {
+        // The shared detail speaks of a listed grant, which this route never reads.
+        session_launcher::StartResult::Refused(r @ session_launcher::StartRefusal::NoSuchDirectory) => (StatusCode::CONFLICT, "refused", r.slug(), "there is no folder at that path"),
+        session_launcher::StartResult::Refused(r) => (StatusCode::CONFLICT, "refused", r.slug(), r.detail()),
+        session_launcher::StartResult::Settled { inbox: crate::session_registry::InboxLookup::Unreadable, started: false } => (StatusCode::CONFLICT, "refused", "registry_unreadable", "Claude Code's session list could not be read, so a running session there cannot be ruled out"),
+        session_launcher::StartResult::Settled { started: false, .. } => (StatusCode::OK, "running", "", "a session is already running in that folder"),
+        session_launcher::StartResult::Settled { inbox: crate::session_registry::InboxLookup::NotFound, started: true } => (StatusCode::OK, "started", "", "started; it has not registered yet"),
+        session_launcher::StartResult::Settled { started: true, .. } => (StatusCode::OK, "started", "", "started"),
+    };
+    tracing::info!(chat_id = %project, decision = "session_open", outcome, reason, dir = %dir.display(), "local session open requested");
+    answer(status, outcome, &project, reason, detail)
+}
+
+/// Every agterm tab running the agent, for the local picker
+/// (`integrations/pick-local-session.py`), which reads this rather than walking
+/// agterm with an agent test of its own: the test is
+/// [`crate::terminals::agterm_facts::occupant`], the one workspace memory and the
+/// idle close use. `tabs` is `null` when agterm could not be asked, and always
+/// off macOS. Loopback `Host` required, like the open route it serves.
+async fn get_session_tabs(State(app): State<AppHandle>, headers: HeaderMap) -> Response {
+    if let Some(detail) = csrf_refusal(&headers, true) {
+        return csrf_refused(detail).into_response();
+    }
+    #[cfg(target_os = "macos")]
+    let tabs = {
+        let memory = app.try_state::<std::sync::Arc<crate::workspace_memory::WorkspaceMemory>>().map(|m| m.inner().clone());
+        tokio::task::spawn_blocking(move || crate::terminals::agterm::agent_tabs(memory.as_deref())).await.ok().flatten()
+    };
+    #[cfg(not(target_os = "macos"))]
+    let tabs: Option<Vec<()>> = {
+        let _ = app;
+        None
+    };
+    Json(serde_json::json!({ "tabs": tabs })).into_response()
 }
 
 /// What `POST /api/window` is being asked to do.
@@ -1211,7 +1277,8 @@ async fn post_message(State(app): State<AppHandle>, headers: HeaderMap, Json(req
             // that never got a surface — is a way to end up with two agents in
             // one directory, and two copies of it would drift.
             let startable = app.try_state::<crate::auto_start_store::AutoStartStore>().map(|s| s.snapshot()).unwrap_or_default();
-            return match session_launcher::start_and_wait(&project, &startable, cfg.projects_root.as_deref(), &registry, &guard, now).await {
+            let memory = app.try_state::<std::sync::Arc<crate::workspace_memory::WorkspaceMemory>>();
+            return match session_launcher::start_and_wait(&project, &startable, cfg.projects_root.as_deref(), &registry, &guard, memory.as_ref().map(|m| m.as_ref()), now).await {
                 session_launcher::StartResult::Refused(r) => {
                     let receipt = Receipt::new(Outcome::Refused, "", &req.target, this_device).because(r.slug()).detailed(r.detail());
                     refused(r.slug(), r.detail().into(), crate::sync::receipt_status(&receipt), this_device)
