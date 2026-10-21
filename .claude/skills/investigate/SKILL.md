@@ -35,17 +35,21 @@ meanings worth having in hand before reading a trail:
   answers "the agent finished" and "nothing here says otherwise" alike, and a
   DONE nobody expected is usually one of those landings rather than a `Stop`.
 - **IDLE** — CLEAN: a confirmed claim that there is nothing left in the session
-  to come back to. Four things set it. Two are a `SessionStart`: a `source` of
+  to come back to. Five things set it. Two are a `SessionStart`: a `source` of
   `clear` or `startup`, and a `resume` whose restored dialog ends at a `/clear`
   boundary. The third is a `Stop` on a turn a peer started to ask this session to
   pull, where the pull reported leaving nothing and the row was clean before the
   request — see `pull_claim` / `pull_clean` below. The fourth is `restore_row`
   after a restart, reading back a `⚫` tab whose session the registry reports
-  idle. No degrade path may set it, so
+  idle. The fifth is also `restore_row`: a session that started while the
+  dashboard was down has its `SessionStart` replayed, which reads no title and
+  sets IDLE where the registry reports the session idle and it is fresh (no
+  dialog kept for its row) or its dialog ends at a `/clear`. No degrade path
+  may set it, so
   IDLE never means "we don't know".
   A CLEAN row also drops off the widget once it has sat there for
   `clean_hide_after_ms`, so an agent listed here as IDLE may not be on screen,
-  and once it has been clean for `idle_close_ms` its session and tab are closed,
+  and once it has been clean for `idle_close_ms` its session is closed, with its tab where one on this machine shows it,
   logged `decision = "idle_close"`, after which the row ends like any exit.
 
 Whether the user has *read* a finished session is a separate flag on the row,
@@ -150,20 +154,29 @@ or `id`), and a `reason`:
   task to Done once it sat unchanged past the window (`waited_ms`,
   `window_ms`): a task the user killed ends silently, so no later `Stop` comes.
 - `restore_row` — after a dashboard restart, a live session with no row got one
-  back, its `status` read from the tab title the dashboard last wrote. A WORK
+  back, its `status` read from the tab title the dashboard last wrote, or, for
+  a session that started while the dashboard was down (the `reason` says so),
+  replayed from its missed `SessionStart`: WORK where the registry reports it
+  busy, IDLE where it is idle and fresh or its dialog ends at a `/clear`, else
+  DONE. For a title readback, a WORK
   or WAIT glyph is only as fresh as the downtime, so it is kept only where the
   session registry independently reports a turn running and degrades to DONE
   otherwise. A CLEAN tab comes back IDLE, so `idle_close` can still close it,
   but only where the registry reports the session idle; otherwise it too
   degrades to DONE.
 - `idle_close` — a local row sat CLEAN past `idle_close_ms`. `outcome=closed`
-  means the dashboard itself closed the session and its terminal tab
-  (`idle_ms`, `window_ms`); the row then ends through the `session_clear` or
+  means the dashboard itself closed the session (`key`, `idle_ms`,
+  `window_ms`): its terminal tab here with it, except for a `tmux|` key, a
+  WSL tmux session no terminal here shows, whose Mac `⇄` tab, if one is
+  attached, `attach.sh` closes there; the row then ends through the `session_clear` or
   `reap_exited` that follows, so a trail ending that way was not the user
   quitting. Every other outcome closed nothing and is logged once per row:
   `close_failed` (the terminal refused, with its `error`, such as a tab whose
   pane no longer runs the agent, or in agwinterm a session on screen in its
-  front window or with a draft in its composer; the close is retried every
+  front window or with a draft in its composer, or for a `tmux|` key a
+  terminal here having attached since, the title leaving CLEAN, more than one
+  pane in the session, the session still there after `/exit`, or `wsl.exe` not
+  answering; the close is retried every
   tick, so a later `closed` can follow), `no_session` (no tab's title names the row),
   `tab_not_idle` (the tab shows another status, so it is not following the
   row), `same_label` (another row carries the same label) or `shared_title`

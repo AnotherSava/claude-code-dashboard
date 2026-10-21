@@ -1,5 +1,5 @@
-//! Ends a local session that has sat CLEAN for `config.idle_close_ms`: the agent
-//! and the terminal tab it runs in.
+//! Ends a local session that has sat CLEAN for `config.idle_close_ms`: the agent,
+//! and the terminal tab it runs in where one on this machine shows it.
 //!
 //! Only `Status::Idle` qualifies. It is the one status set on positive evidence
 //! that nothing is left to come back to (a `/clear`, a fresh start, a `/pull`
@@ -8,9 +8,12 @@
 //! that folder resumes it. A `Done` is never closed, read or not, nor anything a subagent's
 //! dialog is holding, since that row reads `Blocked`.
 //!
-//! **The session is found by the label join**, `terminals::labels::join`, so the
-//! tab this closes is the tab the context line is written to, and the two cannot
-//! disagree about which session is a row's. Three more conditions guard the
+//! **The session is found by the label join**, `terminals::labels::join`, over
+//! the adapter's `close_targets`. Those are its label targets unless it offers
+//! close-only ones, so wherever a session is labelled the tab this closes is
+//! the tab the context line is written to, and the two cannot disagree about
+//! which session is a row's. An adapter's close-only targets have no context
+//! line, and may have no tab on this machine. Three more conditions guard the
 //! close: the tab's title, as the terminal reports it, must carry the `Idle`
 //! glyph, so a tab still showing another status is left alone; the row is
 //! re-read from this process's state just before the close, so a prompt that
@@ -38,7 +41,7 @@ use crate::config::ConfigState;
 use crate::state::{AppState, Status};
 use crate::terminal_title::parse_title;
 use crate::terminals::labels::{join, Claim, DesiredLabel};
-use crate::terminals::{LabelTarget, TerminalAdapter};
+use crate::terminals::{CloseTarget, TerminalAdapter};
 
 /// How often rows are checked. The window is an hour by default, so a minute's
 /// lateness is immaterial, and a tick with nothing due asks the terminal nothing.
@@ -76,7 +79,9 @@ impl Verdict {
     /// The log line's human `reason`.
     fn reason(&self) -> &'static str {
         match self {
-            Verdict::Close(_) => "clean past the window; closed the session and its tab",
+            // What else a close ends, the tab included, is the adapter's:
+            // see `TerminalAdapter::close_session`.
+            Verdict::Close(_) => "clean past the window; closed the session",
             Verdict::NoSession => "clean past the window, but no terminal session's title names this row",
             Verdict::TabNotIdle => "clean past the window, but its tab is showing another status, so it is not following the row",
             Verdict::Declined("same_label") => "clean past the window, but its tab's title names this row and another carrying the same label",
@@ -88,9 +93,10 @@ impl Verdict {
 /// The verdict for every row in `due`. Pure. `rows` is every local row, due or
 /// not, because the join ranks a title against all of them: a title naming
 /// `bga assistant` must go to that row and not to a due `bga`.
-fn pick(rows: &[DesiredLabel], targets: &[LabelTarget], due: &HashSet<&str>) -> Vec<(String, Verdict)> {
+fn pick(rows: &[DesiredLabel], targets: &[CloseTarget], due: &HashSet<&str>) -> Vec<(String, Verdict)> {
     let mut declined = Vec::new();
-    let claims = join(rows, targets, &mut declined);
+    let titles: Vec<Option<&str>> = targets.iter().map(|t| t.title.as_deref()).collect();
+    let claims = join(rows, &titles, &mut declined);
     let mut out: Vec<(String, Verdict)> = Vec::new();
     for row in rows.iter().filter(|r| due.contains(r.row.as_str())) {
         let verdict = if let Some(d) = declined.iter().find(|d| d.row == row.row) {
@@ -132,7 +138,7 @@ fn tick(app: &AppHandle, adapter: &dyn TerminalAdapter, logged: &mut HashMap<Str
     if due.is_empty() {
         return;
     }
-    let Some(targets) = adapter.label_targets() else {
+    let Some(targets) = adapter.close_targets() else {
         tracing::debug!(terminal = adapter.name(), "idle close: the terminal could not be asked; retrying next tick");
         return;
     };
@@ -161,11 +167,11 @@ fn tick(app: &AppHandle, adapter: &dyn TerminalAdapter, logged: &mut HashMap<Str
         match adapter.close_session(&key) {
             Ok(()) => {
                 logged.insert(row.clone(), "closed");
-                tracing::info!(chat_id = %row, decision = "idle_close", outcome = "closed", terminal = adapter.name(), idle_ms, window_ms = window, reason = Verdict::Close(key).reason(), "decision");
+                tracing::info!(chat_id = %row, decision = "idle_close", outcome = "closed", terminal = adapter.name(), %key, idle_ms, window_ms = window, reason = Verdict::Close(key.clone()).reason(), "decision");
             }
             Err(error) => {
                 if logged.insert(row.clone(), "close_failed") != Some("close_failed") {
-                    tracing::warn!(chat_id = %row, decision = "idle_close", outcome = "close_failed", terminal = adapter.name(), %error, "decision");
+                    tracing::warn!(chat_id = %row, decision = "idle_close", outcome = "close_failed", terminal = adapter.name(), %key, %error, "decision");
                 }
             }
         }
@@ -175,7 +181,6 @@ fn tick(app: &AppHandle, adapter: &dyn TerminalAdapter, logged: &mut HashMap<Str
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::terminals::LabelBudget;
 
     const WINDOW: u64 = 3_600_000;
 
@@ -183,8 +188,8 @@ mod tests {
         DesiredLabel { row: id.into(), label: id.into(), context: None }
     }
 
-    fn tab(key: &str, title: &str) -> LabelTarget {
-        LabelTarget { key: key.into(), title: Some(title.into()), context: None, budget: LabelBudget::Utf8Bytes(256) }
+    fn tab(key: &str, title: &str) -> CloseTarget {
+        CloseTarget { key: key.into(), title: Some(title.into()) }
     }
 
     /// A title as `terminal_title::sync` writes it for an `Idle` row.

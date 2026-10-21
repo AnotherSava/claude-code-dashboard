@@ -104,6 +104,7 @@ Under the repo root `claude-code-dashboard/`:
     - `http_server.rs` — the loopback axum server: `/api/event`, `/api/agents`, `/api/message`, `/api/window`, `/api/session-clean`, `/api/project/rename`
     - `sync.rs` — multi-device session sync: source- and token-gated listener, metadata push, receiver-driven pulls
     - `tailnet.rs` — asking Tailscale which machine a connection came from, instead of trusting its envelope
+    - `subprocess.rs` — running a helper program to a deadline, with no console window on Windows
     - `peer_message.rs` — relaying one message to an agent on another machine, and the honesty rules around it
     - `start_approval.rs` — asking this machine's user to approve starting a session on another one
     - `session_launcher.rs` — starting a terminal session for a project that has none
@@ -116,7 +117,7 @@ Under the repo root `claude-code-dashboard/`:
     - `liveness.rs` — process-liveness primitives
     - `liveness_reaper.rs` — drops row members whose Claude process exited without a `SessionEnd`, and removes a row once its last member is gone
     - `waiting_settle.rs` — settles a `waiting` row to `done` once its killed background task can no longer report
-    - `idle_close.rs` — closes a session, and the terminal tab it runs in, once it has sat clean past `idle_close_ms`
+    - `idle_close.rs` — closes a session, and the terminal tab it runs in where one on this machine shows it, once it has sat clean past `idle_close_ms`
     - `subagent_gate.rs` — the subagent permission-prompt overlay, and finding the gated call's result that releases it
     - `prompt_origin.rs` — what a row shows for a task another agent began
     - `nonce_store.rs` — per-session marker nonces for the instruction-adherence canary
@@ -147,6 +148,8 @@ Under the repo root `claude-code-dashboard/`:
       - `agterm.rs` / `agterm_facts.rs` — agterm's adapter, and the facts it reads from agterm and the system (macOS)
       - `agterm_wire.rs` — agterm's `session context` protocol (the argv a write takes, the targets its tree reports, and the release that first served the verb) and its `session close` argv with `close_refusal`, the rule that refuses a close (macOS)
       - `agwinterm.rs` / `agwinterm_state.rs` / `agwinterm_wire.rs` — agwinterm's control pipe, its per-window state files, and its protocol, including `close_pane` and `composer_text`, the rules that refuse a close (Windows)
+      - `tmux.rs` / `tmux_wire.rs` — the WSL tmux server holding remote sessions, an adapter that only closes: it offers `idle_close` the sessions no terminal on this machine is showing, and types `/exit` into one (Windows)
+      - `composer.rs` — where Claude Code's composer sits on a screen of text, and the `/exit` sequence typed into it, shared by every close that types into the agent
       - `windows.rs` / `wt_tabs.rs` — Windows Terminal and the Windows console, and the UI Automation read of what a tab really holds
       - `composite.rs` — presents several terminals on one platform as one adapter
       - `labels.rs` — writes each row's task into a terminal's own per-session context line

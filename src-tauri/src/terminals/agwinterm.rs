@@ -128,6 +128,7 @@ use std::time::{Duration, Instant};
 
 use super::agwinterm_state::{self as state, Frontmost, Watch, TERMINAL as NAME};
 use super::agwinterm_wire as wire;
+use super::composer::{Keys, EXIT_POLL, EXIT_WAIT, KEY_PAUSE};
 use super::{Front, LabelTarget, LabelWrite, LastInput, Observation, Selection, TerminalAdapter, TerminalSession};
 
 /// How long `ping`, `window.list` and `tree` get to answer. `tree` is served on
@@ -143,15 +144,6 @@ const WRITE_DEADLINE: Duration = Duration::from_secs(17);
 /// look is retried by the worker anyway, so this only stops a terminal that is
 /// not running from being probed more often than that.
 const BACKOFF: Duration = Duration::from_secs(10);
-
-/// The pause between the keystrokes of a close, long enough for Claude Code to
-/// take each as typing rather than as one paste.
-const KEY_PAUSE: Duration = Duration::from_millis(600);
-
-/// How long a close waits for the agent to exit after `/exit`, and how often it
-/// looks.
-const EXIT_WAIT: Duration = Duration::from_secs(30);
-const EXIT_POLL: Duration = Duration::from_millis(500);
 
 /// How many rows a close reads to find the composer: it sits above Claude
 /// Code's status lines, which run to a handful of rows.
@@ -587,15 +579,9 @@ impl TerminalAdapter for AgwintermAdapter {
 
     /// End the agent with `/exit`, then close its tab once the pane is back at
     /// a shell. Why typing rather than closing, and what refuses it, is
-    /// [`wire::close_pane`]'s doc, and the composer must be empty
-    /// ([`wire::composer_text`]): a draft there is someone typing, here or on
-    /// the Mac, and the close waits for a later tick rather than append to it.
-    ///
-    /// Enter is a separate write after a pause, because Claude Code reads a
-    /// burst of input as a paste, where Enter is a newline rather than a
-    /// submit, and it is pressed only once the composer holds exactly `/exit`;
-    /// anything else means someone typed in the meantime, and the `/exit` is
-    /// left unsent in their draft rather than submitted with it. A pane that has not
+    /// [`wire::close_pane`]'s doc, and the typing, into a composer read by
+    /// [`wire::composer_text`], is [`super::composer::type_exit`]'s, the
+    /// sequence the tmux adapter's close types too. A pane that has not
     /// fallen back to a shell within [`EXIT_WAIT`] leaves its tab open and the
     /// close reported as failed, since closing the tab then would detach a
     /// client from an agent that is still running. A tree read that fails while
@@ -608,17 +594,14 @@ impl TerminalAdapter for AgwintermAdapter {
         let node = wire::session_node(&tree, session).ok_or_else(|| format!("session {session} is no longer in window {window}"))?;
         let pane = wire::close_pane(node, in_front)?;
         let composer = || call(&wire::styled_text_req(window, &pane.id, COMPOSER_LINES), READ_DEADLINE).map(|t| wire::composer_text(&t));
-        match composer()? {
-            Some(draft) if draft.is_empty() => {}
-            Some(_) => return Err("the composer holds a draft, so someone may be typing into the session".to_string()),
-            None => return Err("no Claude Code composer is on screen in the session's pane".to_string()),
-        }
-        call(&wire::type_req(window, &pane.id, "/exit"), WRITE_DEADLINE)?;
-        std::thread::sleep(KEY_PAUSE);
-        if composer()?.as_deref() != Some("/exit") {
-            return Err("the composer changed while /exit was being typed, so Enter was not pressed".to_string());
-        }
-        call(&wire::type_req(window, &pane.id, "\r"), WRITE_DEADLINE)?;
+        let send = |keys| {
+            let text = match keys {
+                Keys::Exit => "/exit",
+                Keys::Enter => "\r",
+            };
+            call(&wire::type_req(window, &pane.id, text), WRITE_DEADLINE).map(|_| ())
+        };
+        super::composer::type_exit(composer, send, KEY_PAUSE)?;
         let until = Instant::now() + EXIT_WAIT;
         loop {
             std::thread::sleep(EXIT_POLL);

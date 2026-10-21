@@ -228,9 +228,7 @@ pub fn close_pane(node: &Value, in_front: bool) -> Result<ClosePane, String> {
     if covered(node) {
         return Err("an overlay covers the session and would take the input".to_string());
     }
-    let title = node.get("title").and_then(Value::as_str);
-    let idle = title.and_then(crate::terminal_title::parse_title).is_some_and(|r| r.status == crate::state::Status::Idle && !r.remote);
-    if !idle {
+    if !node.get("title").and_then(Value::as_str).is_some_and(crate::terminal_title::shows_clean_here) {
         return Err("the session's title no longer shows it CLEAN".to_string());
     }
     let index = node.get("focusedPane").and_then(Value::as_u64).unwrap_or(0) as usize;
@@ -256,14 +254,11 @@ pub fn agent_gone(node: &Value, index: usize) -> bool {
 }
 
 /// A row with the edge and fill tmux draws beyond a window smaller than the
-/// client cut off. The edge is cut only where fill followed it, since a row
-/// with no fill is the window's own, and its last column is content.
+/// client cut off. Edge and fill are cut only together: a row with no fill is
+/// the window's own, its last column content, and dots with no edge before
+/// them are text.
 fn without_tmux_fill(row: &str) -> &str {
-    let unfilled = row.trim_end_matches('·');
-    if unfilled.len() == row.len() {
-        return row;
-    }
-    unfilled.strip_suffix(['│', '┘']).unwrap_or(unfilled)
+    row.trim_end_matches('·').strip_suffix(['│', '┘']).filter(|_| row.ends_with('·')).unwrap_or(row)
 }
 
 /// What Claude Code's composer holds, from a `session text --styles` result,
@@ -275,14 +270,13 @@ fn without_tmux_fill(row: &str) -> &str {
 /// from: tmux mirrors a client on the Mac into the same pane this tab draws,
 /// so reading the pane covers the Mac's `⇄` tab without asking tmux anything.
 ///
-/// The composer is the last row that starts with the prompt glyph directly
-/// under a `─` rule, through the rows down to the next rule. Faint runs are
-/// left out, being the placeholder suggestions Claude Code draws in an empty
-/// composer, not text anyone typed. tmux draws its window at the size of its
-/// smallest client, edges it with `│` (`┘` at the corner) and fills the rest of
-/// a larger client with `·`, so while the Mac is attached to a session too,
-/// every row this tab shows of it, the rules included, ends in that edge and
-/// fill; [`without_tmux_fill`] cuts both first.
+/// Faint runs are left out, being the placeholder suggestions Claude Code
+/// draws in an empty composer, not text anyone typed. tmux draws its window at
+/// the size of its smallest client, edges it with `│` (`┘` at the corner) and
+/// fills the rest of a larger client with `·`, so while the Mac is attached to
+/// a session too, every row this tab shows of it, the rules included, ends in
+/// that edge and fill; [`without_tmux_fill`] cuts both first. Where the
+/// composer sits is [`super::composer::composer_in`]'s rule.
 pub fn composer_text(styled: &Value) -> Option<String> {
     let rows = styled.get("rows").and_then(Value::as_array)?;
     let lines: Vec<String> = rows
@@ -290,16 +284,7 @@ pub fn composer_text(styled: &Value) -> Option<String> {
         .map(|r| r.get("runs").and_then(Value::as_array).into_iter().flatten().filter(|run| run.get("faint").and_then(Value::as_bool) != Some(true)).filter_map(|run| run.get("text").and_then(Value::as_str)).collect::<String>())
         .map(|l| without_tmux_fill(&l).to_string())
         .collect();
-    let is_rule = |l: &str| !l.trim().is_empty() && l.trim().chars().all(|c| c == '─');
-    let prompt = |l: &str| l.trim_start().strip_prefix(['>', '❯']).map(str::to_string);
-    let top = (1..lines.len()).rev().find(|&i| is_rule(&lines[i - 1]) && prompt(&lines[i]).is_some())?;
-    let bottom = (top + 1..lines.len()).find(|&i| is_rule(&lines[i]))?;
-    let mut text = prompt(&lines[top]).unwrap_or_default();
-    for line in &lines[top + 1..bottom] {
-        text.push('\n');
-        text.push_str(line);
-    }
-    Some(text.trim().to_string())
+    super::composer::composer_in(&lines)
 }
 
 /// The label targets for one window's sessions. The key is
@@ -542,6 +527,8 @@ mod tests {
         assert_eq!(composer_text(&s).as_deref(), Some("/exit"));
         let s = styled(&[(RULE, false), ("> a draft ending │", false), (RULE, false)]);
         assert_eq!(composer_text(&s).as_deref(), Some("a draft ending │"), "an edge with no fill after it is the draft's own");
+        let s = styled(&[(RULE, false), ("> wait…··", false), (RULE, false)]);
+        assert_eq!(composer_text(&s).as_deref(), Some("wait…··"), "dots with no edge before them are the draft's own");
     }
 
     #[test]

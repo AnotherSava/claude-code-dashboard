@@ -1,24 +1,26 @@
 //! Several adapters answering as one.
 //!
-//! On Windows two terminals can host a session at once: Windows Terminal, whose
-//! adapter answers restore and the stale check, and agwinterm, whose adapter
-//! answers labelling; both answer attention. [`super::for_platform`] still
-//! returns one adapter, so every consumer keeps asking one question of one thing
-//! and none of them learns there are two. What it costs is a stated rule per method for turning
+//! On Windows several terminals can host a session at once: Windows Terminal,
+//! whose adapter answers restore and the stale check; agwinterm, whose adapter
+//! answers labelling; both of those answer attention; and the WSL tmux server,
+//! whose adapter only closes the sessions no terminal here shows.
+//! [`super::for_platform`] still returns one adapter, so every consumer keeps
+//! asking one question of one thing and none of them learns there are several. What it costs is a stated rule per method for turning
 //! several answers into one, and each rule is below beside the method it governs.
 //!
 //! **Children must not collide on what they mint.** A surface key goes out
 //! unprefixed, because three readers already hold surface keys and compare them
 //! for equality, so each child must use its own prefix (Windows Terminal mints
-//! `hwnd:`, agwinterm mints none). A label key goes out as
+//! `hwnd:`, agwinterm mints none). A label key, and a close key, goes out as
 //! `"{child name}|{child key}"`, since [`Composite::write_label`] and
-//! [`Composite::close_session`] read it back and need to know whose it is. An [`Observation`] is passed on as the
+//! [`Composite::close_session`] read it back and need to know whose it is;
+//! a child that closes without labelling (tmux) mints only close keys. An [`Observation`] is passed on as the
 //! child made it, carrying that child's slug, so the decision log says which
 //! terminal saw what rather than naming the set.
 
 use std::sync::mpsc::Sender;
 
-use super::{FrontReading, LabelTarget, LabelWrite, Observation, TerminalAdapter, TerminalSession, FALLBACK_STALE_REMEDY};
+use super::{CloseTarget, FrontReading, LabelTarget, LabelWrite, Observation, TerminalAdapter, TerminalSession, FALLBACK_STALE_REMEDY};
 
 pub struct Composite {
     name: &'static str,
@@ -44,8 +46,8 @@ impl Composite {
 
 /// The union of the children that answered, or `None` when none did.
 ///
-/// The rule `sessions`, `front_readings` and `label_targets` share, because all
-/// three draw the same line: `None` is "could not look" and `Some` is a finding.
+/// The rule `sessions`, `front_readings`, `label_targets` and `close_targets`
+/// share, because all four draw the same line: `None` is "could not look" and `Some` is a finding.
 /// One child that could not look does not make the others' findings unknown, so
 /// it is skipped rather than allowed to veto; only a set where nobody looked is a
 /// failure to look. That keeps restore's retry gate where it was: a child that
@@ -61,8 +63,8 @@ fn combine_capability<T>(answers: impl IntoIterator<Item = Option<Vec<T>>>) -> O
     })
 }
 
-/// The child name and the child's own key inside a label key this composite
-/// minted, or `None` for a key it did not mint.
+/// The child name and the child's own key inside a label or close key this
+/// composite minted, or `None` for a key it did not mint.
 fn route_key(key: &str) -> Option<(&str, &str)> {
     key.split_once('|')
 }
@@ -148,6 +150,16 @@ impl TerminalAdapter for Composite {
         target.write_label(inner, write)
     }
 
+    /// Each child's own `close_targets`, never derived from the composite's
+    /// label targets: a child can host sessions it cannot label, and those
+    /// would be lost.
+    fn close_targets(&self) -> Option<Vec<CloseTarget>> {
+        combine_capability(self.children.iter().map(|c| {
+            let child = c.name();
+            c.close_targets().map(|ts| ts.into_iter().map(|t| CloseTarget { key: format!("{child}|{}", t.key), ..t }).collect())
+        }))
+    }
+
     /// Routed to the child that minted the key, as `write_label` is.
     fn close_session(&self, key: &str) -> Result<(), String> {
         let (target, inner) = self.child_for(key)?;
@@ -222,6 +234,24 @@ mod tests {
         }
     }
 
+    /// A child that can close sessions it never labels, the way tmux does.
+    struct CloseOnly(Vec<CloseTarget>);
+
+    impl TerminalAdapter for CloseOnly {
+        fn name(&self) -> &'static str {
+            "tmux"
+        }
+        fn sessions(&self) -> Option<Vec<TerminalSession>> {
+            None
+        }
+        fn poll(&mut self, _now_ms: i64) -> Vec<Observation> {
+            Vec::new()
+        }
+        fn close_targets(&self) -> Option<Vec<CloseTarget>> {
+            Some(self.0.clone())
+        }
+    }
+
     fn tab(title: &str) -> TerminalSession {
         TerminalSession { cwd: None, title: Some(title.to_string()) }
     }
@@ -276,6 +306,17 @@ mod tests {
         assert_eq!(writes.lock().unwrap()[0].0, "close w1/p1");
         assert!(c.close_session("kitty|w1/p1").is_err());
         assert!(!composite(vec![Fake { name: "windows", ..Fake::default() }]).can_close());
+    }
+
+    #[test]
+    fn a_child_that_closes_without_labelling_adds_close_targets_and_no_label_targets() {
+        // agwinterm's close targets come from the trait's default over its label
+        // targets, which the fake does not override.
+        let agw = Fake { name: "agwinterm", targets: Some(vec![target("w1/p1")]), ..Fake::default() };
+        let tmux = CloseOnly(vec![CloseTarget { key: "cc-x".into(), title: Some("⚫ x".into()) }]);
+        let c = Composite::new("windows", vec![Box::new(agw), Box::new(tmux)]);
+        assert_eq!(c.label_targets().unwrap().iter().map(|t| t.key.as_str()).collect::<Vec<_>>(), ["agwinterm|w1/p1"]);
+        assert_eq!(c.close_targets().unwrap().iter().map(|t| t.key.as_str()).collect::<Vec<_>>(), ["agwinterm|w1/p1", "tmux|cc-x"]);
     }
 
     #[test]

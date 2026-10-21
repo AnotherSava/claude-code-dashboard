@@ -495,7 +495,8 @@ pub(crate) enum Claim<'a> {
 /// what this process placed, by key.
 pub fn plan(rows: &[DesiredLabel], targets: &[LabelTarget], written: &HashMap<String, Placed>) -> Plan {
     let mut out = Plan::default();
-    let claims = join(rows, targets, &mut out.declined);
+    let titles: Vec<Option<&str>> = targets.iter().map(|t| t.title.as_deref()).collect();
+    let claims = join(rows, &titles, &mut out.declined);
 
     for (t, claim) in targets.iter().zip(&claims) {
         let ours = match claim {
@@ -520,22 +521,26 @@ pub fn plan(rows: &[DesiredLabel], targets: &[LabelTarget], written: &HashMap<St
     out
 }
 
-/// Which row each target's title names, one claim per target in `targets`'
-/// order, with every row the join refuses (`same_label`, `shared_title`) pushed
-/// onto `declined`. A row no title names is neither claimed nor declined.
+/// Which row each session's title names, one claim per entry in `titles`'
+/// order (`None` for a session with no title), with every row the join refuses
+/// (`same_label`, `shared_title`) pushed onto `declined`. A row no title names
+/// is neither claimed nor declined.
 ///
 /// The join the module doc describes, shared with `idle_close`, which closes the
 /// session a row is joined to: whatever this labels as a row's session is the
 /// session that closes, so the two can never disagree about which tab is whose.
-pub(crate) fn join<'a>(rows: &'a [DesiredLabel], targets: &[LabelTarget], declined: &mut Vec<Declined>) -> Vec<Claim<'a>> {
-    let mut claims: Vec<Claim> = Vec::with_capacity(targets.len());
-    for t in targets {
+/// The reverse does not hold: `idle_close` also joins an adapter's close-only
+/// targets (`TerminalAdapter::close_targets`), sessions this never labels and
+/// which may have no tab on this machine.
+pub(crate) fn join<'a>(rows: &'a [DesiredLabel], titles: &[Option<&str>], declined: &mut Vec<Declined>) -> Vec<Claim<'a>> {
+    let mut claims: Vec<Claim> = Vec::with_capacity(titles.len());
+    for title in titles {
         // Local rows only: a context line is written *into* a session, so it is
         // only ever about one this dashboard owns. A tab rendering another
         // machine's session reads as foreign here and is left alone, which is
         // also the only safe answer — the far machine owns that session's
         // context line as surely as it owns its title.
-        let named = t.title.as_deref().and_then(|title| title_names(title, false, rows.iter().map(|r| (r, r.label.as_str()))));
+        let named = title.and_then(|title| title_names(title, false, rows.iter().map(|r| (r, r.label.as_str()))));
         claims.push(match named {
             None => Claim::Foreign,
             Some(Named::One(r)) => Claim::Row(r),

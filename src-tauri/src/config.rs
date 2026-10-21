@@ -192,12 +192,15 @@ pub struct Config {
     /// question cannot do, because it is waiting for the user.
     ///
     /// Read by `session_restore`, which asks Claude Code's session registry which
-    /// agents are alive here and the terminal what each of their tabs says, and
-    /// creates only the rows that both answer for. Off leaves the dashboard empty
-    /// on a cold start, as it was before the feature existed. Requires a terminal
-    /// adapter (`terminals::for_platform`), so it does nothing on Linux, and
-    /// requires `terminal_titles` — the tab title is the only place a row's status
-    /// outlives this process.
+    /// agents are alive here and the terminal what each of their tabs says. A
+    /// session whose tab carries a title this dashboard wrote gets its row back
+    /// with that status, which needs `terminal_titles`, since the tab title is the
+    /// only place a row's status outlives this process. A session that started
+    /// while the dashboard was down (its `startedAt` later than the previous run's
+    /// last heartbeat) is restored from the registry alone, with `terminal_titles`
+    /// off too and before the terminal answers. Off leaves the dashboard empty on
+    /// a cold start, as it was before the feature existed. Requires a terminal
+    /// adapter (`terminals::for_platform`), so it does nothing on Linux.
     pub restore_sessions: bool,
     /// Grace window (ms) after which a `Waiting` row that hasn't changed status
     /// is settled to `Done`. `Waiting` ("looks done but isn't") is entered at
@@ -212,8 +215,8 @@ pub struct Config {
     /// only a stuck, killed-task WAIT ages past it. `None`/`0` disables.
     pub waiting_settle_ms: Option<u64>,
     /// How long (ms) a local session may sit in `Idle` — CLEAN, nothing left to
-    /// come back to — before `idle_close` ends it: the agent and the terminal
-    /// tab it runs in. Only `Idle` qualifies, never a `Done` however long it has
+    /// come back to — before `idle_close` ends it: the agent, and the terminal
+    /// tab it runs in where one on this machine shows it. Only `Idle` qualifies, never a `Done` however long it has
     /// been read, because `Idle` is the one status set on positive evidence that
     /// nothing is outstanding. The conversation survives on disk, and
     /// `claude --continue` in that folder resumes it. `None`/`0` disables.

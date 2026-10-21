@@ -37,10 +37,12 @@
 //!   [`TerminalAdapter::write_label`] writes one. `crate::terminals::labels`
 //!   consumes them for a terminal whose sessions carry a field of their own beside
 //!   the console title, writing a row's task there, decided from the live reading.
-//! - **End this session.** [`TerminalAdapter::close_session`] closes the session
-//!   behind a label key, agent and tab together. `crate::idle_close` calls it for
-//!   a row that has sat CLEAN past `idle_close_ms`, finding the session by the
-//!   labeller's own title join.
+//! - **End this session.** [`TerminalAdapter::close_targets`] lists the sessions
+//!   a terminal could end, by title, which for a terminal that labels is its
+//!   label targets, and [`TerminalAdapter::close_session`] ends one: the agent,
+//!   and the tab showing it where the terminal has one on this machine.
+//!   `crate::idle_close` calls them for a row that has sat CLEAN
+//!   past `idle_close_ms`, finding the session by the labeller's own title join.
 //!
 //! They are different axes — the first is about a human, the second about a
 //! screen, the third about the gap between what a screen shows and what is behind
@@ -109,6 +111,19 @@ pub mod agwinterm;
 /// every platform so the parsing is exercised on a Mac too.
 #[cfg(any(target_os = "windows", test))]
 pub mod agwinterm_wire;
+/// Where Claude Code's composer sits on a screen of text, shared by every close
+/// that types into the agent. Compiled where such a close exists, and for tests.
+#[cfg(any(target_os = "windows", test))]
+pub mod composer;
+/// The WSL tmux server that holds the claude repo's remote sessions, reached
+/// through `wsl.exe`, as an adapter that can only close: what it adds is the
+/// sessions no Windows terminal is showing.
+#[cfg(target_os = "windows")]
+pub mod tmux;
+/// tmux's answers as pure functions: the session list and its clients, and a
+/// pane capture's text with its styles read. Compiled for tests everywhere.
+#[cfg(any(target_os = "windows", test))]
+pub mod tmux_wire;
 /// agwinterm's per-window state file as pure functions: which session a window
 /// has selected and when the user left one. Compiled for tests everywhere, like
 /// the wire module.
@@ -913,7 +928,8 @@ pub trait TerminalAdapter: Send {
     /// user changed, or one the terminal lost, shows up here.
     ///
     /// **May block**, for as long as a cross-process read takes. It is called only
-    /// from `labels`' worker thread, never from an emit.
+    /// from `labels`' worker thread and, through the default
+    /// [`close_targets`](Self::close_targets), `idle_close`'s, never from an emit.
     fn label_targets(&self) -> Option<Vec<LabelTarget>> {
         None
     }
@@ -929,16 +945,32 @@ pub trait TerminalAdapter: Send {
         Err("this terminal cannot be labelled".to_string())
     }
 
-    /// End the session behind `key` — the agent in it and the tab that shows
-    /// it — or say why not. `key` is a [`LabelTarget::key`] this adapter minted:
-    /// a session is found for closing by the same title join it is labelled by,
-    /// so the label keys double as the address.
+    /// Every session [`close_session`](Self::close_session) could end, with
+    /// its title, or `None` when the terminal could not be asked. The line
+    /// [`label_targets`](Self::label_targets) draws between the two.
+    ///
+    /// A session is found for closing by the same title join it is labelled by,
+    /// so for a terminal that labels the two lists are one, which is the
+    /// default. It is a separate question for a terminal that hosts sessions it
+    /// cannot label: tmux has no context line, and a target listed for
+    /// labelling would be written to on every pass.
+    ///
+    /// **May block**, and is called only from `idle_close`'s worker thread.
+    fn close_targets(&self) -> Option<Vec<CloseTarget>> {
+        self.label_targets().map(|ts| ts.into_iter().map(|t| CloseTarget { key: t.key, title: t.title }).collect())
+    }
+
+    /// End the session behind `key` — the agent in it, and the tab that shows
+    /// it where this terminal draws one — or say why not. `key` is a [`CloseTarget::key`] this adapter
+    /// minted.
     ///
     /// What "end" takes is the terminal's business, and differs: agterm closes
     /// the session and the agent goes with it, while a terminal whose tab only
     /// attaches to an agent hosted elsewhere (agwinterm's tabs onto a WSL tmux
     /// pane) has to end that agent too, or closing the tab detaches a client and
-    /// leaves the agent running unseen.
+    /// leaves the agent running unseen. A terminal that only holds the agent,
+    /// tmux for a session no terminal here shows, ends the agent and has no tab
+    /// to close.
     ///
     /// **May block**, and is called only from `idle_close`'s worker thread. The
     /// default refuses, which leaves a row this terminal cannot close standing.
@@ -965,8 +997,9 @@ pub trait TerminalAdapter: Send {
 pub struct LabelTarget {
     /// Which session this is, opaque to every caller, with the contract
     /// [`FrontReading::surface`] has: compare it, pass it back to
-    /// [`TerminalAdapter::write_label`] or [`TerminalAdapter::close_session`],
-    /// and do nothing else with it.
+    /// [`TerminalAdapter::write_label`], or to [`TerminalAdapter::close_session`]
+    /// as the [`CloseTarget::key`] the default `close_targets` makes of it, and
+    /// do nothing else with it.
     pub key: String,
     /// A pane's program title — agwinterm's focused pane, agterm's primary pane
     /// whichever has focus — which for an agent is the console title this
@@ -978,6 +1011,18 @@ pub struct LabelTarget {
     /// The longest context the terminal accepts, in the unit that terminal
     /// enforces, which `labels` fits a row's text to.
     pub budget: LabelBudget,
+}
+
+/// One session [`TerminalAdapter::close_targets`] reports.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CloseTarget {
+    /// Which session this is, opaque to every caller: compare it, pass it back
+    /// to [`TerminalAdapter::close_session`], and do nothing else with it.
+    pub key: String,
+    /// The session's title as the terminal reports it, which for an agent is
+    /// the console title this dashboard writes, or `None` where it has none.
+    /// What joins the session to a row.
+    pub title: Option<String>,
 }
 
 /// How long a context a terminal accepts, in the unit it measures.
@@ -1506,14 +1551,15 @@ pub fn for_platform(app: &tauri::AppHandle) -> Option<Box<dyn TerminalAdapter>> 
         let _ = app;
         Some(Box::new(agterm::AgtermAdapter::default()))
     }
-    // A composite, because two terminals can host a session here and each knows
-    // only its own: Windows Terminal answers restore and the stale check,
-    // agwinterm answers labelling, and both answer attention. The composite keeps
+    // A composite, because several terminals can host a session here and each
+    // knows only its own: Windows Terminal answers restore and the stale check,
+    // agwinterm answers labelling, both answer attention, and tmux closes the
+    // sessions only the Mac's tabs are showing, or none are. The composite keeps
     // Windows Terminal's slug, so the lines every existing consumer logs keep
     // theirs; an observation carries the slug of the terminal that made it.
     #[cfg(target_os = "windows")]
     {
-        Some(Box::new(composite::Composite::new(windows::NAME, vec![Box::new(windows::WindowsAdapter::new(app.clone())), Box::new(agwinterm::AgwintermAdapter::new())])))
+        Some(Box::new(composite::Composite::new(windows::NAME, vec![Box::new(windows::WindowsAdapter::new(app.clone())), Box::new(agwinterm::AgwintermAdapter::new()), Box::new(tmux::TmuxAdapter)])))
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {

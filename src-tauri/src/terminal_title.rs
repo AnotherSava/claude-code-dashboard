@@ -846,6 +846,14 @@ pub fn parse_title(title: &str) -> Option<TitleReading<'_>> {
     Some(TitleReading { status, read, remote, rest: rest.trim() })
 }
 
+/// Whether `title` is one this machine wrote for a CLEAN row, which is what a
+/// close re-reads just before it types into the session: a title that has moved
+/// off `⚫` since the close was decided means a turn has started there.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn shows_clean_here(title: &str) -> bool {
+    parse_title(title).is_some_and(|r| r.status == Status::Idle && !r.remote)
+}
+
 /// The inverse of [`status_glyph`]. Total over the glyphs that function emits
 /// and `None` everywhere else.
 ///
