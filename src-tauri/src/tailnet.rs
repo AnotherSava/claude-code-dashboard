@@ -47,8 +47,11 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::IpAddr;
+use std::process::Command;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+
+use crate::subprocess::RunFailure;
 
 /// How long a resolved address is trusted before asking `tailscaled` again. The
 /// address→node binding is stable for the life of a node, so this is about
@@ -203,8 +206,6 @@ fn tailscale_bin() -> Option<std::path::PathBuf> {
 }
 
 fn whois_uncached(ip: IpAddr) -> Option<TailnetPeer> {
-    use std::process::{Command, Stdio};
-
     let bin = tailscale_bin()?;
     // The port is required by the argument shape and irrelevant to the answer.
     let addr = match ip {
@@ -212,41 +213,15 @@ fn whois_uncached(ip: IpAddr) -> Option<TailnetPeer> {
         IpAddr::V6(v6) => format!("[{v6}]:0"),
     };
     let mut cmd = Command::new(&bin);
-    cmd.args(["whois", "--json", &addr]).stdout(Stdio::piped()).stderr(Stdio::null()).stdin(Stdio::null());
-    // Redirecting all three stdio handles is NOT enough on Windows. The
-    // dashboard is a GUI process and owns no console, so spawning a console
-    // binary makes Windows allocate a fresh one for the child — which under
-    // Windows Terminal is a real window that flashes open and shut. Reported
-    // from the Windows box 2026-08-31: one window per minute, in lockstep with
-    // `CACHE_TTL` expiring against the peer's 30 s sync heartbeat. Invisible
-    // from macOS, where a spawn has no console to allocate.
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        /// `CREATE_NO_WINDOW` — spelled out rather than pulled from `winapi`,
-        /// which this crate does not depend on for one constant.
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
-    let mut child = cmd.spawn().ok()?;
-
-    // `Command` has no timeout, and a wedged daemon would otherwise hold a
-    // blocking thread indefinitely. Poll, then kill.
-    let deadline = Instant::now() + WHOIS_TIMEOUT;
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
-            Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                tracing::warn!(%ip, "tailscale whois timed out; treating the device as claimed");
-                return None;
-            }
-            Err(_) => return None,
+    cmd.args(["whois", "--json", &addr]);
+    let out = match crate::subprocess::run(cmd, WHOIS_TIMEOUT) {
+        Ok(out) => out,
+        Err(RunFailure::TimedOut) => {
+            tracing::warn!(%ip, "tailscale whois timed out; treating the device as claimed");
+            return None;
         }
-    }
-    let out = child.wait_with_output().ok()?;
+        Err(RunFailure::NotRun(_)) => return None,
+    };
     if !out.status.success() {
         // "peer not found" for anything off the tailnet, including loopback.
         return None;
@@ -352,34 +327,6 @@ mod tests {
     fn a_binding_overrides_incidental_name_agreement() {
         let b = bindings(&[("chrome", "some-other-node")]);
         assert_eq!(attest("chrome", Some(&peer("chrome")), &b), Attestation::Mismatch);
-    }
-
-    /// A console spawn from this GUI process must carry `CREATE_NO_WINDOW` on
-    /// Windows, or it flashes a terminal window at the user — the bug reported
-    /// 2026-08-31, once a minute, for a subprocess whose output nobody sees.
-    ///
-    /// Asserted over the source text rather than behind a helper: this is the
-    /// *only* Windows-reachable `Command::new` in the crate (every other one is
-    /// `#[cfg(not(windows))]` or macOS-only), and wrapping a single call site
-    /// would be abstraction ahead of need. A test scales to the next one without
-    /// that — and unlike a helper, it cannot be bypassed by someone calling
-    /// `Command::new` directly, which is exactly how this would recur.
-    #[test]
-    fn the_whois_spawn_creates_no_console_window() {
-        let src = include_str!("tailnet.rs");
-        // Search the PRODUCTION half only. Every string this test navigates by
-        // — the anchor, `.spawn()`, and the flag it asserts on — also appears
-        // in the test's own body, so scanning the whole file lets a deleted
-        // call site be "found" inside this function and judged against this
-        // function. That reads as a pass while guarding nothing. It happens not
-        // to today, because the real spawn sits earlier and `find` takes the
-        // first match — positional luck, not a property worth relying on.
-        let src = &src[..src.find("#[cfg(test)]").expect("test module marker")];
-        let at = src.find("let mut cmd = Command::new(&bin);").expect("the whois spawn moved — update this test");
-        let spawn_at = src[at..].find(".spawn()").expect("spawn call") + at;
-        let body = &src[at..spawn_at];
-        assert!(body.contains("creation_flags(CREATE_NO_WINDOW)"), "the whois spawn must set CREATE_NO_WINDOW, or it flashes a console window on Windows once per cache expiry");
-        assert!(body.contains("#[cfg(windows)]"), "the flag is Windows-only API and must stay cfg-gated");
     }
 
     /// Parsed against the real output shape, captured from a live peer.

@@ -19,6 +19,9 @@
 #[cfg(target_os = "macos")]
 use std::path::PathBuf;
 
+#[cfg(target_os = "macos")]
+use crate::subprocess::RunFailure;
+
 /// How long any one `agtermctl` call may take before it is killed.
 ///
 /// `Command` has no timeout and agtermctl talks to a control socket, so a
@@ -38,53 +41,13 @@ fn agterm_bin() -> Option<PathBuf> {
     candidates.iter().map(PathBuf::from).find(|p| p.exists())
 }
 
-/// Why one `agtermctl` run produced no output to read.
-#[cfg(target_os = "macos")]
-enum RunFailure {
-    /// It could not be found, started or waited on; the text says which.
-    NotRun(String),
-    /// It outlived its deadline and was killed.
-    TimedOut,
-}
-
 /// Run one `agtermctl` command to completion or `timeout`, whichever is first.
-///
-/// The one copy of the spawn-and-wait every caller below shares. Both pipes are
-/// drained on threads while the child runs, because a child writing more than
-/// the pipe buffer blocks until someone reads — which, with the reads deferred
-/// to after the exit, is until the kill.
 #[cfg(target_os = "macos")]
 fn run(args: &[&str], timeout: std::time::Duration) -> Result<std::process::Output, RunFailure> {
-    use std::io::Read;
-    use std::process::{Command, Stdio};
-
     let bin = agterm_bin().ok_or_else(|| RunFailure::NotRun("agtermctl not found".to_string()))?;
-    let mut child = Command::new(&bin).args(args).stdout(Stdio::piped()).stderr(Stdio::piped()).stdin(Stdio::null()).spawn().map_err(|e| RunFailure::NotRun(format!("could not run agtermctl: {e}")))?;
-    let drain = |pipe: Option<Box<dyn Read + Send>>| {
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            if let Some(mut p) = pipe {
-                let _ = p.read_to_end(&mut buf);
-            }
-            buf
-        })
-    };
-    let stdout = drain(child.stdout.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
-    let stderr = drain(child.stderr.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
-    let deadline = std::time::Instant::now() + timeout;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if std::time::Instant::now() < deadline => std::thread::sleep(std::time::Duration::from_millis(20)),
-            Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(RunFailure::TimedOut);
-            }
-            Err(e) => return Err(RunFailure::NotRun(format!("could not wait for agtermctl: {e}"))),
-        }
-    };
-    Ok(std::process::Output { status, stdout: stdout.join().unwrap_or_default(), stderr: stderr.join().unwrap_or_default() })
+    let mut cmd = std::process::Command::new(&bin);
+    cmd.args(args);
+    crate::subprocess::run(cmd, timeout)
 }
 
 /// Run one `agtermctl` command and parse its JSON answer, or `None` if it could

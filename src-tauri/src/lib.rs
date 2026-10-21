@@ -36,6 +36,7 @@ mod setup;
 mod start_approval;
 mod state;
 mod subagent_gate;
+mod subprocess;
 mod sync;
 mod tailnet;
 mod telegram;
