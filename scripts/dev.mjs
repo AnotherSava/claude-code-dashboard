@@ -29,7 +29,7 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const USE_CASE = 'tauri-dashboard-vite-dev' // the registry's key for this server — `ports.py list` shows it
-const OWNER = 'tauri-dashboard'
+const OWNER = 'claude-code-dashboard' // the GitHub repository name — `ports.py repo-name` prints it
 
 const SELF = fileURLToPath(import.meta.url)
 const REPO_ROOT = join(dirname(SELF), '..')
