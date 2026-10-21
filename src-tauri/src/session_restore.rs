@@ -236,8 +236,11 @@ pub fn restored_status(from_title: Status, activity: Activity) -> Option<Status>
 /// The hook path settles a `startup` or a `/clear` CLEAN and a `resume` `Done`
 /// unless its dialog ends at a `/clear` (`http_server::resume_is_clean`). Which
 /// source fired is not recorded anywhere this can read, so `clean` stands in for
-/// it: a session id this dashboard never saw is a fresh conversation, and a seen
-/// one is a resume, clean where its persisted dialog ends at a `/clear`. A
+/// it: a resume is clean where its persisted dialog ends at a `/clear`, and only
+/// a session with no anchor whose row has no persisted dialog either is taken for
+/// a fresh conversation. The anchor alone cannot say so, because every
+/// `SessionEnd` forgets it, so a `--continue` of a conversation that once exited
+/// cleanly carries none. A
 /// session the registry reports busy took a prompt since, and one reporting
 /// anything else may be parked on a question, which a CLEAN claim would let
 /// `idle_close` end.
@@ -255,7 +258,7 @@ pub fn replayed_status(activity: Activity, clean: bool) -> Status {
 /// `AppHandle`. `derive` is the caller's `derive_chat_id` closure (it needs
 /// `projects_root`), `anchored` its `ChatIdRegistry` lookup, `down_since` the
 /// previous run's last heartbeat and `ends_clean` whether a row's persisted
-/// dialog ends at a `/clear`.
+/// dialog ends at a `/clear`, `None` where the row has none.
 ///
 /// A live session is skipped, rather than restored with a fallback, when its tab
 /// carries no title this dashboard recognizes — a tab we blanked when the row was
@@ -278,7 +281,7 @@ pub fn plan(
     derive: &dyn Fn(&str) -> String,
     anchored: &dyn Fn(&str) -> Option<String>,
     down_since: Option<i64>,
-    ends_clean: &dyn Fn(&str) -> bool,
+    ends_clean: &dyn Fn(&str) -> Option<bool>,
 ) -> Vec<Restorable> {
     let mut out = Vec::new();
     for s in live {
@@ -287,7 +290,7 @@ pub fn plan(
             continue;
         }
         if missed_start(s, down_since) {
-            let status = replayed_status(s.activity, !s.known_to(anchored) || ends_clean(&id));
+            let status = replayed_status(s.activity, ends_clean(&id).unwrap_or(!s.known_to(anchored)));
             out.push(Restorable {
                 id,
                 status,
@@ -435,7 +438,7 @@ fn tick(app: &AppHandle, adapter: &dyn crate::terminals::TerminalAdapter) -> Pas
     let derive = |cwd: &str| crate::adapters::claude::derive_chat_id(Some(cwd), root.as_deref());
     let down_since = app.try_state::<crate::alive_stamp::AliveStamp>().and_then(|a| a.previous());
     let history = app.try_state::<crate::prompt_history::PromptHistoryStore>();
-    let ends_clean = |id: &str| history.as_ref().and_then(|h| h.get(id)).is_some_and(|p| crate::state::ends_with_clear_boundary(&p.dialog));
+    let ends_clean = |id: &str| history.as_ref().and_then(|h| h.get(id)).map(|p| crate::state::ends_with_clear_boundary(&p.dialog));
 
     // Unreadable is not empty. `None` here means the registry directory could not
     // be read, which says nothing about what is running; treating it as "nothing
@@ -596,8 +599,9 @@ mod tests {
     /// only a test that moves a start past it exercises the missed-start path.
     const STAMP: i64 = 5_000;
 
-    fn never_clean(_: &str) -> bool {
-        false
+    /// No row has a persisted dialog.
+    fn never_clean(_: &str) -> Option<bool> {
+        None
     }
 
     /// A session whose process started after [`STAMP`], while the dashboard was down.
@@ -873,11 +877,15 @@ mod tests {
         assert_eq!(replayed_status(Activity::Busy, true), Status::Working, "a prompt arrived since");
         assert_eq!(replayed_status(Activity::Unknown, true), Status::Done, "possibly parked on a question");
         // A seen session whose dialog ends at a `/clear` resumes clean.
-        let out = plan(&[started_while_down("dash", Activity::Idle)], &[], &[], 10_000, &derive, &seen, Some(STAMP), &|id| id == "dash");
+        let out = plan(&[started_while_down("dash", Activity::Idle)], &[], &[], 10_000, &derive, &seen, Some(STAMP), &|id| Some(id == "dash"));
         assert_eq!(out[0].status, Status::Idle);
-        // A session id never seen is a fresh conversation, which `startup` settles clean.
+        // An unanchored id whose row has no dialog is a fresh conversation, which `startup` settles clean.
         let out = plan(&[started_while_down("dash", Activity::Idle)], &[], &[], 10_000, &derive, &no_anchor, Some(STAMP), &never_clean);
         assert_eq!(out[0].status, Status::Idle);
+        // An unanchored id whose row has a dialog is a `--continue` after a
+        // `SessionEnd` forgot the anchor, and resumes `Done` like any resume.
+        let out = plan(&[started_while_down("dash", Activity::Idle)], &[], &[], 10_000, &derive, &no_anchor, Some(STAMP), &|_| Some(false));
+        assert_eq!(out[0].status, Status::Done);
     }
 
     #[test]
