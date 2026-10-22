@@ -219,7 +219,9 @@ python3 .claude/skills/investigate/investigate.py travel-map  # explain one
 ```
 
 Run it from the repo root. The explain output gives the current state, the
-decision that set it (with its reason), and the recent decision timeline.
+decision that set it (with its reason), and the recent decision timeline, where
+a line carrying no `reason`, such as `idle_close`'s `close_failed`, shows its
+`outcome` and `error` instead.
 
 ### 3. Answer
 

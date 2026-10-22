@@ -263,7 +263,10 @@ def explain(agent, trails, aliases):
     for ts, f, s in replay(trail)[-14:]:
         under = status_from(f)
         s = chip(s) if s else (f"({chip(under)})" if under else "  ·  ")
-        print(f"  {ts}  {f.get('decision'):20} {s:6} {f.get('reason', '')}")
+        # A refusal such as idle_close's close_failed carries `outcome` and
+        # `error` instead of a `reason`, and printing nothing hides why it failed.
+        text = f.get("reason") or ": ".join(str(f[k]) for k in ("outcome", "error") if f.get(k))
+        print(f"  {ts}  {f.get('decision'):20} {s:6} {text}")
 
 
 def main():
