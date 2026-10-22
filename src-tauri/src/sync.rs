@@ -980,7 +980,7 @@ async fn post_message(
             // its user for exactly that permission. The capability is the
             // honest answer, and it is the one a project already listed gets
             // from `check_startable` a few lines down.
-            if !crate::session_launcher::can_launch() {
+            if !crate::session_launcher::can_launch(crate::terminals::for_platform(&app).as_deref()) {
                 return refuse_start(crate::session_launcher::StartRefusal::NoLauncher);
             }
             let r = receipt(Outcome::Refused)
@@ -1016,8 +1016,7 @@ async fn post_message(
         let Some(guard) = app.try_state::<crate::session_launcher::StartGuard>() else {
             return (StatusCode::INTERNAL_SERVER_ERROR, Json(receipt(Outcome::Refused).because("state_unavailable")));
         };
-        let memory = app.try_state::<std::sync::Arc<crate::workspace_memory::WorkspaceMemory>>();
-        match crate::session_launcher::start_and_wait(&env.target_project, &startable, cfg.projects_root.as_deref(), &registry, &guard, memory.as_ref().map(|m| m.as_ref()), now).await {
+        match crate::session_launcher::start_and_wait(&env.target_project, &startable, cfg.projects_root.as_deref(), &registry, &guard, crate::terminals::for_platform(&app), now).await {
             crate::session_launcher::StartResult::Refused(refusal) => return refuse_start(refusal),
             crate::session_launcher::StartResult::Settled { inbox: settled, started } => {
                 inbox = settled;
@@ -1442,7 +1441,7 @@ async fn post_grant(State(app): State<AppHandle>, ConnectInfo(peer): ConnectInfo
     // session and the reboot, so a machine that could never honour one must
     // decline to store it rather than accept it and refuse every message.
     let candidate: std::collections::BTreeMap<String, String> = [(env.project.clone(), env.dir.clone())].into_iter().collect();
-    if let Err(refusal) = crate::session_launcher::check_startable(&env.project, &candidate, cfg.projects_root.as_deref()) {
+    if let Err(refusal) = crate::session_launcher::check_startable(&env.project, &candidate, cfg.projects_root.as_deref(), crate::terminals::for_platform(&app).as_deref()) {
         let r = GrantReceipt::refused(refusal.slug(), refusal.detail());
         tracing::warn!(chat_id = %env.project, decision = "peer_refused", peer_ip = %peer.ip(), origin_device = %env.origin_device, reason = refusal.slug(), "grant refused");
         return (StatusCode::BAD_REQUEST, Json(r));

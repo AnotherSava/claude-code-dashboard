@@ -107,7 +107,7 @@ Under the repo root `claude-code-dashboard/`:
     - `subprocess.rs` — running a helper program to a deadline, with no console window on Windows
     - `peer_message.rs` — relaying one message to an agent on another machine, and the honesty rules around it
     - `start_approval.rs` — asking this machine's user to approve starting a session on another one
-    - `session_launcher.rs` — starting a terminal session for a project that has none, for a relayed message or for the local picker (`integrations/pick-local-session.py`, through `POST /api/session/open`); on macOS it drives agterm directly, its workspace placement included, outside the `terminals::TerminalAdapter` seam, so a launcher for a second terminal means moving starting and placement onto the seam rather than adding a branch here
+    - `session_launcher.rs` — starting a terminal session for a project that has none, for a relayed message or for the local picker (`integrations/pick-local-session.py`, through `POST /api/session/open`); it names no terminal, asking the platform's `terminals::TerminalAdapter` to launch the session (agterm's adapter on macOS, its workspace placement included), so a launcher for another terminal is that terminal's adapter implementing `launch`
     - `auto_start_store.rs` — the `chat_id → absolute path` grants that permit those starts, in `auto_start.json`
     - `workspace_memory.rs` — the agterm window and workspace each project's agent was last seen in, so a started session opens there, in `agterm_workspaces.json`
     - `session_restore.rs` — giving a live session its row back after a restart
@@ -146,7 +146,7 @@ Under the repo root `claude-code-dashboard/`:
     - `agterm.rs` — transport for agterm's `agtermctl` control socket (macOS)
     - `terminals/` — one adapter per terminal behind the `TerminalAdapter` seam, so nothing downstream names a terminal
       - `mod.rs` — the trait, the shared vocabulary, and the pure verdicts over it (`person_verdict`, `departure_stamp`, `read_front`)
-      - `agterm.rs` / `agterm_facts.rs` — agterm's adapter, and the facts it reads from agterm and the system (macOS)
+      - `agterm.rs` / `agterm_facts.rs` — agterm's adapter, which also starts sessions, and the facts it reads from agterm and the system (macOS)
       - `agterm_wire.rs` — agterm's `session context` protocol (the argv a write takes, the targets its tree reports, and the release that first served the verb) its `session close` argv with `close_refusal`, the rule that refuses a close, and `placement`, which picks the workspace a started session opens in (macOS)
       - `agwinterm.rs` / `agwinterm_state.rs` / `agwinterm_wire.rs` — agwinterm's control pipe, its per-window state files, and its protocol, including `close_pane` and `composer_text`, the rules that refuse a close (Windows)
       - `tmux.rs` / `tmux_wire.rs` — the WSL tmux server holding remote sessions, an adapter that only closes: it offers `idle_close` the sessions no terminal on this machine is showing, and types `/exit` into one (Windows)

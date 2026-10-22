@@ -50,6 +50,8 @@ impl WorkspaceMemory {
         Self { path, data: Mutex::new(data) }
     }
 
+    // Called only by the agterm adapter's launch, which is macOS-only.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn get(&self, dir: &str) -> Option<LastWorkspace> {
         self.data.lock().unwrap().get(dir).cloned()
     }

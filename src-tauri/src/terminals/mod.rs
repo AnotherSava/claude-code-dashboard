@@ -986,6 +986,51 @@ pub trait TerminalAdapter: Send {
     fn can_close(&self) -> bool {
         false
     }
+
+    /// Whether [`launch`](Self::launch) can ever succeed here. A fact about the
+    /// adapter, answered without asking the terminal, because it is asked before
+    /// a directory is offered for approval or a grant recorded: a machine that
+    /// offers and only refuses at launch asks its user to approve a grant that
+    /// can never produce a session.
+    fn can_launch(&self) -> bool {
+        false
+    }
+
+    /// Start a session running the agent in `dir`, one the user can walk up to,
+    /// type in and close, and answer the key of what was created, or `None`
+    /// where the terminal named nothing it could be found by later. `select`
+    /// puts it in front; otherwise it must not take focus from whoever is at the
+    /// machine. Where it opens (which window, which workspace) is the terminal's
+    /// business.
+    ///
+    /// The key is opaque, with [`LabelTarget::key`]'s contract, and is good only
+    /// for [`launch_unrealized`](Self::launch_unrealized) and
+    /// [`discard_launch`](Self::discard_launch).
+    ///
+    /// **May block** for as long as the terminal takes to answer. The default
+    /// refuses.
+    fn launch(&self, dir: &std::path::Path, select: bool) -> Result<Option<String>, String> {
+        let _ = (dir, select);
+        Err("this terminal cannot start a session".to_string())
+    }
+
+    /// Whether the terminal is known to have given the launched session nothing
+    /// to run in, so it will never start the agent and waiting longer cannot
+    /// help. Positive knowledge only: an unanswerable question is `false`,
+    /// since the caller acts on `true` by giving up and discarding the session,
+    /// which done to one merely slow would destroy a live agent. **May block.**
+    fn launch_unrealized(&self, key: &str) -> bool {
+        let _ = key;
+        false
+    }
+
+    /// Remove a launched session that never came to life. Best-effort, and
+    /// unconditional where [`close_session`](Self::close_session) checks what
+    /// runs in the session first: a session that never ran its command has no
+    /// agent to check for. **May block.**
+    fn discard_launch(&self, key: &str) {
+        let _ = key;
+    }
 }
 
 /// One labellable session, as [`TerminalAdapter::label_targets`] reports it.

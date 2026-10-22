@@ -171,6 +171,28 @@ impl TerminalAdapter for Composite {
     fn can_close(&self) -> bool {
         self.children.iter().any(|c| c.can_close())
     }
+
+    fn can_launch(&self) -> bool {
+        self.children.iter().any(|c| c.can_launch())
+    }
+
+    /// The first child that can launch, in the order the set was built: a
+    /// session is started once, so the order is the preference.
+    fn launch(&self, dir: &std::path::Path, select: bool) -> Result<Option<String>, String> {
+        let child = self.children.iter().find(|c| c.can_launch()).ok_or_else(|| "no terminal in this set can start a session".to_string())?;
+        let name = child.name();
+        child.launch(dir, select).map(|key| key.map(|k| format!("{name}|{k}")))
+    }
+
+    fn launch_unrealized(&self, key: &str) -> bool {
+        self.child_for(key).is_ok_and(|(target, inner)| target.launch_unrealized(inner))
+    }
+
+    fn discard_launch(&self, key: &str) {
+        if let Ok((target, inner)) = self.child_for(key) {
+            target.discard_launch(inner);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -191,6 +213,7 @@ mod tests {
         targets: Option<Vec<LabelTarget>>,
         labels: bool,
         closes: bool,
+        launches: bool,
         writes: Arc<Mutex<Vec<(String, LabelWrite)>>>,
         watched: Arc<Mutex<u32>>,
     }
@@ -231,6 +254,18 @@ mod tests {
         fn close_session(&self, key: &str) -> Result<(), String> {
             self.writes.lock().unwrap().push((format!("close {key}"), LabelWrite::ClearContext));
             Ok(())
+        }
+        fn can_launch(&self) -> bool {
+            self.launches
+        }
+        fn launch(&self, _dir: &std::path::Path, _select: bool) -> Result<Option<String>, String> {
+            Ok(Some(format!("{}-session", self.name)))
+        }
+        fn launch_unrealized(&self, key: &str) -> bool {
+            key == format!("{}-session", self.name)
+        }
+        fn discard_launch(&self, key: &str) {
+            self.writes.lock().unwrap().push((format!("discard {key}"), LabelWrite::ClearContext));
         }
     }
 
@@ -306,6 +341,26 @@ mod tests {
         assert_eq!(writes.lock().unwrap()[0].0, "close w1/p1");
         assert!(c.close_session("kitty|w1/p1").is_err());
         assert!(!composite(vec![Fake { name: "windows", ..Fake::default() }]).can_close());
+    }
+
+    #[test]
+    fn a_launch_goes_to_the_first_child_that_can_launch_and_its_key_routes_back() {
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let c = composite(vec![
+            Fake { name: "windows", ..Fake::default() },
+            Fake { name: "tmux", launches: true, writes: writes.clone(), ..Fake::default() },
+            Fake { name: "agwinterm", launches: true, ..Fake::default() },
+        ]);
+        assert!(c.can_launch());
+        let key = c.launch(std::path::Path::new("/p"), false).unwrap().unwrap();
+        assert_eq!(key, "tmux|tmux-session", "the order the set was built in is the preference");
+        assert!(c.launch_unrealized(&key), "the child that minted the key answers for it");
+        c.discard_launch(&key);
+        assert_eq!(writes.lock().unwrap()[0].0, "discard tmux-session");
+        assert!(!c.launch_unrealized("kitty|x"), "a key naming no child is not known to be dead");
+        let none = composite(vec![Fake { name: "windows", ..Fake::default() }]);
+        assert!(!none.can_launch());
+        assert!(none.launch(std::path::Path::new("/p"), false).is_err());
     }
 
     #[test]

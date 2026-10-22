@@ -208,9 +208,8 @@ async fn post_session_open(State(app): State<AppHandle>, headers: HeaderMap, Jso
         return answer(StatusCode::INTERNAL_SERVER_ERROR, "refused", "", "state_unavailable", "the dashboard is still starting");
     };
     let cfg = cfg.snapshot();
-    let memory = app.try_state::<std::sync::Arc<crate::workspace_memory::WorkspaceMemory>>();
     let dir = std::path::PathBuf::from(req.dir.trim());
-    let (project, result) = session_launcher::open_and_wait(&dir, cfg.projects_root.as_deref(), &registry, &guard, memory.as_ref().map(|m| m.as_ref()), now_ms()).await;
+    let (project, result) = session_launcher::open_and_wait(&dir, cfg.projects_root.as_deref(), &registry, &guard, crate::terminals::for_platform(&app), now_ms()).await;
     let (status, outcome, reason, detail) = match &result {
         // The shared detail speaks of a listed grant, which this route never reads.
         session_launcher::StartResult::Refused(r @ session_launcher::StartRefusal::NoSuchDirectory) => (StatusCode::CONFLICT, "refused", r.slug(), "there is no folder at that path"),
@@ -1277,8 +1276,7 @@ async fn post_message(State(app): State<AppHandle>, headers: HeaderMap, Json(req
             // that never got a surface — is a way to end up with two agents in
             // one directory, and two copies of it would drift.
             let startable = app.try_state::<crate::auto_start_store::AutoStartStore>().map(|s| s.snapshot()).unwrap_or_default();
-            let memory = app.try_state::<std::sync::Arc<crate::workspace_memory::WorkspaceMemory>>();
-            return match session_launcher::start_and_wait(&project, &startable, cfg.projects_root.as_deref(), &registry, &guard, memory.as_ref().map(|m| m.as_ref()), now).await {
+            return match session_launcher::start_and_wait(&project, &startable, cfg.projects_root.as_deref(), &registry, &guard, crate::terminals::for_platform(&app), now).await {
                 session_launcher::StartResult::Refused(r) => {
                     let receipt = Receipt::new(Outcome::Refused, "", &req.target, this_device).because(r.slug()).detailed(r.detail());
                     refused(r.slug(), r.detail().into(), crate::sync::receipt_status(&receipt), this_device)

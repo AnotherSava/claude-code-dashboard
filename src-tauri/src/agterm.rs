@@ -1,11 +1,12 @@
 //! Talking to agterm, the macOS terminal, over its `agtermctl` control socket.
 //!
 //! Transport only — the binary lookup, the kill timeout, and the JSON envelope.
-//! Two callers share it: `session_launcher`, which creates a session for a
-//! project that has none, and `terminals::agterm`, which asks which session the
-//! user is sitting in, writes context lines and closes sessions. They must not each own a copy: the binary lookup has to
-//! keep working from a GUI app that inherits no shell profile, and the timeout is
-//! what stops a wedged terminal from holding a dashboard thread forever.
+//! Its caller is `terminals::agterm`, which asks which session the user is
+//! sitting in, writes context lines, and starts and closes sessions, with the
+//! pure readers in `agterm_wire` and `agterm_facts`. Every call goes through
+//! here so there is one binary lookup, which has to keep working from a GUI app
+//! that inherits no shell profile, and one timeout, which is what stops a wedged
+//! terminal from holding a dashboard thread forever.
 //!
 //! Compiled on macOS, and for tests everywhere: agterm does not exist on Windows,
 //! so the transport is gated to macOS item by item and has no counterpart branch
@@ -67,7 +68,7 @@ pub(crate) fn agtermctl(args: &[&str]) -> Option<serde_json::Value> {
     }
     let value: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
     // `ok` is agterm's own verdict on the request. It says the request was
-    // served, never that the session it names is alive — see `LaunchHandle`.
+    // served, never that the session it names is alive — see `TerminalAdapter::launch_unrealized`.
     value.get("ok").and_then(serde_json::Value::as_bool).unwrap_or(false).then_some(value)
 }
 

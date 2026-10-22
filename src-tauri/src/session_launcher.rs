@@ -6,7 +6,8 @@
 //! real terminal session in that directory, the same way they would have.
 //!
 //! **The session is a first-class one, not a worker.** That is a requirement,
-//! not a nicety, and it is what dictates the command shape below. A session
+//! not a nicety, and it is what dictates the command each terminal adapter's
+//! `TerminalAdapter::launch` runs. A session
 //! spawned as a bare process would be invisible in the roster (the registry
 //! keeps only `kind == "interactive"`), untitleable, and — the part that
 //! matters most — unkillable: nothing in this crate can stop a Claude Code
@@ -32,12 +33,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use crate::adapters::claude::derive_chat_id;
-#[cfg(target_os = "macos")]
-use crate::agterm::agtermctl;
-#[cfg(target_os = "macos")]
-use crate::agterm::session_node;
-#[cfg(target_os = "macos")]
-use crate::terminals::agterm_wire as wire;
+use crate::terminals::TerminalAdapter;
 use crate::session_registry::InboxLookup;
 
 /// How long a claimed start blocks another for. A start normally releases in
@@ -55,12 +51,12 @@ pub const POLL_INTERVAL_MS: u64 = 250;
 /// launch rather than from the poll.
 ///
 /// It has to bound the *sequence*, not one step of it: the launch, the poll, and
-/// the two `agtermctl` calls that check and clean up an unrealized session are
-/// four serial waits on one request. Budgeting only the poll let the worst case
+/// the terminal's two calls that check and clean up an unrealized session
+/// (`launch_unrealized`, `discard_launch`) are four serial waits on one request. Budgeting only the poll let the worst case
 /// add up past `sync::MESSAGE_HOP_TIMEOUT_SECS`, and a hop that times out is
 /// reported `Unknown` — "may or may not have been written" — which is the one
-/// answer where a retry writes twice. Worst case now: 2s launch + the remainder
-/// of this window + 2s `tree` + 2s `close`, comfortably inside 20s.
+/// answer where a retry writes twice. Worst case now, on agterm: 2s launch + the
+/// remainder of this window + 2s `tree` + 2s `close`, comfortably inside 20s.
 pub const START_DEADLINE_MS: i64 = 10_000;
 
 /// Why a start did not happen. Each is a distinct thing for the sender to do
@@ -316,13 +312,13 @@ fn candidates_in(config: &serde_json::Value, project: &str, projects_root: Optio
 
 /// Everything about a start that can be decided before touching a terminal.
 ///
-/// Split from [`launch`] so the whole policy is testable without spawning
-/// anything, and so a refusal costs no process.
+/// Split from the launch ([`TerminalAdapter::launch`]) so the whole policy is
+/// testable without spawning anything, and so a refusal costs no process.
 ///
 /// Includes [`can_launch`], which is what lets a caller validating a *grant*
 /// through this function — `sync::post_grant` — rely on it to record nothing
-/// `launch` would later refuse.
-pub fn check_startable(project: &str, auto_start: &BTreeMap<String, String>, projects_root: Option<&str>) -> Result<PathBuf, StartRefusal> {
+/// a launch would later refuse.
+pub fn check_startable(project: &str, auto_start: &BTreeMap<String, String>, projects_root: Option<&str>, launcher: Option<&dyn TerminalAdapter>) -> Result<PathBuf, StartRefusal> {
     let dir = match listed_dir(project, auto_start, projects_root) {
         Ok(dir) => dir,
         // Asked about an id nothing here derives, "its owner has not listed it
@@ -355,7 +351,7 @@ pub fn check_startable(project: &str, auto_start: &BTreeMap<String, String>, pro
     // `unknown_project` for an id nothing here derives and `NotListed` for one
     // awaiting a grant, or its own missing capability would mask what the
     // caller got wrong about the address.
-    if !can_launch() {
+    if !can_launch(launcher) {
         return Err(StartRefusal::NoLauncher);
     }
     Ok(dir)
@@ -430,14 +426,15 @@ pub async fn start_and_wait(
     projects_root: Option<&str>,
     registry: &crate::session_registry::SessionRegistry,
     guard: &StartGuard,
-    memory: Option<&crate::workspace_memory::WorkspaceMemory>,
+    launcher: Option<Box<dyn TerminalAdapter>>,
     now: i64,
 ) -> StartResult {
-    let dir = match check_startable(project, auto_start, projects_root) {
+    let dir = match check_startable(project, auto_start, projects_root, launcher.as_deref()) {
         Ok(dir) => dir,
         Err(refusal) => return StartResult::Refused(refusal),
     };
-    start_in(project, &dir, projects_root, registry, guard, memory, false, now).await
+    let Some(launcher) = launcher else { return StartResult::Refused(StartRefusal::NoLauncher) };
+    start_in(project, &dir, projects_root, registry, guard, launcher, false, now).await
 }
 
 /// Open a session for the project in `dir` because the user asked for one
@@ -455,17 +452,17 @@ pub async fn open_and_wait(
     projects_root: Option<&str>,
     registry: &crate::session_registry::SessionRegistry,
     guard: &StartGuard,
-    memory: Option<&crate::workspace_memory::WorkspaceMemory>,
+    launcher: Option<Box<dyn TerminalAdapter>>,
     now: i64,
 ) -> (String, StartResult) {
     let project = derive_chat_id(Some(&dir.to_string_lossy()), projects_root);
     if !dir.is_absolute() || !dir.is_dir() {
         return (project, StartResult::Refused(StartRefusal::NoSuchDirectory));
     }
-    if !can_launch() {
+    let Some(launcher) = launcher.filter(|l| l.can_launch()) else {
         return (project, StartResult::Refused(StartRefusal::NoLauncher));
-    }
-    let result = start_in(&project, dir, projects_root, registry, guard, memory, true, now).await;
+    };
+    let result = start_in(&project, dir, projects_root, registry, guard, launcher, true, now).await;
     (project, result)
 }
 
@@ -479,7 +476,7 @@ async fn start_in(
     projects_root: Option<&str>,
     registry: &crate::session_registry::SessionRegistry,
     guard: &StartGuard,
-    memory: Option<&crate::workspace_memory::WorkspaceMemory>,
+    launcher: Box<dyn TerminalAdapter>,
     select: bool,
     now: i64,
 ) -> StartResult {
@@ -498,28 +495,49 @@ async fn start_in(
         return StartResult::Settled { inbox: confirmed, started: false };
     }
 
-    // Started before the launch, so a slow `agtermctl` spends the same budget
-    // the poll would have and the total stays inside the caller's hop.
+    // Started before the launch, so a slow terminal spends the same budget the
+    // poll would have and the total stays inside the caller's hop.
     let deadline = crate::commands::now_ms() + START_DEADLINE_MS;
     let launch_dir = dir.to_path_buf();
-    let last = memory.and_then(|m| m.get(&dir.to_string_lossy()));
-    let launched = tokio::task::spawn_blocking(move || launch(&launch_dir, last.as_ref(), select)).await.unwrap_or(Err(StartRefusal::NoLauncher));
-    let handle = match launched {
-        Ok(handle) => handle,
-        Err(refusal) => {
+    // The adapter blocks, so every call to it runs off the async runtime and the
+    // adapter travels with the call rather than being borrowed across an await.
+    let launched = tokio::task::spawn_blocking(move || {
+        let result = launcher.launch(&launch_dir, select);
+        (launcher, result)
+    })
+    .await;
+    let (launcher, key) = match launched {
+        Ok((launcher, Ok(key))) => (launcher, key),
+        Ok((launcher, Err(reason))) => {
+            tracing::warn!(chat_id = %project, terminal = launcher.name(), reason = %reason, "the terminal refused to start a session");
             guard.release(project);
-            return StartResult::Refused(refusal);
+            return StartResult::Refused(StartRefusal::NoLauncher);
+        }
+        Err(_) => {
+            guard.release(project);
+            return StartResult::Refused(StartRefusal::NoLauncher);
         }
     };
 
     let inbox = await_inbox(registry, project, projects_root, deadline).await;
     if matches!(inbox, InboxLookup::NotFound) {
-        // Nothing appeared. Ask the terminal whether it ever gave the session a
-        // surface: an unrealized one will never run its command, so waiting
-        // longer cannot help and the empty session should not be left to
+        // Nothing appeared. Ask the terminal whether it ever gave the session
+        // something to run in: an unrealized one will never run its command, so
+        // waiting longer cannot help and the empty session should not be left to
         // accumulate one row per message.
-        if handle.is_unrealized() {
-            handle.close();
+        let unrealized = match key {
+            Some(key) => tokio::task::spawn_blocking(move || {
+                let dead = launcher.launch_unrealized(&key);
+                if dead {
+                    launcher.discard_launch(&key);
+                }
+                dead
+            })
+            .await
+            .unwrap_or(false),
+            None => false,
+        };
+        if unrealized {
             // The claim is deliberately still held: the display is asleep for
             // more than one message, and retrying just makes another dead row.
             return StartResult::Refused(StartRefusal::NotRealized);
@@ -554,151 +572,17 @@ async fn await_inbox(registry: &crate::session_registry::SessionRegistry, projec
     }
 }
 
-/// Open a real terminal session running `claude` in `dir`.
-///
-/// macOS drives agterm's control socket. The command is
-/// `zsh -ilc 'claude; exec zsh -i'`, and every part of that earns its place:
-///
-/// - `--command` rather than creating a shell and typing into it. agterm's own
-///   guidance is explicit that `session type` "is not a launcher" — its
-///   keystrokes land in a shared line buffer that a concurrent writer can
-///   corrupt.
-/// - `zsh -ilc`, not `-lc`. A GUI app inherits the launchd `PATH`
-///   (`/usr/bin:/bin:/usr/sbin:/sbin`), and the user's `claude` lives in
-///   `~/.local/bin`, which `.zshrc` prepends — a login-but-non-interactive
-///   shell never sources it and resolves `claude: none`. `-i` also picks up the
-///   user's own `claude` shell function, so the session is started with the
-///   same `--continue` and the same title handling as one started by hand.
-/// - `exec zsh -i` after it. Bare `--command` closes the session when the
-///   command exits, and `--wait` only holds a dead session on a press-any-key
-///   prompt; neither leaves something to walk up to. Exec'ing an interactive
-///   shell means quitting claude drops to a live prompt in the project
-///   directory, exactly as a hand-started session does.
-/// - `--no-select` for a start a message caused, so it never steals focus
-///   from whoever is at the machine. Verified not to cost anything: a
-///   `--no-select` session is realized immediately, pty and all. A session the
-///   user opened from the picker is selected instead.
-/// - no `--name`. agterm's `--name` sets a `customName` that permanently
-///   outranks the OSC title, which would make that row dark for the dashboard's
-///   own status writes forever. The user's `claude` function passes its own
-///   `--name` to *claude*, which is a different thing and is preserved.
-///
-/// - `--window`/`--workspace` from [`crate::workspace_memory`], so the session
-///   opens in the workspace the project's agent was last seen in. A workspace
-///   deleted since is recreated under its old name; see
-///   [`crate::terminals::agterm_wire::placement`] for the order the two are tried in.
-///
-/// Windows is not wired up yet and refuses [`StartRefusal::NoLauncher`]. The
-/// launch mechanism there is known — a plain `Command::new` from this
-/// console-less GUI process makes Windows allocate a console, which under
-/// Windows Terminal is a real window (that is the flash `CREATE_NO_WINDOW`
-/// suppresses for `tailscale whois`) — but which shell wrapper leaves a live
-/// prompt when claude exits depends on how that machine starts claude, and is
-/// not yet established.
-fn launch(dir: &Path, last: Option<&crate::workspace_memory::LastWorkspace>, select: bool) -> Result<LaunchHandle, StartRefusal> {
-    #[cfg(target_os = "macos")]
-    {
-        launch_macos(dir, last, select)
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = (dir, last, select);
-        Err(StartRefusal::NoLauncher)
-    }
-}
-
 /// Whether this machine can start a session at all — asked before a directory
 /// is offered or a grant recorded, not only when a start is attempted.
 ///
-/// Sited beside [`launch`] under the same `#[cfg]`, because the two have to
-/// agree. Leaving the question to `launch` alone costs something real: the
+/// Leaving the question to the launch alone costs something real: the
 /// sender's approval prompt is gated on [`StartRefusal::NotListed`]'s slug, so
 /// a machine that offers its directories and refuses `NoLauncher` only
 /// afterwards asks its user to approve a grant that can never produce a
 /// session — and the grant, once recorded, replaces that slug and so silences
 /// the prompt for good.
-pub fn can_launch() -> bool {
-    cfg!(target_os = "macos")
-}
-
-/// A session a launcher created, so the caller can ask whether it came to life
-/// and clean it up when it did not.
-///
-/// It exists because the launcher's `ok` answer is weaker than it looks: on
-/// macOS agterm reports success for a session that exists **in its model**, and
-/// libghostty refuses to give one a surface while the display is asleep. Such a
-/// session never runs its command, so no `claude` starts, no registry record
-/// appears, and a caller with nothing but `ok` would wait out its deadline and
-/// leave a dead row behind — one more per message, forever.
-struct LaunchHandle {
-    #[cfg(target_os = "macos")]
-    session_id: Option<String>,
-}
-
-impl LaunchHandle {
-    /// Whether the terminal is known to have created no surface for this
-    /// session.
-    ///
-    /// Positive knowledge only: an unanswerable query returns `false`, because
-    /// the caller acts on this by giving up, and giving up on a session that is
-    /// merely slow would be a worse mistake than waiting for one that is dead.
-    fn is_unrealized(&self) -> bool {
-        #[cfg(target_os = "macos")]
-        {
-            let Some(id) = self.session_id.as_deref() else { return false };
-            let Some(tree) = agtermctl(&["tree", "--json"]) else { return false };
-            return session_node(&tree, id).is_some_and(|n| n.get("realized").and_then(serde_json::Value::as_bool) == Some(false));
-        }
-        #[cfg(not(target_os = "macos"))]
-        false
-    }
-
-    /// Remove a session that never came to life. Best-effort: a failure here
-    /// leaves one stale row, which is strictly better than the alternative of
-    /// not trying.
-    fn close(&self) {
-        #[cfg(target_os = "macos")]
-        if let Some(id) = self.session_id.as_deref() {
-            let _ = agtermctl(&["session", "close", "--target", id, "--json"]);
-        }
-    }
-}
-
-/// The command handed to agterm. Shared with the test that pins it, so the
-/// shape above cannot drift from the shape documented on [`launch`].
-#[cfg(target_os = "macos")]
-const AGTERM_COMMAND: &str = "zsh -ilc 'claude; exec zsh -i'";
-
-#[cfg(target_os = "macos")]
-fn launch_macos(dir: &Path, last: Option<&crate::workspace_memory::LastWorkspace>, select: bool) -> Result<LaunchHandle, StartRefusal> {
-    let placement = placement_now(last);
-    tracing::info!(dir = %dir.display(), placement = ?placement, select, "placing the started session");
-    let dir = dir.to_string_lossy();
-    let mut argv = vec!["session", "new", "--cwd", &dir, "--json", "--command", AGTERM_COMMAND];
-    if !select {
-        argv.push("--no-select");
-    }
-    let placed = wire::placement_argv(&placement);
-    argv.extend(placed.iter().map(String::as_str));
-    let answer = agtermctl(&argv).ok_or(StartRefusal::NoLauncher)?;
-    // The id is what makes the session addressable afterwards. Its absence is
-    // not fatal — the session was created — but it costs the realized check and
-    // the cleanup, so it is worth a line in the log.
-    let session_id = answer.get("result").and_then(|r| r.get("id")).and_then(serde_json::Value::as_str).map(str::to_string);
-    if session_id.is_none() {
-        tracing::warn!("agterm created a session but returned no id; it cannot be checked or cleaned up");
-    }
-    Ok(LaunchHandle { session_id })
-}
-
-/// [`wire::placement`] over what agterm holds now: whether the recorded window
-/// is open, and which workspaces it has.
-#[cfg(target_os = "macos")]
-fn placement_now(last: Option<&crate::workspace_memory::LastWorkspace>) -> wire::Placement {
-    let Some(last) = last else { return wire::Placement::Current };
-    let open = agtermctl(&["window", "list", "--json"]).is_some_and(|list| crate::agterm::open_window_ids(&list).contains(&last.window));
-    let ids = open.then(|| agtermctl(&["tree", "--json", "--window", &last.window])).flatten().map(|tree| wire::workspace_ids(&tree));
-    wire::placement(Some(last), open, ids.as_deref())
+pub fn can_launch(launcher: Option<&dyn TerminalAdapter>) -> bool {
+    launcher.is_some_and(|l| l.can_launch())
 }
 
 #[cfg(test)]
@@ -813,21 +697,10 @@ mod tests {
         assert!(!trusted_in(&cfg, Path::new("D:/projects/Transcripts")), "case is left alone; the ids these paths derive are case-sensitive");
     }
 
-    /// The predicate and the launcher are two statements about one capability,
-    /// and a disagreement between them is invisible until a grant has already
-    /// been recorded against it.
+    /// A platform with no terminal adapter has nothing to start a session in.
     #[test]
-    fn the_predicate_agrees_with_the_launcher_it_speaks_for() {
-        #[cfg(target_os = "macos")]
-        assert!(can_launch(), "agterm is wired up here, and `launch` dispatches to `launch_macos`");
-        #[cfg(not(target_os = "macos"))]
-        {
-            assert!(!can_launch());
-            assert!(
-                matches!(launch(Path::new("/zz-no-such-dir-4f2a"), None, false), Err(StartRefusal::NoLauncher)),
-                "the predicate must not promise a launch this platform refuses"
-            );
-        }
+    fn no_terminal_means_no_launch() {
+        assert!(!can_launch(None));
     }
 
     /// The capability is this machine's business and the address is the
@@ -835,10 +708,9 @@ mod tests {
     /// masking the second — a mistyped id has to keep answering
     /// `unknown_project` on a machine that could not have started it anyway,
     /// since that is the half the sender can act on.
-    #[cfg(not(target_os = "macos"))]
     #[test]
     fn a_missing_launcher_does_not_mask_what_the_caller_got_wrong() {
-        let answer = check_startable("zz-derives-nowhere-4f2a", &BTreeMap::new(), None);
+        let answer = check_startable("zz-derives-nowhere-4f2a", &BTreeMap::new(), None, None);
         assert!(
             matches!(answer, Err(StartRefusal::NotListed) | Err(StartRefusal::NoSuchProject)),
             "the listing and existence questions come first, got {answer:?}"
@@ -982,25 +854,5 @@ mod tests {
         assert_ne!(knowledge_in(None, "nested", None), knowledge_in(Some(&serde_json::json!({})), "nested", None), "not having looked must stay distinguishable from having looked and found nothing");
 
         let _ = std::fs::remove_dir_all(&here);
-    }
-
-    /// Positive knowledge only. A handle with no id, or a tree we cannot read,
-    /// must not report "unrealized" — the caller acts on that by giving up and
-    /// closing the session, and doing that to one that is merely slow would
-    /// destroy a live agent.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn an_unknown_session_is_never_reported_unrealized() {
-        assert!(!LaunchHandle { session_id: None }.is_unrealized());
-    }
-
-    /// The command shape is the whole requirement — a session the user can walk
-    /// up to — so it is pinned rather than left to drift.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn the_agterm_command_leaves_a_live_shell_behind() {
-        assert!(AGTERM_COMMAND.contains("zsh -ilc"), "-lc resolves no claude from a GUI app's PATH");
-        assert!(AGTERM_COMMAND.contains("exec zsh -i"), "without this the session closes when claude exits and there is nothing to walk up to");
-        assert!(AGTERM_COMMAND.contains("claude"));
     }
 }

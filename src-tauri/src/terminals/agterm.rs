@@ -214,6 +214,73 @@ impl TerminalAdapter for AgtermAdapter {
         crate::agterm::agtermctl_checked(&args).map(|_| ())
     }
 
+    fn can_launch(&self) -> bool {
+        true
+    }
+
+    /// `session new` with [`AGTERM_COMMAND`], every part of which earns its
+    /// place:
+    ///
+    /// - `--command` rather than creating a shell and typing into it. agterm's own
+    ///   guidance is explicit that `session type` "is not a launcher" — its
+    ///   keystrokes land in a shared line buffer that a concurrent writer can
+    ///   corrupt.
+    /// - `zsh -ilc`, not `-lc`. A GUI app inherits the launchd `PATH`
+    ///   (`/usr/bin:/bin:/usr/sbin:/sbin`), and the user's `claude` lives in
+    ///   `~/.local/bin`, which `.zshrc` prepends — a login-but-non-interactive
+    ///   shell never sources it and resolves `claude: none`. `-i` also picks up the
+    ///   user's own `claude` shell function, so the session is started with the
+    ///   same `--continue` and the same title handling as one started by hand.
+    /// - `exec zsh -i` after it. Bare `--command` closes the session when the
+    ///   command exits, and `--wait` only holds a dead session on a press-any-key
+    ///   prompt; neither leaves something to walk up to. Exec'ing an interactive
+    ///   shell means quitting claude drops to a live prompt in the project
+    ///   directory, exactly as a hand-started session does.
+    /// - `--no-select` unless `select`, so a start a message caused never steals
+    ///   focus. Verified not to cost anything: a `--no-select` session is realized
+    ///   immediately, pty and all.
+    /// - no `--name`. agterm's `--name` sets a `customName` that permanently
+    ///   outranks the OSC title, which would make that row dark for the dashboard's
+    ///   own status writes forever. The user's `claude` function passes its own
+    ///   `--name` to *claude*, which is a different thing and is preserved.
+    /// - `--window`/`--workspace` from [`crate::workspace_memory`], so the session
+    ///   opens in the workspace the project's agent was last seen in. A workspace
+    ///   deleted since is recreated under its old name; see [`wire::placement`]
+    ///   for the order the two are tried in.
+    fn launch(&self, dir: &std::path::Path, select: bool) -> Result<Option<String>, String> {
+        let last = self.memory.as_deref().and_then(|m| m.get(&dir.to_string_lossy()));
+        let placement = placement_now(last.as_ref());
+        tracing::info!(dir = %dir.display(), placement = ?placement, select, "placing the started session");
+        let dir = dir.to_string_lossy();
+        let mut argv = vec!["session", "new", "--cwd", &dir, "--json", "--command", AGTERM_COMMAND];
+        if !select {
+            argv.push("--no-select");
+        }
+        let placed = wire::placement_argv(&placement);
+        argv.extend(placed.iter().map(String::as_str));
+        let answer = crate::agterm::agtermctl_checked(&argv)?;
+        // The id is what makes the session addressable afterwards. Its absence is
+        // not fatal — the session was created — but it costs the realized check and
+        // the cleanup, so it is worth a line in the log.
+        let id = answer.get("result").and_then(|r| r.get("id")).and_then(Value::as_str).map(str::to_string);
+        if id.is_none() {
+            tracing::warn!("agterm created a session but returned no id; it cannot be checked or cleaned up");
+        }
+        Ok(id)
+    }
+
+    /// agterm answers `ok` for a session that exists in its model, and
+    /// libghostty refuses one a surface while the display is asleep. Such a
+    /// session reads `realized: false` and never runs its command.
+    fn launch_unrealized(&self, key: &str) -> bool {
+        let Some(tree) = crate::agterm::agtermctl(&["tree", "--json"]) else { return false };
+        crate::agterm::session_node(&tree, key).is_some_and(|n| n.get("realized").and_then(Value::as_bool) == Some(false))
+    }
+
+    fn discard_launch(&self, key: &str) {
+        let _ = crate::agterm::agtermctl(&["session", "close", "--target", key, "--json"]);
+    }
+
     /// Input to the session on screen in agterm's active window.
     ///
     /// Asked in an order that spends least where nothing could count: whether
@@ -518,6 +585,21 @@ fn input_observation(reading: &Reading, front: Front, front_since: Since, select
     Observation { terminal: NAME, session: reading.selected.clone(), at_ms, kind: ObservationKind::Input(facts), occupant: reading.occupant, naming: Naming::OwnTitle }
 }
 
+/// The command a started session runs; [`AgtermAdapter::launch`] says why each
+/// part of it is there, and a test pins it.
+#[cfg(target_os = "macos")]
+const AGTERM_COMMAND: &str = "zsh -ilc 'claude; exec zsh -i'";
+
+/// [`wire::placement`] over what agterm holds now: whether the recorded window
+/// is open, and which workspaces it has.
+#[cfg(target_os = "macos")]
+fn placement_now(last: Option<&crate::workspace_memory::LastWorkspace>) -> wire::Placement {
+    let Some(last) = last else { return wire::Placement::Current };
+    let open = crate::agterm::agtermctl(&["window", "list", "--json"]).is_some_and(|list| crate::agterm::open_window_ids(&list).contains(&last.window));
+    let ids = open.then(|| crate::agterm::agtermctl(&["tree", "--json", "--window", &last.window])).flatten().map(|tree| wire::workspace_ids(&tree));
+    wire::placement(Some(last), open, ids.as_deref())
+}
+
 /// Every agterm tab running the agent, across every open window, for the
 /// local picker (`GET /api/session/tabs`). `None` when agterm could not be
 /// asked at all.
@@ -551,7 +633,7 @@ pub(crate) fn agent_tabs(memory: Option<&crate::workspace_memory::WorkspaceMemor
 /// legitimately differs between callers.
 ///
 /// Every walk also records which workspace each agent sits in, into `memory`
-/// ([`crate::workspace_memory`]), which `session_launcher` reads to start a
+/// ([`crate::workspace_memory`]), which [`AgtermAdapter::launch`] reads to start a
 /// project's next session where its last one was. Restore, the label pass,
 /// idle close (through `label_targets`) and the picker's tab list all walk; the
 /// label pass is the periodic one, every 15s, but it runs only on an agterm with
@@ -617,6 +699,16 @@ mod tests {
     use super::*;
     use crate::terminals::window_files::{FileRead, WindowFiles};
     use crate::terminals::{person_verdict, Cover, NamedBy, Occupant, Refusal};
+
+    /// The command shape is the whole requirement — a session the user can walk
+    /// up to — so it is pinned rather than left to drift.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_agterm_command_leaves_a_live_shell_behind() {
+        assert!(AGTERM_COMMAND.contains("zsh -ilc"), "-lc resolves no claude from a GUI app's PATH");
+        assert!(AGTERM_COMMAND.contains("exec zsh -i"), "without this the session closes when claude exits and there is nothing to walk up to");
+        assert!(AGTERM_COMMAND.contains("claude"));
+    }
 
     fn tree(active_id: &str, active_title: &str) -> Value {
         let t = serde_json::json!({"workspaces": [
