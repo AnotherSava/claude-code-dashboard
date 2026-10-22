@@ -145,10 +145,6 @@ const WRITE_DEADLINE: Duration = Duration::from_secs(17);
 /// not running from being probed more often than that.
 const BACKOFF: Duration = Duration::from_secs(10);
 
-/// How many rows a close reads to find the composer: it sits above Claude
-/// Code's status lines, which run to a handful of rows.
-const COMPOSER_LINES: u32 = 30;
-
 /// How long a connect waits for a listening instance when every one is taken.
 /// agwinterm creates the next instance as soon as it accepts one, and its own
 /// hooks connect once per hook event, so a busy pipe is a gap of milliseconds.
@@ -593,7 +589,7 @@ impl TerminalAdapter for AgwintermAdapter {
         let tree = call(&wire::tree_req(window), READ_DEADLINE)?;
         let node = wire::session_node(&tree, session).ok_or_else(|| format!("session {session} is no longer in window {window}"))?;
         let pane = wire::close_pane(node, in_front)?;
-        let composer = || call(&wire::styled_text_req(window, &pane.id, COMPOSER_LINES), READ_DEADLINE).map(|t| wire::composer_text(&t));
+        let composer = || call(&wire::styled_text_req(window, &pane.id), READ_DEADLINE).map(|t| wire::composer_text(&t));
         let send = |keys| {
             let text = match keys {
                 Keys::Exit => "/exit",

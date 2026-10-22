@@ -68,9 +68,12 @@ pub fn close_req(window: &str, target: &str) -> String {
     json!({ "cmd": "session.close", "target": target, "window": window }).to_string()
 }
 
-/// `session text --styles` over the last `lines` rows of `target`.
-pub fn styled_text_req(window: &str, target: &str, lines: u32) -> String {
-    json!({ "cmd": "session.text", "target": target, "window": window, "args": { "styles": true, "lines": lines } }).to_string()
+/// `session text --styles` over the screen of `target`. The whole screen and
+/// not its last rows: while a smaller client is attached through tmux, the
+/// rows below tmux's window are fill, and a pane can show more of them than
+/// any fixed count, which leaves the composer above the rows read.
+pub fn styled_text_req(window: &str, target: &str) -> String {
+    json!({ "cmd": "session.text", "target": target, "window": window, "args": { "styles": true } }).to_string()
 }
 
 /// A reply's `result`, or its `error` text.
@@ -431,8 +434,8 @@ mod tests {
         // `HandleType` reads `args.text`; `session.close` takes only its target.
         assert_eq!(v(type_req("w", "p", "/exit")), json!({ "cmd": "session.type", "target": "p", "window": "w", "args": { "text": "/exit" } }));
         assert_eq!(v(close_req("w", "s")), json!({ "cmd": "session.close", "target": "s", "window": "w" }));
-        // `HandleText` reads `args.styles` and `args.lines`.
-        assert_eq!(v(styled_text_req("w", "p", 30)), json!({ "cmd": "session.text", "target": "p", "window": "w", "args": { "styles": true, "lines": 30 } }));
+        // `HandleText` reads `args.styles`, and with no `args.lines` the whole screen.
+        assert_eq!(v(styled_text_req("w", "p")), json!({ "cmd": "session.text", "target": "p", "window": "w", "args": { "styles": true } }));
         assert!(!ping_req().contains('\n'), "the caller frames each request with one newline");
     }
 
