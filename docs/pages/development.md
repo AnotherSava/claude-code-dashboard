@@ -149,7 +149,7 @@ Under the repo root `claude-code-dashboard/`:
       - `agterm.rs` / `agterm_facts.rs` — agterm's adapter, which also starts sessions, and the facts it reads from agterm and the system (macOS)
       - `agterm_wire.rs` — agterm's `session context` protocol (the argv a write takes, the targets its tree reports, and the release that first served the verb) its `session close` argv with `close_refusal`, the rule that refuses a close, and `placement`, which picks the workspace a started session opens in (macOS)
       - `agwinterm.rs` / `agwinterm_state.rs` / `agwinterm_wire.rs` — agwinterm's control pipe, its per-window state files, and its protocol, including `close_pane` and `composer_text`, the rules that refuse a close (Windows)
-      - `tmux.rs` / `tmux_wire.rs` — the WSL tmux server holding remote sessions, an adapter that only closes: it offers `idle_close` the sessions no terminal on this machine is showing, and types `/exit` into one (Windows)
+      - `tmux.rs` / `tmux_wire.rs` — the WSL tmux server holding remote sessions, an adapter that closes and starts them: it offers `idle_close` the sessions no terminal on this machine is showing and types `/exit` into one, and starts a detached session through the claude repo's `cc-session.sh` where `remote_session_script` is set (Windows)
       - `composer.rs` — where Claude Code's composer sits on a screen of text, and the `/exit` sequence typed into it, shared by every close that types into the agent
       - `windows.rs` / `wt_tabs.rs` — Windows Terminal and the Windows console, and the UI Automation read of what a tab really holds
       - `composite.rs` — presents several terminals on one platform as one adapter

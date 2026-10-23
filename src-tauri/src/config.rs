@@ -225,6 +225,15 @@ pub struct Config {
     /// an hour in a build you deployed, off in the downloadable one, where
     /// sessions closing on their own would be a surprise.
     pub idle_close_ms: Option<u64>,
+    /// Windows only: the WSL path of the claude repo's
+    /// `claude/remote-session/wsl/cc-session.sh`, through which a session is
+    /// started for a project nothing is running in — a relayed message to it,
+    /// or a start the local picker asks for. The session runs detached in the
+    /// remote-session holder's tmux server, as one cmd+shift+r creates from the
+    /// Mac does. `None` leaves this machine unable to start a session, refusing
+    /// such a message `start_no_launcher` and offering no directories for a
+    /// start grant.
+    pub remote_session_script: Option<String>,
     /// Multi-device session sync (see `sync.rs`). Disabled by default:
     /// `listen=false` and empty `peers` make every sync task a no-op.
     pub sync: SyncConfig,
@@ -747,6 +756,7 @@ impl Default for Config {
             restore_sessions: true,
             waiting_settle_ms: Some(600_000),
             idle_close_ms: (!built_for_release()).then_some(IDLE_CLOSE_MS),
+            remote_session_script: None,
             sync: SyncConfig::default(),
             tray_badge: TrayBadge::None,
             tray_context_alert_enabled: true,

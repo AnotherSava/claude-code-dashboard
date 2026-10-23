@@ -3,7 +3,8 @@
 //! On Windows several terminals can host a session at once: Windows Terminal,
 //! whose adapter answers restore and the stale check; agwinterm, whose adapter
 //! answers labelling; both of those answer attention; and the WSL tmux server,
-//! whose adapter only closes the sessions no terminal here shows.
+//! whose adapter closes the sessions no terminal here shows and starts one
+//! where nothing runs.
 //! [`super::for_platform`] still returns one adapter, so every consumer keeps
 //! asking one question of one thing and none of them learns there are several. What it costs is a stated rule per method for turning
 //! several answers into one, and each rule is below beside the method it governs.

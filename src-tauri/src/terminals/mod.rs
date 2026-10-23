@@ -116,8 +116,8 @@ pub mod agwinterm_wire;
 #[cfg(any(target_os = "windows", test))]
 pub mod composer;
 /// The WSL tmux server that holds the claude repo's remote sessions, reached
-/// through `wsl.exe`, as an adapter that can only close: what it adds is the
-/// sessions no Windows terminal is showing.
+/// through `wsl.exe`, as an adapter that closes the sessions no Windows
+/// terminal is showing and starts one where nothing runs.
 #[cfg(target_os = "windows")]
 pub mod tmux;
 /// tmux's answers as pure functions: the session list and its clients, and a
@@ -1601,12 +1601,14 @@ pub fn for_platform(app: &tauri::AppHandle) -> Option<Box<dyn TerminalAdapter>> 
     // A composite, because several terminals can host a session here and each
     // knows only its own: Windows Terminal answers restore and the stale check,
     // agwinterm answers labelling, both answer attention, and tmux closes the
-    // sessions only the Mac's tabs are showing, or none are. The composite keeps
+    // sessions only the Mac's tabs are showing, or none are, and starts them. The composite keeps
     // Windows Terminal's slug, so the lines every existing consumer logs keep
     // theirs; an observation carries the slug of the terminal that made it.
     #[cfg(target_os = "windows")]
     {
-        Some(Box::new(composite::Composite::new(windows::NAME, vec![Box::new(windows::WindowsAdapter::new(app.clone())), Box::new(agwinterm::AgwintermAdapter::new()), Box::new(tmux::TmuxAdapter)])))
+        use tauri::Manager;
+        let script = app.try_state::<crate::config::ConfigState>().and_then(|c| c.config.lock().unwrap().remote_session_script.clone());
+        Some(Box::new(composite::Composite::new(windows::NAME, vec![Box::new(windows::WindowsAdapter::new(app.clone())), Box::new(agwinterm::AgwintermAdapter::new()), Box::new(tmux::TmuxAdapter::new(script))])))
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {

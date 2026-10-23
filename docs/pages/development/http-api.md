@@ -322,7 +322,7 @@ The `start_*` refusals, all of them certain and none of them retryable by the ca
 | `start_no_directory` | `404` | the allowed directory is gone |
 | `start_untrusted_directory` | `503` | Claude Code has never been trusted there, so a session would stop at a prompt nobody can answer |
 | `start_already_running` | `409` | a start for this project is already in flight |
-| `start_no_launcher` | `503` | no terminal this dashboard can start a session in (Windows today; its terminal adapter reads tabs but launches nothing) |
+| `start_no_launcher` | `503` | no terminal this dashboard can start a session in (Windows without `remote_session_script`, whose adapters read and close tabs but launch nothing) |
 | `start_not_realized` | `503` | the terminal made a session but never gave it a screen — a sleeping display; the empty session is closed rather than left behind |
 | `start_not_ready` | `502` | a session was launched and had not registered in time; nothing was written, and whether it comes up is not observable from here. The outcome is `unreachable` rather than `refused` — we tried and found nothing listening yet — so it maps to `502` here even though the peer deliberately answered `200`, keeping the sender from reading it as a lost hop |
 
@@ -396,7 +396,7 @@ Opens a Claude session for a local project because its user asked for one, from 
 { "dir": "/Users/you/Projects/my-app" }
 ```
 
-Carries the loopback `Host` gate on top of the `Origin` check. macOS only.
+On Windows the session starts detached in the remote-session holder's tmux server, so there is no tab to select, and only where `remote_session_script` is set, refusing `start_no_launcher` otherwise. Carries the loopback `Host` gate on top of the `Origin` check.
 
 | Status | `outcome` | Meaning |
 |---     |---        |---      |

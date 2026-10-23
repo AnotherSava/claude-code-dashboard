@@ -1,5 +1,5 @@
 //! The WSL tmux server holding the claude repo's remote sessions, as an
-//! adapter that only closes.
+//! adapter that closes and starts them.
 //!
 //! A remote session is a native `claude.exe` in a tmux pane, and it can run
 //! with no terminal on this machine attached at all: the Mac's `⇄` tab is
@@ -16,6 +16,14 @@
 //! (`cc-session.sh … resume`) that finds it exits instead of creating. So the
 //! close has to end the agent with exit 0: a `tmux kill-session` would make it
 //! exit non-zero, write no marker, and be undone by the next reconnect.
+//!
+//! It also starts one, where `config.remote_session_script` names the claude
+//! repo's `cc-session.sh`: run with `detach`, the script refuses while the
+//! holder is down, names the session by the rule its picker uses, and creates
+//! it in the holder's server with no client attached, so the agent runs with
+//! no window on this machine until someone attaches. That launch names nothing
+//! to check afterwards: a pane with no client has no surface to go unrealized,
+//! and the script owns the session's name.
 //!
 //! The rest of the seam answers nothing: restore reads each session's console
 //! title through the console adapter already, tmux has no context line, and
@@ -43,7 +51,16 @@ pub const NAME: &str = "tmux";
 /// hundred milliseconds; a cold one boots first, which is why this is not two.
 const CALL_TIMEOUT: Duration = Duration::from_secs(10);
 
-pub struct TmuxAdapter;
+pub struct TmuxAdapter {
+    /// `config.remote_session_script`, read when the adapter was built.
+    script: Option<String>,
+}
+
+impl TmuxAdapter {
+    pub fn new(script: Option<String>) -> Self {
+        Self { script }
+    }
+}
 
 /// Run `args` in the default WSL distro, without its login shell, and answer
 /// its output or why there is none.
@@ -151,5 +168,23 @@ impl TerminalAdapter for TmuxAdapter {
 
     fn can_close(&self) -> bool {
         true
+    }
+
+    fn can_launch(&self) -> bool {
+        self.script.is_some()
+    }
+
+    /// `cc-session.sh <dir> windows start detach`. The directory goes as its
+    /// Windows path and the script translates it, since only the script knows
+    /// the project root a session is named below. `select` changes nothing: the
+    /// session has no window here to put in front.
+    fn launch(&self, dir: &std::path::Path, _select: bool) -> Result<Option<String>, String> {
+        let script = self.script.as_deref().ok_or("config.remote_session_script is not set")?;
+        let dir = dir.to_string_lossy();
+        let out = wsl(&[script, &dir, "windows", "start", "detach"])?;
+        if !out.status.success() {
+            return Err(format!("cc-session.sh exited {}: {}", out.status.code().map_or("by signal".to_string(), |c| c.to_string()), failure_text(&out)));
+        }
+        Ok(None)
     }
 }
