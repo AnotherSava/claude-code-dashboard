@@ -178,13 +178,13 @@ impl TerminalAdapter for TmuxAdapter {
     /// Windows path and the script translates it, since only the script knows
     /// the project root a session is named below. `select` changes nothing: the
     /// session has no window here to put in front.
-    fn launch(&self, dir: &std::path::Path, _select: bool) -> Result<Option<String>, String> {
+    fn launch(&self, dir: &std::path::Path, _select: bool) -> Result<super::Launched, String> {
         let script = self.script.as_deref().ok_or("config.remote_session_script is not set")?;
         let dir = dir.to_string_lossy();
         let out = wsl(&[script, &dir, "windows", "start", "detach"])?;
         if !out.status.success() {
             return Err(format!("cc-session.sh exited {}: {}", out.status.code().map_or("by signal".to_string(), |c| c.to_string()), failure_text(&out)));
         }
-        Ok(None)
+        Ok(super::Launched::default())
     }
 }

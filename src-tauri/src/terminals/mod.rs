@@ -997,19 +997,14 @@ pub trait TerminalAdapter: Send {
     }
 
     /// Start a session running the agent in `dir`, one the user can walk up to,
-    /// type in and close, and answer the key of what was created, or `None`
-    /// where the terminal named nothing it could be found by later. `select`
-    /// puts it in front; otherwise it must not take focus from whoever is at the
-    /// machine. Where it opens (which window, which workspace) is the terminal's
+    /// type in and close, and answer what was created. `select` puts it in
+    /// front; otherwise it must not take focus from whoever is at the machine.
+    /// Where it opens (which window, which workspace) is the terminal's
     /// business.
-    ///
-    /// The key is opaque, with [`LabelTarget::key`]'s contract, and is good only
-    /// for [`launch_unrealized`](Self::launch_unrealized) and
-    /// [`discard_launch`](Self::discard_launch).
     ///
     /// **May block** for as long as the terminal takes to answer. The default
     /// refuses.
-    fn launch(&self, dir: &std::path::Path, select: bool) -> Result<Option<String>, String> {
+    fn launch(&self, dir: &std::path::Path, select: bool) -> Result<Launched, String> {
         let _ = (dir, select);
         Err("this terminal cannot start a session".to_string())
     }
@@ -1031,6 +1026,43 @@ pub trait TerminalAdapter: Send {
     fn discard_launch(&self, key: &str) {
         let _ = key;
     }
+
+    /// Whether [`attach_hosted`](Self::attach_hosted) can ever succeed here. A
+    /// fact about the adapter, answered without asking the terminal.
+    fn can_attach_hosted(&self) -> bool {
+        false
+    }
+
+    /// Open a tab on this machine attached to the remote-session holder's
+    /// session `name`, a [`Launched::hosted_name`], without putting it in front.
+    /// It is how a session started for an agent here, on whichever machine the
+    /// holder runs, gets a tab where that agent's user is: on the Mac a `⇄` tab
+    /// reaching the Windows holder over ssh, on Windows a tab attaching to the
+    /// local one.
+    ///
+    /// **May block.** The default refuses.
+    fn attach_hosted(&self, name: &str) -> Result<(), String> {
+        let _ = name;
+        Err("this terminal cannot attach a hosted session".to_string())
+    }
+}
+
+/// What [`TerminalAdapter::launch`] created.
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Launched {
+    /// The session as this terminal can find it again, opaque with
+    /// [`LabelTarget::key`]'s contract and good only for
+    /// [`TerminalAdapter::launch_unrealized`] and
+    /// [`TerminalAdapter::discard_launch`]. `None` where the terminal named
+    /// nothing it could be found by later.
+    pub key: Option<String>,
+    /// The name the claude repo's remote-session scripts attach to this session
+    /// by, where the terminal is the holder those scripts reach, and `None`
+    /// everywhere else. Not opaque, unlike `key`: it travels in a relay receipt
+    /// to the machine whose agent asked for the session, and is handed to that
+    /// machine's [`TerminalAdapter::attach_hosted`].
+    pub hosted_name: Option<String>,
 }
 
 /// One labellable session, as [`TerminalAdapter::label_targets`] reports it.
@@ -1596,7 +1628,8 @@ pub fn for_platform(app: &tauri::AppHandle) -> Option<Box<dyn TerminalAdapter>> 
     {
         use tauri::Manager;
         let memory = app.try_state::<std::sync::Arc<crate::workspace_memory::WorkspaceMemory>>().map(|m| m.inner().clone());
-        Some(Box::new(agterm::AgtermAdapter::new(memory)))
+        let attach_script = app.try_state::<crate::config::ConfigState>().and_then(|c| c.config.lock().unwrap().remote_attach_script.clone());
+        Some(Box::new(agterm::AgtermAdapter::new(memory, attach_script)))
     }
     // A composite, because several terminals can host a session here and each
     // knows only its own: Windows Terminal answers restore and the stale check,

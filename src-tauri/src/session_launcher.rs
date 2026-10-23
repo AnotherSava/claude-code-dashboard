@@ -393,8 +393,11 @@ impl StartGuard {
 pub enum StartResult {
     /// The registry now answers for this project. `started` says whether that
     /// is because we started it, or because the absence that got us here was
-    /// stale and a session was already there.
-    Settled { inbox: InboxLookup, started: bool },
+    /// stale and a session was already there. `hosted_name` is the started
+    /// session's [`crate::terminals::Launched::hosted_name`], `None` when
+    /// nothing was started or the terminal hosts nothing another machine
+    /// attaches to.
+    Settled { inbox: InboxLookup, started: bool, hosted_name: Option<String> },
     /// Nothing was started, and nothing about the registry changed.
     Refused(StartRefusal),
 }
@@ -492,7 +495,7 @@ async fn start_in(
     let confirmed = registry.inbox_for(project, projects_root, now);
     if !matches!(confirmed, InboxLookup::NotFound) {
         guard.release(project);
-        return StartResult::Settled { inbox: confirmed, started: false };
+        return StartResult::Settled { inbox: confirmed, started: false, hosted_name: None };
     }
 
     // Started before the launch, so a slow terminal spends the same budget the
@@ -506,8 +509,8 @@ async fn start_in(
         (launcher, result)
     })
     .await;
-    let (launcher, key) = match launched {
-        Ok((launcher, Ok(key))) => (launcher, key),
+    let (launcher, launched) = match launched {
+        Ok((launcher, Ok(launched))) => (launcher, launched),
         Ok((launcher, Err(reason))) => {
             tracing::warn!(chat_id = %project, terminal = launcher.name(), reason = %reason, "the terminal refused to start a session");
             guard.release(project);
@@ -525,7 +528,7 @@ async fn start_in(
         // something to run in: an unrealized one will never run its command, so
         // waiting longer cannot help and the empty session should not be left to
         // accumulate one row per message.
-        let unrealized = match key {
+        let unrealized = match launched.key {
             Some(key) => tokio::task::spawn_blocking(move || {
                 let dead = launcher.launch_unrealized(&key);
                 if dead {
@@ -544,10 +547,10 @@ async fn start_in(
         }
         // Slow rather than dead. Keep the claim so a resend cannot open a
         // second window while this one is still coming up.
-        return StartResult::Settled { inbox, started: true };
+        return StartResult::Settled { inbox, started: true, hosted_name: launched.hosted_name };
     }
     guard.release(project);
-    StartResult::Settled { inbox, started: true }
+    StartResult::Settled { inbox, started: true, hosted_name: launched.hosted_name }
 }
 
 /// Wait for a just-started session to publish its inbox.

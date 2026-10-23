@@ -194,6 +194,14 @@ pub struct Receipt {
     /// a peer that predates the field parses, and contributes none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub start_candidates: Vec<crate::session_launcher::StartCandidate>,
+    /// Where this message started the session it was written to, and that
+    /// session is one the remote-session holder hosts: the name another machine
+    /// attaches to it by ([`crate::terminals::Launched::hosted_name`]). The
+    /// sending dashboard opens a tab on it, so a session an agent caused to
+    /// exist is in front of that agent's user. Defaulted and skipped when absent
+    /// so a peer on either side of the field parses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hosted_session: Option<String>,
 }
 
 impl Receipt {
@@ -207,6 +215,7 @@ impl Receipt {
             device: device.map(str::to_string),
             observed: observed_text(outcome).to_string(),
             start_candidates: Vec::new(),
+            hosted_session: None,
         }
     }
 

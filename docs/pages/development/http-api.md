@@ -312,6 +312,8 @@ The candidates come from the peer's own disk and are gated on a bound identity, 
 
 **A peer with no launcher answers `start_no_launcher` instead of offering directories**, so no approval prompt is raised for it. There is nothing an approval could buy: such a machine refuses the grant itself, and were one already on its list it would be refused at every message arriving against it — while the prompt is raised on `start_not_listed` alone, so a stored grant replaces that slug and silences the prompt for good. The capability is asked inside the one function every start is checked through, so a project already listed on such a machine gets the same answer — the question is about the machine, not about the address, and it is asked after the listing and existence checks so a mistyped id still reads back as `start_not_listed` or `unknown_project` rather than being masked by a capability the sender cannot act on.
 
+**A message that started a session the remote-session holder hosts says so** with `hosted_session`, the name the claude repo's attach scripts reach that session by, on a `written` or `start_not_ready` receipt. The sending dashboard opens a background tab on it through its own terminal (on the Mac a `⇄` tab running `attach.sh`, which needs `remote_attach_script`), logged `peer_attach`, so a session an agent caused to exist is in front of that agent's user. The field is absent wherever nothing was started or the session has no such name, and an attach that fails changes nothing about the receipt.
+
 The `start_*` refusals, all of them certain and none of them retryable by the caller:
 
 | `reason` | status | what it means |

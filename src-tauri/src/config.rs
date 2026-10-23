@@ -234,6 +234,12 @@ pub struct Config {
     /// such a message `start_no_launcher` and offering no directories for a
     /// start grant.
     pub remote_session_script: Option<String>,
+    /// macOS only: the path of the claude repo's
+    /// `claude/remote-session/mac/attach.sh`, through which a session the
+    /// Windows machine starts for a message an agent here sent gets a `⇄` tab
+    /// on this Mac, in the background. `None` opens no tab, and the session
+    /// stays reachable through cmd+shift+r.
+    pub remote_attach_script: Option<String>,
     /// Multi-device session sync (see `sync.rs`). Disabled by default:
     /// `listen=false` and empty `peers` make every sync task a no-op.
     pub sync: SyncConfig,
@@ -757,6 +763,7 @@ impl Default for Config {
             waiting_settle_ms: Some(600_000),
             idle_close_ms: (!built_for_release()).then_some(IDLE_CLOSE_MS),
             remote_session_script: None,
+            remote_attach_script: None,
             sync: SyncConfig::default(),
             tray_badge: TrayBadge::None,
             tray_context_alert_enabled: true,

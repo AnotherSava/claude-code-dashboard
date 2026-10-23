@@ -950,6 +950,7 @@ async fn post_message(
     // exists — starting on a failed look is how a machine ends up with two
     // agents in one directory.
     let mut started_session = false;
+    let mut hosted_session = None;
     // `listed_dir` runs before the attestation check, and the order matters:
     // asked about a project nobody ever listed, the honest answer is that
     // nothing is running for it, not that the caller failed a check for a start
@@ -1018,9 +1019,10 @@ async fn post_message(
         };
         match crate::session_launcher::start_and_wait(&env.target_project, &startable, cfg.projects_root.as_deref(), &registry, &guard, crate::terminals::for_platform(&app), now).await {
             crate::session_launcher::StartResult::Refused(refusal) => return refuse_start(refusal),
-            crate::session_launcher::StartResult::Settled { inbox: settled, started } => {
+            crate::session_launcher::StartResult::Settled { inbox: settled, started, hosted_name } => {
                 inbox = settled;
                 started_session = started;
+                hosted_session = hosted_name;
                 if started {
                     tracing::info!(
                         chat_id = %env.target_project,
@@ -1052,7 +1054,7 @@ async fn post_message(
         // sender that reads the status first would otherwise turn it into a
         // transport diagnosis.
         InboxLookup::NotFound if started_session => {
-            let r = receipt(Outcome::Unreachable)
+            let mut r = receipt(Outcome::Unreachable)
                 .because("start_not_ready")
                 .detailed("a session was launched for that project and had not registered within the start window, so nothing was written; whether it comes up is not observable from here");
             tracing::info!(
@@ -1065,6 +1067,7 @@ async fn post_message(
                 reason = "start_not_ready",
                 "relayed message not written after starting a session"
             );
+            r.hosted_session = hosted_session;
             return (StatusCode::OK, Json(r));
         }
         // Nothing is running for that id — and *why* is two different answers a
@@ -1159,7 +1162,9 @@ async fn post_message(
                 outcome = "written",
                 "frame written to the session's inbox"
             );
-            (StatusCode::OK, Json(receipt(Outcome::Written)))
+            let mut r = receipt(Outcome::Written);
+            r.hosted_session = hosted_session;
+            (StatusCode::OK, Json(r))
         }
         Err(e) => {
             dedupe.release(&env.origin_device, &env.message_id);

@@ -21,7 +21,7 @@
 
 use std::sync::mpsc::Sender;
 
-use super::{CloseTarget, FrontReading, LabelTarget, LabelWrite, Observation, TerminalAdapter, TerminalSession, FALLBACK_STALE_REMEDY};
+use super::{CloseTarget, FrontReading, LabelTarget, LabelWrite, Launched, Observation, TerminalAdapter, TerminalSession, FALLBACK_STALE_REMEDY};
 
 pub struct Composite {
     name: &'static str,
@@ -179,10 +179,10 @@ impl TerminalAdapter for Composite {
 
     /// The first child that can launch, in the order the set was built: a
     /// session is started once, so the order is the preference.
-    fn launch(&self, dir: &std::path::Path, select: bool) -> Result<Option<String>, String> {
+    fn launch(&self, dir: &std::path::Path, select: bool) -> Result<Launched, String> {
         let child = self.children.iter().find(|c| c.can_launch()).ok_or_else(|| "no terminal in this set can start a session".to_string())?;
         let name = child.name();
-        child.launch(dir, select).map(|key| key.map(|k| format!("{name}|{k}")))
+        child.launch(dir, select).map(|l| Launched { key: l.key.map(|k| format!("{name}|{k}")), ..l })
     }
 
     fn launch_unrealized(&self, key: &str) -> bool {
@@ -193,6 +193,17 @@ impl TerminalAdapter for Composite {
         if let Ok((target, inner)) = self.child_for(key) {
             target.discard_launch(inner);
         }
+    }
+
+    fn can_attach_hosted(&self) -> bool {
+        self.children.iter().any(|c| c.can_attach_hosted())
+    }
+
+    /// The first child that can attach, in the order the set was built, as
+    /// `launch` is routed.
+    fn attach_hosted(&self, name: &str) -> Result<(), String> {
+        let child = self.children.iter().find(|c| c.can_attach_hosted()).ok_or_else(|| "no terminal in this set can attach a hosted session".to_string())?;
+        child.attach_hosted(name)
     }
 }
 
@@ -259,8 +270,15 @@ mod tests {
         fn can_launch(&self) -> bool {
             self.launches
         }
-        fn launch(&self, _dir: &std::path::Path, _select: bool) -> Result<Option<String>, String> {
-            Ok(Some(format!("{}-session", self.name)))
+        fn launch(&self, _dir: &std::path::Path, _select: bool) -> Result<Launched, String> {
+            Ok(Launched { key: Some(format!("{}-session", self.name)), hosted_name: Some(format!("{}-hosted", self.name)) })
+        }
+        fn can_attach_hosted(&self) -> bool {
+            self.launches
+        }
+        fn attach_hosted(&self, name: &str) -> Result<(), String> {
+            self.writes.lock().unwrap().push((format!("attach {name}"), LabelWrite::ClearContext));
+            Ok(())
         }
         fn launch_unrealized(&self, key: &str) -> bool {
             key == format!("{}-session", self.name)
@@ -353,15 +371,22 @@ mod tests {
             Fake { name: "agwinterm", launches: true, ..Fake::default() },
         ]);
         assert!(c.can_launch());
-        let key = c.launch(std::path::Path::new("/p"), false).unwrap().unwrap();
+        let launched = c.launch(std::path::Path::new("/p"), false).unwrap();
+        let key = launched.key.unwrap();
         assert_eq!(key, "tmux|tmux-session", "the order the set was built in is the preference");
+        assert_eq!(launched.hosted_name.as_deref(), Some("tmux-hosted"), "the hosted name crosses machines, so it goes out unprefixed");
         assert!(c.launch_unrealized(&key), "the child that minted the key answers for it");
         c.discard_launch(&key);
         assert_eq!(writes.lock().unwrap()[0].0, "discard tmux-session");
+        assert!(c.can_attach_hosted());
+        c.attach_hosted("web").unwrap();
+        assert_eq!(writes.lock().unwrap()[1].0, "attach web", "an attach goes to the first child that can, like a launch");
         assert!(!c.launch_unrealized("kitty|x"), "a key naming no child is not known to be dead");
         let none = composite(vec![Fake { name: "windows", ..Fake::default() }]);
         assert!(!none.can_launch());
         assert!(none.launch(std::path::Path::new("/p"), false).is_err());
+        assert!(!none.can_attach_hosted());
+        assert!(none.attach_hosted("web").is_err());
     }
 
     #[test]

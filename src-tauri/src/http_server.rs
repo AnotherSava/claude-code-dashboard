@@ -214,9 +214,9 @@ async fn post_session_open(State(app): State<AppHandle>, headers: HeaderMap, Jso
         // The shared detail speaks of a listed grant, which this route never reads.
         session_launcher::StartResult::Refused(r @ session_launcher::StartRefusal::NoSuchDirectory) => (StatusCode::CONFLICT, "refused", r.slug(), "there is no folder at that path"),
         session_launcher::StartResult::Refused(r) => (StatusCode::CONFLICT, "refused", r.slug(), r.detail()),
-        session_launcher::StartResult::Settled { inbox: crate::session_registry::InboxLookup::Unreadable, started: false } => (StatusCode::CONFLICT, "refused", "registry_unreadable", "Claude Code's session list could not be read, so a running session there cannot be ruled out"),
+        session_launcher::StartResult::Settled { inbox: crate::session_registry::InboxLookup::Unreadable, started: false, .. } => (StatusCode::CONFLICT, "refused", "registry_unreadable", "Claude Code's session list could not be read, so a running session there cannot be ruled out"),
         session_launcher::StartResult::Settled { started: false, .. } => (StatusCode::OK, "running", "", "a session is already running in that folder"),
-        session_launcher::StartResult::Settled { inbox: crate::session_registry::InboxLookup::NotFound, started: true } => (StatusCode::OK, "started", "", "started; it has not registered yet"),
+        session_launcher::StartResult::Settled { inbox: crate::session_registry::InboxLookup::NotFound, started: true, .. } => (StatusCode::OK, "started", "", "started; it has not registered yet"),
         session_launcher::StartResult::Settled { started: true, .. } => (StatusCode::OK, "started", "", "started"),
     };
     tracing::info!(chat_id = %project, decision = "session_open", outcome, reason, dir = %dir.display(), "local session open requested");
@@ -1289,9 +1289,12 @@ async fn post_message(State(app): State<AppHandle>, headers: HeaderMap, Json(req
                     StatusCode::BAD_REQUEST,
                     this_device,
                 ),
-                session_launcher::StartResult::Settled { inbox, started: true } => {
+                session_launcher::StartResult::Settled { inbox, started: true, hosted_name } => {
                     let reached = !matches!(inbox, crate::session_registry::InboxLookup::NotFound);
                     tracing::info!(chat_id = %project, decision = "peer_start", from_agent, reached_inbox = reached, "started a local terminal session for a project with none");
+                    if let Some(name) = hosted_name {
+                        attach_started(&app, &project, name).await;
+                    }
                     // `Refused` is the honest outcome: nothing was relayed, and
                     // nothing will be. The relay was declined for the same
                     // reason a live local target is declined — `SendMessage`
@@ -1418,6 +1421,9 @@ async fn post_message(State(app): State<AppHandle>, headers: HeaderMap, Json(req
     };
 
     log_send(&receipt, from_agent, &req.target, Some(&device), req.text.len());
+    if let Some(name) = receipt.hosted_session.clone() {
+        attach_started(&app, &req.target, name).await;
+    }
     // The peer disclosed its directory layout to *this dashboard* so its owner
     // could pick one; it gated that on a bound identity. Passing the paths on to
     // whatever loopback process called us would re-disclose them to a caller the
@@ -1505,6 +1511,26 @@ async fn await_start_approval(app: &AppHandle, receipt: &Receipt, device: &str, 
     // rather than here so that approving a request nobody is waiting on does
     // exactly the same thing. All that is left is to send again.
     answer.map(|_| ())
+}
+
+/// Open a background tab on this machine for a session an agent here caused to
+/// be started — on the other machine through the relay, or on this one —
+/// where the session runs with no tab of its own, so the agent's user can read
+/// and answer it. A refusal is logged and changes nothing about the send,
+/// whose outcome is already decided; on the Mac, cmd+shift+r still reaches the
+/// session.
+/// Logged `peer_attach`, keyed by the started session's row.
+async fn attach_started(app: &AppHandle, chat_id: &str, name: String) {
+    let Some(adapter) = crate::terminals::for_platform(app).filter(|a| a.can_attach_hosted()) else {
+        tracing::info!(chat_id, decision = "peer_attach", session = %name, outcome = "no_attacher", "a started session has no tab here: no terminal on this machine attaches hosted sessions");
+        return;
+    };
+    let session = name.clone();
+    let result = tokio::task::spawn_blocking(move || adapter.attach_hosted(&session)).await.unwrap_or_else(|e| Err(format!("the attach task did not finish: {e}")));
+    match result {
+        Ok(()) => tracing::info!(chat_id, decision = "peer_attach", session = %name, outcome = "attached", "opened a background tab on a started session"),
+        Err(reason) => tracing::warn!(chat_id, decision = "peer_attach", session = %name, outcome = "attach_failed", reason = %reason, "could not open a tab on a started session"),
+    }
 }
 
 /// The permanent record of one relay attempt, keyed by the **sender's** chat_id

@@ -83,12 +83,14 @@ pub struct AgtermAdapter {
     /// Where each project's agent was last seen, written on every `tree` walk.
     /// `None` only when the store is not managed, which nothing ships.
     memory: Option<Arc<crate::workspace_memory::WorkspaceMemory>>,
+    /// `config.remote_attach_script`, read when the adapter was built.
+    attach_script: Option<String>,
 }
 
 #[cfg(target_os = "macos")]
 impl AgtermAdapter {
-    pub fn new(memory: Option<Arc<crate::workspace_memory::WorkspaceMemory>>) -> Self {
-        Self { selections: Arc::default(), files: Arc::new(Mutex::new(WindowFiles::new(NAME))), memory }
+    pub fn new(memory: Option<Arc<crate::workspace_memory::WorkspaceMemory>>, attach_script: Option<String>) -> Self {
+        Self { selections: Arc::default(), files: Arc::new(Mutex::new(WindowFiles::new(NAME))), memory, attach_script }
     }
 }
 
@@ -247,7 +249,7 @@ impl TerminalAdapter for AgtermAdapter {
     ///   opens in the workspace the project's agent was last seen in. A workspace
     ///   deleted since is recreated under its old name; see [`wire::placement`]
     ///   for the order the two are tried in.
-    fn launch(&self, dir: &std::path::Path, select: bool) -> Result<Option<String>, String> {
+    fn launch(&self, dir: &std::path::Path, select: bool) -> Result<super::Launched, String> {
         let last = self.memory.as_deref().and_then(|m| m.get(&dir.to_string_lossy()));
         let placement = placement_now(last.as_ref());
         tracing::info!(dir = %dir.display(), placement = ?placement, select, "placing the started session");
@@ -266,7 +268,7 @@ impl TerminalAdapter for AgtermAdapter {
         if id.is_none() {
             tracing::warn!("agterm created a session but returned no id; it cannot be checked or cleaned up");
         }
-        Ok(id)
+        Ok(super::Launched { key: id, hosted_name: None })
     }
 
     /// agterm answers `ok` for a session that exists in its model, and
@@ -279,6 +281,21 @@ impl TerminalAdapter for AgtermAdapter {
 
     fn discard_launch(&self, key: &str) {
         let _ = crate::agterm::agtermctl(&["session", "close", "--target", key, "--json"]);
+    }
+
+    fn can_attach_hosted(&self) -> bool {
+        self.attach_script.is_some()
+    }
+
+    /// A `⇄` tab running the claude repo's `attach.sh <name>`, opened as its
+    /// cmd+shift+r picker opens one ([`ATTACH_WORKSPACE`], cwd `/`, no
+    /// `--name`), except that it stays in the background. With no start token
+    /// the script attaches to the session as it stands, which is the case here:
+    /// the session was started before this was asked.
+    fn attach_hosted(&self, name: &str) -> Result<(), String> {
+        let script = self.attach_script.as_deref().ok_or("config.remote_attach_script is not set")?;
+        let command = attach_command(script, name);
+        crate::agterm::agtermctl_checked(&["session", "new", "--workspace-name", ATTACH_WORKSPACE, "--create-workspace", "--cwd", "/", "--no-select", "--json", "--command", &command]).map(|_| ())
     }
 
     /// Input to the session on screen in agterm's active window.
@@ -590,6 +607,20 @@ fn input_observation(reading: &Reading, front: Front, front_since: Since, select
 #[cfg(target_os = "macos")]
 const AGTERM_COMMAND: &str = "zsh -ilc 'claude; exec zsh -i'";
 
+/// The workspace `⇄` tabs open in, the claude repo's `mac/pick-session.py`
+/// `WORKSPACE`, so a tab opened here sits beside the ones the picker opens.
+#[cfg(target_os = "macos")]
+const ATTACH_WORKSPACE: &str = "remote";
+
+/// The shell command an attach tab runs. `attach.sh` refuses a name outside the
+/// characters that survive the Windows shell, so quoting here only has to keep
+/// the two words apart for agterm's shell.
+#[cfg(any(target_os = "macos", test))]
+fn attach_command(script: &str, name: &str) -> String {
+    let quote = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
+    format!("{} {}", quote(script), quote(name))
+}
+
 /// [`wire::placement`] over what agterm holds now: whether the recorded window
 /// is open, and which workspaces it has.
 #[cfg(target_os = "macos")]
@@ -699,6 +730,12 @@ mod tests {
     use super::*;
     use crate::terminals::window_files::{FileRead, WindowFiles};
     use crate::terminals::{person_verdict, Cover, NamedBy, Occupant, Refusal};
+
+    #[test]
+    fn the_attach_command_keeps_script_and_name_as_two_words() {
+        assert_eq!(attach_command("/p/remote-session/mac/attach.sh", "url-cleaner"), "'/p/remote-session/mac/attach.sh' 'url-cleaner'");
+        assert_eq!(attach_command("/p/it's/attach.sh", "a"), "'/p/it'\\''s/attach.sh' 'a'", "a quote in the path is closed, escaped and reopened");
+    }
 
     /// The command shape is the whole requirement — a session the user can walk
     /// up to — so it is pinned rather than left to drift.
