@@ -288,29 +288,15 @@ Claude Code's own identical-repeat drop is not relied on: it compares only again
 
 ### Starting a session that is not running
 
-A message can only ever reach an agent that already exists, so a target with no live session used to end the story at `no_such_session`. It no longer has to. Which of three things happens depends on where the project is and whether its owner has allowed it.
+A message can only ever reach an agent that already exists, so a target with no live session used to end the story at `no_such_session`. It no longer has to. What happens depends on where the project is.
 
-None of them applies to an address that names no project at all, which answers `unknown_project` on whichever machine the target pointed at — the same slug the receiving side uses, because it is the same fact and a caller should not have to know which route it took to read it. That distinction is the whole reason the slug exists: `start_not_listed` says a project is there and waiting on a grant, so its detail sends the reader to ask for one, and saying that about an id nothing derives points at a grant for a project that does not exist.
+None of them applies to an address that names no project at all, which answers `unknown_project` on whichever machine the target pointed at — the same slug the receiving side uses, because it is the same fact and a caller should not have to know which route it took to read it.
 
 **A local project with nothing running** answers `local_target_started`: the dashboard opens a terminal session for it and then stands aside. Nothing is relayed — the outcome is still `refused`, and the status is the same `400` a live `local_target` gets, because what the caller asked for is what did not happen. The detail says what did. This is not a softening of the local-target rule: `SendMessage` carries a kernel-verified sender and a working reply address that a relay destroys, and that is as true after the start as before. What it *cannot* do is address a session that does not exist, which is the gap being filled — the dashboard supplies existence, Claude Code keeps delivery.
 
-**A remote project the peer has allowed** is started by the peer and the message is delivered into it, answering an ordinary `written`. Nothing about the receipt changes.
+**A remote project with nothing running** is started by the peer and the message is delivered into it, answering an ordinary `written`. Nothing about the receipt changes.
 
-**A remote project the peer has *not* allowed** answers `refused` / `start_not_listed` — and, when that machine found directories matching the name *and* could start a session in one, carries them as `start_candidates`:
-
-```json
-{
-  "outcome": "refused",
-  "reason": "start_not_listed",
-  "start_candidates": [
-    { "dir": "/Users/you/Projects/transcripts", "trusted": true }
-  ]
-}
-```
-
-The candidates come from the peer's own disk and are gated on a bound identity, because they disclose a little of its directory layout. The sending dashboard uses them to raise an approval prompt on *its* screen — the machine that would run the session is by definition the one nobody is at — and holds this HTTP call open for up to 90 s while the user decides. On approval it records the grant on the peer over `POST /api/sync/grant` and re-sends, so a caller sees a normal `written` and never learns an approval happened. If nobody answers in time, the original refusal is returned unchanged, nothing is stored on either machine, and the request stays approvable so a later yes spares the *next* message the same trip. **`start_candidates` is stripped before the receipt reaches the loopback caller** — the peer disclosed those paths to the dashboard, not to whatever process called it, and the choice is the user's, made here.
-
-**A peer with no launcher answers `start_no_launcher` instead of offering directories**, so no approval prompt is raised for it. There is nothing an approval could buy: such a machine refuses the grant itself, and were one already on its list it would be refused at every message arriving against it — while the prompt is raised on `start_not_listed` alone, so a stored grant replaces that slug and silences the prompt for good. The capability is asked inside the one function every start is checked through, so a project already listed on such a machine gets the same answer — the question is about the machine, not about the address, and it is asked after the listing and existence checks so a mistyped id still reads back as `start_not_listed` or `unknown_project` rather than being masked by a capability the sender cannot act on.
+Either way the dashboard starts a session only where it can tell which directory the id means and the user has consented to an agent there. It resolves the id against Claude Code's own index of every directory a session ran in, and starts one only where exactly one existing directory derives it and Claude Code has been trusted in it; the trust prompt is the consent, and no grant or allowlist sits in front of it. Any sender that may message a running session may start one, since that message already starts a turn with the user's permissions.
 
 **A message that started a session the remote-session holder hosts says so** with `hosted_session`, the name the claude repo's attach scripts reach that session by, on a `written` or `start_not_ready` receipt. The sending dashboard opens a background tab on it through its own terminal (on the Mac a `⇄` tab running `attach.sh`, which needs `remote_attach_script`), logged `peer_attach`, so a session an agent caused to exist is in front of that agent's user. The field is absent wherever nothing was started or the session has no such name, and an attach that fails changes nothing about the receipt.
 
@@ -318,17 +304,16 @@ The `start_*` refusals, all of them certain and none of them retryable by the ca
 
 | `reason` | status | what it means |
 |---|---|---|
-| `start_not_listed` | `404` | nothing is running and the owner has not allowed this project |
 | `start_unattested` | `403` | the sending device has no `sync.peer_identity` binding on the peer, so its name is only claimed |
-| `start_path_mismatch` | `404` | the allowed directory does not derive the project id it is filed under |
-| `start_no_directory` | `404` | the allowed directory is gone |
+| `start_ambiguous_project` | `409` | more than one existing directory derives the project id, so it does not say which to start in |
+| `start_no_directory` | `404` | the folder the local picker named does not exist |
 | `start_untrusted_directory` | `503` | Claude Code has never been trusted there, so a session would stop at a prompt nobody can answer |
 | `start_already_running` | `409` | a start for this project is already in flight |
 | `start_no_launcher` | `503` | no terminal this dashboard can start a session in (Windows without `remote_session_script`, whose adapters read and close tabs but launch nothing) |
 | `start_not_realized` | `503` | the terminal made a session but never gave it a screen — a sleeping display; the empty session is closed rather than left behind |
 | `start_not_ready` | `502` | a session was launched and had not registered in time; nothing was written, and whether it comes up is not observable from here. The outcome is `unreachable` rather than `refused` — we tried and found nothing listening yet — so it maps to `502` here even though the peer deliberately answered `200`, keeping the sender from reading it as a lost hop |
 
-**Attested is not enough to start something.** Reading a peer's rows tolerates the case where an unbound device name happens to equal its Tailscale node name — the sender picks that name, so it chooses both sides of the comparison, which is fair corroboration for attribution and useless as a gate. Causing a process to exist, recording a standing permission, and disclosing directories all require an explicit `sync.peer_identity` entry the *receiver* wrote down.
+**Attested is not enough to start something.** Reading a peer's rows tolerates the case where an unbound device name happens to equal its Tailscale node name — the sender picks that name, so it chooses both sides of the comparison, which is fair corroboration for attribution and useless as a gate. Causing a process to exist requires an explicit `sync.peer_identity` entry the *receiver* wrote down, asked only once the project is known to exist there, so an id nothing derives still answers `unknown_project`.
 
 ## `POST /api/session-clean`
 
@@ -359,13 +344,11 @@ A row's id is derived from its project folder, so renaming or moving the folder 
 { "old_path": "/Users/you/Projects/my-app", "new_path": "/Users/you/Projects/my-app-renamed" }
 ```
 
-The dashboard derives the ids itself, with `projects_root` applied, so the caller sends paths and never ids. Besides the folder's own id it covers each subfolder Claude Code has run a session in or a start grant names, because with `projects_root` set a subfolder's id contains the parent's name. For every id that changes it moves, under the rows' locks:
+The dashboard derives the ids itself, with `projects_root` applied, so the caller sends paths and never ids. Besides the folder's own id it covers each subfolder Claude Code has run a session in, because with `projects_root` set a subfolder's id contains the parent's name. For every id that changes it moves, under the rows' locks:
 
 - **the history** — the `prompt_history.json` entry, so the next session in the new folder opens with the old dialog
 - **session anchors** — every `session_chat_ids.json` entry pointing at the old id, so a resumed session lands on the new row rather than keeping the old one alive beside it
 - **the custom name**
-
-Every start grant whose directory moved is re-pointed at the new path, with its id changed alongside where the id changed too.
 
 Each changed id is also recorded in `project_renames.json` and rides the [sync push](#post-apisync) for 30 days. Each peer applies it once and re-files its stored copy of the dialog and its own custom name for that row.
 
@@ -384,7 +367,7 @@ Carries the loopback `Host` gate on top of the `Origin` check, like the session-
 
 | Status | Body | Meaning |
 |---     |---   |---      |
-| `200`  | `{"ok": true, "report": {…}}` | done; `report.ids` lists each id that changed with whether its `history` and `custom_name` were `moved`, `absent` or hit a `conflict` and how many `anchors` moved, `start_grants` counts the grants re-pointed, `cleared_rows` counts the ended sessions' rows removed first, and `live_sessions_checked` is false where Claude Code's session list could not be read, which the call survives only when no row was present |
+| `200`  | `{"ok": true, "report": {…}}` | done; `report.ids` lists each id that changed with whether its `history` and `custom_name` were `moved`, `absent` or hit a `conflict` and how many `anchors` moved, `cleared_rows` counts the ended sessions' rows removed first, and `live_sessions_checked` is false where Claude Code's session list could not be read, which the call survives only when no row was present |
 | `400`  | `{"ok": false, "detail": …}` | a path is missing |
 | `409`  | `{"ok": false, "detail": …}` | one of the refusals above; `detail` says which, and what clears it |
 
@@ -392,7 +375,7 @@ Logged as `decision = "project_rename"` under each new id, with `from` naming th
 
 ## `POST /api/session/open`
 
-Opens a Claude session for a local project because its user asked for one, from the local picker (`integrations/pick-local-session.py`). The start runs the same sequence as a [start for a relayed message](#starting-a-session-that-is-not-running): the session opens in the agterm workspace the project's agent was last seen in, and a fresh read of Claude Code's session list makes sure the folder has no session already. It differs in three ways, since the person asking is at the machine: it needs no `auto_start.json` grant, Claude Code's trust prompt is left for them to answer, and the new session is selected rather than started in the background.
+Opens a Claude session for a local project because its user asked for one, from the local picker (`integrations/pick-local-session.py`). The start runs the same sequence as a [start for a relayed message](#starting-a-session-that-is-not-running): the session opens in the agterm workspace the project's agent was last seen in, and a fresh read of Claude Code's session list makes sure the folder has no session already. It differs in three ways, since the person asking is at the machine: the folder is named rather than resolved from an id, Claude Code's trust prompt is left for them to answer, and the new session is selected rather than started in the background.
 
 ```json
 { "dir": "/Users/you/Projects/my-app" }
@@ -507,17 +490,3 @@ Both machines can observe a read and neither can observe the other's: the origin
 `attended_at` is **our own content watermark echoed back** — the newest thing the reporter had of this row, which is a number this machine minted. It needs no clock agreement, and it cannot be read as a time anybody was at a keyboard. It is clamped on arrival to the row's current watermark, because the stamp only ever moves forward: unclamped, a value from the far future would mark the row read for every turn it ever has. A value *below* ours is kept as sent — the reporter's dialog copy lags while a pull is outstanding, and the row then stays unread here, which leaves the work showing.
 
 Answers `{"recorded": true}`, with `reason: "no_change"` when the row was already read or this machine has `attention_tracking` off; `400` without a `chat_id`, `404` when no local row derives it. The sender does not retry: a lost report leaves that row showing on the machine that owns it, and a retry would need a per-row record of what the far side had taken — the kind of guess about another device's contents this protocol removed everywhere else.
-
-### `POST /api/sync/grant`
-
-One machine telling another that its user approved starting a project. The only route in the system that writes a **standing permission** on another computer — everything else acts once and is done.
-
-```json
-{ "origin_device": "air", "project": "transcripts", "dir": "/Users/you/Projects/transcripts" }
-```
-
-Answers `{"granted": true}`, or `granted: false` with a `reason` and `detail`. The click is not the authority: the peer re-runs every check it would run at start time — the path derives the id it is filed under, the directory exists, Claude Code trusts it, and this machine has a terminal it can start a session in at all — against its own disk, and requires the bound identity above. A peer cannot grant anything the receiving dashboard would not have granted about its own filesystem. The capability check is there because a permission outlives the message, the session and the reboot, so a machine that could never honour one declines to store it rather than accepting it and refusing every message that arrives against it. The single thing taken on faith is that a human clicked over there, which no design can verify across a machine boundary, and which is why this route accepts nothing weaker than a binding.
-
-One `reason` is this machine's own failure rather than anything the caller got wrong: `grant_not_recorded`, answered `500`, means the permission could not be written to `auto_start.json` and nothing is in force. It is reported rather than swallowed because a human pressed **Allow** on the other side — reporting success there would send them back round to re-send a message into a machine that still holds no grant for it.
-
-Grants live in `auto_start.json` in the app data directory, not in `config.json` — an install overwrites `config.json`, and a permission that vanished at the next deploy would have the user re-approving a project they had already allowed. The file is re-read on every use, so deleting a line withdraws the grant immediately.

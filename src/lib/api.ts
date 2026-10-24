@@ -172,45 +172,6 @@ export function onHistoryLoading(
   return listen<{ id: string; loading: boolean }>('history_loading', (evt) => handler(evt.payload))
 }
 
-// A peer has nothing running for a project a local agent messaged, and offered
-// directories it could start one in. The answer is a standing permission on
-// that machine, so the prompt is raised here — where a human plausibly is.
-export interface StartCandidate {
-  dir: string
-  trusted: boolean
-}
-
-export interface PendingStart {
-  id: string
-  device: string
-  project: string
-  target: string
-  from_agent: string
-  candidates: StartCandidate[]
-  requested_at: number
-  /** False once the requesting agent stopped waiting: approving still records
-   *  the permission for next time, but can no longer deliver that message. */
-  still_waiting: boolean
-}
-
-export function getStartApprovals(): Promise<PendingStart[]> {
-  return invoke<PendingStart[]>('get_start_approvals')
-}
-
-export function approveStart(requestId: string, dir: string): Promise<void> {
-  return invoke('approve_start', { requestId, dir })
-}
-
-export function dismissStart(requestId: string): Promise<void> {
-  return invoke('dismiss_start', { requestId })
-}
-
-export function onStartApprovalsUpdated(
-  handler: (pending: PendingStart[]) => void,
-): Promise<UnlistenFn> {
-  return listen<PendingStart[]>('start_approvals_updated', (evt) => handler(evt.payload))
-}
-
 // The stored dialog for a session with no live row. A row can be absent for a
 // conversation that is complete on disk — a session the restore could not vouch
 // for, one on a platform with no terminal adapter, or simply one that has ended —

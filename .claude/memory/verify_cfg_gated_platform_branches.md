@@ -74,10 +74,9 @@ runnable locally:
 The predicate's own agreement test fails while flipped, which is the point of
 having one: run the behavioural tests by name rather than the whole module. Used
 2026-10-08 on `can_launch`, which `check_startable` asks last, confirming both
-arms macOS cannot reach — an unlisted id still answers `NotListed`/
-`NoSuchProject` rather than `NoLauncher`, and a listed, present, trusted project
-answers `NoLauncher`, which is what `sync::post_grant` relies on to refuse a
-grant this machine could never honour. The design consequence is worth more than
+arms macOS cannot reach — an id nothing derives still answers `NoSuchProject`
+rather than `NoLauncher`, and a present, trusted project answers `NoLauncher`.
+The design consequence is worth more than
 the technique: one predicate behind one `cfg!()` is exercisable on both
 platforms, while the same fact spread over `#[cfg]` arms is only compilable.
 

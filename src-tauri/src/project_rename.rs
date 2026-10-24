@@ -4,8 +4,7 @@
 //! so renaming `my-app` to `my-app-renamed` makes every store keyed by the id
 //! point at a row that will never be written again: the history stays under the
 //! old key, a resumed session's anchor keeps landing on the old row while new
-//! sessions land on the new one, and a custom name or a start grant stops
-//! applying. Nothing can tell a rename from a different project from the outside,
+//! sessions land on the new one, and a custom name stops applying. Nothing can tell a rename from a different project from the outside,
 //! so the move is announced: `POST /api/project/rename` (`http_server`) runs
 //! [`rename_project`], which re-keys every local store in one pass, and the
 //! rename then rides every sync push ([`RenameLog`]) so a peer re-files its
@@ -23,7 +22,6 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager};
 
 use crate::adapters::claude::derive_chat_id;
-use crate::auto_start_store::AutoStartStore;
 use crate::chat_id_registry::ChatIdRegistry;
 use crate::commands::RowLocks;
 use crate::config::ConfigState;
@@ -100,14 +98,13 @@ fn relocate(dir: &str, old_root: &str, new_root: &str) -> Option<String> {
 #[derive(Debug, Clone, PartialEq)]
 pub struct DirMove {
     pub old_dir: String,
-    pub new_dir: String,
     pub from: String,
     pub to: String,
 }
 
 /// Every directory a move of `old_path` to `new_path` relocates: the folder
 /// itself, plus each known directory beneath it (`known` is Claude Code's
-/// project index and the start grants). A subfolder needs its own entry because
+/// project index). A subfolder needs its own entry because
 /// with `projects_root` set its id contains the parent's name, so it changes
 /// too; with `projects_root` unset its id is its own name and stays, which the
 /// caller sees as `from == to`.
@@ -123,7 +120,7 @@ pub fn plan_moves(old_path: &str, new_path: &str, known: &[String], projects_roo
             let new_dir = relocate(&old_dir, old_path, new_path)?;
             let from = derive_chat_id(Some(&old_dir), projects_root);
             let to = derive_chat_id(Some(&new_dir), projects_root);
-            Some(DirMove { old_dir, new_dir, from, to })
+            Some(DirMove { old_dir, from, to })
         })
         .collect()
 }
@@ -202,8 +199,6 @@ pub struct IdReport {
 pub struct RenameReport {
     /// One entry per id that changed: the folder's own, then any subfolder's.
     pub ids: Vec<IdReport>,
-    /// Start grants re-pointed at the new location, whether or not their id changed.
-    pub start_grants: usize,
     /// Rows whose session had ended without telling the dashboard, removed so
     /// their dialog could move.
     pub cleared_rows: usize,
@@ -322,9 +317,7 @@ pub fn rename_project(app: &AppHandle, old_path: &str, new_path: &str, now: i64)
     // file the history under a name no folder derives.
     check_moved(old_path, new_path)?;
     let projects_root = app.try_state::<ConfigState>().and_then(|c| c.snapshot().projects_root);
-    let grants = app.try_state::<AutoStartStore>();
-    let mut known = crate::session_launcher::indexed_dirs().ok_or(RenameRefusal::IndexUnreadable)?;
-    known.extend(grants.iter().flat_map(|g| g.snapshot().into_values()));
+    let known = crate::session_launcher::indexed_dirs().ok_or(RenameRefusal::IndexUnreadable)?;
     let moves = order_moves(plan_moves(old_path, new_path, &known, projects_root.as_deref()))?;
     let renamed: Vec<&DirMove> = moves.iter().filter(|m| m.from != m.to).collect();
 
@@ -404,14 +397,13 @@ pub fn rename_project(app: &AppHandle, old_path: &str, new_path: &str, now: i64)
             log.record(&m.from, &m.to, now);
         }
     }
-    let start_grants = grants.as_ref().map_or(0, |g| moves.iter().filter(|m| g.move_grant(&m.from, &m.old_dir, &m.to, &m.new_dir) == KeyMove::Moved).count());
     if !renamed.is_empty() {
         if let Some(dirty) = app.try_state::<crate::sync::SyncDirty>() {
             dirty.0.notify_one();
         }
     }
 
-    let report = RenameReport { ids: reports, start_grants, cleared_rows: present.len(), live_sessions_checked: live_ids.is_some() };
+    let report = RenameReport { ids: reports, cleared_rows: present.len(), live_sessions_checked: live_ids.is_some() };
     for r in &report.ids {
         tracing::info!(
             chat_id = %r.to,
@@ -472,11 +464,10 @@ mod tests {
     }
 
     #[test]
-    fn without_a_projects_root_a_subfolder_keeps_its_id_and_only_its_path_moves() {
+    fn without_a_projects_root_a_subfolder_keeps_its_id() {
         let known = vec!["/p/bga/assistant".to_string()];
         let moves = plan_moves("/p/bga", "/p/games", &known, None);
         assert_eq!(moves[1].from, moves[1].to, "its id is its own name");
-        assert_eq!(moves[1].new_dir, "/p/games/assistant", "but a start grant still needs the new path");
     }
 
     /// `bga` → `bga-assistant` beside `bga/assistant`: the parent's new id is
@@ -491,7 +482,7 @@ mod tests {
 
     #[test]
     fn a_move_landing_on_an_id_still_to_be_carried_away_is_refused() {
-        let mv = |old_dir: &str, from: &str, to: &str| DirMove { old_dir: old_dir.into(), new_dir: String::new(), from: from.into(), to: to.into() };
+        let mv = |old_dir: &str, from: &str, to: &str| DirMove { old_dir: old_dir.into(), from: from.into(), to: to.into() };
         let tangled = vec![mv("/p/a/b", "x", "y"), mv("/p/c/d", "y", "z")];
         assert_eq!(order_moves(tangled), Err(RenameRefusal::Tangled("y".into())));
     }

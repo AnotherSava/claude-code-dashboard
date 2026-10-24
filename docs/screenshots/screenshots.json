@@ -93,7 +93,7 @@
           "FRAME: `dash.add_hairline` runs the screenshot skill's `hairline.py --require`, which strokes the edge in place. The capture as it stands just before that step — after the halo trim and the sRGB conversion — is committed beside the frame, in docs/screenshots/raw/ under the same name; a --probe run keeps none."
         ]
       },
-      "verifiedAt": "ccecb94"
+      "verifiedAt": "2b3fd81"
     },
     {
       "id": "terminal-tabs-windows",

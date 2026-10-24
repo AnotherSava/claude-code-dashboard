@@ -88,7 +88,6 @@ Under the repo root `claude-code-dashboard/`:
       - `SessionItem.svelte` — per-row rendering (status badge, timer, tokens, label)
       - `SetupPanel.svelte` — onboarding panel: bundled hook snippet, copy-to-clipboard, hide affordance
       - `LimitBar.svelte` — header 5h / 7d usage bar (segmented fill, percent + timer caps)
-      - `StartApprovals.svelte` — the prompt asking you to approve starting a session on another machine
 - `src-tauri/`
   - `Cargo.toml` — Rust deps: tauri, axum, notify, tracing, serde, reqwest, chrono, open
   - `tauri.conf.json` — NSIS + DMG bundle targets, WebView2 bootstrapper, window config
@@ -106,13 +105,11 @@ Under the repo root `claude-code-dashboard/`:
     - `tailnet.rs` — asking Tailscale which machine a connection came from, instead of trusting its envelope
     - `subprocess.rs` — running a helper program to a deadline, with no console window on Windows
     - `peer_message.rs` — relaying one message to an agent on another machine, and the honesty rules around it
-    - `start_approval.rs` — asking this machine's user to approve starting a session on another one
     - `session_launcher.rs` — starting a terminal session for a project that has none, for a relayed message or for the local picker (`integrations/pick-local-session.py`, through `POST /api/session/open`); it names no terminal, asking the platform's `terminals::TerminalAdapter` to launch the session (agterm's adapter on macOS, its workspace placement included), so a launcher for another terminal is that terminal's adapter implementing `launch`
-    - `auto_start_store.rs` — the `chat_id → absolute path` grants that permit those starts, in `auto_start.json`
     - `workspace_memory.rs` — the agterm window and workspace each project's agent was last seen in, so a started session opens there, in `agterm_workspaces.json`
     - `session_restore.rs` — giving a live session its row back after a restart
     - `alive_stamp.rs` — the previous run's last heartbeat, which tells `session_restore` a session started while the dashboard was down
-    - `project_rename.rs` — carrying a project's history, anchors, name and start grant over to the id its renamed folder derives, and announcing the rename to peers
+    - `project_rename.rs` — carrying a project's history, anchors and name over to the id its renamed folder derives, and announcing the rename to peers
     - `log_watcher.rs` — per-session transcript tailing + infer_state + assistant text upsert
     - `membership.rs` — which live sessions belong to a row and which one (its main) drives it
     - `liveness.rs` — process-liveness primitives
@@ -173,7 +170,7 @@ Under the repo root `claude-code-dashboard/`:
 ### Where state lives at runtime
 
 - **In-memory** — `AppState` (local and remote sessions) and `ConfigState` (config) via `tauri::State`, alongside the other managed stores the frontend and the HTTP routes read.
-- **On disk** — `config.json`, `widget.jsonl`, `prompt_history.json`, `session_chat_ids.json`, `custom_names.json`, `auto_start.json`, `agterm_workspaces.json`, `alive_stamp.json`, `project_renames.json`, `usage_history.jsonl`, `usage_cache.json`, `token_history.jsonl`, `token_scan_cursor.json`, and the `remote_history/`, `remote_usage/` and `remote_tokens/` directories under `app_data_dir()`:
+- **On disk** — `config.json`, `widget.jsonl`, `prompt_history.json`, `session_chat_ids.json`, `custom_names.json`, `agterm_workspaces.json`, `alive_stamp.json`, `project_renames.json`, `usage_history.jsonl`, `usage_cache.json`, `token_history.jsonl`, `token_scan_cursor.json`, and the `remote_history/`, `remote_usage/` and `remote_tokens/` directories under `app_data_dir()`:
   - Windows: `%APPDATA%\com.anothersava.claude-code-dashboard\`
   - macOS: `~/Library/Application Support/com.anothersava.claude-code-dashboard/`
 

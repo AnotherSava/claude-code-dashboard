@@ -37,15 +37,7 @@ enough on its own. The frame this replaces carries a row for a private project,
 which is the whole reason it is being re-shot, so the check is not hypothetical.
 
 The check reads the roster's `agents` array, so it covers the session rows and
-nothing else. ONE THING ON SCREEN IS OUTSIDE ITS REACH: the pending-start
-approvals panel the widget draws above the session list. It prints the requesting
-device and project as one `<device>/<project>` string, and under it the project's
-full directory path on that machine. Those requests reach the frontend over the
-Tauri command `get_start_approvals` and appear on no HTTP route, so no request
-this script can make would ever see one. This is the sync-on variant, so a peer
-agent asking to start a session here during the shot is a live case rather than a
-hypothetical: answer or dismiss any pending request before the shutter, and read
-the top of the frame by eye before committing it.
+nothing else.
 
 The allowed names are `dash.PUBLISHABLE_PROJECTS`, which `--publishable` replaces, and the
 operator owns that list. It lives in the lib because three scripts enforce the

@@ -3,7 +3,6 @@ mod agterm;
 mod alive_stamp;
 mod attention;
 mod auto_resize;
-mod auto_start_store;
 mod chat_id_registry;
 mod commands;
 mod config;
@@ -33,7 +32,6 @@ mod session_launcher;
 mod session_registry;
 mod session_restore;
 mod setup;
-mod start_approval;
 mod state;
 mod subagent_gate;
 mod subprocess;
@@ -166,7 +164,6 @@ pub fn run() {
         // the frontend, so the builder is early enough — the build()/run()
         // gap is for state a webview can race at mount.
         .manage(session_launcher::StartGuard::default())
-        .manage(start_approval::ApprovalQueue::default())
         .manage(peer_message::MessageDedupe::default())
         .manage(peer_message::MessageIds::default())
         .manage(tailnet::TailnetResolver::default())
@@ -199,9 +196,6 @@ pub fn run() {
             commands::set_window_size,
             commands::set_compact_width,
             commands::get_persisted_dialog,
-            commands::get_start_approvals,
-            commands::approve_start,
-            commands::dismiss_start,
         ])
         .setup(|app| {
             // Runs at `RunEvent::Ready`, AFTER the webviews exist — so it does
@@ -483,9 +477,6 @@ pub fn run() {
     ));
     app.manage(project_rename::RenameLog::new(
         app_data.join("project_renames.json"),
-    ));
-    app.manage(auto_start_store::AutoStartStore::new(
-        app_data.join(auto_start_store::FILE_NAME),
     ));
     app.manage(std::sync::Arc::new(workspace_memory::WorkspaceMemory::new(
         app_data.join(workspace_memory::FILE_NAME),

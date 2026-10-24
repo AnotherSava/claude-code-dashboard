@@ -1,7 +1,6 @@
 <script lang="ts">
   import { onMount, tick } from 'svelte'
   import SessionList from './lib/components/SessionList.svelte'
-  import StartApprovals from './lib/components/StartApprovals.svelte'
   import SetupPanel from './lib/components/SetupPanel.svelte'
   import HistoryApp from './HistoryApp.svelte'
   import AboutApp from './AboutApp.svelte'
@@ -13,7 +12,6 @@
     getConfig,
     getSessions,
     getSetupState,
-    getStartApprovals,
     getUsageLimits,
     getWindowLabel,
     getWindowLabelSync,
@@ -22,8 +20,6 @@
     onRefitWindow,
     onSessionsUpdated,
     onShowSetupInstructions,
-    onStartApprovalsUpdated,
-    type PendingStart,
     onUsageLimitsUpdated,
     refreshUsageLimits,
     setCompactWidth,
@@ -100,7 +96,6 @@
     }
   })
   let sessions = $state<AgentSession[]>([])
-  let startApprovals = $state<PendingStart[]>([])
   let config = $state<Config | null>(null)
   let usage = $state<UsageLimits | null>(null)
   let setup = $state<SetupState | null>(null)
@@ -449,7 +444,6 @@
   // window resize.
   $effect(() => {
     sessions
-    startApprovals
     usage
     config?.auto_resize
     config?.compact_mode
@@ -526,7 +520,6 @@
   })
 
   onMount(() => {
-    let unlistenApprovals: (() => void) | undefined
     let unlistenSessions: (() => void) | undefined
     let unlistenConfig: (() => void) | undefined
     let unlistenUsage: (() => void) | undefined
@@ -550,7 +543,6 @@
         }
         config = await getConfig()
         sessions = await getSessions()
-        startApprovals = await getStartApprovals()
         usage = await getUsageLimits()
         setup = await getSetupState()
         frontendLog('trace', 'mount snapshot', {
@@ -558,9 +550,6 @@
           seven_day_present: usage?.seven_day != null,
           status: usage?.status,
         }).catch(() => {})
-        unlistenApprovals = await onStartApprovalsUpdated((p) => {
-          startApprovals = p
-        })
         unlistenSessions = await onSessionsUpdated((s) => {
           frontendLog('trace', 'event sessions_updated', { sessions: s.length }).catch(() => {})
           sessions = s
@@ -677,7 +666,6 @@
       document.removeEventListener('visibilitychange', onVisibility)
       window.removeEventListener('resize', onWindowResize)
       dprMedia?.removeEventListener('change', onDprChange)
-      unlistenApprovals?.()
       unlistenSessions?.()
       unlistenConfig?.()
       unlistenUsage?.()
@@ -737,7 +725,6 @@
     </div>
     <button class="hide-btn" class:shown={headerHovered} onclick={onHide} aria-label="Hide to tray" title="Hide to tray">×</button>
   </header>
-  <StartApprovals pending={startApprovals} />
   {#if config}
     {#if showSetup && setup}
       <SetupPanel

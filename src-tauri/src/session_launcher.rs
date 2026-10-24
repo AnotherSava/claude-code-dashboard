@@ -2,8 +2,8 @@
 //!
 //! The relay can only ever reach an agent a human already started, so
 //! `InboxLookup::NotFound` has until now been the end of the story. This module
-//! is the other answer: for a project its owner has explicitly listed, open a
-//! real terminal session in that directory, the same way they would have.
+//! is the other answer: for a project this machine knows, open a real terminal
+//! session in its directory, the same way the user would have.
 //!
 //! **The session is a first-class one, not a worker.** That is a requirement,
 //! not a nicety, and it is what dictates the command each terminal adapter's
@@ -14,19 +14,20 @@
 //! session. A terminal window is the stop button, and it only exists if the
 //! session is one the user can walk up to, type in, and close.
 //!
-//! **The grant.** Listing a project here is a standing invitation. From then on
-//! any agent on any device holding the shared sync token can, at any hour and
-//! with nobody at this computer, open a terminal here and start Claude Code in
-//! that directory — with these permission settings, these hooks, these
-//! credentials and this file access. It is not the approval of a message; it is
-//! the approval that a session may come into existence without you. The device
-//! half of the sender's identity is attestable and is required to be
-//! (`tailnet::bound`, an explicit `sync.peer_identity` entry — not merely
-//! `Attested`, which also accepts an unbound name that happens to match the
-//! node's own and so lets a token-holder self-attest); the agent half is checked by
-//! nothing and cannot be, since the sending route is loopback and
-//! unauthenticated by design. List only directories you would be content to
-//! find an agent already working in.
+//! **Who may start one.** Any sender that may message a running session: a
+//! local process on the loopback route, and a peer device holding the shared
+//! sync token whose name a `sync.peer_identity` entry binds to its Tailscale
+//! node. A message to a running session already starts a turn with the user's
+//! permission settings, hooks and files, so a start adds an agent coming into
+//! existence unasked, and nothing a message could not already do. Consent to
+//! an agent running in a directory is Claude Code's own trust prompt: a
+//! directory never trusted is refused, never started.
+//!
+//! **Which directory.** A project id is derived from a directory and many
+//! directories can derive one id (with `projects_root` unset it is the
+//! basename), so the id is resolved against Claude Code's `~/.claude.json`
+//! index of every directory a session ran in, and a start happens only where
+//! exactly one existing directory derives it.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -61,17 +62,15 @@ pub const START_DEADLINE_MS: i64 = 10_000;
 
 /// Why a start did not happen. Each is a distinct thing for the sender to do
 /// about it, which is why they are separate slugs rather than one refusal with
-/// prose — a caller can branch on `not_listed` (ask the owner to add it) but
-/// never on `untrusted_directory` (nobody remote can fix that).
+/// prose — a caller can branch on `ambiguous_project` (address a running
+/// session instead) but never on `untrusted_directory` (nobody remote can fix
+/// that).
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum StartRefusal {
-    /// The project is not in `auto_start.json`. The default state, and the
-    /// answer for every project the owner has not opted in.
-    NotListed,
-    /// The listed directory does not derive the id it is filed under, so the
-    /// entry cannot mean what it says.
-    PathMismatch,
-    /// Listed, but the directory is not there any more.
+    /// More than one existing directory derives the project id, so the id does
+    /// not say which one was meant.
+    AmbiguousProject,
+    /// The directory the local picker named is not one.
     NoSuchDirectory,
     /// Claude Code has never been trusted in that directory. Starting anyway
     /// produces a live process parked on a modal prompt that publishes no
@@ -90,11 +89,8 @@ pub enum StartRefusal {
     /// Nothing on this machine derives that project id, so there is no session
     /// to message and nothing to start — the address names nothing here.
     ///
-    /// Split out of [`Self::NotListed`], which is *true* of this case and is the
-    /// wrong thing to say about it: its detail sends the caller to ask an owner
-    /// to list a project that does not exist. Reported by a sibling session that
-    /// probed both cases through the same-device route and got one answer,
-    /// byte-identical apart from the echoed target.
+    /// Its slug is the one the receiving route answers with, so a caller reads
+    /// one answer whichever route it hit.
     NoSuchProject,
 }
 
@@ -102,8 +98,7 @@ impl StartRefusal {
     /// The stable slug, for the receipt and the log line.
     pub fn slug(self) -> &'static str {
         match self {
-            Self::NotListed => "start_not_listed",
-            Self::PathMismatch => "start_path_mismatch",
+            Self::AmbiguousProject => "start_ambiguous_project",
             Self::NoSuchDirectory => "start_no_directory",
             Self::UntrustedDirectory => "start_untrusted_directory",
             Self::AlreadyStarting => "start_already_running",
@@ -122,34 +117,15 @@ impl StartRefusal {
     /// have to change, and by whom — a sender cannot act on most of these.
     pub fn detail(self) -> &'static str {
         match self {
-            Self::NotListed => "no session is running for that project and its owner has not listed it as startable",
-            Self::PathMismatch => "that project is listed as startable but its configured directory derives a different project id",
-            Self::NoSuchDirectory => "that project is listed as startable but its configured directory does not exist",
-            Self::UntrustedDirectory => "that project is listed as startable but Claude Code has not been trusted in its directory, so a session would stop at a prompt nobody is there to answer",
+            Self::AmbiguousProject => "more than one directory on this machine derives that project id, so it does not say which one to start a session in",
+            Self::NoSuchDirectory => "that directory does not exist",
+            Self::UntrustedDirectory => "Claude Code has not been trusted in that project's directory, so a session would stop at a prompt nobody is there to answer",
             Self::AlreadyStarting => "a session for that project is already being started",
             Self::NoLauncher => "this machine has no terminal this dashboard can start a session in",
             Self::NotRealized => "the terminal created a session but never gave it a surface, most likely because this machine's display is asleep, so no agent was started",
-            Self::NoSuchProject => "no existing directory on this machine derives that project id, so this is an address that names nothing here rather than a session that ended or a project awaiting a grant",
+            Self::NoSuchProject => "no existing directory on this machine derives that project id, so this is an address that names nothing here rather than a session that ended",
         }
     }
-}
-
-/// The directory to start `project` in, if the config says one and the config
-/// means it.
-///
-/// The second half is the point. `auto_start.json` is hand-written, its keys are
-/// `derive_chat_id` outputs, and a wrong key is invisible: filing
-/// `/Users/me/Projects/scheduler` under `transcripts` would silently send every
-/// message addressed to one project into the other's directory. Re-deriving the
-/// id from the listed path and requiring it to match makes the entry check
-/// itself, so the only way to start a directory is to have named it under the
-/// id it actually produces.
-pub fn listed_dir(project: &str, auto_start: &BTreeMap<String, String>, projects_root: Option<&str>) -> Result<PathBuf, StartRefusal> {
-    let dir = auto_start.get(project).map(|d| d.trim()).filter(|d| !d.is_empty()).ok_or(StartRefusal::NotListed)?;
-    if derive_chat_id(Some(dir), projects_root) != project {
-        return Err(StartRefusal::PathMismatch);
-    }
-    Ok(PathBuf::from(dir))
 }
 
 /// Claude Code's own top-level config file.
@@ -168,67 +144,18 @@ fn claude_config_file() -> Option<PathBuf> {
     std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(|h| PathBuf::from(h).join(".claude.json"))
 }
 
-/// Pure half of the trust check: does this config blob record `dir` as trusted?
-///
-/// Absence is **not** trusted. The map is an undocumented Claude Code internal
-/// that accumulates every directory a session ever ran in, so a missing entry
-/// means "never opened here", which is exactly the case that would stop at the
-/// trust prompt. Comparison is on the path as written after trailing-separator
-/// normalisation only — no canonicalisation, because a symlinked alias of a
-/// trusted directory is a *different* key to Claude Code too, and guessing
-/// otherwise would claim a trust decision that was never made.
-fn trusted_in(config: &serde_json::Value, dir: &Path) -> bool {
-    let Some(projects) = config.get("projects").and_then(|p| p.as_object()) else { return false };
-    let wanted = normalize_dir(&dir.to_string_lossy());
-    projects
-        .iter()
-        .any(|(k, v)| normalize_dir(k) == wanted && v.get("hasTrustDialogAccepted").and_then(serde_json::Value::as_bool).unwrap_or(false))
-}
-
-/// Separator- and trailing-slash-insensitive form, so a `D:\p\x` entry and a
-/// `D:/p/x` one are the same directory. Case is left alone: both filesystems
-/// here are case-insensitive but the ids derived from these paths are not, and
-/// folding here would let a differently-cased entry authorise a start under an
-/// id it does not produce.
-fn normalize_dir(path: &str) -> String {
-    path.replace('\\', "/").trim_end_matches('/').to_string()
-}
-
-/// A directory this machine could plausibly start `project` in, offered to the
-/// user when they are asked to approve one.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct StartCandidate {
-    pub dir: String,
-    /// Whether Claude Code has been trusted here. An untrusted candidate is
-    /// still shown, with this false, rather than filtered out: the user is
-    /// looking for a folder they recognise, and silently omitting the right one
-    /// would leave them concluding the dashboard cannot see it. What it needs is
-    /// a sentence telling them to open it in Claude Code once, not a hidden row.
-    pub trusted: bool,
-}
-
-/// Directories on this machine whose derived id is `project`.
-///
-/// The source is Claude Code's `~/.claude.json` projects map — the only index
-/// anywhere that holds real absolute paths. It is emphatically **not** an
-/// allowlist and is never used as one: it accumulates every directory a session
-/// was ever run in, including `C:\WINDOWS\system32` and directories that no
-/// longer exist. As a *suggestion* source it is exactly right, because the
-/// question here is "which of these did you mean", asked of the one party who
-/// can answer, and the answer still has to pass every check in
-/// [`check_startable`] afterwards.
-pub fn candidates_for(project: &str, projects_root: Option<&str>) -> Vec<StartCandidate> {
-    let Some(config) = claude_project_index() else {
-        return Vec::new();
-    };
-    candidates_in(&config, project, projects_root)
+/// An existing directory whose derived id is the project asked about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StartCandidate {
+    dir: String,
+    /// Whether Claude Code has been trusted here.
+    trusted: bool,
 }
 
 /// Claude Code's `~/.claude.json`, parsed, or `None` when it could not be read.
 ///
 /// Its own function because every caller needs the same bytes and they need the
-/// failure differently: [`candidates_for`] has nothing to suggest either way,
-/// [`check_startable`] treats an unreadable index as an untrusted directory —
+/// failure differently: [`check_startable`] treats an unreadable index as an untrusted directory —
 /// the conservative direction — and [`project_knowledge`] must not report it as
 /// an absent project at all.
 fn claude_project_index() -> Option<serde_json::Value> {
@@ -266,9 +193,8 @@ pub enum ProjectKnowledge {
 
 /// Ask [`ProjectKnowledge`] about one project id.
 ///
-/// Deliberately **not** `!candidates_for(..).is_empty()`: that reads an
-/// unreadable index as an empty one, which is the single answer this
-/// distinction exists to avoid.
+/// An unreadable index answers `Unreadable` and never `Unknown`, which is the
+/// single confusion this distinction exists to avoid.
 pub fn project_knowledge(project: &str, projects_root: Option<&str>) -> ProjectKnowledge {
     knowledge_in(claude_project_index().as_ref(), project, projects_root)
 }
@@ -287,8 +213,13 @@ fn knowledge_in(index: Option<&serde_json::Value>, project: &str, projects_root:
     if candidates_in(config, project, projects_root).is_empty() { ProjectKnowledge::Unknown } else { ProjectKnowledge::Known }
 }
 
-/// Pure half of [`candidates_for`], so the filtering is testable without a
-/// Claude Code install.
+/// The existing directories in Claude Code's index whose derived id is
+/// `project`, trusted first.
+///
+/// The index accumulates every directory a session was ever run in, including
+/// system directories and ones that no longer exist, so it is read as the set
+/// of places the id could mean and never as an allowlist: what a start needs
+/// beyond membership is decided in [`resolve_dir`].
 fn candidates_in(config: &serde_json::Value, project: &str, projects_root: Option<&str>) -> Vec<StartCandidate> {
     let Some(projects) = config.get("projects").and_then(|p| p.as_object()) else { return Vec::new() };
     let mut out: Vec<StartCandidate> = projects
@@ -314,47 +245,37 @@ fn candidates_in(config: &serde_json::Value, project: &str, projects_root: Optio
 ///
 /// Split from the launch ([`TerminalAdapter::launch`]) so the whole policy is
 /// testable without spawning anything, and so a refusal costs no process.
-///
-/// Includes [`can_launch`], which is what lets a caller validating a *grant*
-/// through this function — `sync::post_grant` — rely on it to record nothing
-/// a launch would later refuse.
-pub fn check_startable(project: &str, auto_start: &BTreeMap<String, String>, projects_root: Option<&str>, launcher: Option<&dyn TerminalAdapter>) -> Result<PathBuf, StartRefusal> {
-    let dir = match listed_dir(project, auto_start, projects_root) {
-        Ok(dir) => dir,
-        // Asked about an id nothing here derives, "its owner has not listed it
-        // as startable" is true and useless: it points at a grant for a project
-        // that does not exist. The existence question is only asked once
-        // `listed_dir` has already said no, so the documented ordering — a
-        // listing answer before anything else — is unchanged, and a `PathMismatch`
-        // keeps its own reason because there the entry does exist.
-        //
-        // An index we could not read leaves `NotListed` standing, for the reason
-        // it leaves `no_such_session` standing on the receiving route: our own
-        // failure to read a file must not become a claim about the caller's
-        // address.
-        Err(StartRefusal::NotListed) if project_knowledge(project, projects_root) == ProjectKnowledge::Unknown => return Err(StartRefusal::NoSuchProject),
-        Err(refusal) => return Err(refusal),
-    };
-    if !dir.is_dir() {
-        return Err(StartRefusal::NoSuchDirectory);
-    }
-    match claude_project_index() {
-        Some(config) if trusted_in(&config, &dir) => {}
-        // An unreadable config file is treated the same as an untrusted
-        // directory. It is the conservative direction and the honest one: we
-        // could not establish the trust decision, and a start that stops at the
-        // prompt leaves an orphan window on an unattended machine.
-        _ => return Err(StartRefusal::UntrustedDirectory),
-    }
+pub fn check_startable(project: &str, projects_root: Option<&str>, launcher: Option<&dyn TerminalAdapter>) -> Result<PathBuf, StartRefusal> {
+    let dir = resolve_dir(claude_project_index().as_ref(), project, projects_root)?;
     // Asked last, so every refusal naming something about *this project* is
     // reached first. A machine with no launcher must still answer
-    // `unknown_project` for an id nothing here derives and `NotListed` for one
-    // awaiting a grant, or its own missing capability would mask what the
-    // caller got wrong about the address.
+    // `unknown_project` for an id nothing here derives, or its own missing
+    // capability would mask what the caller got wrong about the address.
     if !can_launch(launcher) {
         return Err(StartRefusal::NoLauncher);
     }
     Ok(dir)
+}
+
+/// The one directory `project` names on this machine, if it names exactly one
+/// and Claude Code has been trusted there.
+///
+/// The ambiguity is counted over every existing directory deriving the id,
+/// trusted or not: starting the one trusted directory beside an untrusted twin
+/// would answer a question the id never settled.
+///
+/// An unreadable index is treated as an untrusted directory. It is the
+/// conservative direction and the honest one: the trust decision could not be
+/// established, and a start that stops at the prompt leaves an orphan session
+/// on an unattended machine.
+fn resolve_dir(index: Option<&serde_json::Value>, project: &str, projects_root: Option<&str>) -> Result<PathBuf, StartRefusal> {
+    let index = index.ok_or(StartRefusal::UntrustedDirectory)?;
+    match candidates_in(index, project, projects_root).as_slice() {
+        [] => Err(StartRefusal::NoSuchProject),
+        [one] if one.trusted => Ok(PathBuf::from(&one.dir)),
+        [_] => Err(StartRefusal::UntrustedDirectory),
+        _ => Err(StartRefusal::AmbiguousProject),
+    }
 }
 
 /// One start at a time per project, so the 5s registry cache cannot turn two
@@ -425,14 +346,13 @@ pub enum StartResult {
 /// - **A launch that produced no surface is closed, not left behind.**
 pub async fn start_and_wait(
     project: &str,
-    auto_start: &BTreeMap<String, String>,
     projects_root: Option<&str>,
     registry: &crate::session_registry::SessionRegistry,
     guard: &StartGuard,
     launcher: Option<Box<dyn TerminalAdapter>>,
     now: i64,
 ) -> StartResult {
-    let dir = match check_startable(project, auto_start, projects_root, launcher.as_deref()) {
+    let dir = match check_startable(project, projects_root, launcher.as_deref()) {
         Ok(dir) => dir,
         Err(refusal) => return StartResult::Refused(refusal),
     };
@@ -444,10 +364,9 @@ pub async fn start_and_wait(
 /// here, from the local picker (`integrations/pick-local-session.py`), and
 /// wait for it as [`start_and_wait`] does.
 ///
-/// Two of that function's checks are for a start nobody is watching, and are
-/// skipped here: the `auto_start.json` grant, since the person asking is the
-/// owner, and Claude Code's trust prompt, which they are in front of to
-/// answer. The session is selected rather than started in the background,
+/// The directory comes from the user rather than from an id, so nothing is
+/// resolved, and Claude Code's trust prompt is not checked, since they are in
+/// front of it to answer. The session is selected rather than started in the background,
 /// since it is the thing they asked to see. A project already running answers
 /// `Settled { started: false }`, which the picker answers by raising its tab.
 pub async fn open_and_wait(
@@ -575,16 +494,8 @@ async fn await_inbox(registry: &crate::session_registry::SessionRegistry, projec
     }
 }
 
-/// Whether this machine can start a session at all — asked before a directory
-/// is offered or a grant recorded, not only when a start is attempted.
-///
-/// Leaving the question to the launch alone costs something real: the
-/// sender's approval prompt is gated on [`StartRefusal::NotListed`]'s slug, so
-/// a machine that offers its directories and refuses `NoLauncher` only
-/// afterwards asks its user to approve a grant that can never produce a
-/// session — and the grant, once recorded, replaces that slug and so silences
-/// the prompt for good.
-pub fn can_launch(launcher: Option<&dyn TerminalAdapter>) -> bool {
+/// Whether this machine can start a session at all.
+fn can_launch(launcher: Option<&dyn TerminalAdapter>) -> bool {
     launcher.is_some_and(|l| l.can_launch())
 }
 
@@ -592,27 +503,88 @@ pub fn can_launch(launcher: Option<&dyn TerminalAdapter>) -> bool {
 mod tests {
     use super::*;
 
-    fn listing(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
-        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    /// An index naming `dirs` as existing directories, each with its trust flag.
+    fn index_of(dirs: &[(&str, bool)]) -> serde_json::Value {
+        let projects: serde_json::Map<String, serde_json::Value> = dirs.iter().map(|(d, t)| (d.to_string(), serde_json::json!({"hasTrustDialogAccepted": t}))).collect();
+        serde_json::json!({ "projects": projects })
     }
 
-    /// The default is off, and off means every project.
-    #[test]
-    fn an_empty_listing_starts_nothing() {
-        assert_eq!(listed_dir("transcripts", &BTreeMap::new(), None), Err(StartRefusal::NotListed));
+    /// A temporary tree holding `rel` directories, removed when dropped.
+    struct Tree(PathBuf);
+    impl Tree {
+        fn new(tag: &str, rel: &[&str]) -> Self {
+            let root = std::env::temp_dir().join(format!("resolve_{tag}_{}", std::process::id()));
+            for r in rel {
+                std::fs::create_dir_all(root.join(r)).unwrap();
+            }
+            Self(root)
+        }
+        fn path(&self, rel: &str) -> String {
+            self.0.join(rel).to_string_lossy().to_string()
+        }
+    }
+    impl Drop for Tree {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 
-    /// The listing question is answered without consulting the project index, so
-    /// the documented ordering holds and [`check_startable`] is the only thing
-    /// that can upgrade a `NotListed` to a `NoSuchProject`.
+    /// One trusted directory deriving the id is the whole of what a start needs
+    /// to know about the project.
     #[test]
-    fn listed_dir_answers_only_about_the_listing() {
-        let cfg = listing(&[("transcripts", "/Users/me/Projects/transcripts")]);
-        assert_eq!(
-            listed_dir("zz-derives-nowhere-4f2a", &cfg, None),
-            Err(StartRefusal::NotListed),
-            "an id nothing derives is still only unlisted as far as this function can see"
-        );
+    fn one_trusted_directory_resolves() {
+        let t = Tree::new("one", &["web"]);
+        let index = index_of(&[(&t.path("web"), true)]);
+        assert_eq!(resolve_dir(Some(&index), "web", None), Ok(PathBuf::from(t.path("web"))));
+    }
+
+    /// Two directories deriving one id is the many-to-one case, and the id does
+    /// not say which was meant. An untrusted twin still counts, or the start
+    /// would pick the trusted one for a question the id never settled.
+    #[test]
+    fn two_directories_deriving_the_id_are_refused_even_when_one_is_untrusted() {
+        let t = Tree::new("two", &["a/web", "b/web"]);
+        let both = index_of(&[(&t.path("a/web"), true), (&t.path("b/web"), true)]);
+        assert_eq!(resolve_dir(Some(&both), "web", None), Err(StartRefusal::AmbiguousProject));
+        let twin = index_of(&[(&t.path("a/web"), true), (&t.path("b/web"), false)]);
+        assert_eq!(resolve_dir(Some(&twin), "web", None), Err(StartRefusal::AmbiguousProject));
+    }
+
+    /// The id is derived the way the roster derives it, so a `projects_root`
+    /// separates what the bare basename would merge.
+    #[test]
+    fn the_projects_root_separates_same_named_directories() {
+        let t = Tree::new("root", &["a/web", "b/web"]);
+        let index = index_of(&[(&t.path("a/web"), true), (&t.path("b/web"), true)]);
+        let root = t.0.to_string_lossy().to_string();
+        assert_eq!(resolve_dir(Some(&index), "a web", Some(&root)), Ok(PathBuf::from(t.path("a/web"))));
+    }
+
+    /// Claude Code's own trust prompt is the consent, so a directory never
+    /// trusted is refused rather than started into a prompt nobody answers.
+    #[test]
+    fn an_untrusted_directory_is_refused() {
+        let t = Tree::new("untrusted", &["web"]);
+        let index = index_of(&[(&t.path("web"), false)]);
+        assert_eq!(resolve_dir(Some(&index), "web", None), Err(StartRefusal::UntrustedDirectory));
+        let silent = serde_json::json!({"projects": {t.path("web"): {}}});
+        assert_eq!(resolve_dir(Some(&silent), "web", None), Err(StartRefusal::UntrustedDirectory), "a missing flag is not a yes");
+    }
+
+    /// Nothing deriving the id, and the id only deriving from a directory gone
+    /// from disk, are the same fact: the address names nothing here.
+    #[test]
+    fn an_id_nothing_existing_derives_names_nothing() {
+        let index = index_of(&[("/no/such/directory/zzz-gone-4f2a", true)]);
+        assert_eq!(resolve_dir(Some(&index), "zzz-gone-4f2a", None), Err(StartRefusal::NoSuchProject));
+        assert_eq!(resolve_dir(Some(&index), "zz-derives-nowhere-4f2a", None), Err(StartRefusal::NoSuchProject));
+    }
+
+    /// An index that could not be read cannot establish trust, so it refuses in
+    /// the conservative direction rather than claiming the project is unknown.
+    #[test]
+    fn an_unreadable_index_refuses_as_untrusted() {
+        assert_eq!(resolve_dir(None, "web", None), Err(StartRefusal::UntrustedDirectory));
     }
 
     /// A caller must not have to know which route it hit to read the same fact,
@@ -621,83 +593,6 @@ mod tests {
     #[test]
     fn nothing_derives_it_is_one_slug_across_both_routes() {
         assert_eq!(StartRefusal::NoSuchProject.slug(), "unknown_project");
-        assert_ne!(StartRefusal::NoSuchProject.slug(), StartRefusal::NotListed.slug());
-    }
-
-    /// The detail is the half that misled: `NotListed` sends the reader to ask an
-    /// owner for a grant, which is the wrong instruction for a project that does
-    /// not exist, so this one must not repeat it.
-    #[test]
-    fn the_no_such_project_detail_does_not_ask_for_a_grant() {
-        let detail = StartRefusal::NoSuchProject.detail();
-        assert!(!detail.contains("listed as startable"), "must not point at a grant: {detail}");
-        assert!(detail.contains("names nothing here"), "must name the real fact: {detail}");
-        assert!(StartRefusal::NotListed.detail().contains("has not listed it"), "the grant wording belongs to the refusal that means it");
-    }
-
-    #[test]
-    fn a_listed_project_resolves_to_its_directory() {
-        let cfg = listing(&[("transcripts", "/Users/me/Projects/transcripts")]);
-        assert_eq!(listed_dir("transcripts", &cfg, None), Ok(PathBuf::from("/Users/me/Projects/transcripts")));
-        assert_eq!(listed_dir("scheduler", &cfg, None), Err(StartRefusal::NotListed), "listing one project does not list its neighbours");
-    }
-
-    /// The check that makes a hand-written map safe. Without it a mistyped key
-    /// silently aims one project's messages at another's directory, and every
-    /// downstream signal — the row, the title, the history — would agree with
-    /// the mistake.
-    #[test]
-    fn a_directory_filed_under_the_wrong_id_is_refused() {
-        let cfg = listing(&[("transcripts", "/Users/me/Projects/scheduler")]);
-        assert_eq!(listed_dir("transcripts", &cfg, None), Err(StartRefusal::PathMismatch));
-    }
-
-    /// The id is derived the same way the roster derives it, so a `projects_root`
-    /// deployment must file its entries under the root-relative form.
-    #[test]
-    fn the_id_is_derived_under_the_configured_projects_root() {
-        let cfg = listing(&[("games achievement overlay", "/Users/me/Projects/games/achievement-overlay")]);
-        assert_eq!(
-            listed_dir("games achievement overlay", &cfg, Some("/Users/me/Projects")),
-            Ok(PathBuf::from("/Users/me/Projects/games/achievement-overlay"))
-        );
-        assert_eq!(
-            listed_dir("games achievement overlay", &cfg, None),
-            Err(StartRefusal::PathMismatch),
-            "without the root the same path derives the bare basename, and the entry no longer means what it says"
-        );
-    }
-
-    #[test]
-    fn a_windows_style_path_derives_and_matches() {
-        let cfg = listing(&[("transcripts", r"D:\projects\transcripts")]);
-        assert_eq!(listed_dir("transcripts", &cfg, None), Ok(PathBuf::from(r"D:\projects\transcripts")));
-    }
-
-    /// Absence is not trust. The map records directories Claude Code has been
-    /// opened in, so "no entry" is precisely the case that stops at the prompt.
-    #[test]
-    fn trust_requires_an_explicit_accepted_flag() {
-        let cfg: serde_json::Value = serde_json::json!({
-            "projects": {
-                "/Users/me/Projects/yes": {"hasTrustDialogAccepted": true},
-                "/Users/me/Projects/no": {"hasTrustDialogAccepted": false},
-                "/Users/me/Projects/silent": {},
-            }
-        });
-        assert!(trusted_in(&cfg, Path::new("/Users/me/Projects/yes")));
-        assert!(!trusted_in(&cfg, Path::new("/Users/me/Projects/no")));
-        assert!(!trusted_in(&cfg, Path::new("/Users/me/Projects/silent")), "a missing flag is not a yes");
-        assert!(!trusted_in(&cfg, Path::new("/Users/me/Projects/absent")), "a directory never opened is not trusted");
-        assert!(!trusted_in(&serde_json::json!({}), Path::new("/Users/me/Projects/yes")), "no projects map, no trust");
-    }
-
-    #[test]
-    fn trust_matching_ignores_separator_style_and_trailing_slashes() {
-        let cfg: serde_json::Value = serde_json::json!({"projects": {r"D:\projects\transcripts": {"hasTrustDialogAccepted": true}}});
-        assert!(trusted_in(&cfg, Path::new("D:/projects/transcripts")));
-        assert!(trusted_in(&cfg, Path::new("D:/projects/transcripts/")));
-        assert!(!trusted_in(&cfg, Path::new("D:/projects/Transcripts")), "case is left alone; the ids these paths derive are case-sensitive");
     }
 
     /// A platform with no terminal adapter has nothing to start a session in.
@@ -713,10 +608,10 @@ mod tests {
     /// since that is the half the sender can act on.
     #[test]
     fn a_missing_launcher_does_not_mask_what_the_caller_got_wrong() {
-        let answer = check_startable("zz-derives-nowhere-4f2a", &BTreeMap::new(), None, None);
+        let answer = check_startable("zz-derives-nowhere-4f2a", None, None);
         assert!(
-            matches!(answer, Err(StartRefusal::NotListed) | Err(StartRefusal::NoSuchProject)),
-            "the listing and existence questions come first, got {answer:?}"
+            matches!(answer, Err(StartRefusal::NoSuchProject) | Err(StartRefusal::UntrustedDirectory)),
+            "the existence question comes first, got {answer:?}"
         );
     }
 
@@ -742,13 +637,12 @@ mod tests {
     }
 
     /// Every refusal is distinguishable in the log and in the receipt. A shared
-    /// slug would make "add me to the list" and "your directory is gone" the
-    /// same event to `/investigate`.
+    /// slug would make "which directory did you mean" and "nothing is trusted
+    /// there" the same event to `/investigate`.
     #[test]
     fn every_refusal_has_its_own_slug() {
         let all = [
-            StartRefusal::NotListed,
-            StartRefusal::PathMismatch,
+            StartRefusal::AmbiguousProject,
             StartRefusal::NoSuchDirectory,
             StartRefusal::UntrustedDirectory,
             StartRefusal::AlreadyStarting,
@@ -763,8 +657,7 @@ mod tests {
         // cover "every refusal".
         fn _every_variant_is_listed(r: StartRefusal) {
             match r {
-                StartRefusal::NotListed
-                | StartRefusal::PathMismatch
+                StartRefusal::AmbiguousProject
                 | StartRefusal::NoSuchDirectory
                 | StartRefusal::UntrustedDirectory
                 | StartRefusal::AlreadyStarting
@@ -809,7 +702,7 @@ mod tests {
         assert!(START_DEADLINE_MS < crate::sync::MESSAGE_HOP_TIMEOUT_SECS as i64 * 1_000);
     }
 
-    /// The suggestion source is Claude Code's index, so the filtering has to
+    /// The resolution source is Claude Code's index, so the filtering has to
     /// survive what is actually in it: system directories, stale renames, and
     /// entries never trusted.
     #[test]
@@ -839,7 +732,7 @@ mod tests {
         assert_eq!(found, vec![StartCandidate { dir: sibling_s, trusted: true }]);
 
         let untrusted = candidates_in(&config, &leaf, None);
-        assert_eq!(untrusted, vec![StartCandidate { dir: here_s, trusted: false }], "an untrusted folder is offered, not hidden — the user is looking for it");
+        assert_eq!(untrusted, vec![StartCandidate { dir: here_s, trusted: false }], "an untrusted folder is still a directory the id could mean");
 
         assert!(candidates_in(&config, "zzz-gone-4f2a", None).is_empty(), "a directory that is gone is not a candidate even though the index still lists it — this id DOES derive from a listed path, so only the is_dir filter can reject it");
         assert!(candidates_in(&config, "no-such-directory-anywhere", None).is_empty(), "and an id no listed path derives matches nothing, for the other reason");

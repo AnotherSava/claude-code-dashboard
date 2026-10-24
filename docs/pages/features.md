@@ -190,7 +190,7 @@ Sync also carries an optional second capability: an agent on one machine can sen
 
 A message can only ever reach an agent that's already running, so one sent to a project you don't happen to have open would normally come back saying nothing was delivered. The widget can answer that differently: it starts a session in the project folder and delivers the message into it. The session is an ordinary one. On a Mac it opens in a terminal tab, which stays open after the conversation is over and is waiting when you come back to the machine; on Windows it runs in the background, and you join it from that folder.
 
-Nothing starts without your say-so, and the asking happens where you actually are. The machine that would run the session is, by definition, the one nobody is sitting at — so the request appears in the widget on the machine you're *using*: who asked, what they wanted to reach, and the folders the other machine found matching that name. Allow it and the project is remembered over there, so it never asks again; the message that prompted it is delivered straight away. Ignore it and the asking agent gives up after a minute and a half and tells its own user that nothing arrived — nothing is queued and no message text is stored. The request stays in your widget either way, so a later yes still spares the next message the same trip. Allowing a project is a lasting decision, not a one-off: [Settings](settings) spells out what you're agreeing to.
+It starts one only in a folder Claude Code has been trusted in, and only where exactly one folder on that machine matches the project's name. Anything that can message your agents can start one this way, and [Settings](settings#starting-sessions-on-request) spells out what that covers.
 
 ## Configuration
 

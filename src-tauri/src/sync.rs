@@ -919,9 +919,8 @@ async fn post_message(
     };
     // Two tiers, and the difference matters exactly once: `attestation` decides
     // whose rows a push becomes and tolerates the unbound happy coincidence,
-    // while anything that *authorises* — starting a process, or disclosing this
-    // machine's directories so one can be approved — requires a binding this
-    // receiver wrote down. Without that split a node holding the fleet token
+    // while anything that *authorises* — starting a process — requires a
+    // binding this receiver wrote down. Without that split a node holding the fleet token
     // attests itself by truthfully naming itself, which is exactly the
     // circularity `peer_identity` exists to break.
     let sender_is_bound = app
@@ -940,9 +939,8 @@ async fn post_message(
 
     let mut inbox = registry.inbox_for(&env.target_project, cfg.projects_root.as_deref(), now);
 
-    // A project with nothing running is where this route used to end. If its
-    // owner listed it in `auto_start.json`, open a real terminal session for it
-    // instead and deliver into that.
+    // A project with nothing running is where this route used to end. Start a
+    // terminal session for it instead and deliver into that.
     //
     // Deliberately only from `NotFound`. `Ambiguous` already has two sessions
     // and `NoInbox` has one; adding a third would make either worse, and
@@ -951,88 +949,44 @@ async fn post_message(
     // agents in one directory.
     let mut started_session = false;
     let mut hosted_session = None;
-    // `listed_dir` runs before the attestation check, and the order matters:
-    // asked about a project nobody ever listed, the honest answer is that
-    // nothing is running for it, not that the caller failed a check for a start
-    // it never requested. Gating on attestation first would turn every
-    // dead-project reply into `403 start_unattested` for a `Claimed` peer — the
-    // normal state whenever whois cannot answer — the moment a single project
-    // was listed.
-    let startable = app.try_state::<crate::auto_start_store::AutoStartStore>().map(|s| s.snapshot()).unwrap_or_default();
-    let listed = crate::session_launcher::listed_dir(&env.target_project, &startable, cfg.projects_root.as_deref()).is_ok();
-
-    // Not listed, but this machine has directories that would derive the id: say
-    // so, and offer them. That answer is what lets the *sender's* user approve
-    // one — the prompt has to be raised where a human plausibly is, and only
-    // this machine can name its own directories.
-    //
-    // Attestation is required to receive them even though nothing is started:
-    // the list is a small disclosure of this machine's layout, and an
-    // unattested peer gets the plain absence instead. It is checked here rather
-    // than above the whole block so that a project nobody ever listed still
-    // answers `no_such_session` — the honest reply — instead of failing a check
-    // for a start it never asked for.
-    if matches!(inbox, InboxLookup::NotFound) && !listed && sender_is_bound {
-        let candidates = crate::session_launcher::candidates_for(&env.target_project, cfg.projects_root.as_deref());
-        if !candidates.is_empty() {
-            // There is nothing to approve on a machine with no launcher: the
-            // grant would be recorded and then refused by `launch` on every
-            // message, while the prompt the sender raises for this slug asks
-            // its user for exactly that permission. The capability is the
-            // honest answer, and it is the one a project already listed gets
-            // from `check_startable` a few lines down.
-            if !crate::session_launcher::can_launch(crate::terminals::for_platform(&app).as_deref()) {
-                return refuse_start(crate::session_launcher::StartRefusal::NoLauncher);
-            }
-            let r = receipt(Outcome::Refused)
-                .because("start_not_listed")
-                .detailed("nothing is running for that project and it is not listed as startable here; its owner can approve one of the offered directories")
-                .with_candidates(candidates);
-            tracing::info!(
-                chat_id = %env.target_project,
-                decision = "peer_refused",
-                peer_ip = %peer.ip(),
-                origin_device = %env.origin_device,
-                message_id = %env.message_id,
-                reason = "start_not_listed",
-                candidates = r.start_candidates.len(),
-                "relayed message refused, offering directories its owner could approve"
-            );
-            return (receipt_status(&r), Json(r));
-        }
-    }
-
-    if matches!(inbox, InboxLookup::NotFound) && listed {
+    if matches!(inbox, InboxLookup::NotFound) {
         // Starting a process on a peer's word needs the stronger half of the
         // identity check. `Claimed` is the fail-open answer — no whois reply, or
         // no binding configured — which is tolerable for writing into an agent
         // the user chose to run, and is not tolerable for causing one to exist.
+        //
+        // Asked only once the project is known to exist here, so an id nothing
+        // derives still answers `unknown_project` below, the honest reply,
+        // rather than failing a check for a start that could not have happened.
         if !sender_is_bound {
-            return refuse(
-                "start_unattested",
-                StatusCode::FORBIDDEN,
-                Some("starting a session requires a sync.peer_identity entry on this device binding the sending device name to its Tailscale node; without one the name is only claimed".into()),
-            );
-        }
-        let Some(guard) = app.try_state::<crate::session_launcher::StartGuard>() else {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(receipt(Outcome::Refused).because("state_unavailable")));
-        };
-        match crate::session_launcher::start_and_wait(&env.target_project, &startable, cfg.projects_root.as_deref(), &registry, &guard, crate::terminals::for_platform(&app), now).await {
-            crate::session_launcher::StartResult::Refused(refusal) => return refuse_start(refusal),
-            crate::session_launcher::StartResult::Settled { inbox: settled, started, hosted_name } => {
-                inbox = settled;
-                started_session = started;
-                hosted_session = hosted_name;
-                if started {
-                    tracing::info!(
-                        chat_id = %env.target_project,
-                        decision = "peer_start",
-                        peer_ip = %peer.ip(),
-                        origin_device = %env.origin_device,
-                        message_id = %env.message_id,
-                        reached_inbox = !matches!(inbox, InboxLookup::NotFound),
-                        "started a terminal session for a project with none"
-                    );
+            if crate::session_launcher::project_knowledge(&env.target_project, cfg.projects_root.as_deref()) == crate::session_launcher::ProjectKnowledge::Known {
+                return refuse(
+                    "start_unattested",
+                    StatusCode::FORBIDDEN,
+                    Some("starting a session requires a sync.peer_identity entry on this device binding the sending device name to its Tailscale node; without one the name is only claimed".into()),
+                );
+            }
+        } else {
+            let Some(guard) = app.try_state::<crate::session_launcher::StartGuard>() else {
+                return (StatusCode::INTERNAL_SERVER_ERROR, Json(receipt(Outcome::Refused).because("state_unavailable")));
+            };
+            match crate::session_launcher::start_and_wait(&env.target_project, cfg.projects_root.as_deref(), &registry, &guard, crate::terminals::for_platform(&app), now).await {
+                crate::session_launcher::StartResult::Refused(refusal) => return refuse_start(refusal),
+                crate::session_launcher::StartResult::Settled { inbox: settled, started, hosted_name } => {
+                    inbox = settled;
+                    started_session = started;
+                    hosted_session = hosted_name;
+                    if started {
+                        tracing::info!(
+                            chat_id = %env.target_project,
+                            decision = "peer_start",
+                            peer_ip = %peer.ip(),
+                            origin_device = %env.origin_device,
+                            message_id = %env.message_id,
+                            reached_inbox = !matches!(inbox, InboxLookup::NotFound),
+                            "started a terminal session for a project with none"
+                        );
+                    }
                 }
             }
         }
@@ -1076,14 +1030,12 @@ async fn post_message(
         // address, and reporting the first for the second is how a transport
         // error became a confident wrong claim that a live agent had gone away.
         // The distinguishing fact is already on this machine, in the same index
-        // `start_not_listed` offers directories from.
+        // a start resolves the id against.
         //
         // Answered to every peer, attested or not. What the two slugs disclose
         // is one bit — whether any project here derives that id — which is the
         // same kind of fact the existing `no_such_session`-versus-`written`
-        // difference already tells anyone who can reach this route. The
-        // *directory list* stays behind attestation, because naming this
-        // machine's layout is a real disclosure and a yes/no is not.
+        // difference already tells anyone who can reach this route.
         InboxLookup::NotFound => {
             return match crate::session_launcher::project_knowledge(&env.target_project, cfg.projects_root.as_deref()) {
                 crate::session_launcher::ProjectKnowledge::Unknown => refuse(
@@ -1225,9 +1177,9 @@ pub fn receipt_status(receipt: &Receipt) -> StatusCode {
             // every one falls to `400`, which tells a caller its request was
             // malformed when the truth is that the target is absent, the machine
             // declined, or it should try again in a moment.
-            Some("start_not_listed") | Some("start_path_mismatch") | Some("start_no_directory") => StatusCode::NOT_FOUND,
+            Some("start_no_directory") => StatusCode::NOT_FOUND,
             Some("start_unattested") | Some("messages_not_accepted") => StatusCode::FORBIDDEN,
-            Some("start_already_running") => StatusCode::CONFLICT,
+            Some("start_already_running") | Some("start_ambiguous_project") => StatusCode::CONFLICT,
             Some("start_untrusted_directory") | Some("start_no_launcher") | Some("start_not_realized") => StatusCode::SERVICE_UNAVAILABLE,
             // A local start: the session now exists, and the relay was still
             // declined — the same answer as `local_target`, and the same status,
@@ -1276,10 +1228,8 @@ enum HopAnswer {
 /// route, behind a permanent `200 unknown`.
 /// What a peer's bare status means when it carried no receipt.
 ///
-/// Shared by both hops because they must agree: the same peer condition — an
-/// unreachable route, a mistyped token — has to be reported identically whether
-/// it was a message or a grant that hit it, and two copies of a five-line map
-/// are exactly the shape that drifts.
+/// A peer condition — an unreachable route, a mistyped token — that produced
+/// no receipt of the peer's own.
 fn hop_status_reason(status: StatusCode) -> &'static str {
     match status.as_u16() {
         401 => "peer_rejected_token",
@@ -1357,154 +1307,6 @@ pub async fn send_message_hop(app: &AppHandle, origin_addr: &str, env: &MessageE
             let reason = if outcome == Outcome::Unreachable { "peer_unreachable" } else { "response_lost" };
             receipt(outcome).because(reason).detailed(crate::peer_message::redact(&e.to_string()))
         }
-    }
-}
-
-/// One machine telling another that its user approved starting a project.
-///
-/// It rides the same authenticated, source-scoped channel as everything else
-/// here, and it is the only thing in this crate that writes a **standing
-/// permission** on another computer — every other route acts once and is done.
-/// So it is the one place where "who asked" has to be more than a claim, and
-/// `post_grant` refuses anything short of [`crate::tailnet::Attestation::Attested`].
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GrantEnvelope {
-    pub origin_device: String,
-    /// The chat_id as the *receiving* machine derives it — the same string
-    /// `inbox_for` compares and a message addresses.
-    pub project: String,
-    /// The absolute directory on the receiving machine. Chosen by the user from
-    /// candidates that machine itself supplied, never composed by the sender.
-    pub dir: String,
-}
-
-/// What the receiver made of a grant. Deliberately not a [`Receipt`]: that type
-/// answers "what happened to my message", and every one of its fields would be
-/// empty or a lie here.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GrantReceipt {
-    pub granted: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reason: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub detail: Option<String>,
-}
-
-impl GrantReceipt {
-    fn refused(reason: &str, detail: impl Into<String>) -> Self {
-        Self { granted: false, reason: Some(reason.to_string()), detail: Some(detail.into()) }
-    }
-}
-
-/// Record a peer's user-approved permission to start a project here.
-///
-/// The approval was given on the *other* machine, which is the only place a
-/// human was, and that is the one fact this route takes on faith. Everything
-/// else is re-established locally: the directory is checked here, against this
-/// machine's filesystem, this machine's Claude Code trust state and whether
-/// this machine can start a session at all, by exactly the function that will
-/// gate the start itself. A peer cannot grant anything this dashboard would not
-/// have granted about its own disk.
-async fn post_grant(State(app): State<AppHandle>, ConnectInfo(peer): ConnectInfo<SocketAddr>, Json(env): Json<GrantEnvelope>) -> (StatusCode, Json<GrantReceipt>) {
-    let refuse = |reason: &str, status: StatusCode, detail: String| {
-        tracing::warn!(chat_id = %env.project, decision = "peer_refused", peer_ip = %peer.ip(), origin_device = %env.origin_device, reason, "grant refused");
-        (status, Json(GrantReceipt::refused(reason, detail)))
-    };
-
-    let (Some(cfg_state), Some(store)) = (app.try_state::<ConfigState>(), app.try_state::<crate::auto_start_store::AutoStartStore>()) else {
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(GrantReceipt::refused("state_unavailable", "the dashboard is still starting")));
-    };
-    let cfg = cfg_state.snapshot();
-    if !cfg.sync.accept_messages {
-        return refuse("messages_not_accepted", StatusCode::FORBIDDEN, "this device has sync.accept_messages off".into());
-    }
-    if env.project.trim().is_empty() || env.dir.trim().is_empty() {
-        return refuse("malformed_grant", StatusCode::BAD_REQUEST, "project and dir are both required".into());
-    }
-
-    // Bound, not merely attested. It is not enough that the claimed name
-    // *happens* to equal the node's own, which a sender arranges for free by
-    // telling the truth about itself. A message writes into an agent the user
-    // already chose to run; this writes a permission that outlives the message,
-    // the session and the reboot, so the fail-open answer is not good enough.
-    let bound = app
-        .try_state::<crate::tailnet::TailnetResolver>()
-        .is_some_and(|r| r.peer_is_bound(peer.ip(), &env.origin_device, &cfg.sync.peer_identity));
-    if !bound {
-        return refuse(
-            "grant_unattested",
-            StatusCode::FORBIDDEN,
-            "a standing permission is only accepted from a device this machine has bound to a Tailscale node in sync.peer_identity".into(),
-        );
-    }
-
-    // The pair is validated as if it were already in the list, by the same
-    // function that will gate the start — so a grant can never record something
-    // the start would later refuse, and the two cannot drift. That covers the
-    // capability as well as the pair, `check_startable` asking
-    // `session_launcher::can_launch`: a permission outlives the message, the
-    // session and the reboot, so a machine that could never honour one must
-    // decline to store it rather than accept it and refuse every message.
-    let candidate: std::collections::BTreeMap<String, String> = [(env.project.clone(), env.dir.clone())].into_iter().collect();
-    if let Err(refusal) = crate::session_launcher::check_startable(&env.project, &candidate, cfg.projects_root.as_deref(), crate::terminals::for_platform(&app).as_deref()) {
-        let r = GrantReceipt::refused(refusal.slug(), refusal.detail());
-        tracing::warn!(chat_id = %env.project, decision = "peer_refused", peer_ip = %peer.ip(), origin_device = %env.origin_device, reason = refusal.slug(), "grant refused");
-        return (StatusCode::BAD_REQUEST, Json(r));
-    }
-
-    let outcome = store.grant(&env.project, env.dir.trim());
-    if !outcome.is_in_force() {
-        // This machine's own failure rather than anything the caller got wrong,
-        // and the one answer here that must not read as success: a human on the
-        // other side clicked Allow, and `granted: true` would send them back
-        // round to re-send the message into a machine that still holds no grant
-        // for it. `grant` has already logged why it could not write.
-        return refuse(
-            "grant_not_recorded",
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "this device could not write the permission to auto_start.json, so nothing was recorded and the project is still not startable here".into(),
-        );
-    }
-    tracing::info!(
-        chat_id = %env.project,
-        decision = "peer_grant",
-        peer_ip = %peer.ip(),
-        origin_device = %env.origin_device,
-        dir = %env.dir,
-        outcome = outcome.as_str(),
-        "recorded a user-approved permission to start this project"
-    );
-    (StatusCode::OK, Json(GrantReceipt { granted: true, reason: None, detail: None }))
-}
-
-/// Ask a peer to record a grant its user approved here.
-pub async fn send_grant_hop(app: &AppHandle, origin_addr: &str, env: &GrantEnvelope) -> GrantReceipt {
-    let Some(token) = app.try_state::<ConfigState>().and_then(|c| c.snapshot().sync.token).filter(|t| !t.is_empty()) else {
-        return GrantReceipt::refused("no_sync_token", "this device has no sync token, so it cannot authenticate to a peer");
-    };
-    let client = match reqwest::Client::builder().timeout(Duration::from_secs(MESSAGE_HOP_TIMEOUT_SECS)).build() {
-        Ok(c) => c,
-        Err(e) => return GrantReceipt::refused("client_build_failed", e.to_string()),
-    };
-    let url = format!("{}/api/sync/grant", origin_addr.trim_end_matches('/'));
-    match client.post(&url).bearer_auth(&token).json(env).send().await {
-        Ok(resp) => {
-            let status = resp.status();
-            // Body first, for the reason `hop_answer` documents: the peer's own
-            // verdict is more specific than any status code, and reading the
-            // status first is how a real refusal became a wrong diagnosis.
-            match resp.json::<GrantReceipt>().await {
-                Ok(receipt) => receipt,
-                // Same reasoning as `hop_answer`: the answers this handler never
-                // produced — the guard's bare 401/403, and axum's 404 for a peer
-                // without the route — are certain refusals, and reporting them as
-                // an unreadable body would hide the two failures every rollout
-                // passes through behind a vague one.
-                Err(_) if !status.is_success() => GrantReceipt::refused(hop_status_reason(status), format!("peer answered {status} with no receipt")),
-                Err(_) => GrantReceipt::refused("unreadable_receipt", format!("peer answered {status} with a body this build could not read")),
-            }
-        }
-        Err(e) => GrantReceipt::refused("peer_unreachable", crate::peer_message::redact(&e.to_string())),
     }
 }
 
@@ -1759,7 +1561,6 @@ pub async fn run_listener(app: AppHandle, port: u16, scope: SyncBindScope) {
         .route("/api/sync/usage", get(get_usage))
         .route("/api/sync/tokens", get(get_tokens))
         .route("/api/sync/message", post(post_message))
-        .route("/api/sync/grant", post(post_grant))
         .route("/api/sync/attention", post(post_attention))
         .layer(middleware::from_fn_with_state(GuardState { app: app.clone(), scope }, guard))
         .with_state(app.clone());
@@ -2420,16 +2221,12 @@ mod tests {
         // unguarded registration would be worst: it starts a turn inside a live
         // agent rather than reading state.
         //
-        // 5 -> 6 with `POST /api/sync/grant`, which takes that title from it:
-        // the message route acts once, this one writes a standing permission
-        // that outlives every message and every restart.
-        //
-        // 6 -> 7 with `POST /api/sync/attention`, the first route that writes a
+        // 5 -> 6 with `POST /api/sync/attention`, the first route that writes a
         // *local* row — the attention stamp a peer observed on one of our
         // sessions, which the notifier revokes Telegram messages on. That is
         // what makes its clamp (`post_attention`) part of the gate rather than a
         // nicety.
-        assert_eq!(expr.matches(".route(").count(), 7, "route count changed — confirm the new route is above the layer, then update this number");
+        assert_eq!(expr.matches(".route(").count(), 6, "route count changed — confirm the new route is above the layer, then update this number");
     }
 
     #[test]
@@ -3129,13 +2926,12 @@ mod tests {
     /// mid-start — three different things to do next, none of them "fix your
     /// request".
     #[test]
-    fn an_auto_start_refusal_is_not_reported_as_a_bad_request() {
+    fn a_start_refusal_is_not_reported_as_a_bad_request() {
         let refused = |reason: &str| receipt_status(&Receipt::new(Outcome::Refused, "air-1-0", "chrome/p", Some("chrome")).because(reason));
-        for reason in ["start_not_listed", "start_path_mismatch", "start_no_directory"] {
-            assert_eq!(refused(reason), StatusCode::NOT_FOUND, "{reason} is an absent target");
-        }
+        assert_eq!(refused("start_no_directory"), StatusCode::NOT_FOUND, "an absent target");
         assert_eq!(refused("start_unattested"), StatusCode::FORBIDDEN);
         assert_eq!(refused("start_already_running"), StatusCode::CONFLICT);
+        assert_eq!(refused("start_ambiguous_project"), StatusCode::CONFLICT, "two directories answer to the id, as two sessions do for ambiguous_target");
         for reason in ["start_untrusted_directory", "start_no_launcher", "start_not_realized"] {
             assert_eq!(refused(reason), StatusCode::SERVICE_UNAVAILABLE, "{reason} is the machine declining, not the caller erring");
         }

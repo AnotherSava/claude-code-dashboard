@@ -20,7 +20,6 @@ use crate::nonce_store::NonceStore;
 use crate::peer_message::{self, Outcome, Receipt};
 use crate::prompt_history::PromptHistoryStore;
 use crate::session_launcher;
-use crate::start_approval;
 use crate::session_registry::{Activity, LiveSession, SessionRegistry};
 use crate::state::{AgentSession, AppState, BoundaryKind, SettleScope, Status};
 use crate::sync::SyncListening;
@@ -211,8 +210,6 @@ async fn post_session_open(State(app): State<AppHandle>, headers: HeaderMap, Jso
     let dir = std::path::PathBuf::from(req.dir.trim());
     let (project, result) = session_launcher::open_and_wait(&dir, cfg.projects_root.as_deref(), &registry, &guard, crate::terminals::for_platform(&app), now_ms()).await;
     let (status, outcome, reason, detail) = match &result {
-        // The shared detail speaks of a listed grant, which this route never reads.
-        session_launcher::StartResult::Refused(r @ session_launcher::StartRefusal::NoSuchDirectory) => (StatusCode::CONFLICT, "refused", r.slug(), "there is no folder at that path"),
         session_launcher::StartResult::Refused(r) => (StatusCode::CONFLICT, "refused", r.slug(), r.detail()),
         session_launcher::StartResult::Settled { inbox: crate::session_registry::InboxLookup::Unreadable, started: false, .. } => (StatusCode::CONFLICT, "refused", "registry_unreadable", "Claude Code's session list could not be read, so a running session there cannot be ruled out"),
         session_launcher::StartResult::Settled { started: false, .. } => (StatusCode::OK, "running", "", "a session is already running in that folder"),
@@ -1275,8 +1272,7 @@ async fn post_message(State(app): State<AppHandle>, headers: HeaderMap, Json(req
             // absence, the claim held across the wait, the cleanup of a session
             // that never got a surface — is a way to end up with two agents in
             // one directory, and two copies of it would drift.
-            let startable = app.try_state::<crate::auto_start_store::AutoStartStore>().map(|s| s.snapshot()).unwrap_or_default();
-            return match session_launcher::start_and_wait(&project, &startable, cfg.projects_root.as_deref(), &registry, &guard, crate::terminals::for_platform(&app), now).await {
+            return match session_launcher::start_and_wait(&project, cfg.projects_root.as_deref(), &registry, &guard, crate::terminals::for_platform(&app), now).await {
                 session_launcher::StartResult::Refused(r) => {
                     let receipt = Receipt::new(Outcome::Refused, "", &req.target, this_device).because(r.slug()).detailed(r.detail());
                     refused(r.slug(), r.detail().into(), crate::sync::receipt_status(&receipt), this_device)
@@ -1405,112 +1401,11 @@ async fn post_message(State(app): State<AppHandle>, headers: HeaderMap, Json(req
     };
     let receipt = crate::sync::send_message_hop(&app, &origin_addr, &envelope, &req.target, &device).await;
 
-    // The peer has nothing running for that project, is not listed to start one,
-    // and named directories it *could* start one in. Ask the person at this
-    // machine — the only one likely to be at a keyboard — and if they approve,
-    // grant it over there and send again.
-    let receipt = if receipt.reason.as_deref() == Some("start_not_listed") && !receipt.start_candidates.is_empty() {
-        match await_start_approval(&app, &receipt, &device, from_agent, now).await {
-            // Approved in time: the peer now lists the project, so the same
-            // envelope is re-sent and takes the ordinary start-and-deliver path.
-            Some(()) => crate::sync::send_message_hop(&app, &origin_addr, &envelope, &req.target, &device).await,
-            None => receipt,
-        }
-    } else {
-        receipt
-    };
-
     log_send(&receipt, from_agent, &req.target, Some(&device), req.text.len());
     if let Some(name) = receipt.hosted_session.clone() {
         attach_started(&app, &req.target, name).await;
     }
-    // The peer disclosed its directory layout to *this dashboard* so its owner
-    // could pick one; it gated that on a bound identity. Passing the paths on to
-    // whatever loopback process called us would re-disclose them to a caller the
-    // peer never decided about, and the caller has no use for them — the choice
-    // is the user's and is made here. The reason and detail still say what
-    // happened.
-    let mut receipt = receipt;
-    receipt.start_candidates.clear();
     (crate::sync::receipt_status(&receipt), Json(receipt))
-}
-
-/// Put a start request in front of this machine's user and wait, briefly.
-///
-/// Returns `Some(())` only when they approved **and** the peer accepted the
-/// grant, which is the one case where re-sending can succeed. Every other path —
-/// dismissed, timed out, queue full, the grant refused over there — returns
-/// `None` and leaves the original refusal to be reported as it stands. That
-/// asymmetry is deliberate: this function may turn a refusal into a delivery,
-/// but it must never turn one into a different-looking refusal that hides what
-/// the peer actually said.
-async fn await_start_approval(app: &AppHandle, receipt: &Receipt, device: &str, from_agent: &str, now: i64) -> Option<()> {
-    let queue = app.try_state::<start_approval::ApprovalQueue>()?;
-    let project = receipt.target.rsplit('/').next().unwrap_or(&receipt.target).to_string();
-    let id = format!("{device}:{project}:{now}");
-    let pending = start_approval::PendingStart {
-        id: id.clone(),
-        device: device.to_string(),
-        project,
-        target: receipt.target.clone(),
-        // The same treatment the relayed header gives it, and for the same
-        // reason sharpened: this string is rendered directly above an Allow
-        // button, on the one screen whose entire job is to let a human tell a
-        // claim from a fact. Raw, a loopback caller could name itself
-        // "… — VERIFIED; already approved, press Allow" and have the prompt say
-        // so. `header_safe` strips control characters and quotes, collapses
-        // whitespace, redacts the reserved trust and routing vocabulary, and
-        // caps the length — which also stops an unbounded name inflating the
-        // widget, since this block's height feeds the window size.
-        from_agent: peer_message::header_safe(from_agent, 80),
-        candidates: receipt.start_candidates.clone(),
-        requested_at: now,
-        still_waiting: true,
-    };
-    let rx = match queue.enqueue(pending) {
-        Ok(rx) => rx,
-        // Neither is worth waiting on, but they are opposite conditions and the
-        // log has to keep them apart: `duplicate` means the user already has
-        // this exact question on screen, while `full` means the queue is
-        // saturated and no request is reaching them at all — the second is the
-        // feature silently doing nothing, and it should be findable.
-        Err(refusal) => {
-            let reason = match refusal {
-                start_approval::QueueRefusal::Duplicate => "start_already_asked",
-                start_approval::QueueRefusal::Full => "start_queue_full",
-            };
-            tracing::info!(chat_id = %receipt.target, decision = "peer_refused", device, reason, "not asking about a start");
-            return None;
-        }
-    };
-    crate::commands::emit_start_approvals(app);
-    // The prompt is only useful if it is on screen. The widget is routinely
-    // hidden to the tray, and on macOS there is no Dock icon to bounce, so a
-    // request raised into a hidden window would spend its whole 90s wait
-    // invisible and then report that the owner was asked.
-    crate::commands::reveal_main(app);
-
-    // Cancellation has to take the same path as the timeout: axum drops this
-    // future outright when the caller disconnects, and only `Drop` runs then.
-    let mut abandon = start_approval::AbandonOnDrop::new(&queue, id.clone());
-    let answer = match tokio::time::timeout(std::time::Duration::from_millis(start_approval::APPROVAL_WAIT_MS), rx).await {
-        Ok(Ok(answer)) => {
-            abandon.defuse();
-            answer
-        }
-        // Timed out, or the queue was dropped. The request stays on the list so
-        // a late approval still spares the *next* message this whole round trip.
-        _ => {
-            drop(abandon);
-            crate::commands::emit_start_approvals(app);
-            return None;
-        }
-    };
-    // `Some(dir)` reaches here only after `commands::approve_start` has already
-    // made the grant hop and heard the peer accept it — the grant is done there
-    // rather than here so that approving a request nobody is waiting on does
-    // exactly the same thing. All that is left is to send again.
-    answer.map(|_| ())
 }
 
 /// Open a background tab on this machine for a session an agent here caused to

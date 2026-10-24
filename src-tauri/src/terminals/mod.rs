@@ -988,10 +988,8 @@ pub trait TerminalAdapter: Send {
     }
 
     /// Whether [`launch`](Self::launch) can ever succeed here. A fact about the
-    /// adapter, answered without asking the terminal, because it is asked before
-    /// a directory is offered for approval or a grant recorded: a machine that
-    /// offers and only refuses at launch asks its user to approve a grant that
-    /// can never produce a session.
+    /// adapter, answered without asking the terminal, because it is asked on
+    /// every start before the session is looked for or claimed.
     fn can_launch(&self) -> bool {
         false
     }

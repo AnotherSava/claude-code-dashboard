@@ -184,16 +184,6 @@ pub struct Receipt {
     /// [`observed_text`] for `outcome`, carried on the wire so a caller that
     /// only ever prints the receipt cannot accidentally print "delivered".
     pub observed: String,
-    /// On a `start_not_listed` refusal only: directories on the **receiving**
-    /// machine whose derived id is the target project, for its owner to choose
-    /// between when approving.
-    ///
-    /// They have to travel, because only that machine can produce them — the
-    /// sender has no view of the peer's filesystem and a path composed here
-    /// would be a guess presented as a fact. Defaulted and skipped when empty so
-    /// a peer that predates the field parses, and contributes none.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub start_candidates: Vec<crate::session_launcher::StartCandidate>,
     /// Where this message started the session it was written to, and that
     /// session is one the remote-session holder hosts: the name another machine
     /// attaches to it by ([`crate::terminals::Launched::hosted_name`]). The
@@ -214,15 +204,8 @@ impl Receipt {
             target: target.to_string(),
             device: device.map(str::to_string),
             observed: observed_text(outcome).to_string(),
-            start_candidates: Vec::new(),
             hosted_session: None,
         }
-    }
-
-    /// Attach the directories the receiving machine could start this project in.
-    pub fn with_candidates(mut self, candidates: Vec<crate::session_launcher::StartCandidate>) -> Self {
-        self.start_candidates = candidates;
-        self
     }
 
     pub fn because(mut self, reason: &str) -> Self {

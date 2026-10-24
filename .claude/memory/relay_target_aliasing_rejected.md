@@ -9,7 +9,7 @@ On 2026-10-06 a display-name fallback for relay targets was built: the receiver 
 
 Two traps the adversarial review found, for anyone re-attempting target aliasing:
 
-- `sync::send_message_hop` restamps `receipt.target` with the caller's address, so an id the receiver resolved never reaches the sender. The start-approval flow then files its grant under the alias, and `post_grant` refuses it as `start_path_mismatch`.
+- `sync::send_message_hop` restamps `receipt.target` with the caller's address, so an id the receiver resolved never reaches the sender.
 - Nothing proves an alias names the same repository, so an unrelated folder on the peer carrying the alias receives the message.
 
 The origin-URL alternative (its memo closed 2026-10-07) was never built.
