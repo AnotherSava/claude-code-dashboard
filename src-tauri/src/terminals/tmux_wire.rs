@@ -94,6 +94,12 @@ pub fn close_refusal(session: &TmuxSession) -> Option<String> {
     }
 }
 
+/// The project name `cc-session.sh … detach` printed, its last nonblank line,
+/// which is the name an attach to the session takes.
+pub fn hosted_name(stdout: &str) -> Option<String> {
+    stdout.lines().map(str::trim).filter(|l| !l.is_empty()).next_back().map(str::to_string)
+}
+
 /// Whether `tmux has-session`'s stderr says the session is gone, which with
 /// the server gone too is still gone. Anything else is a failure to ask.
 pub fn says_gone(stderr: &str) -> bool {
@@ -170,6 +176,13 @@ fn apply_sgr(params: &str, mut faint: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_hosted_name_is_the_last_line_detach_printed() {
+        assert_eq!(hosted_name("games/achievement-overlay\n"), Some("games/achievement-overlay".to_string()));
+        assert_eq!(hosted_name("noise from a profile\nweb\n\n"), Some("web".to_string()), "anything printed before it is not the name");
+        assert_eq!(hosted_name(""), None, "a script that printed nothing named nothing");
+    }
     use crate::terminals::composer::composer_in;
 
     /// [`LIST_SCRIPT`]'s output, captured 2026-10-19 from the holder's server

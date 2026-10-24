@@ -1639,7 +1639,7 @@ pub fn for_platform(app: &tauri::AppHandle) -> Option<Box<dyn TerminalAdapter>> 
     {
         use tauri::Manager;
         let script = app.try_state::<crate::config::ConfigState>().and_then(|c| c.config.lock().unwrap().remote_session_script.clone());
-        Some(Box::new(composite::Composite::new(windows::NAME, vec![Box::new(windows::WindowsAdapter::new(app.clone())), Box::new(agwinterm::AgwintermAdapter::new()), Box::new(tmux::TmuxAdapter::new(script))])))
+        Some(Box::new(composite::Composite::new(windows::NAME, vec![Box::new(windows::WindowsAdapter::new(app.clone())), Box::new(agwinterm::AgwintermAdapter::new(script.clone())), Box::new(tmux::TmuxAdapter::new(script))])))
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {

@@ -230,9 +230,10 @@ pub struct Config {
     /// started for a project nothing is running in — a relayed message to it,
     /// or a start the local picker asks for. The session runs detached in the
     /// remote-session holder's tmux server, as one cmd+shift+r creates from the
-    /// Mac does. `None` leaves this machine unable to start a session, refusing
-    /// such a message `start_no_launcher` and offering no directories for a
-    /// start grant.
+    /// Mac does. It is also what a background agwinterm tab runs to attach to
+    /// such a session when an agent on this machine caused it to be started.
+    /// `None` leaves this machine unable to start a session, refusing such a
+    /// message `start_no_launcher`, and opens no such tab.
     pub remote_session_script: Option<String>,
     /// macOS only: the path of the claude repo's
     /// `claude/remote-session/mac/attach.sh`, through which a session the

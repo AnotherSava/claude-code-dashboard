@@ -76,6 +76,22 @@ pub fn styled_text_req(window: &str, target: &str) -> String {
     json!({ "cmd": "session.text", "target": target, "window": window, "args": { "styles": true } }).to_string()
 }
 
+/// A `session.new` request for a session running `command` with no shell
+/// around it, left behind whatever is selected. It names no window, so
+/// agwinterm puts it in its active workspace.
+pub fn new_session_req(command: &str) -> String {
+    json!({ "cmd": "session.new", "args": { "command": command, "command-mode": "direct", "no-select": true } }).to_string()
+}
+
+/// The command a tab attaching to the holder session `name` runs:
+/// `cc-session.sh <name> windows start` under WSL, the call every tab opened
+/// on a remote session here makes. Each argument is quoted, since agwinterm
+/// splits a direct command by Windows argv rules and a project path can hold
+/// a space.
+pub fn attach_command(script: &str, name: &str) -> String {
+    format!("wsl.exe -e \"{script}\" \"{name}\" windows start")
+}
+
 /// A reply's `result`, or its `error` text.
 pub fn parse_reply(line: &str) -> Result<Value, String> {
     let reply: Value = serde_json::from_str(line).map_err(|e| format!("unparseable reply: {e}"))?;
@@ -310,6 +326,20 @@ pub const CONTEXT_MAX_UTF16: usize = 200;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_hosted_session_is_attached_by_a_background_direct_command() {
+        let v = |s: String| serde_json::from_str::<serde_json::Value>(&s).unwrap();
+        assert_eq!(
+            v(new_session_req("wsl.exe -e x")),
+            json!({ "cmd": "session.new", "args": { "command": "wsl.exe -e x", "command-mode": "direct", "no-select": true } })
+        );
+        assert_eq!(
+            attach_command("/mnt/d/p/claude/claude/remote-session/wsl/cc-session.sh", "AutoHotkey scripts"),
+            r#"wsl.exe -e "/mnt/d/p/claude/claude/remote-session/wsl/cc-session.sh" "AutoHotkey scripts" windows start"#,
+            "a name with a space stays one argument"
+        );
+    }
 
     /// `tree` captured read-only from agwinterm 0.20.13.1 on 2026-10-02. The live
     /// tree had no split session, no context, no title and no renamed session, so

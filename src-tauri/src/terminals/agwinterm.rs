@@ -166,6 +166,8 @@ const WAIT_OBJECT_0: u32 = 0;
 
 pub struct AgwintermAdapter {
     shared: Arc<Shared>,
+    /// `config.remote_session_script`, the script an attaching tab runs.
+    attach_script: Option<String>,
 }
 
 /// What the adapter and its watch thread share.
@@ -190,12 +192,12 @@ impl AgwintermAdapter {
     /// Reads `AGWINTERM_PIPE`, `AGWINTERM_APP_ID` and `LOCALAPPDATA`, and does no
     /// I/O. The first two are set only in processes agwinterm starts, so a
     /// dashboard started at login uses the release build's pipe and data.
-    pub fn new() -> Self {
+    pub fn new(attach_script: Option<String>) -> Self {
         let path = wire::pipe_path(std::env::var("AGWINTERM_PIPE").ok().as_deref());
         let app_id = state::app_id(std::env::var("AGWINTERM_APP_ID").ok().as_deref());
         let app_dir = std::env::var_os("LOCALAPPDATA").map(|base| PathBuf::from(base).join(&app_id));
         let pipe = Mutex::new(Pipe { path, conn: None, down: None, link: None });
-        Self { shared: Arc::new(Shared { pipe, app_id, app_dir, watch: Mutex::new(Watch::default()), watching: OnceLock::new() }) }
+        Self { shared: Arc::new(Shared { pipe, app_id, app_dir, watch: Mutex::new(Watch::default()), watching: OnceLock::new() }), attach_script }
     }
 }
 
@@ -615,6 +617,20 @@ impl TerminalAdapter for AgwintermAdapter {
             }
         }
         call(&wire::close_req(window, session), WRITE_DEADLINE).map(|_| ())
+    }
+
+    fn can_attach_hosted(&self) -> bool {
+        self.attach_script.is_some()
+    }
+
+    /// A background session running [`wire::attach_command`], which attaches
+    /// to the holder's session the way every tab opened on a remote session
+    /// here does. The session already exists when this is asked, so the
+    /// script's `start` creates nothing.
+    fn attach_hosted(&self, name: &str) -> Result<(), String> {
+        let script = self.attach_script.as_deref().ok_or("config.remote_session_script is not set")?;
+        let req = wire::new_session_req(&wire::attach_command(script, name));
+        self.shared.pipe.lock().unwrap().call(&req, WRITE_DEADLINE).map(|_| ()).map_err(|f| f.reason())
     }
 }
 

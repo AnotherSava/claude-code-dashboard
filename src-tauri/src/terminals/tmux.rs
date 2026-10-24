@@ -176,8 +176,9 @@ impl TerminalAdapter for TmuxAdapter {
 
     /// `cc-session.sh <dir> windows start detach`. The directory goes as its
     /// Windows path and the script translates it, since only the script knows
-    /// the project root a session is named below. `select` changes nothing: the
-    /// session has no window here to put in front.
+    /// the project root a session is named below, and it prints the name an
+    /// attach takes, which becomes [`super::Launched::hosted_name`]. `select`
+    /// changes nothing: the session has no window here to put in front.
     fn launch(&self, dir: &std::path::Path, _select: bool) -> Result<super::Launched, String> {
         let script = self.script.as_deref().ok_or("config.remote_session_script is not set")?;
         let dir = dir.to_string_lossy();
@@ -185,6 +186,6 @@ impl TerminalAdapter for TmuxAdapter {
         if !out.status.success() {
             return Err(format!("cc-session.sh exited {}: {}", out.status.code().map_or("by signal".to_string(), |c| c.to_string()), failure_text(&out)));
         }
-        Ok(super::Launched::default())
+        Ok(super::Launched { key: None, hosted_name: wire::hosted_name(&String::from_utf8_lossy(&out.stdout)) })
     }
 }
