@@ -1040,11 +1040,7 @@ async fn post_message(
         // difference already tells anyone who can reach this route.
         InboxLookup::NotFound => {
             return match crate::session_launcher::project_knowledge(&env.target_project, cfg.projects_root.as_deref()) {
-                crate::session_launcher::ProjectKnowledge::Unknown => refuse(
-                    "unknown_project",
-                    StatusCode::NOT_FOUND,
-                    Some("no existing directory on this machine derives that project id, so this is an address that names nothing here rather than a session that ended".into()),
-                ),
+                crate::session_launcher::ProjectKnowledge::Unknown => refuse_start(crate::session_launcher::StartRefusal::NoSuchProject),
                 // The weaker claim, and the honest one when our own index could
                 // not be read: nothing is running, and whether the project even
                 // exists here went unchecked rather than answered no.

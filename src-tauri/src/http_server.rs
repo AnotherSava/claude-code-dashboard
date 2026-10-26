@@ -1174,6 +1174,10 @@ fn sender_task(rows: &[AgentSession], from_agent: &str) -> Option<String> {
         .filter(|p| !p.is_empty())
 }
 
+/// What a `local_target` refusal says: it names the tool that does the job
+/// properly, or a caller learns only that it failed.
+const LOCAL_TARGET_DETAIL: &str = "this session is on this machine; use Claude Code's `SendMessage`, which carries a kernel-verified sender identity and a reply address this route destroys";
+
 /// Relay one message to an agent on another machine.
 ///
 /// **This is the only entry point that holds the originating agent's identity**,
@@ -1215,6 +1219,9 @@ async fn post_message(State(app): State<AppHandle>, headers: HeaderMap, Json(req
     let cfg = cfg_state.snapshot();
     let now = now_ms();
     let this_device = Some(cfg.sync.device_name.trim()).filter(|d| !d.is_empty());
+    // One answer for a live local target, whether it was live from the start or
+    // turned up while a start re-checked the registry.
+    let refuse_local = || refused("local_target", LOCAL_TARGET_DETAIL.into(), StatusCode::BAD_REQUEST, this_device);
 
     // Local ids come from both session sources, so a session the hook stream has
     // not heard from this run is still recognized as local rather than being
@@ -1236,12 +1243,7 @@ async fn post_message(State(app): State<AppHandle>, headers: HeaderMap, Json(req
     let (device, project) = match peer_message::resolve_message_target(&req.target, &local_ids, &devices, this_device) {
         peer_message::TargetResolution::Remote { device, project } => (device, project),
         peer_message::TargetResolution::LocalLive => {
-            return refused(
-                "local_target",
-                "this session is on this machine; use Claude Code's `SendMessage`, which carries a kernel-verified sender identity and a reply address this route destroys".into(),
-                StatusCode::BAD_REQUEST,
-                this_device,
-            );
+            return refuse_local();
         }
         // Nothing is running for a project on this machine. `SendMessage` is
         // still the right way to talk to a local agent — but it can only address
@@ -1279,12 +1281,7 @@ async fn post_message(State(app): State<AppHandle>, headers: HeaderMap, Json(req
                 }
                 // Reached when the absence turned out to be stale: a session was
                 // already there, so this is the ordinary local refusal after all.
-                session_launcher::StartResult::Settled { started: false, .. } => refused(
-                    "local_target",
-                    "this session is on this machine; use Claude Code's `SendMessage`, which carries a kernel-verified sender identity and a reply address this route destroys".into(),
-                    StatusCode::BAD_REQUEST,
-                    this_device,
-                ),
+                session_launcher::StartResult::Settled { started: false, .. } => refuse_local(),
                 session_launcher::StartResult::Settled { inbox, started: true, hosted_name } => {
                     let reached = !matches!(inbox, crate::session_registry::InboxLookup::NotFound);
                     tracing::info!(chat_id = %project, decision = "peer_start", from_agent, reached_inbox = reached, "started a local terminal session for a project with none");
@@ -2950,8 +2947,7 @@ mod tests {
     /// sender and a reply address; this route has neither.
     #[test]
     fn the_local_refusal_names_send_message() {
-        let detail = "this session is on this machine; use Claude Code's `SendMessage`, which carries a kernel-verified sender identity and a reply address this route destroys";
-        let receipt = Receipt::new(Outcome::Refused, "", "transcripts", None).because("local_target").detailed(detail);
+        let receipt = Receipt::new(Outcome::Refused, "", "transcripts", None).because("local_target").detailed(LOCAL_TARGET_DETAIL);
         assert!(receipt.detail.as_deref().is_some_and(|d| d.contains("SendMessage")));
         assert_eq!(receipt.reason.as_deref(), Some("local_target"));
         assert!(!receipt.observed.to_ascii_lowercase().contains("deliver"));

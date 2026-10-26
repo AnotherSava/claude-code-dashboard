@@ -271,7 +271,7 @@ A typical two-device setup — desktop: `"listen": true, "peers": ["http://lapto
 
 ### Starting sessions on request
 
-A message can only reach an agent that's already running. When an agent messages a project with nothing running in it, the widget on the receiving computer starts a session there and delivers the message into it. It does so only when all of these hold:
+A message can only reach an agent that's already running. When an agent messages a project with nothing running in it, the widget on the receiving computer starts a session there. A message from one of your other devices is then delivered into it; an agent on the same computer is told the session is up and sends its message itself. It does so only when all of these hold:
 
 - Exactly one folder on that computer matches the project's name. If two do, nothing starts; set `projects_root` so their names differ.
 - Claude Code has been trusted in that folder. Open it in Claude Code once and accept the trust question.

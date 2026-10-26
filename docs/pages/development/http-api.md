@@ -304,7 +304,7 @@ The `start_*` refusals, each certain about the moment it was made. Several descr
 |---|---|---|
 | `start_unattested` | `403` | the sending device has no `sync.peer_identity` binding on the peer, so its name is only claimed |
 | `start_ambiguous_project` | `409` | more than one existing directory derives the project id, so it does not say which to start in |
-| `start_no_directory` | `404` | the folder the local picker named does not exist |
+| `start_no_directory` | — | never answered on this route; the local picker's [`POST /api/session/open`](#post-apisessionopen) answers it as `409` when the folder it named does not exist |
 | `start_untrusted_directory` | `503` | Claude Code has never been trusted there, so a session would stop at a prompt nobody can answer |
 | `start_already_running` | `409` | a start for this project is already in flight |
 | `start_no_launcher` | `503` | no terminal this dashboard can start a session in (Windows without `remote_session_script`, whose adapters read and close tabs but launch nothing) |
