@@ -18,7 +18,7 @@ The tray's **Open config/logs location** shortcut opens this folder. The widget 
 
 Right-click the tray icon for the controls you reach for most.
 
-{% include figure.html id="tray-menu" alt="The tray menu, open: Show / Hide, the checkable toggles, the submenus, the Work intensity, and config folder items, Help and Quit" %}
+{% include figure.html id="tray-menu" alt="The tray menu, open: Show / Hide, the checkable toggles, the submenus, the Work intensity and config folder items, Help and Quit" %}
 
 - **Show / Hide** — toggle the window (also a left-click on the tray icon).
 - **Always on top** — keep the widget above your other windows.

@@ -126,9 +126,7 @@ def assert_frame_worthy(when: str, public) -> None:
 
     Only `agents` is examined. The roster's `registry_only` array is a read-path
     union of Claude Code's own live-session list and never becomes a dashboard
-    row, so none of it reaches the frame. The approvals panel does reach the frame
-    and is on no HTTP route at all, which is why the module docstring hands it to
-    the operator as an eye-check instead.
+    row, so none of it reaches the frame.
     """
     roster = dash.agents()
     rows = roster.get("agents", [])

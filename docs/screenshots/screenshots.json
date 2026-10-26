@@ -240,7 +240,7 @@
       "files": [
         "tray-menu-windows.png"
       ],
-      "shows": "Windows. The tray icon's menu, open: Show / Hide, the checkable toggles, its submenus closed, the Work intensity / config folder / Startable projects items, Help and Quit",
+      "shows": "Windows. The tray icon's menu, open: Show / Hide, the checkable toggles, its submenus closed, the Work intensity and config folder items, Help and Quit",
       "policy": "auto",
       "capture": {
         "command": "pwsh -File docs/screenshots/capture/tray-menu-windows.ps1",
