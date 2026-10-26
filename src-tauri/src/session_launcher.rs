@@ -79,8 +79,14 @@ pub enum StartRefusal {
     UntrustedDirectory,
     /// A start for this project is already in flight.
     AlreadyStarting,
-    /// This platform has no launcher wired up, or its terminal is not running.
+    /// This platform has no launcher wired up.
     NoLauncher,
+    /// A launcher exists and was asked, and the launch failed: on macOS agterm
+    /// not running or `agtermctl` refusing, on Windows the remote-session
+    /// holder down, a script error, or `wsl.exe` killed at its timeout. Kept
+    /// apart from `NoLauncher` because that one tells the sender this machine
+    /// can never host a session, when here a later attempt may work.
+    LaunchFailed,
     /// The terminal accepted the request but never gave the session a surface.
     /// On macOS libghostty refuses to create one while the display is asleep,
     /// so the session exists in agterm's model and its command never runs — no
@@ -103,6 +109,7 @@ impl StartRefusal {
             Self::UntrustedDirectory => "start_untrusted_directory",
             Self::AlreadyStarting => "start_already_running",
             Self::NoLauncher => "start_no_launcher",
+            Self::LaunchFailed => "start_launch_failed",
             Self::NotRealized => "start_not_realized",
             // Deliberately outside the `start_*` family, and sharing the slug
             // the receiving route answers with: "nothing here derives that id"
@@ -122,6 +129,7 @@ impl StartRefusal {
             Self::UntrustedDirectory => "Claude Code has not been trusted in that project's directory, so a session would stop at a prompt nobody is there to answer",
             Self::AlreadyStarting => "a session for that project is already being started",
             Self::NoLauncher => "this machine has no terminal this dashboard can start a session in",
+            Self::LaunchFailed => "the terminal was asked to start a session and failed; this machine's log says why, and a later attempt may succeed",
             Self::NotRealized => "the terminal created a session but never gave it a surface, most likely because this machine's display is asleep, so no agent was started",
             Self::NoSuchProject => "no existing directory on this machine derives that project id, so this is an address that names nothing here rather than a session that ended",
         }
@@ -337,7 +345,9 @@ pub enum StartResult {
 ///   the registry a moment before Claude Code writes the `<pid>.json`. For the
 ///   next five seconds the cache says that directory is empty while a session
 ///   is booting in it.
-/// - **The claim is held across the wait, and released only on success.** A
+/// - **The claim is held across the wait, and released only where no launched
+///   session is left unaccounted for**: on success, when the fresh re-check
+///   finds a session already there, and when the launch itself fails. A
 ///   start that never registers — an unresolvable `claude`, an onboarding or
 ///   auth prompt, a display asleep — leaves the project `NotFound` forever, so
 ///   releasing the claim on that path means every later message opens another
@@ -433,11 +443,12 @@ async fn start_in(
         Ok((launcher, Err(reason))) => {
             tracing::warn!(chat_id = %project, terminal = launcher.name(), reason = %reason, "the terminal refused to start a session");
             guard.release(project);
-            return StartResult::Refused(StartRefusal::NoLauncher);
+            return StartResult::Refused(StartRefusal::LaunchFailed);
         }
-        Err(_) => {
+        Err(error) => {
+            tracing::warn!(chat_id = %project, error = %error, "the launch task died");
             guard.release(project);
-            return StartResult::Refused(StartRefusal::NoLauncher);
+            return StartResult::Refused(StartRefusal::LaunchFailed);
         }
     };
 
@@ -647,6 +658,7 @@ mod tests {
             StartRefusal::UntrustedDirectory,
             StartRefusal::AlreadyStarting,
             StartRefusal::NoLauncher,
+            StartRefusal::LaunchFailed,
             StartRefusal::NotRealized,
             StartRefusal::NoSuchProject,
         ];
@@ -662,6 +674,7 @@ mod tests {
                 | StartRefusal::UntrustedDirectory
                 | StartRefusal::AlreadyStarting
                 | StartRefusal::NoLauncher
+                | StartRefusal::LaunchFailed
                 | StartRefusal::NotRealized
                 | StartRefusal::NoSuchProject => {}
             }

@@ -18,3 +18,7 @@ To verify first:
 - an equivalent of agterm's unrealized-session check
 
 Source: the agwinterm skill survey in this session (agwinterm's ControlServer.cs case session.new, SessionCommand.TryCreate). Medium effort.
+
+## Superseded (2026-10-25)
+
+Windows starts sessions through `TmuxAdapter::launch` (cc-session.sh, since e8208dc) whenever `remote_session_script` is set, chosen over this route in the closed memo on starting Windows sessions inside the remote-session holder's tmux. A second launcher here would compete with it, since `Composite::launch` takes the first child that can launch; what is left for agwinterm is opening a tab onto the hosted session (`attach_hosted`).

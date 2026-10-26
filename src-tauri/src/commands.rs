@@ -1390,7 +1390,7 @@ pub async fn test_telegram_notification(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-/// Bring the main window to the front because something needs an answer.
+/// Bring the main window to the front for a `POST /api/window` request.
 ///
 /// Separate from `toggle_main`, which is the user's own show/hide and must stay
 /// a toggle: a request arriving while the window is already up must not hide it.
@@ -1398,8 +1398,7 @@ pub async fn test_telegram_notification(app: AppHandle) -> Result<(), String> {
 pub fn reveal_main(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         // Best-effort: a window that refuses to come forward is not a reason to
-        // fail the request, and the prompt is still in the widget when the user
-        // next opens it.
+        // fail the request.
         let _ = reveal(&window);
     }
 }

@@ -871,8 +871,10 @@ async fn post_message(
     // The opt-in, checked before anything else. Passing the guard proves the
     // caller holds the sync token and comes from an allowed source — it does not
     // prove this machine's owner agreed that peers may start turns in their
-    // agents. `listen` bought a read-only view of session state; this is a
-    // different grant and needs its own yes.
+    // agents, or start a new session for any trusted project here, which this
+    // flag permits for a peer that `sync.peer_identity` also binds (checked
+    // below, refused `start_unattested`). `listen` bought a read-only view of
+    // session state; this is a different grant and needs its own yes.
     if !app.try_state::<ConfigState>().is_some_and(|c| c.snapshot().sync.accept_messages) {
         return refuse(
             "messages_not_accepted",
@@ -997,10 +999,10 @@ async fn post_message(
         InboxLookup::Ambiguous { sessions } => {
             return refuse("ambiguous_target", StatusCode::CONFLICT, Some(format!("{sessions} live interactive sessions share that directory; picking one would decide which agent reads this")));
         }
-        // Reached either because the feature is off for this project, or
-        // because a session we started had not published its inbox in time. The
-        // second is a different fact and says so: a terminal is now open on that
-        // machine, and the message is still not delivered.
+        // Reached only when a session we started had not published its inbox
+        // in time, which is a different fact from a project with nothing
+        // running and says so: a terminal is now open on that machine, and the
+        // message is still not delivered.
         //
         // `Unreachable`, not `Refused` — we did not decline, we tried and found
         // nothing listening yet — and answered `200` for the same reason the
@@ -1180,7 +1182,7 @@ pub fn receipt_status(receipt: &Receipt) -> StatusCode {
             Some("start_no_directory") => StatusCode::NOT_FOUND,
             Some("start_unattested") | Some("messages_not_accepted") => StatusCode::FORBIDDEN,
             Some("start_already_running") | Some("start_ambiguous_project") => StatusCode::CONFLICT,
-            Some("start_untrusted_directory") | Some("start_no_launcher") | Some("start_not_realized") => StatusCode::SERVICE_UNAVAILABLE,
+            Some("start_untrusted_directory") | Some("start_no_launcher") | Some("start_launch_failed") | Some("start_not_realized") => StatusCode::SERVICE_UNAVAILABLE,
             // A local start: the session now exists, and the relay was still
             // declined — the same answer as `local_target`, and the same status,
             // because what the caller asked for is what did not happen. The
@@ -2932,7 +2934,7 @@ mod tests {
         assert_eq!(refused("start_unattested"), StatusCode::FORBIDDEN);
         assert_eq!(refused("start_already_running"), StatusCode::CONFLICT);
         assert_eq!(refused("start_ambiguous_project"), StatusCode::CONFLICT, "two directories answer to the id, as two sessions do for ambiguous_target");
-        for reason in ["start_untrusted_directory", "start_no_launcher", "start_not_realized"] {
+        for reason in ["start_untrusted_directory", "start_no_launcher", "start_launch_failed", "start_not_realized"] {
             assert_eq!(refused(reason), StatusCode::SERVICE_UNAVAILABLE, "{reason} is the machine declining, not the caller erring");
         }
         assert_eq!(refused("local_target_started"), refused("local_target"), "a local start still refuses the relay, so it answers like the refusal it is");

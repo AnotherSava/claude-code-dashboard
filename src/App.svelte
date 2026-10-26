@@ -254,19 +254,6 @@
   // so a window resize doesn't change its height and can't feed back a loop.
   let contentObserver: ResizeObserver | null = null
   let observedEl: Element | null = null
-  // A second, independent observer target. `observeContent` unobserves whatever
-  // it watched before — it tracks a single moving element (list / panel / empty)
-  // — so reusing it for the approvals block would make the two evict each other.
-  let observedApprovals: Element | null = null
-  let approvalsObserver: ResizeObserver | null = null
-  function observeApprovals(el: Element | null) {
-    if (el === observedApprovals) return
-    if (!approvalsObserver) approvalsObserver = new ResizeObserver(() => scheduleMeasure())
-    if (observedApprovals) approvalsObserver.unobserve(observedApprovals)
-    observedApprovals = el
-    if (el) approvalsObserver.observe(el)
-  }
-
   function observeContent(el: Element | null) {
     if (el === observedEl) return
     if (!contentObserver) contentObserver = new ResizeObserver(() => scheduleMeasure())
@@ -302,12 +289,6 @@
     const content = widgetEl?.querySelector('.list-inner') as HTMLElement | null
     const panel = widgetEl?.querySelector('.panel') as HTMLElement | null
     const emptyEl = widgetEl?.querySelector('.empty') as HTMLElement | null
-    // A third sibling inside .widget, outside the header/content pair the sum
-    // below is built from. Without this term the window is sized short by
-    // exactly this block's height, the list loses that space to it, and the
-    // resulting scrollbar self-corrects nowhere: `desired` never exceeds the
-    // viewport, so neither the overflow path nor the collapse heal fires.
-    const approvalsEl = widgetEl?.querySelector('.approvals') as HTMLElement | null
     const contentEl = content ?? panel ?? emptyEl
     if (!widgetEl || !config || !headerEl || !contentEl) {
       // Not ready — retry until the tree commits (see scheduleReadyRetry). Log
@@ -352,13 +333,7 @@
     // Subpixel-accurate getBoundingClientRect(), then ceil the total: rounding
     // down would leave us asking for a hair less than the content needs and the
     // OS would resize to exactly that, surfacing a scrollbar.
-    // Observed as well as summed: this block changes its own height from state
-    // inside the component — a revealed trust warning, a grant error, a button
-    // label — and the `$effect` below can only see the array identity, so
-    // nothing else would re-measure.
-    observeApprovals(approvalsEl)
-    const approvalsH = approvalsEl?.getBoundingClientRect().height ?? 0
-    const desired = Math.ceil(headerEl.getBoundingClientRect().height + approvalsH + listH)
+    const desired = Math.ceil(headerEl.getBoundingClientRect().height + listH)
     // Always fire when content actually exceeds the viewport — that's the
     // overflow case we're guarding against. Drift sources (DPI shift, OS
     // clamp on a prior request, external resize) leave `lastSentHeight`
@@ -676,7 +651,6 @@
       if (widthTimer !== null) clearTimeout(widthTimer)
       cancelReadyRetry()
       contentObserver?.disconnect()
-      approvalsObserver?.disconnect()
     }
   })
 

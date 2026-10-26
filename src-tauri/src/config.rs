@@ -441,7 +441,10 @@ pub struct SyncConfig {
     /// set — never run unauthenticated.
     pub token: Option<String>,
     /// Accept relayed peer messages, which **start a turn** in a live local
-    /// agent at that agent's permission level.
+    /// agent at that agent's permission level, or **start a new session** in
+    /// a trusted project that has none running. It is the only switch on that
+    /// start, for a relayed message (a bound peer) and a local one
+    /// (`TargetResolution::LocalIdle`) alike.
     ///
     /// Separate from `listen`, and off by default, because the two grant
     /// materially different things. A user who turned sync on was buying a

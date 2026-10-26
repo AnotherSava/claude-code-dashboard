@@ -15,7 +15,7 @@ Each Claude Code session becomes one row. The row's `id` is *initially* derived 
 
 **Two sessions in one folder.** A row belongs to a folder, so a second Claude Code session started in the same folder joins the same row rather than getting its own. The row keeps following the session it was showing, even while you type into the other one. Only when the session it was showing quits while the other keeps running does the row pass to the other one, settling to DONE. Until then the second session changes nothing, so a session a script starts briefly in your project folder can't take the row over, or make it disappear when it exits. Two sessions lasting in one folder is usually a mistake, so after a minute the dashboard sends a Telegram message, when Telegram is set up, asking you to close the one you aren't using — see [Settings](settings#notifications).
 
-**Renaming or moving a project folder.** A row's id comes from the folder, so a renamed folder would otherwise start over as a new row with no history. Once the sessions in that folder have exited and the folder has moved, tell the widget about the move with one call to its [local API](development/http-api#post-apiprojectrename), and the history, custom name and start permission follow the project to its new name. Your other synced devices carry their copy of the history, and their own name for the row, over too.
+**Renaming or moving a project folder.** A row's id comes from the folder, so a renamed folder would otherwise start over as a new row with no history. Once the sessions in that folder have exited and the folder has moved, tell the widget about the move with one call to its [local API](development/http-api#post-apiprojectrename), and the history and custom name follow the project to its new name. Your other synced devices carry their copy of the history, and their own name for the row, over too.
 
 ## Live status
 
@@ -190,7 +190,7 @@ Sync also carries an optional second capability: an agent on one machine can sen
 
 A message can only ever reach an agent that's already running, so one sent to a project you don't happen to have open would normally come back saying nothing was delivered. The widget can answer that differently: it starts a session in the project folder and delivers the message into it. The session is an ordinary one. On a Mac it opens in a terminal tab, which stays open after the conversation is over and is waiting when you come back to the machine; on Windows it runs in the background, and you join it from that folder. A session started on Windows also gets a background tab where the agent that asked for it runs — in agwinterm when that agent is on Windows, a `⇄` tab in agterm when it's on the Mac — so it's there for you to read.
 
-It starts one only in a folder Claude Code has been trusted in, and only where exactly one folder on that machine matches the project's name. Anything that can message your agents can start one this way, and [Settings](settings#starting-sessions-on-request) spells out what that covers.
+It starts one only in a folder Claude Code has been trusted in, and only where exactly one folder on that machine matches the project's name. Any agent on this computer, or on one of your devices this one knows by its Tailscale name, can start one this way, and [Settings](settings#starting-sessions-on-request) spells out what that covers.
 
 ## Configuration
 

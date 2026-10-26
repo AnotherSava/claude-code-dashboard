@@ -131,8 +131,8 @@ pub fn attest(claimed_device: &str, peer: Option<&TailnetPeer>, bindings: &BTree
 /// itself. That is a fair corroboration for deciding whose rows a push becomes,
 /// which is all `attest` was written for. It is not a gate.
 ///
-/// So starting a process, recording a standing permission, and disclosing this
-/// machine's directory layout all require a binding the *receiver* wrote down —
+/// So starting a process (`sync::post_message`'s `start_unattested`) requires a
+/// binding the *receiver* wrote down —
 /// which is what makes the check non-circular, exactly as `attest`'s own doc
 /// says about the map living locally.
 pub fn bound(claimed_device: &str, peer: Option<&TailnetPeer>, bindings: &BTreeMap<String, String>) -> bool {

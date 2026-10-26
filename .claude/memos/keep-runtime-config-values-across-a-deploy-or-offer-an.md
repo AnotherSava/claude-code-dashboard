@@ -10,5 +10,5 @@ Mechanism: the shared ~/.claude/skills/deploy/scripts/deploy-tauri.sh does cp -f
 
 Wanted: runtime-changed values survive a deploy by default, or at least an option to make them. Open design questions to settle before building:
 - Merge instead of overwrite: the source file's keys win, keys present only in the live config are kept. Cost: a key deleted from the source file then lives on forever in config.json, so removal needs its own path.
-- Where it lives: the shared deploy script (dotfiles repo, affects every Tauri project) vs this project's scripts/deploy.sh vs the app itself (persist tray-toggled settings in their own app-data file, the way custom_names.json and auto_start.json already are, which is the pattern that memory recommends).
+- Where it lives: the shared deploy script (dotfiles repo, affects every Tauri project) vs this project's scripts/deploy.sh vs the app itself (persist tray-toggled settings in their own app-data file, the way custom_names.json already is, which is the pattern that memory recommends).
 - Which settings count as runtime state: at least the tray checkboxes (high_alert, tray_context_alert_enabled, keep awake, tray_badge, history_font_size).

@@ -14,7 +14,7 @@
 //!
 //! - **Is an agent alive in this directory?** Claude Code's own session registry
 //!   ([`crate::session_registry`]), which is pid-backed and image-confirmed. Not
-//!   the terminal: a tab *outlives* the agent in it — `session_launcher` starts
+//!   the terminal: a tab *outlives* the agent in it — agterm's `launch` starts
 //!   sessions as `zsh -ilc 'claude; exec zsh -i'` precisely so the tab survives —
 //!   so a tab-driven restore resurrects rows for agents that have exited, frozen
 //!   on the glyph they died on, and the row would then be immortal (see below).
