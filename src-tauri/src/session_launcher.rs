@@ -253,16 +253,14 @@ fn candidates_in(config: &serde_json::Value, project: &str, projects_root: Optio
 ///
 /// Split from the launch ([`TerminalAdapter::launch`]) so the whole policy is
 /// testable without spawning anything, and so a refusal costs no process.
-pub fn check_startable(project: &str, projects_root: Option<&str>, launcher: Option<&dyn TerminalAdapter>) -> Result<PathBuf, StartRefusal> {
+pub fn check_startable(project: &str, projects_root: Option<&str>, launcher: Option<Box<dyn TerminalAdapter>>) -> Result<(PathBuf, Box<dyn TerminalAdapter>), StartRefusal> {
     let dir = resolve_dir(claude_project_index().as_ref(), project, projects_root)?;
     // Asked last, so every refusal naming something about *this project* is
     // reached first. A machine with no launcher must still answer
     // `unknown_project` for an id nothing here derives, or its own missing
     // capability would mask what the caller got wrong about the address.
-    if !can_launch(launcher) {
-        return Err(StartRefusal::NoLauncher);
-    }
-    Ok(dir)
+    let launcher = launcher.filter(|l| l.can_launch()).ok_or(StartRefusal::NoLauncher)?;
+    Ok((dir, launcher))
 }
 
 /// The one directory `project` names on this machine, if it names exactly one
@@ -362,11 +360,10 @@ pub async fn start_and_wait(
     launcher: Option<Box<dyn TerminalAdapter>>,
     now: i64,
 ) -> StartResult {
-    let dir = match check_startable(project, projects_root, launcher.as_deref()) {
-        Ok(dir) => dir,
+    let (dir, launcher) = match check_startable(project, projects_root, launcher) {
+        Ok(checked) => checked,
         Err(refusal) => return StartResult::Refused(refusal),
     };
-    let Some(launcher) = launcher else { return StartResult::Refused(StartRefusal::NoLauncher) };
     start_in(project, &dir, projects_root, registry, guard, launcher, false, now).await
 }
 
@@ -505,11 +502,6 @@ async fn await_inbox(registry: &crate::session_registry::SessionRegistry, projec
     }
 }
 
-/// Whether this machine can start a session at all.
-fn can_launch(launcher: Option<&dyn TerminalAdapter>) -> bool {
-    launcher.is_some_and(|l| l.can_launch())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -606,12 +598,6 @@ mod tests {
         assert_eq!(StartRefusal::NoSuchProject.slug(), "unknown_project");
     }
 
-    /// A platform with no terminal adapter has nothing to start a session in.
-    #[test]
-    fn no_terminal_means_no_launch() {
-        assert!(!can_launch(None));
-    }
-
     /// The capability is this machine's business and the address is the
     /// caller's. Ordering the launcher check last is what stops the first from
     /// masking the second — a mistyped id has to keep answering
@@ -619,9 +605,9 @@ mod tests {
     /// since that is the half the sender can act on.
     #[test]
     fn a_missing_launcher_does_not_mask_what_the_caller_got_wrong() {
-        let answer = check_startable("zz-derives-nowhere-4f2a", None, None);
+        let answer = check_startable("zz-derives-nowhere-4f2a", None, None).err();
         assert!(
-            matches!(answer, Err(StartRefusal::NoSuchProject) | Err(StartRefusal::UntrustedDirectory)),
+            matches!(answer, Some(StartRefusal::NoSuchProject) | Some(StartRefusal::UntrustedDirectory)),
             "the existence question comes first, got {answer:?}"
         );
     }

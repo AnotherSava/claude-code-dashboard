@@ -58,9 +58,8 @@ Everything above answers whether the other platform's arm *builds*. None of it
 answers what that platform *does*, because `cargo test` here still skips every
 `#[cfg(not(target_os = "macos"))]` test. Where the platform fact is funnelled
 through a single predicate *function* instead of being spread across `#[cfg]`
-attributes — `session_launcher::can_launch`, whose body is one
-`cfg!(target_os = "macos")` — flipping that one body makes the behaviour
-runnable locally:
+attributes — a function whose whole body is one `cfg!(target_os = "macos")` —
+flipping that one body makes the behaviour runnable locally:
 
 1. `cp <mod>.rs /tmp/<mod>-real.rs` first; a self-inverse `sed` cannot undo
    step 3.
@@ -73,7 +72,8 @@ runnable locally:
 
 The predicate's own agreement test fails while flipped, which is the point of
 having one: run the behavioural tests by name rather than the whole module. Used
-2026-10-08 on `can_launch`, which `check_startable` asks last, confirming both
+2026-10-08 on `session_launcher::can_launch`, a predicate `check_startable`
+asked last and since folded into it, confirming both
 arms macOS cannot reach — an id nothing derives still answers `NoSuchProject`
 rather than `NoLauncher`, and a present, trusted project answers `NoLauncher`.
 The design consequence is worth more than
