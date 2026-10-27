@@ -386,7 +386,7 @@ On Windows the session starts detached in the remote-session holder's tmux serve
 |---     |---        |---      |
 | `200`  | `started` | a session was started; `detail` says whether it has registered yet |
 | `200`  | `running` | a session is already running in that folder, so nothing was started |
-| `409`  | `refused` | `reason` is the start refusal's slug, such as `start_no_directory` or `start_already_running` |
+| `409`  | `refused` | `reason` is the start refusal's slug, such as `start_no_directory` or `start_already_running`, or `registry_unreadable` when Claude Code's session list could not be read, so a running session there cannot be ruled out |
 
 Every answer also carries the `project` id the folder derives. Logged as `decision = "session_open"` with that id and the `outcome`.
 
@@ -470,7 +470,7 @@ Every field is optional on the wire (`serde(default)`) so a peer on an older bui
 
 That tolerance runs both ways, and `from_task` is the field that exercised it: the **sending** dashboard stamps it, so until both machines are on the same build one of them is the older one. A peer that predates the field drops it silently and renders a header without the line — which is correct, and is also why the field cannot be checked by relaying to a peer and asking what it saw. `from_label` is the sender's account of why it is writing; `from_task` is what the sending dashboard has on record for the row `from_agent` names, kept separate so neither has to stand in for the other.
 
-Returns `200` and a receipt for anything it observed about the socket (`written`, `duplicate`, `unreachable`), and a `4xx` with a receipt for an envelope or target problem: `404` when no live interactive session on this machine derives that project id, `409` when two do. Two sessions in one directory are two inboxes and there is no way to choose between them, so it refuses rather than picking — the same rule terminal titles already follow, where the stake was only which tab got a title.
+Returns `200` and a receipt for anything it observed about the socket (`written`, `duplicate`, `unreachable`), and a `4xx` with a receipt for an envelope or target problem: `404` when no live interactive session on this machine derives that project id and none could be started (`unknown_project` where no directory here derives it), `409` when two do. A known project with nothing running is started for the message where the sender's device is bound in `sync.peer_identity`; an unbound sender gets `403 start_unattested`, and the other `start_*` refusals in [Starting a session that is not running](#starting-a-session-that-is-not-running) can answer here too, at the statuses that table gives, several of them `503`. Two sessions in one directory are two inboxes and there is no way to choose between them, so it refuses rather than picking — the same rule terminal titles already follow, where the stake was only which tab got a title.
 
 **No credential crosses the wire.** The alternative shape — reaching into the other machine to read a session's key file and injecting it into that machine's IPC channel — is indistinguishable from exfiltration whatever the intent, and was refused when tried. This design exists so the only process that ever reads a messaging key is the dashboard already running as that user on that machine.
 

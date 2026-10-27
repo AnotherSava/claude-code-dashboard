@@ -263,7 +263,7 @@ The `sync` block shows sessions from your other computers — see [Features → 
 
   You need it on both devices, each naming the other. The two names are usually *not* the same — a Mac may call itself `Some-Laptop.local` while Tailscale knows it as `some-laptop` — which is why it is written down rather than guessed. Find the Tailscale name with `tailscale status` (on macOS the command lives inside the app: `/Applications/Tailscale.app/Contents/MacOS/Tailscale status`).
 
-  A device you leave out isn't blocked, just unchecked. The widget shows which is which: `/api/agents` reports each peer as `attested` or `claimed`.
+  A device you leave out can still sync and message running sessions, unchecked, but it can't start a session on this computer: a message to a project with nothing running is refused until the device is listed here. The widget shows which is which: `/api/agents` reports each peer as `attested` or `claimed`.
 - `peers` — addresses of the other devices' sync listeners, e.g. `["http://my-laptop:9078"]`.
 - `token` — a shared secret, the same string on every device; pushes without it are rejected. Sync stays fully off while it's `null`.
 
