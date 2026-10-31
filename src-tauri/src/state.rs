@@ -450,14 +450,12 @@ pub struct AgentSession {
     #[serde(skip)]
     pub origin_label: Option<String>,
     /// Whether the turn currently in flight was begun by a relayed peer message
-    /// rather than by something a human typed — captured by `apply_set` on the
-    /// same non-`Working` → `Working` transition that captures
-    /// `status_before_working`, from `SetInput::turn_from_relay`.
+    /// rather than by something a human typed — written by `apply_set` on every
+    /// prompt, from `SetInput::turn_begun_by` being `Some(TurnOrigin::Peer)`.
     ///
-    /// Both facts are about *this turn*, and both are written by one line of one
-    /// function at one instant, so they cannot come to disagree about which turn
-    /// they describe. That is the whole reason this is captured at the transition
-    /// rather than stamped when the frame is written into the session's inbox:
+    /// It is about *this turn* and is written when the prompt that began the turn
+    /// arrives, which is the whole reason it is not stamped when the frame is
+    /// written into the session's inbox:
     /// across 115 measured `peer_write`s, 16 produced no arriving prompt at all
     /// and 4 arrived in one burst 3.8 to 8.1 hours later, so a stamp left waiting
     /// for "the next turn" to collect it would be collected by a turn that had
@@ -469,6 +467,28 @@ pub struct AgentSession {
     /// CLEAN claim rather than inventing one.
     #[serde(skip)]
     pub turn_from_relay: bool,
+    /// The label of a question this row was blocked on when something other than
+    /// the user began the turn now in flight — a notification Claude Code
+    /// submitted on its own account ([`TurnOrigin::Notification`]) or another
+    /// agent's message, relayed ([`TurnOrigin::Peer`]) or sent with `SendMessage`
+    /// ([`TurnOrigin::Agent`]) — `None` whenever no such question is being carried.
+    ///
+    /// Such a turn runs because the agent was woken, not because the user
+    /// answered, so the question is still unanswered when the turn ends, however
+    /// that turn's own final message reads. `http_server::question_still_pending`
+    /// reads it at the turn's `Stop` and keeps the row BLOCK where the turn would
+    /// otherwise settle DONE or WAIT. Captured by `apply_set` only when such a
+    /// prompt lands on a row whose main agent is BLOCK, so one arriving
+    /// mid-turn — after the user answered an `AskUserQuestion`, say — carries
+    /// nothing; replaced on every prompt, so a prompt the user types ends the
+    /// hold; and cleared once the turn ends DONE, ERROR or CLEAN. A BLOCK inside
+    /// the turn (a tool approval) keeps it, and so does a WAIT, since a held
+    /// `Stop` settles BLOCK and the next notification captures it again.
+    ///
+    /// In memory only, like `turn_from_relay`: a restart loses it, and the row
+    /// then settles as the turn's own `Stop` says.
+    #[serde(skip)]
+    pub held_question: Option<String>,
     /// When a `/pull` run told this dashboard it left nothing worth coming back
     /// to (`POST /api/session-clean`), as wall-clock ms — `None` whenever no such
     /// claim is outstanding.
@@ -940,6 +960,33 @@ pub struct CleanClaimFacts {
     pub status_before_working: Status,
 }
 
+/// What began a turn, read off the prompt that arrived.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TurnOrigin {
+    /// Anything not recognised as one of the others — a prompt typed by the
+    /// user, or an empty one.
+    Person,
+    /// A relayed peer message, recognised by the preamble this dashboard writes.
+    Peer,
+    /// A message another session on this machine sent with Claude Code's own
+    /// `SendMessage` (`peer_message::parse_agent_message`). Kept apart from
+    /// [`TurnOrigin::Peer`] because only a relay counts toward the CLEAN rule.
+    Agent,
+    /// Claude Code waking the agent on its own account
+    /// (`peer_message::parse_harness_prompt`): background work finished, a
+    /// subagent handed back, or a notice about another session.
+    Notification,
+}
+
+impl TurnOrigin {
+    /// Whether the turn was begun by something other than the user — Claude Code
+    /// or another agent waking the agent — so it answers no question the row was
+    /// blocked on.
+    pub fn is_not_the_user(self) -> bool {
+        self != TurnOrigin::Person
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct SetInput {
     pub id: String,
@@ -953,15 +1000,17 @@ pub struct SetInput {
     /// silently-killable (`shell`) background task holds the WAIT, arming the
     /// `waiting_settle` backstop. `false` for every other event/status.
     pub waiting_backstop_armed: bool,
-    /// Who began the turn this event belongs to — `Some(true)` when a relayed
-    /// peer message did, `Some(false)` when a human typed it, and `None` from
-    /// every event that says nothing either way.
+    /// Who began the turn this event belongs to — `Some` with the [`TurnOrigin`]
+    /// on a prompt, and `None` from every event that says nothing either way.
     ///
     /// Set to `Some` by the `UserPromptSubmit` adapter alone, which is the only
-    /// event that *is* a prompt arriving. The three-state form is what keeps the
-    /// question separate from the status: `log_watcher`'s promote also sets
-    /// `Working`, and reading relay-ness off the status would let a promotion
-    /// mid-turn silently rewrite who started it.
+    /// event that *is* a prompt arriving. Carrying it beside the status, as an
+    /// `Option` that only a prompt fills, is what keeps who began the turn
+    /// separate from the status: `log_watcher`'s promote also sets `Working`, and
+    /// reading the origin off the status would let a promotion mid-turn silently
+    /// rewrite who started it. `apply_set` reads it twice: `Peer` sets
+    /// `AgentSession::turn_from_relay`, and any origin but `Person` landing on a
+    /// BLOCK row captures `AgentSession::held_question`.
     ///
     /// `apply_set` acts on `Some` regardless of the transition, unlike
     /// `status_before_working`, which is captured only on a real entry into
@@ -971,7 +1020,7 @@ pub struct SetInput {
     /// flight and has to follow every prompt. Conflating them left a claim from an
     /// unsettled turn redeemable by the next one — caught by
     /// `a_new_turn_revokes_an_unredeemed_clean_claim`.
-    pub turn_from_relay: Option<bool>,
+    pub turn_begun_by: Option<TurnOrigin>,
     /// For a prompt another agent wrote, its sender's own task where that was
     /// resolved — settled by `http_server` through `prompt_origin::for_arrival`
     /// before the event is applied. `None` for a prompt a person typed and for
@@ -1206,8 +1255,8 @@ impl AppState {
                 // empty prompt, a `<task-notification>`, a subagent's hand-back or
                 // a cross-session notice — runs a turn of the task already there,
                 // so its timer and its dialog's task marks stay as they are. A
-                // prompt is what `turn_from_relay` being `Some` means.
-                let prompt_names_no_task = input.label.is_none() && input.turn_from_relay.is_some();
+                // prompt is what `turn_begun_by` being `Some` means.
+                let prompt_names_no_task = input.label.is_none() && input.turn_begun_by.is_some();
                 // Another agent's message belongs to the exchange already under
                 // way, not to a new task, when it arrives while this row's turn is
                 // still running, or when it is a reply to a message this row's
@@ -1243,9 +1292,12 @@ impl AppState {
                 // Either way it no longer describes anything about to end, which
                 // is the revocation rule falling out of the ordering rather than
                 // needing a timer.
-                if let Some(relay) = input.turn_from_relay {
-                    existing.turn_from_relay = relay;
+                if let Some(origin) = input.turn_begun_by {
+                    existing.turn_from_relay = origin == TurnOrigin::Peer;
                     existing.clean_claim_at = None;
+                    existing.held_question = (origin.is_not_the_user() && prior == Status::Blocked).then(|| existing.label.clone());
+                } else if matches!(input.status, Status::Done | Status::Error | Status::Idle) {
+                    existing.held_question = None;
                 }
 
                 let crate::label_policy::Selected { label: new_label, original_prompt: new_original_prompt, delegated_task: new_delegated_task, message_line: new_message_line } =
@@ -1549,7 +1601,8 @@ fn new_session(
         // row is still refused a CLEAN settle, because `status_before_working`
         // on a row this process has never seen before cannot say it was clean —
         // but the fact that is knowable is recorded rather than flattened.
-        turn_from_relay: input.turn_from_relay.unwrap_or(false),
+        turn_from_relay: input.turn_begun_by == Some(TurnOrigin::Peer),
+        held_question: None,
         clean_claim_at: None,
         read: false,
         name_shared_by: None,
@@ -1694,6 +1747,11 @@ impl AppState {
             // row cannot make its pre-turn state unreadable.
             status_before_working: s.status_before_working,
         })
+    }
+
+    /// The question a turn the user did not begin is carrying for this row, if any — see [`AgentSession::held_question`].
+    pub fn held_question(&self, id: &str) -> Option<String> {
+        self.sessions.lock().unwrap().iter().find(|s| s.id == id).and_then(|s| s.held_question.clone())
     }
 
     /// Settle a stale `Waiting` row to `Done` — the backstop for background work
@@ -2104,7 +2162,7 @@ mod tests {
             input_tokens: None,
             dialog_entry: None,
             waiting_backstop_armed: false,
-            turn_from_relay: None,
+            turn_begun_by: None,
             delegated_task: None,
             message_line: None,
             message_is_reply: None,
@@ -2121,7 +2179,7 @@ mod tests {
             input_tokens: None,
             dialog_entry: None,
             waiting_backstop_armed: false,
-            turn_from_relay: None,
+            turn_begun_by: None,
             delegated_task: None,
             message_line: None,
             message_is_reply: None,
@@ -2876,7 +2934,7 @@ mod tests {
                 input_tokens: Some(50_000),
                 dialog_entry: None,
                 waiting_backstop_armed: false,
-                turn_from_relay: None,
+                turn_begun_by: None,
                 delegated_task: None,
                 message_line: None,
                 message_is_reply: None,
@@ -3056,7 +3114,7 @@ mod tests {
                 text: label.to_string(),
             }),
             waiting_backstop_armed: false,
-            turn_from_relay: None,
+            turn_begun_by: None,
             delegated_task: None,
             message_line: None,
             message_is_reply: None,
@@ -3076,7 +3134,7 @@ mod tests {
                 text: agent_text.to_string(),
             }),
             waiting_backstop_armed: false,
-            turn_from_relay: None,
+            turn_begun_by: None,
             delegated_task: None,
             message_line: None,
             message_is_reply: None,
@@ -3181,12 +3239,95 @@ mod tests {
         state.apply_set(stop_with_dialog("a", Status::Waiting, "started"), 5_000, NO_CONTINUATIONS, None);
         let before = get(&state, "a");
         assert_eq!(before.working_accumulated_ms, 5_000);
-        let notification = prompt_submitted("<task-notification>\n<status>completed</status>\n</task-notification>");
+        let notification = prompt_submitted(NOTIFICATION);
         assert!(notification.dialog_entry.is_none());
         state.apply_set(notification, 9_000, NO_CONTINUATIONS, None);
         let s = get(&state, "a");
         assert_eq!(s.status, Status::Working);
         assert_eq!((s.original_prompt.as_deref(), s.task_started_at, s.working_accumulated_ms), (Some("start the dev server"), before.task_started_at, 5_000));
+    }
+
+    const NOTIFICATION: &str = "<task-notification>\n<status>completed</status>\n</task-notification>";
+
+    /// A row left BLOCK on a question: a task, then a `Stop` that asks.
+    fn blocked_on_a_question(state: &AppState) {
+        state.apply_set(prompt_submitted("commit the memo"), 0, NO_CONTINUATIONS, None);
+        state.apply_set(SetInput { label: Some("has a question".into()), ..stop_with_dialog("a", Status::Blocked, "Deploy too?") }, 5_000, NO_CONTINUATIONS, None);
+    }
+
+    /// A notification landing on a BLOCK row carries the question through the
+    /// turn it begins. A held BLOCK keeps carrying it for the next notification,
+    /// and a turn ending DONE, ERROR or CLEAN lets go of it.
+    #[test]
+    fn a_notification_on_a_blocked_row_carries_the_question() {
+        let state = AppState::new();
+        blocked_on_a_question(&state);
+        assert_eq!(state.held_question("a"), None);
+        state.apply_set(prompt_submitted(NOTIFICATION), 9_000, NO_CONTINUATIONS, None);
+        assert_eq!(get(&state, "a").status, Status::Working);
+        assert_eq!(state.held_question("a").as_deref(), Some("has a question"));
+        state.apply_set(SetInput { label: Some("has a question".into()), ..stop_with_dialog("a", Status::Blocked, "CI passed.") }, 12_000, NO_CONTINUATIONS, None);
+        assert_eq!(state.held_question("a").as_deref(), Some("has a question"), "a held BLOCK still carries it");
+        state.apply_set(stop_with_dialog("a", Status::Error, ""), 13_000, NO_CONTINUATIONS, None);
+        assert_eq!(state.held_question("a"), None, "a failed turn carries nothing into the next");
+    }
+
+    /// A tool approval inside the notification turn is no answer to the
+    /// question, so the hold outlives it.
+    #[test]
+    fn a_tool_approval_inside_the_turn_keeps_the_hold() {
+        let state = AppState::new();
+        blocked_on_a_question(&state);
+        state.apply_set(prompt_submitted(NOTIFICATION), 9_000, NO_CONTINUATIONS, None);
+        state.apply_set(SetInput { label: Some("needs approval: Bash".into()), dialog_entry: None, ..stop_with_dialog("a", Status::Blocked, "") }, 10_000, NO_CONTINUATIONS, None);
+        assert_eq!(state.held_question("a").as_deref(), Some("has a question"));
+    }
+
+    /// The user typing anything — the answer above all — ends the hold, even
+    /// mid-turn before that notification turn's `Stop`.
+    #[test]
+    fn a_typed_prompt_ends_the_hold() {
+        let state = AppState::new();
+        blocked_on_a_question(&state);
+        state.apply_set(prompt_submitted(NOTIFICATION), 9_000, NO_CONTINUATIONS, None);
+        state.apply_set(prompt_submitted("yes"), 10_000, NO_CONTINUATIONS, None);
+        assert_eq!(state.held_question("a"), None);
+    }
+
+    /// A notification arriving while a turn runs carries nothing: the row is
+    /// WORK, so whatever it was blocked on before has already been answered.
+    #[test]
+    fn a_notification_mid_turn_carries_nothing() {
+        let state = AppState::new();
+        blocked_on_a_question(&state);
+        state.apply_set(prompt_submitted("yes"), 9_000, NO_CONTINUATIONS, None);
+        state.apply_set(prompt_submitted(NOTIFICATION), 10_000, NO_CONTINUATIONS, None);
+        assert_eq!(get(&state, "a").status_before_working, Status::Blocked, "the stale pre-turn status a naive check would read");
+        assert_eq!(state.held_question("a"), None);
+    }
+
+    /// Another agent's message is no answer either, relayed or sent locally with
+    /// `SendMessage`, so it carries the question like a notification does.
+    #[test]
+    fn an_agent_message_on_a_blocked_row_carries_the_question() {
+        let local = "<cross-session-message from=\"uds:/tmp/cc-socks/7.sock\" from-name=\"peer\" from-mode=\"prompting\">\nplease pull\n</cross-session-message>";
+        for origin in [TurnOrigin::Peer, TurnOrigin::Agent] {
+            let state = AppState::new();
+            blocked_on_a_question(&state);
+            let prompt = SetInput { turn_begun_by: Some(origin), ..prompt_submitted(local) };
+            state.apply_set(prompt, 9_000, NO_CONTINUATIONS, None);
+            assert_eq!(state.held_question("a").as_deref(), Some("has a question"), "{origin:?}");
+        }
+    }
+
+    /// A notification on a row that was not waiting on the user carries nothing.
+    #[test]
+    fn a_notification_on_a_finished_row_carries_nothing() {
+        let state = AppState::new();
+        state.apply_set(prompt_submitted("start the build"), 0, NO_CONTINUATIONS, None);
+        state.apply_set(stop_with_dialog("a", Status::Waiting, "started"), 5_000, NO_CONTINUATIONS, None);
+        state.apply_set(prompt_submitted(NOTIFICATION), 9_000, NO_CONTINUATIONS, None);
+        assert_eq!(state.held_question("a"), None);
     }
 
     /// A person who pasted a report to ask about it is a person, and starts a
@@ -3338,6 +3479,7 @@ why did this become the task?");
             content_seen_at: None,
             origin_label: None,
             turn_from_relay: false,
+            held_question: None,
             delegated_task: None,
             message_line: None,
             clean_claim_at: None,
@@ -3616,6 +3758,7 @@ why did this become the task?");
             content_seen_at: None,
             origin_label: None,
             turn_from_relay: false,
+            held_question: None,
             delegated_task: None,
             message_line: None,
             clean_claim_at: None,

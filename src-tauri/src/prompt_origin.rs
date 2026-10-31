@@ -392,7 +392,7 @@ mod tests {
         // task, with no `delegated_task`.
         let rows_with_task = |task: &str| {
             let state = AppState::new();
-            state.apply_set(SetInput { id: "b".into(), status: Status::Working, label: Some(clean_prompt(task)), source: None, model: None, input_tokens: None, dialog_entry: None, waiting_backstop_armed: false, turn_from_relay: None, delegated_task: None, message_line: None, message_is_reply: None }, 1_000, &[], None);
+            state.apply_set(SetInput { id: "b".into(), status: Status::Working, label: Some(clean_prompt(task)), source: None, model: None, input_tokens: None, dialog_entry: None, waiting_backstop_armed: false, turn_begun_by: None, delegated_task: None, message_line: None, message_is_reply: None }, 1_000, &[], None);
             state.snapshot()
         };
         let found = |_: Option<&str>, _: Option<&str>| Ok("b".to_string());
@@ -446,7 +446,7 @@ mod tests {
         use crate::state::{AppState, SetInput, Status};
         let envelope = clean_prompt(&local("pipe-a", "a", "here is the answer"));
         let res = Resolution { text: Some("add a title-bar caption".into()), outcome: Outcome::ResolvedLocal, sender: Some("a".into()) };
-        let set = |status, label: Option<&str>, res: Option<&Resolution>| SetInput { id: "r".into(), status, label: label.map(str::to_string), source: None, model: None, input_tokens: None, dialog_entry: None, waiting_backstop_armed: false, turn_from_relay: None, delegated_task: res.and_then(Resolution::delegated_task), message_line: res.and_then(Resolution::message_line), message_is_reply: label.and_then(parse_agent_message).map(|m| m.is_reply()) };
+        let set = |status, label: Option<&str>, res: Option<&Resolution>| SetInput { id: "r".into(), status, label: label.map(str::to_string), source: None, model: None, input_tokens: None, dialog_entry: None, waiting_backstop_armed: false, turn_begun_by: None, delegated_task: res.and_then(Resolution::delegated_task), message_line: res.and_then(Resolution::message_line), message_is_reply: label.and_then(parse_agent_message).map(|m| m.is_reply()) };
         let row = |state: &AppState| state.snapshot().into_iter().find(|s| s.id == "r");
 
         let state = AppState::new();

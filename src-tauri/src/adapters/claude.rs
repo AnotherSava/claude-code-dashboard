@@ -11,7 +11,7 @@ use serde_json::Value;
 
 use crate::adapters::{AdapterOutput, SubagentEffect};
 use crate::config::Config;
-use crate::state::{DialogRole, PendingDialogEntry, SetInput, Status, SubagentPromptRequest};
+use crate::state::{DialogRole, PendingDialogEntry, SetInput, Status, SubagentPromptRequest, TurnOrigin};
 
 /// Built-in Claude Code tools that pause the model on a user decision. The
 /// call's `tool_use` block reaches the JSONL transcript while the dialog is
@@ -21,12 +21,12 @@ use crate::state::{DialogRole, PendingDialogEntry, SetInput, Status, SubagentPro
 /// counting it as a tool call would flip a question still on screen to WORK.
 pub(crate) const USER_GATING_TOOLS: &[&str] = &["AskUserQuestion", "ExitPlanMode"];
 
-/// Claude Code injects synthetic prompts (e.g. background-task completion
-/// notices) as `<task-notification>` blocks. They are not real user input and
-/// must not become dialog entries — filtered on both the hook path and the
+/// Claude Code injects background-task completion notices as
+/// `<task-notification>` blocks. Unlike its other harness prompts they must not
+/// become dialog entries — filtered on both the hook path and the
 /// transcript-watcher path.
 pub(crate) fn is_system_injected(prompt: &str) -> bool {
-    prompt.starts_with("<task-notification>")
+    crate::peer_message::parse_harness_prompt(prompt) == Some(crate::peer_message::HarnessPrompt::TaskNotification)
 }
 
 /// The adherence-canary marker template — the literal text the agent is asked to
@@ -185,7 +185,7 @@ pub fn dispatch(event: &str, payload: &Value, cfg: &Config) -> AdapterOutput {
     // an empty template makes `strip_response_marker` a plain trim, so a user who
     // never turned the feature on never has an incidental hex comment altered.
     let marker_template = if cfg.instruction_canary_enabled { CANARY_MARKER } else { "" };
-    let Some(Classification { status, label, reason, waiting_backstop_armed, turn_from_relay }) = classify_detailed(event, payload, QuestionRules::from_config(cfg), marker_template) else {
+    let Some(Classification { status, label, reason, waiting_backstop_armed, turn_begun_by, agent_message }) = classify_detailed(event, payload, QuestionRules::from_config(cfg), marker_template) else {
         return AdapterOutput::Ignore;
     };
 
@@ -220,11 +220,6 @@ pub fn dispatch(event: &str, payload: &Value, cfg: &Config) -> AdapterOutput {
         _ => None,
     };
 
-    // Read off the raw prompt the dialog entry keeps, so the envelope parses with
-    // its line structure intact; a prompt that becomes no entry (empty, or a
-    // `<task-notification>`) becomes no task either.
-    let agent_message = dialog_entry.as_ref().and_then(|e| crate::peer_message::parse_agent_message(&e.text));
-
     let subagent = match (event, subagent_id(payload), label.as_deref()) {
         ("PermissionRequest", Some(agent_id), Some(label)) => SubagentEffect::PromptOpened(SubagentPromptRequest {
             agent_id: agent_id.to_string(),
@@ -249,7 +244,7 @@ pub fn dispatch(event: &str, payload: &Value, cfg: &Config) -> AdapterOutput {
             input_tokens: None,
             dialog_entry,
             waiting_backstop_armed,
-            turn_from_relay,
+            turn_begun_by,
             delegated_task: None,
             message_line: None,
             message_is_reply: None,
@@ -318,26 +313,28 @@ struct Classification {
     waiting_backstop_armed: bool,
     /// Who began the turn — `Some` only on `UserPromptSubmit`, the one event that
     /// is a prompt arriving, and `None` from every other event because they say
-    /// nothing about it. See `state::SetInput::turn_from_relay`.
-    turn_from_relay: Option<bool>,
+    /// nothing about it. See `state::SetInput::turn_begun_by`.
+    turn_begun_by: Option<TurnOrigin>,
+    /// The agent message an arriving prompt carries, parsed once here so the
+    /// turn's origin and `AdapterOutput::Set::agent_message` are one answer.
+    agent_message: Option<crate::peer_message::AgentMessage>,
 }
 
 impl Classification {
     fn new(status: Status, label: Option<String>, reason: impl Into<String>) -> Self {
-        Self { status, label, reason: reason.into(), waiting_backstop_armed: false, turn_from_relay: None }
+        Self { status, label, reason: reason.into(), waiting_backstop_armed: false, turn_begun_by: None, agent_message: None }
     }
 
-    /// Record who began this turn: `true` for a relayed peer message, `false`
-    /// for a prompt a human typed. Only `UserPromptSubmit` may answer.
-    fn begun_by(mut self, relayed: bool) -> Self {
-        self.turn_from_relay = Some(relayed);
+    /// Record who began this turn. Only `UserPromptSubmit` may answer.
+    fn begun_by(mut self, origin: TurnOrigin) -> Self {
+        self.turn_begun_by = Some(origin);
         self
     }
 
     /// A `Waiting` classification carrying whether the time-backstop should arm
     /// (a `shell` background task is in flight vs. subagents only).
     fn waiting(backstop_armed: bool, reason: impl Into<String>) -> Self {
-        Self { status: Status::Waiting, label: None, reason: reason.into(), waiting_backstop_armed: backstop_armed, turn_from_relay: None }
+        Self { status: Status::Waiting, label: None, reason: reason.into(), waiting_backstop_armed: backstop_armed, turn_begun_by: None, agent_message: None }
     }
 }
 
@@ -457,18 +454,24 @@ fn classify_detailed(
             // turn" dangles and is then collected by whatever turn comes next,
             // including one a human typed. The prompt carries the fact with no
             // such gap.
-            let relayed = crate::peer_message::is_relayed_prompt(prompt);
+            let harness = crate::peer_message::parse_harness_prompt(prompt);
+            let agent_message = if harness.is_some() { None } else { crate::peer_message::parse_agent_message(prompt) };
+            let origin = match (&harness, &agent_message) {
+                (Some(_), _) => TurnOrigin::Notification,
+                (None, Some(crate::peer_message::AgentMessage::Relayed { .. })) => TurnOrigin::Peer,
+                (None, Some(crate::peer_message::AgentMessage::Local { .. })) => TurnOrigin::Agent,
+                (None, None) => TurnOrigin::Person,
+            };
             // A subagent's hand-back or a cross-session notice is no task from
             // anyone either, and gets no label for the same reason; unlike a
             // `<task-notification>` it keeps its dialog entry.
-            let classification = if prompt.trim().is_empty() || is_system_injected(prompt.trim()) {
-                Classification::new(Status::Working, None, "user submitted a prompt (empty/continuation)")
-            } else if let Some(harness) = crate::peer_message::parse_harness_prompt(prompt) {
-                Classification::new(Status::Working, None, format!("harness submitted a {}: no task from anyone, the row keeps its task", harness.slug()))
-            } else {
-                Classification::new(Status::Working, Some(clean_prompt(prompt)), "user submitted a prompt")
+            let classification = match harness {
+                Some(crate::peer_message::HarnessPrompt::TaskNotification) => Classification::new(Status::Working, None, "background work finished: the agent was woken, not answered"),
+                Some(harness) => Classification::new(Status::Working, None, format!("harness submitted a {}: no task from anyone, the row keeps its task", harness.slug())),
+                None if prompt.trim().is_empty() => Classification::new(Status::Working, None, "user submitted a prompt (empty/continuation)"),
+                None => Classification::new(Status::Working, Some(clean_prompt(prompt)), "user submitted a prompt"),
             };
-            Some(classification.begun_by(relayed))
+            Some(Classification { agent_message, ..classification.begun_by(origin) })
         }
         "UserPromptExpansion" => {
             // Fires the instant a slash command is invoked — seconds before
@@ -1331,7 +1334,7 @@ mod tests {
     #[test]
     fn only_a_prompt_answers_who_began_the_turn() {
         let begun_by = |event: &str, payload: &Value| {
-            classify_detailed(event, payload, NO_RULES, "").map(|c| c.turn_from_relay)
+            classify_detailed(event, payload, NO_RULES, "").map(|c| c.turn_begun_by)
         };
         let envelope = crate::peer_message::build_content(&crate::peer_message::Relayed {
             origin_device: "desktop",
@@ -1347,12 +1350,15 @@ mod tests {
             tailnet_user: None,
         });
 
-        assert_eq!(begun_by("UserPromptSubmit", &json!({"prompt": envelope})), Some(Some(true)));
-        assert_eq!(begun_by("UserPromptSubmit", &json!({"prompt": "/pull"})), Some(Some(false)));
+        assert_eq!(begun_by("UserPromptSubmit", &json!({"prompt": envelope})), Some(Some(TurnOrigin::Peer)));
+        assert_eq!(begun_by("UserPromptSubmit", &json!({"prompt": "/pull"})), Some(Some(TurnOrigin::Person)));
+        let local = "<cross-session-message from=\"uds:/tmp/cc-socks/7.sock\" from-name=\"peer\" from-mode=\"prompting\">\nplease pull\n</cross-session-message>";
+        assert_eq!(begun_by("UserPromptSubmit", &json!({"prompt": local})), Some(Some(TurnOrigin::Agent)));
         // An empty or auto-submitted prompt is still a prompt, and still answers:
-        // a `<task-notification>` resumes the turn a human or a peer started, and
         // leaving it `None` would let the previous answer stand for a new turn.
-        assert_eq!(begun_by("UserPromptSubmit", &json!({"prompt": ""})), Some(Some(false)));
+        assert_eq!(begun_by("UserPromptSubmit", &json!({"prompt": ""})), Some(Some(TurnOrigin::Person)));
+        assert_eq!(begun_by("UserPromptSubmit", &json!({"prompt": "<task-notification>\n<status>completed</status>\n</task-notification>"})), Some(Some(TurnOrigin::Notification)));
+        assert_eq!(begun_by("UserPromptSubmit", &json!({"prompt": "[Cross-session idle notice] another session went idle"})), Some(Some(TurnOrigin::Notification)), "every prompt Claude Code submits on its own account");
 
         // Every other event says nothing, so `apply_set` leaves the row's answer
         // alone rather than overwriting it mid-turn.

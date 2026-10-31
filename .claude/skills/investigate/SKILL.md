@@ -116,6 +116,15 @@ or `id`), and a `reason`:
     arrived.
   A `recorded` `pull_claim` with no `pull_clean` at all means a later prompt
   revoked the claim before any `Stop` came.
+- `question_held` — a `Stop` that would have settled DONE or WAIT was kept
+  BLOCK under `label`, because the turn it ended was begun by a prompt Claude
+  Code submitted on its own account (a background-task notification, a
+  subagent hand-back, a cross-session notice) or by another agent's message
+  (relayed or `SendMessage`; a `prompt_origin` line marks its arrival) while
+  the row was blocked on a question nobody had answered. The `classify` line
+  just before it carries the turn's own verdict. The script does not attribute a status to this line, so
+  for a held row "Set by" names the older `classify` BLOCK from before the
+  holding turn; look for `question_held` in the recent decisions.
 - `session_clear` / `compact_boundary` — session removed / context-compaction
   separator inserted. A `/clear` whose `SessionStart` arrived before its
   `SessionEnd` logs `session_clear` from the start; its late end then logs

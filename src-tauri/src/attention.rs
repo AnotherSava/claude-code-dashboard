@@ -472,7 +472,7 @@ mod tests {
                 input_tokens: None,
                 dialog_entry: None,
                 waiting_backstop_armed: false,
-                turn_from_relay: None,
+                turn_begun_by: None,
                 delegated_task: None,
                 message_line: None,
                 message_is_reply: None,

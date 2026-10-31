@@ -1247,6 +1247,7 @@ mod tests {
             content_seen_at: None,
             origin_label: None,
             turn_from_relay: false,
+            held_question: None,
             delegated_task: None,
             message_line: None,
             clean_claim_at: None,

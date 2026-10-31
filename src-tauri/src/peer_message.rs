@@ -536,30 +536,6 @@ pub struct Relayed<'a> {
 /// exactly like no relayed message having arrived.
 pub(crate) const RELAY_PREAMBLE: &str = "[cross-machine message, relayed by the dashboard]";
 
-/// Whether a `UserPromptSubmit` prompt is a relayed peer message this dashboard
-/// delivered, rather than something a human typed.
-///
-/// Nothing *outside* the envelope says so — measured, zero of 99 stored relay
-/// envelopes arrive inside a `<cross-session-message>` wrapper — so the only
-/// mark there is sits inside the text, and it is one this dashboard minted
-/// itself in [`build_content`].
-///
-/// # Why the preamble at the start, and not `contains`
-///
-/// The preamble is the envelope's first line and the sender's own text is fenced
-/// *below* it, so at offset 0 the marker cannot be forged from inside the body.
-/// A `contains` test would be forgeable there, and would additionally misread
-/// the four measured envelopes whose sender text quotes a delivery wrapper.
-/// `RESERVED_PHRASES` is therefore not the guard here: position is.
-///
-/// The preamble alone is not the whole test: [`parse_relayed`] also holds the
-/// envelope to its shape at the far end, so a person who pasted a delivered
-/// envelope and typed a question under it is a person. This is that parser's
-/// answer, so the CLEAN rule and the row's text read one envelope by one test.
-pub(crate) fn is_relayed_prompt(prompt: &str) -> bool {
-    parse_relayed(prompt).is_some()
-}
-
 /// Opening of the envelope Claude Code's own `SendMessage` puts around a message
 /// between two sessions on one machine:
 /// `<cross-session-message from="uds:<inbox>" from-name="<session name>" from-mode="…">`.
@@ -625,8 +601,7 @@ impl AgentMessage {
 
 /// Read an arriving prompt as a message another agent wrote, or `None` for one a
 /// person typed. One parser per transport: [`parse_local`] for Claude Code's
-/// `SendMessage`, and [`parse_relayed`], whose answer [`is_relayed_prompt`] is,
-/// so the CLEAN rule and this read one relay envelope by one test.
+/// `SendMessage`, and [`parse_relayed`] for this dashboard's relay.
 ///
 /// Both read the raw prompt and the whitespace-collapsed copy a row keeps as
 /// `original_prompt`, because a row persisted before envelopes were read holds
@@ -678,6 +653,21 @@ fn parse_local(prompt: &str) -> Option<AgentMessage> {
 /// [`build_content`] writes every one of them, so a prompt with text after the
 /// trailer is a person who pasted a delivered envelope and asked about it, and
 /// stays a person.
+///
+/// Nothing *outside* the envelope says a prompt is relayed — measured, zero of
+/// 99 stored relay envelopes arrive inside a `<cross-session-message>` wrapper —
+/// so the only mark sits inside the text, and it is one this dashboard minted
+/// itself. This answer decides the turn's origin (`TurnOrigin::Peer`, which the
+/// CLEAN rule reads) and the row's text alike, so both read one envelope by one
+/// test.
+///
+/// # Why the preamble at the start, and not `contains`
+///
+/// The preamble is the envelope's first line and the sender's own text is fenced
+/// *below* it, so at offset 0 the marker cannot be forged from inside the body.
+/// A `contains` test would be forgeable there, and would additionally misread
+/// the four measured envelopes whose sender text quotes a delivery wrapper.
+/// `RESERVED_PHRASES` is therefore not the guard here: position is.
 fn parse_relayed(prompt: &str) -> Option<AgentMessage> {
     let after_preamble = prompt.trim_start().strip_prefix(RELAY_PREAMBLE)?;
     // Everything above the fence is the dashboard's header and everything inside
@@ -742,6 +732,9 @@ const HAND_BACK_OPEN: &str = "<agent-message from=\"";
 const HAND_BACK_MARK: &str = "[Subagent hand-back]";
 const HAND_BACK_CLOSE: &str = "</agent-message>";
 
+/// The opening of the prompt Claude Code submits when background work finishes.
+const TASK_NOTIFICATION_OPEN: &str = "<task-notification>";
+
 /// Openings of the notices Claude Code submits to a session about another one.
 /// The idle notice is read off the stored prompts (3 on this machine on
 /// 2026-10-02); the delivery notice is the one Claude Code's `SendMessage` tool
@@ -752,6 +745,9 @@ const CROSS_SESSION_NOTICES: [&str; 2] = ["[Cross-session idle notice] ", "[Cros
 /// anyone: the turn runs, and the row keeps the task it had.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HarnessPrompt {
+    /// Background work this session started has finished
+    /// (`<task-notification>`).
+    TaskNotification,
     /// A subagent of this session handing back its final report.
     SubagentHandBack,
     /// Claude Code telling this session about another session.
@@ -759,9 +755,12 @@ pub enum HarnessPrompt {
 }
 
 impl HarnessPrompt {
-    /// The name the `classify` log line's `reason` gives it.
+    /// The name the `classify` log line's `reason` gives a hand-back or a
+    /// notice. A task notification is logged under its own fixed reason
+    /// ("background work finished…"), so its name here never reaches the log.
     pub fn slug(self) -> &'static str {
         match self {
+            HarnessPrompt::TaskNotification => "task_notification",
             HarnessPrompt::SubagentHandBack => "subagent_hand_back",
             HarnessPrompt::CrossSessionNotice => "cross_session_notice",
         }
@@ -772,16 +771,20 @@ impl HarnessPrompt {
 /// `None` for one a person or another agent wrote.
 ///
 /// Matched at the start only, as [`parse_agent_message`]'s parsers are, so a
-/// prompt that mentions either shape is a person's. A hand-back is held to its
+/// prompt that mentions any of these shapes is a person's. A hand-back is held to its
 /// whole shape as [`parse_local`] holds a delivery — the mark on the line after
 /// the opening tag and the closing tag ending the prompt — so a person who
 /// pasted one to ask about it stays a person. A notice is matched by its
-/// opening alone, since the delivery notice's far end has not been observed.
+/// opening alone, since the delivery notice's far end has not been observed,
+/// and so is a task notification, which Claude Code alone writes.
 ///
 /// Reads the raw prompt and the whitespace-collapsed copy a row keeps as
 /// `original_prompt`, as [`parse_agent_message`] does.
 pub(crate) fn parse_harness_prompt(prompt: &str) -> Option<HarnessPrompt> {
     let prompt = prompt.trim();
+    if prompt.starts_with(TASK_NOTIFICATION_OPEN) {
+        return Some(HarnessPrompt::TaskNotification);
+    }
     if CROSS_SESSION_NOTICES.iter().any(|n| prompt.starts_with(n)) {
         return Some(HarnessPrompt::CrossSessionNotice);
     }
@@ -1210,6 +1213,10 @@ pub fn deliver_to_inbox(socket_path: &str, pid: u32, msg_id: &str, from: &str, c
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn is_relayed_prompt(prompt: &str) -> bool {
+        parse_relayed(prompt).is_some()
+    }
 
     fn ids(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()

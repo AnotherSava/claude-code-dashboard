@@ -659,7 +659,7 @@ mod tests {
     fn unread_row(id: &str) -> crate::state::AgentSession {
         let state = crate::state::AppState::new();
         state.apply_set(
-            crate::state::SetInput { delegated_task: None, message_line: None, message_is_reply: None, id: id.into(), status: crate::state::Status::Done, label: None, source: None, model: None, input_tokens: None, dialog_entry: None, waiting_backstop_armed: false, turn_from_relay: None },
+            crate::state::SetInput { delegated_task: None, message_line: None, message_is_reply: None, id: id.into(), status: crate::state::Status::Done, label: None, source: None, model: None, input_tokens: None, dialog_entry: None, waiting_backstop_armed: false, turn_begun_by: None },
             0,
             &[],
             None,

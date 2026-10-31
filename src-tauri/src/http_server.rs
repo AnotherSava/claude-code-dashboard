@@ -1069,6 +1069,23 @@ fn pull_declared_clean(settling: Status, facts: Option<crate::state::CleanClaimF
     Ok(())
 }
 
+/// The label a `Stop` should settle BLOCK under instead of DONE or WAIT, because
+/// the turn it ends was begun by a notification or another agent's message while
+/// the row was blocked on a question (`AgentSession::held_question`).
+///
+/// A `Stop` that is itself a question already reads `Blocked`. A `Waiting` one is
+/// held too: the background work behind it may be a dev server that never ends,
+/// and a WAIT would otherwise lose the question to the next notification's turn
+/// or to the `waiting_settle` backstop. Holding errs toward a row that keeps
+/// showing: a notification turn that made the question moot leaves it BLOCK
+/// until the user sends something. A held WAIT also stops counting as live work
+/// for `idle_awake` and `lid_awake`, which read `Status::is_live_work` off the
+/// base status: background work started inside the notification turn runs
+/// without a sleep hold.
+fn question_still_pending(event: &str, settling: Status, held: Option<String>) -> Option<String> {
+    (event == "Stop" && matches!(settling, Status::Done | Status::Waiting)).then_some(held).flatten()
+}
+
 /// Mutates nothing — no `apply_set`, no emit, no `SyncDirty` poke, no store
 /// write — which is also why it writes no `decision` line: every one of those
 /// tags marks a state change and the `investigate` skill replays them to
@@ -1760,6 +1777,19 @@ fn apply_event_in(app: &AppHandle, req: &EventRequest, placed: Option<String>) -
             if resume_is_clean(&req.event, source, restored.as_ref().map(|r| r.dialog.as_slice())) {
                 input.status = Status::Idle;
             }
+            if let Some(label) = question_still_pending(&req.event, input.status, state.held_question(&chat_id)) {
+                tracing::info!(
+                    chat_id = %chat_id,
+                    decision = "question_held",
+                    label = %label,
+                    reason = "a notification or another agent's message began this turn while the row was blocked on a question nobody has answered",
+                    settling = ?input.status,
+                    "keeping BLOCK instead of the turn's own verdict"
+                );
+                input.status = Status::Blocked;
+                input.label = Some(label);
+                input.waiting_backstop_armed = false;
+            }
             // The other CLEAN source the adapter cannot answer: a peer asked this
             // session to pull, the pull left nothing behind, and the session was
             // already clean when the request arrived. Read before `apply_set`,
@@ -2003,6 +2033,7 @@ mod tests {
             content_seen_at: None,
             origin_label: None,
             turn_from_relay: false,
+            held_question: None,
             delegated_task: None,
             message_line: None,
             clean_claim_at: None,
@@ -2021,6 +2052,20 @@ mod tests {
 
     fn with_prompt(id: &str, origin: Option<&str>, prompt: Option<&str>) -> AgentSession {
         AgentSession { original_prompt: prompt.map(str::to_string), ..session(id, Status::Working, origin, 0) }
+    }
+
+    /// Only a `Stop` settling DONE or WAIT gives way to a carried question; a
+    /// `Stop` that asks, and every other event, keep their own verdict.
+    #[test]
+    fn a_carried_question_holds_only_a_settling_done_or_wait() {
+        let held = || Some("has a question".to_string());
+        assert_eq!(question_still_pending("Stop", Status::Done, held()).as_deref(), Some("has a question"));
+        assert_eq!(question_still_pending("Stop", Status::Waiting, held()).as_deref(), Some("has a question"));
+        assert_eq!(question_still_pending("Stop", Status::Done, None), None);
+        for settling in [Status::Blocked, Status::Error, Status::Idle] {
+            assert_eq!(question_still_pending("Stop", settling, held()), None, "{settling:?} keeps its own verdict");
+        }
+        assert_eq!(question_still_pending("StopFailure", Status::Done, held()), None);
     }
 
     #[test]
@@ -2548,14 +2593,14 @@ mod tests {
             input_tokens: None,
             dialog_entry: None,
             waiting_backstop_armed: false,
-            turn_from_relay: Some(relay),
+            turn_begun_by: Some(if relay { crate::state::TurnOrigin::Peer } else { crate::state::TurnOrigin::Person }),
             delegated_task: None,
             message_line: None,
             message_is_reply: None,
         };
         // A `/clear`-style settle to CLEAN is not a prompt, so it says nothing
         // about who begins the next turn.
-        let clean = crate::state::SetInput { status: Status::Idle, label: None, turn_from_relay: None, ..prompt(false) };
+        let clean = crate::state::SetInput { status: Status::Idle, label: None, turn_begun_by: None, ..prompt(false) };
 
         // A clean row, then a relayed turn opens on it and reports a clean run.
         state.apply_set(clean, 1_000, &[], None);
@@ -2662,7 +2707,7 @@ mod tests {
             input_tokens: None,
             dialog_entry: None,
             waiting_backstop_armed: false,
-            turn_from_relay: None,
+            turn_begun_by: None,
             delegated_task: None,
             message_line: None,
             message_is_reply: None,
@@ -2726,7 +2771,7 @@ mod tests {
             input_tokens: None,
             dialog_entry: None,
             waiting_backstop_armed: false,
-            turn_from_relay: None,
+            turn_begun_by: None,
             delegated_task: None,
             message_line: None,
             message_is_reply: None,
