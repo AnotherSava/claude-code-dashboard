@@ -85,16 +85,14 @@ impl UsageCacheStore {
     /// loses the peer margin once; that cost is accepted.
     pub fn replay(&self, status: UsageStatus) -> Option<UsageLimits> {
         let d = self.data.lock().unwrap();
-        if d.updated == 0 || d.five_hour.is_none() {
-            return None;
-        }
-        Some(UsageLimits {
+        let limits = UsageLimits {
             five_hour: d.five_hour.clone(),
             seven_day: d.seven_day.clone(),
             status,
             updated: d.updated,
             source: None,
-        })
+        };
+        (d.updated != 0 && limits.has_reading()).then_some(limits)
     }
 
     /// Store a reading this machine's own poll took.
@@ -209,6 +207,20 @@ mod tests {
         let s = store();
         let until = s.block_for(999_999_999, NOW).unwrap();
         assert_eq!(until, NOW + MAX_BACKOFF_MS, "a garbage value must not brick the bars");
+    }
+
+    #[test]
+    fn a_sample_holding_only_the_7d_bucket_replays() {
+        let s = store();
+        let sample = UsageLimits {
+            five_hour: None,
+            seven_day: Some(LimitBucket { utilization: 0.88, resets_at: None }),
+            status: UsageStatus::Ok,
+            updated: NOW,
+            source: None,
+        };
+        s.store_sample(&sample);
+        assert_eq!(s.replay(UsageStatus::Ok).map(|r| r.updated), Some(NOW), "a plan with no 5h limit still has a reading to replay");
     }
 
     #[test]

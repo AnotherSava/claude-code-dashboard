@@ -676,22 +676,24 @@
   <header bind:this={headerEl} data-tauri-drag-region>
     <span class="title" data-tauri-drag-region>AI AGENTS</span>
     <div class="limits" class:compact={config?.compact_mode} data-tauri-drag-region>
-      <LimitBar
-        bucket={usage?.five_hour ?? null}
-        status={usage?.status ?? 'unavailable'}
-        updated={usage?.updated ?? 0}
-        {now}
-        segments={config?.limit_bar_segments ?? 16}
-        format="hm"
-        colors={usageColors}
-        compact={config?.compact_mode ?? false}
-      />
+      {#if usage?.five_hour_limit !== false}
+        <LimitBar
+          bucket={usage?.five_hour ?? null}
+          status={usage?.status ?? 'unavailable'}
+          updated={usage?.updated ?? 0}
+          {now}
+          segments={config?.limit_bar_segments ?? 16}
+          format="hm"
+          colors={usageColors}
+          compact={config?.compact_mode ?? false}
+        />
+      {/if}
       <LimitBar
         bucket={usage?.seven_day ?? null}
         status={usage?.status ?? 'unavailable'}
         updated={usage?.updated ?? 0}
         {now}
-        segments={config?.limit_bar_segments ?? 16}
+        segments={(config?.limit_bar_segments ?? 16) * (usage?.five_hour_limit === false ? 2 : 1)}
         format="dhm"
         colors={usageColors}
         compact={config?.compact_mode ?? false}

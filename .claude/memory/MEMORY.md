@@ -50,6 +50,7 @@
 - [A Status variant is a wire break](status_variant_is_a_wire_break.md) — a new variant 422s the whole sync push on an older peer and wipes prompt_history.json on a downgrade; redefine or add a field instead
 - [Doppler secret storage](doppler_secret_storage.md) — DRIFTED (verified 2026-08-07): documented render-then-wipe flow no longer exists; sync token sits in plaintext config/local.json now
 - [Usage endpoint weekly resets](usage_endpoint_weekly_resets.md) — usage API has at times reported resets_at null for 7d (often 5h too) after a 7d reset, none since 2026-09-07 (null resets_at is the transient); separately, a 7d drop to ~0 mid-window is a real reset and mostly follows no 5h cap
+- [Usage endpoint drops the 5h bucket](usage_endpoint_no_five_hour_bucket.md) — no 5h limit = five_hour absent; a 0/null bucket is a reset transient; detection and reset tracker rely on it
 - [Context-% features need watcher-resolved tokens](context_percent_tokens_watcher_only.md) — input_tokens is watcher-only (None post-restart, can't be faked via hooks); config reload doesn't re-sync terminal titles
 - [Background-task kill is silent](background-task-kill-is-silent.md) — a user-killed bg task (dev server) fires no hook and writes nothing to the transcript; WAIT can't self-clear → waiting_settle backstop
 - [Measure background-task duration](measure-background-task-duration.md) — task-notification ts is flush-time not completion; use the output-file mtime; finite shell tasks + subagents cap ~9 min

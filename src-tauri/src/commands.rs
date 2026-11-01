@@ -8,7 +8,7 @@ use crate::prompt_history::PromptHistoryStore;
 use crate::setup;
 use crate::state::{AgentSession, AppState, Attention, BoundaryKind, Canary};
 use crate::telegram::TelegramNotifier;
-use crate::usage_limits::{UsageLimits, UsageLimitsState};
+use crate::usage_limits::{UsageLimitsState, UsageView};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State, WebviewWindow};
 
@@ -251,8 +251,8 @@ pub fn get_config(app: AppHandle) -> Config {
 }
 
 #[tauri::command]
-pub fn get_usage_limits(state: State<UsageLimitsState>) -> UsageLimits {
-    state.snapshot()
+pub fn get_usage_limits(state: State<UsageLimitsState>) -> UsageView {
+    state.view()
 }
 
 #[tauri::command]
@@ -1348,8 +1348,10 @@ pub fn emit_config_updated(app: &AppHandle) {
 
 pub fn emit_usage_limits_updated(app: &AppHandle) {
     if let Some(state) = app.try_state::<UsageLimitsState>() {
-        let _ = app.emit("usage_limits_updated", state.snapshot());
+        let _ = app.emit("usage_limits_updated", state.view());
     }
+    // Before the repaint, so a badge moved off the 5h bucket is drawn moved.
+    crate::tray::follow_five_hour_limit(app);
     // Keep the tray badge/tooltip in step with every usage update.
     crate::tray_badge::refresh(app);
 }

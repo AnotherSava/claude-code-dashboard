@@ -44,7 +44,37 @@ pub struct UsageLimits {
     pub source: Option<String>,
 }
 
+/// What the frontend receives: the snapshot plus the plan's 5h-limit fact, which
+/// outlives any one snapshot (see `UsageLimitsState::five_hour_limit`).
+#[derive(Clone, Debug, Serialize)]
+pub struct UsageView {
+    #[serde(flatten)]
+    pub limits: UsageLimits,
+    pub five_hour_limit: Option<bool>,
+}
+
 impl UsageLimits {
+    /// Whether this snapshot holds a reading at all. Either bucket counts: a
+    /// plan without a 5h limit answers with the 7d bucket alone.
+    pub fn has_reading(&self) -> bool {
+        self.five_hour.is_some() || self.seven_day.is_some()
+    }
+
+    /// Whether the plan behind this reading has a 5h limit, or `None` when the
+    /// snapshot holds no reading to say. The endpoint omits the 5h bucket for a
+    /// plan without one while still answering the 7d bucket, and every reading
+    /// from June to 2026-11-01 carried it, its reset transient included (that
+    /// one reports 0% with a null `resets_at`, never a missing bucket).
+    fn five_hour_limit(&self) -> Option<bool> {
+        if self.five_hour.is_some() {
+            Some(true)
+        } else if self.seven_day.is_some() {
+            Some(false)
+        } else {
+            None
+        }
+    }
+
     pub fn empty() -> Self {
         Self {
             five_hour: None,
@@ -73,6 +103,12 @@ pub struct UsageLimitsState {
     /// attempts to one per `REFRESH_COOLDOWN_SECS` so a sequence of failed
     /// refreshes doesn't hammer Anthropic.
     last_refresh_attempt: Mutex<Option<Instant>>,
+    /// Whether the plan has a 5h limit, as the newest reading said; `None` until
+    /// one has. Kept apart from the snapshot because a failed poll replaces the
+    /// snapshot with one holding no reading, and that says nothing about the plan:
+    /// the dashboard's layout and the tray menu would otherwise flip back and
+    /// forth on every expired token.
+    five_hour_limit: RwLock<Option<bool>>,
     /// Last time `poll_once` started, successful or not. The refresh gate reads
     /// this rather than the snapshot's `updated`, because `updated` answers a
     /// different question: it is the age of the last *reading*, and a transient
@@ -94,6 +130,7 @@ impl UsageLimitsState {
             inner: RwLock::new(UsageLimits::empty()),
             wake: Arc::new(Notify::new()),
             last_refresh_attempt: Mutex::new(None),
+            five_hour_limit: RwLock::new(None),
             last_poll_attempt: Mutex::new(None),
             saw_expired_last_poll: AtomicBool::new(false),
         }
@@ -103,8 +140,26 @@ impl UsageLimitsState {
         self.inner.read().unwrap().clone()
     }
 
+    pub fn view(&self) -> UsageView {
+        UsageView { limits: self.snapshot(), five_hour_limit: self.five_hour_limit() }
+    }
+
+    pub fn five_hour_limit(&self) -> Option<bool> {
+        *self.five_hour_limit.read().unwrap()
+    }
+
+    /// The one place a snapshot is written, so the 5h-limit fact cannot miss a
+    /// reading. Takes the lock already held, keeping both under one write.
+    fn store(&self, current: &mut UsageLimits, next: UsageLimits) {
+        if let Some(limit) = next.five_hour_limit() {
+            *self.five_hour_limit.write().unwrap() = Some(limit);
+        }
+        *current = next;
+    }
+
     fn replace(&self, next: UsageLimits) {
-        *self.inner.write().unwrap() = next;
+        let mut current = self.inner.write().unwrap();
+        self.store(&mut current, next);
     }
 
     /// Replace the snapshot with a peer's reading unless what it holds is a
@@ -113,11 +168,10 @@ impl UsageLimitsState {
     /// overwritten by the older reading.
     fn replace_with_peer_reading(&self, next: UsageLimits) -> bool {
         let mut current = self.inner.write().unwrap();
-        let holds_reading = current.five_hour.is_some() || current.seven_day.is_some();
-        if holds_reading && next.updated <= current.updated {
+        if current.has_reading() && next.updated <= current.updated {
             return false;
         }
-        *current = next;
+        self.store(&mut current, next);
         true
     }
 
@@ -843,7 +897,7 @@ async fn poll_once(app: &AppHandle, client: &reqwest::Client) {
             // succeeded this run holds a fresher reading than the file does,
             // and `replay` reports `NetworkError`, so overwriting would
             // downgrade a good snapshot on a later skip.
-            if state.snapshot().five_hour.is_none() {
+            if !state.snapshot().has_reading() {
                 if let Some(stale) = cache.replay(UsageStatus::NetworkError) {
                     tracing::debug!(age_ms = now - stale.updated, "replaying the stored usage sample while blocked");
                     state.replace(stale);
@@ -1019,7 +1073,7 @@ async fn poll_once(app: &AppHandle, client: &reqwest::Client) {
             // with its own age instead; `updated` is what the UI renders as
             // "as of N ago".
             let fallback = cache.as_ref().and_then(|c| c.replay(UsageStatus::NetworkError));
-            let prev = if previous.five_hour.is_some() { Some(previous.clone()) } else { fallback };
+            let prev = if previous.has_reading() { Some(previous.clone()) } else { fallback };
             let keep_prev = matches!(status, UsageStatus::NetworkError) && prev.is_some();
             let prev = prev.unwrap_or_else(UsageLimits::empty);
             state.replace(UsageLimits {
@@ -1290,6 +1344,30 @@ mod tests {
             updated,
             source: source.map(str::to_string),
         }
+    }
+
+    #[test]
+    fn a_reading_without_the_5h_bucket_means_the_plan_has_no_5h_limit() {
+        let mut seven_only = reading(NOW, None, None);
+        seven_only.seven_day = seven_only.five_hour.take();
+        assert_eq!(seven_only.five_hour_limit(), Some(false));
+        assert_eq!(reading(NOW, None, None).five_hour_limit(), Some(true));
+        assert_eq!(UsageLimits::empty().five_hour_limit(), None, "no reading says nothing about the plan");
+    }
+
+    #[test]
+    fn a_snapshot_with_no_reading_keeps_the_plans_5h_fact() {
+        let state = UsageLimitsState::new();
+        assert_eq!(state.five_hour_limit(), None);
+        let mut seven_only = reading(NOW, None, None);
+        seven_only.seven_day = seven_only.five_hour.take();
+        state.replace(seven_only);
+        assert_eq!(state.five_hour_limit(), Some(false));
+        // An expired token replaces the snapshot with no buckets at all.
+        state.replace(UsageLimits { five_hour: None, seven_day: None, status: UsageStatus::AuthExpired, updated: NOW + 1, source: None });
+        assert_eq!(state.five_hour_limit(), Some(false));
+        state.replace(reading(NOW + 2, None, None));
+        assert_eq!(state.five_hour_limit(), Some(true), "a 5h bucket seen again restores it");
     }
 
     #[test]

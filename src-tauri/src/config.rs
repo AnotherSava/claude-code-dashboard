@@ -52,7 +52,8 @@ pub struct Config {
     pub usage_reset_poll_delay_seconds: u64,
     /// Number of segments in the 5h / 7d usage limit bars. Segments scale to
     /// fit the available track width; higher values give finer resolution but
-    /// thinner individual segments.
+    /// thinner individual segments. A plan with no 5h limit shows the 7d bar
+    /// alone with twice this many.
     pub limit_bar_segments: u32,
     /// Auto-resize the window to fit content height. When set to Up, the
     /// bottom edge stays put and the window grows upward; Down keeps the top
@@ -248,7 +249,8 @@ pub struct Config {
     /// icon. The `*Light` modes recolor the traffic-light icon by usage; the
     /// `*Number` modes draw the percentage (and the all-red light at 100%).
     /// Read by `tray_badge::refresh`; the tray's "Tray usage badge" submenu
-    /// writes it. The hover tooltip always shows both buckets regardless.
+    /// writes it. The hover tooltip shows every bucket the reading carries,
+    /// whatever this is set to.
     pub tray_badge: TrayBadge,
     /// Whether the tray icon flags high context usage at all — the user toggle
     /// behind the "Show high context usage" tray checkbox (on by default). When
@@ -388,6 +390,15 @@ impl TrayBadge {
     /// True for the traffic-light modes (vs the numeric modes or `None`).
     pub fn is_light(self) -> bool {
         matches!(self, Self::FiveHourLight | Self::SevenDayLight)
+    }
+
+    /// The same style on the 7d bucket, for a plan with no 5h limit to show.
+    pub fn without_five_hour(self) -> Self {
+        match self {
+            Self::FiveHourLight => Self::SevenDayLight,
+            Self::FiveHourNumber => Self::SevenDayNumber,
+            other => other,
+        }
     }
 }
 
@@ -561,10 +572,13 @@ pub struct TelegramConfig {
     pub context_alert_percent: Option<f32>,
     /// Fire a one-shot Telegram message when the 5-hour or 7-day usage window
     /// resets, if the window that just ended had been used to at least this
-    /// percent. `null` or `0` disables it. A reset is detected from the usage
-    /// poller's `resets_at` jumping forward by ~a window length (never the
-    /// ±1min-jittery value directly), so the post-cap transient that briefly
-    /// zeroes both buckets' percentages doesn't false-fire. Unlike the other
+    /// percent. `null` or `0` disables it. A reset is detected by
+    /// `notifications::ResetTracker`, from a window's `resets_at` clearing at 0%
+    /// once its scheduled reset has arrived or jumping forward by ~a window
+    /// length (never the ±1min-jittery value directly), so the post-cap
+    /// transient that briefly zeroes both buckets' percentages doesn't
+    /// false-fire, and a bucket that disappears because the plan dropped that
+    /// limit sends nothing. Unlike the other
     /// alerts this is a point event — it's sent once and never auto-deleted.
     /// Account-wide, so with the dashboard running on several devices each one
     /// pings independently; set this to `null` on the extras to avoid dupes.
@@ -1181,6 +1195,15 @@ mod tests {
                 cfg.continuation_prompts.iter().any(|s| s == phrase),
                 "default continuation_prompts must include the affirmation {phrase:?}"
             );
+        }
+    }
+
+    #[test]
+    fn without_five_hour_keeps_the_badge_style_on_the_7d_bucket() {
+        assert_eq!(TrayBadge::FiveHourLight.without_five_hour(), TrayBadge::SevenDayLight);
+        assert_eq!(TrayBadge::FiveHourNumber.without_five_hour(), TrayBadge::SevenDayNumber);
+        for kept in [TrayBadge::None, TrayBadge::SevenDayLight, TrayBadge::SevenDayNumber] {
+            assert_eq!(kept.without_five_hour(), kept);
         }
     }
 

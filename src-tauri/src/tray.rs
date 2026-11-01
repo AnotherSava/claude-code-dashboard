@@ -92,6 +92,10 @@ pub struct TrayHandles {
     /// only touches the menu when the displayed value actually changes.
     pub lid_awake_label: std::sync::Mutex<String>,
     pub lid_awake_submenu: tauri::menu::Submenu<Wry>,
+    pub tray_badge_submenu: tauri::menu::Submenu<Wry>,
+    /// Whether the two 5h items are in `tray_badge_submenu`, so
+    /// `follow_five_hour_limit` touches the menu only when the plan changes.
+    pub five_hour_items_shown: std::sync::Mutex<bool>,
 }
 
 pub fn setup(app: &AppHandle) -> tauri::Result<()> {
@@ -314,6 +318,8 @@ pub fn setup(app: &AppHandle) -> tauri::Result<()> {
         lid_awake_start_now: lid_awake_start_now.clone(),
         lid_awake_label: std::sync::Mutex::new("Start now".to_string()),
         lid_awake_submenu: lid_awake_submenu.clone(),
+        tray_badge_submenu: tray_badge_submenu.clone(),
+        five_hour_items_shown: std::sync::Mutex::new(true),
     });
 
     let icon = app
@@ -706,6 +712,48 @@ fn toggle_high_alert(app: &AppHandle) {
     // on its next tick, so persisting is enough — no immediate refresh needed
     // (unlike the tray badge / context alert, which repaint the icon).
     emit_config_updated(app);
+}
+
+/// Fit the tray badge to whether the plan has a 5h limit: without one, the two
+/// 5h styles leave the "Tray usage badge" submenu and a selected 5h style moves
+/// to the same style on the 7d bucket. Run on every usage update, so a 5h style
+/// typed into `config.json` by hand is moved at the next one. When a 5h limit
+/// is seen again the items come back and the badge stays where it was moved.
+pub fn follow_five_hour_limit(app: &AppHandle) {
+    let Some(limit) = app.try_state::<crate::usage_limits::UsageLimitsState>().and_then(|s| s.five_hour_limit()) else { return };
+    if !limit {
+        if let Some(state) = app.try_state::<ConfigState>() {
+            let badge = state.snapshot().tray_badge;
+            let moved = badge.without_five_hour();
+            if moved != badge {
+                tracing::info!(from = ?badge, to = ?moved, "tray badge moved to the 7d bucket; this plan has no 5h limit");
+                select_tray_badge(app, moved);
+            }
+        }
+    }
+    let Some(handles) = app.try_state::<TrayHandles>() else { return };
+    let mut shown = handles.five_hour_items_shown.lock().unwrap();
+    if *shown == limit {
+        return;
+    }
+    let menu = &handles.tray_badge_submenu;
+    let result = if limit {
+        // Each 5h item goes back directly ahead of its 7d sibling, wherever
+        // setup() placed that sibling. The 7d items are never removed, so the
+        // sibling is always found.
+        let insert_before = |item: &CheckMenuItem<Wry>, sibling: &CheckMenuItem<Wry>| -> tauri::Result<()> {
+            let items = menu.items()?;
+            let at = items.iter().position(|i| i.id() == sibling.id()).unwrap_or(items.len());
+            menu.insert(item, at)
+        };
+        insert_before(&handles.tray_badge_5h_light, &handles.tray_badge_7d_light).and_then(|_| insert_before(&handles.tray_badge_5h_num, &handles.tray_badge_7d_num))
+    } else {
+        menu.remove(&handles.tray_badge_5h_light).and_then(|_| menu.remove(&handles.tray_badge_5h_num))
+    };
+    match result {
+        Ok(()) => *shown = limit,
+        Err(e) => tracing::warn!(?e, limit, "could not update the 5h items in the tray badge menu"),
+    }
 }
 
 fn sync_tray_badge_checks(app: &AppHandle, mode: TrayBadge) {

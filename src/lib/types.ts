@@ -134,6 +134,8 @@ export interface UsageLimits {
   seven_day: LimitBucket | null
   status: UsageStatus
   updated: number
+  /** Whether the plan has a 5h limit, as the newest reading said; null until one has. */
+  five_hour_limit: boolean | null
 }
 
 export interface SetupState {

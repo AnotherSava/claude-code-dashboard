@@ -1,5 +1,5 @@
 //! Renders a usage-limit indicator on the tray icon and keeps the tray tooltip
-//! showing both buckets. Two indicator styles (per the `TrayBadge` mode):
+//! showing every bucket the reading carries. Two indicator styles (per the `TrayBadge` mode):
 //!
 //! - **Light**: recolor the app icon's three traffic lights by usage, stepping
 //!   green → amber → red as the bucket fills (`render_light_badge`).
