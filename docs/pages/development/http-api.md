@@ -380,7 +380,7 @@ Opens a Claude session for a local project because its user asked for one, from 
 { "dir": "/Users/you/Projects/my-app" }
 ```
 
-On Windows the session starts detached in the remote-session holder's tmux server, so there is no tab to select, and only where `remote_session_script` is set, refusing `start_no_launcher` otherwise. Carries the loopback `Host` gate on top of the `Origin` check.
+On Windows the session starts detached in the remote-session holder's tmux server, and only where `remote_session_script` is set, refusing `start_no_launcher` otherwise; agwinterm then opens a tab on it, in the background rather than selected, before the answer is returned. Carries the loopback `Host` gate on top of the `Origin` check.
 
 | Status | `outcome` | Meaning |
 |---     |---        |---      |
@@ -388,7 +388,7 @@ On Windows the session starts detached in the remote-session holder's tmux serve
 | `200`  | `running` | a session is already running in that folder, so nothing was started |
 | `409`  | `refused` | `reason` is the start refusal's slug, such as `start_no_directory` or `start_already_running`, or `registry_unreadable` when Claude Code's session list could not be read, so a running session there cannot be ruled out |
 
-Every answer also carries the `project` id the folder derives. Logged as `decision = "session_open"` with that id and the `outcome`.
+Every answer also carries the `project` id the folder derives. Logged as `decision = "session_open"` with that id and the `outcome`; a Windows start that opened a tab is followed by a `decision = "peer_attach"` line under the same id, with an `outcome` of `attached`, `attach_failed` or `no_attacher`.
 
 ## `GET /api/session/tabs`
 

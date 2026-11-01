@@ -198,6 +198,12 @@ struct SessionOpenRequest {
 /// Answers `outcome` of `started`, `running` (a session was already there, so
 /// the picker raises its tab) or `refused` with the refusal's `reason`. Loopback
 /// `Host` required: it starts a process.
+///
+/// A started session the terminal hosts with no tab of its own (Windows' tmux
+/// launch) gets one through [`attach_started`] before the answer is returned,
+/// so the answer waits on that adapter call. That tab opens in the background
+/// even though this route asks for a selected session, since `attach_hosted`
+/// never selects.
 async fn post_session_open(State(app): State<AppHandle>, headers: HeaderMap, Json(req): Json<SessionOpenRequest>) -> Response {
     if let Some(detail) = csrf_refusal(&headers, true) {
         return csrf_refused(detail).into_response();
@@ -217,6 +223,9 @@ async fn post_session_open(State(app): State<AppHandle>, headers: HeaderMap, Jso
         session_launcher::StartResult::Settled { started: true, .. } => (StatusCode::OK, "started", "", "started"),
     };
     tracing::info!(chat_id = %project, decision = "session_open", outcome, reason, dir = %dir.display(), "local session open requested");
+    if let session_launcher::StartResult::Settled { started: true, hosted_name: Some(name), .. } = result {
+        attach_started(&app, &project, name).await;
+    }
     answer(status, outcome, &project, reason, detail)
 }
 
@@ -1422,12 +1431,12 @@ async fn post_message(State(app): State<AppHandle>, headers: HeaderMap, Json(req
     (crate::sync::receipt_status(&receipt), Json(receipt))
 }
 
-/// Open a background tab on this machine for a session an agent here caused to
-/// be started — on the other machine through the relay, or on this one —
-/// where the session runs with no tab of its own, so the agent's user can read
-/// and answer it. A refusal is logged and changes nothing about the send,
-/// whose outcome is already decided; on the Mac, cmd+shift+r still reaches the
-/// session.
+/// Open a background tab on this machine for a session started from here — on
+/// the other machine through the relay, or on this one by a relayed message or
+/// `POST /api/session/open` — where the session runs with no tab of its own, so
+/// its user can read and answer it. A refusal is logged and changes nothing
+/// about the caller's answer, which is already decided; on the Mac,
+/// cmd+shift+r still reaches the session.
 /// Logged `peer_attach`, keyed by the started session's row.
 async fn attach_started(app: &AppHandle, chat_id: &str, name: String) {
     let Some(adapter) = crate::terminals::for_platform(app).filter(|a| a.can_attach_hosted()) else {
