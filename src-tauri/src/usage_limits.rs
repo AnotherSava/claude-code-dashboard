@@ -34,6 +34,14 @@ pub struct UsageLimits {
     pub seven_day: Option<LimitBucket>,
     pub status: UsageStatus,
     pub updated: i64,
+    /// The peer device whose poll this reading is, or `None` for this machine's
+    /// own or for any reading replayed from the cache (`UsageCacheStore::replay`),
+    /// which keeps no source even for a sample a peer took, so such a reading is
+    /// scheduled without the peer margin. A peer's reading stands in for a local
+    /// poll until it is due, so the poller has to know which kind it is holding
+    /// (`UsageLimits::peer_due_at`).
+    #[serde(skip)]
+    pub source: Option<String>,
 }
 
 impl UsageLimits {
@@ -43,7 +51,18 @@ impl UsageLimits {
             seven_day: None,
             status: UsageStatus::Unavailable,
             updated: 0,
+            source: None,
         }
+    }
+
+    /// Epoch ms at which this reading stops standing in for a local poll, or
+    /// `None` when it is not an `Ok` reading from a peer. The poller's wake time
+    /// and `poll_once`'s skip both read this, so the two cannot disagree.
+    fn peer_due_at(&self, configured_secs: u64, reset_delay_secs: u64) -> Option<i64> {
+        if self.status != UsageStatus::Ok || self.source.is_none() {
+            return None;
+        }
+        Some(peer_reading_due_at(configured_secs, reset_delay_secs, self))
     }
 }
 
@@ -86,6 +105,20 @@ impl UsageLimitsState {
 
     fn replace(&self, next: UsageLimits) {
         *self.inner.write().unwrap() = next;
+    }
+
+    /// Replace the snapshot with a peer's reading unless what it holds is a
+    /// reading at least as new. Checked under the write lock, so a local poll
+    /// that lands between the caller's decision and this write is not
+    /// overwritten by the older reading.
+    fn replace_with_peer_reading(&self, next: UsageLimits) -> bool {
+        let mut current = self.inner.write().unwrap();
+        let holds_reading = current.five_hour.is_some() || current.seven_day.is_some();
+        if holds_reading && next.updated <= current.updated {
+            return false;
+        }
+        *current = next;
+        true
     }
 
     /// Ask the poller to run a fresh poll ASAP. Rate-limited: if the last
@@ -449,9 +482,15 @@ fn to_bucket(wire: UsageBucketWire) -> LimitBucket {
     // (= 1%) was treated as the fraction 1.0 (= 100%) and the bar showed
     // full red. Always divide by 100; if Anthropic ever flips back to
     // fractions we'll see ~0% bars and revisit.
+    bucket_from_pct(wire.utilization, wire.resets_at.map(|t| t.timestamp_millis()))
+}
+
+/// A display bucket from a raw API percentage, shared by a wire response and a
+/// peer's stored history record so both scale the same way.
+fn bucket_from_pct(pct: f32, resets_at: Option<i64>) -> LimitBucket {
     LimitBucket {
-        utilization: (wire.utilization / 100.0).clamp(0.0, 1.0),
-        resets_at: wire.resets_at.map(|t| t.timestamp_millis()),
+        utilization: (pct / 100.0).clamp(0.0, 1.0),
+        resets_at,
     }
 }
 
@@ -487,10 +526,7 @@ impl UsageLimitsPoller {
             loop {
                 poll_once(&app, &client).await;
                 let configured = poll_interval_seconds(&app);
-                let delay = app
-                    .try_state::<ConfigState>()
-                    .map(|c| c.snapshot().usage_reset_poll_delay_seconds)
-                    .unwrap_or(30);
+                let delay = reset_delay_seconds(&app);
                 let (five_reset, seven_reset) = app
                     .try_state::<UsageLimitsState>()
                     .map(|s| {
@@ -507,6 +543,13 @@ impl UsageLimitsPoller {
                     .filter(|u| *u > 0)
                     .map_or(0, |u| ((now_ms() - u).max(0) / 1000) as u64);
                 let scheduled = next_poll_secs(configured, delay, five_reset, seven_reset, now_ms(), reading_age_secs);
+                // A peer's reading is scheduled from like our own, plus the
+                // margin that lets its owner poll first; the same not-before rule
+                // the endpoint's deadline uses applies, so it shares that helper.
+                let peer_due = app
+                    .try_state::<UsageLimitsState>()
+                    .and_then(|s| s.snapshot().peer_due_at(configured, delay));
+                let scheduled = sleep_secs_honouring_block(scheduled, peer_due, now_ms());
                 let blocked_until = app.try_state::<UsageCacheStore>().and_then(|c| c.blocked_until(now_ms()));
                 let secs = sleep_secs_honouring_block(scheduled, blocked_until, now_ms());
                 let wake = app
@@ -620,6 +663,65 @@ fn poll_interval_seconds(app: &AppHandle) -> u64 {
         .map(|cfg| cfg.snapshot().usage_limits_poll_interval_seconds)
         .unwrap_or(600)
         .max(MIN_POLL_SECS)
+}
+
+fn reset_delay_seconds(app: &AppHandle) -> u64 {
+    app.try_state::<ConfigState>()
+        .map(|c| c.snapshot().usage_reset_poll_delay_seconds)
+        .unwrap_or(30)
+}
+
+/// How much later than on the device that took it a peer's reading falls due
+/// here. Without it both machines compute the same next poll from the same
+/// reading and ask at once every interval, saving nothing. With it the owner
+/// polls first and its new reading, pushed the moment it is taken, arrives well
+/// inside the margin; only a peer that has gone quiet (asleep, closed) lets it
+/// run out, and then this machine polls and becomes the owner.
+const PEER_READING_MARGIN_MS: i64 = MIN_POLL_SECS as i64 * 1000;
+
+/// Epoch ms at which a peer's reading stops standing in for a local poll: when
+/// this machine would have polled next had it taken the reading itself, plus
+/// [`PEER_READING_MARGIN_MS`].
+fn peer_reading_due_at(configured_secs: u64, reset_delay_secs: u64, reading: &UsageLimits) -> i64 {
+    let five = reading.five_hour.as_ref().and_then(|b| b.resets_at);
+    let seven = reading.seven_day.as_ref().and_then(|b| b.resets_at);
+    let secs = next_poll_secs(configured_secs, reset_delay_secs, five, seven, reading.updated, 0);
+    reading.updated + secs as i64 * 1000 + PEER_READING_MARGIN_MS
+}
+
+/// Show a peer's usage reading in place of polling for one.
+///
+/// The 5h and 7d counters are account-wide, so another machine's poll on the
+/// same account answers exactly the question a local poll would, and every
+/// request one machine skips is one fewer the endpoint's rate limiter sees.
+/// Only a reading young enough to stand in for a poll is taken; an older one,
+/// such as the tail of a first contact's history catch-up, is left to the
+/// Work intensity chart, which already reads every peer's records.
+pub fn adopt_peer_reading(app: &AppHandle, device: &str, record: &UsageHistoryRecord) {
+    let Some(state) = app.try_state::<UsageLimitsState>() else { return };
+    let now = now_ms();
+    let reading = UsageLimits {
+        five_hour: record.five_hour_pct.map(|p| bucket_from_pct(p, record.five_hour_resets_at)),
+        seven_day: record.seven_day_pct.map(|p| bucket_from_pct(p, record.seven_day_resets_at)),
+        status: UsageStatus::Ok,
+        // Stamped on the peer's clock; one running ahead of ours must not make
+        // the reading look newer than this moment.
+        updated: record.ts.min(now),
+        source: Some(device.to_string()),
+    };
+    let due = peer_reading_due_at(poll_interval_seconds(app), reset_delay_seconds(app), &reading);
+    if now >= due {
+        return;
+    }
+    let age_ms = now - reading.updated;
+    if !state.replace_with_peer_reading(reading.clone()) {
+        return;
+    }
+    tracing::debug!(device, age_ms, due_in_ms = due - now, "usage reading adopted from a peer");
+    if let Some(cache) = app.try_state::<UsageCacheStore>() {
+        cache.store_peer_sample(&reading);
+    }
+    emit_usage_limits_updated(app);
 }
 
 /// Seconds to sleep before the next usage poll.
@@ -792,6 +894,15 @@ async fn poll_once(app: &AppHandle, client: &reqwest::Client) {
     state.mark_poll_attempt();
     let previous = state.snapshot();
 
+    // A peer's reading stands in for ours until it is due; polling sooner would
+    // re-ask a question another machine has just answered for the same account.
+    if let Some(due) = previous.peer_due_at(poll_interval_seconds(app), reset_delay_seconds(app)) {
+        if now < due {
+            tracing::debug!(device = previous.source.as_deref(), in_ms = due - now, "usage poll skipped; a peer's reading is not due yet");
+            return;
+        }
+    }
+
     let token = match read_credentials() {
         Ok(t) => {
             state.saw_expired_last_poll.store(false, Ordering::SeqCst);
@@ -804,6 +915,7 @@ async fn poll_once(app: &AppHandle, client: &reqwest::Client) {
                 seven_day: None,
                 status: UsageStatus::Unavailable,
                 updated: now,
+                source: None,
             });
             emit_usage_limits_updated(app);
             return;
@@ -842,6 +954,7 @@ async fn poll_once(app: &AppHandle, client: &reqwest::Client) {
                         seven_day: None,
                         status: UsageStatus::AuthExpired,
                         updated: now,
+                        source: None,
                     });
                     emit_usage_limits_updated(app);
                     return;
@@ -874,12 +987,18 @@ async fn poll_once(app: &AppHandle, client: &reqwest::Client) {
                 seven_day: usage.seven_day.map(to_bucket),
                 status: UsageStatus::Ok,
                 updated: now,
+                source: None,
             };
             if let Some(cache) = cache.as_ref() {
                 cache.store_sample(&fresh);
             }
             state.replace(fresh);
             emit_usage_limits_updated(app);
+            // Push now rather than at the next heartbeat, so a peer has this
+            // reading well inside `PEER_READING_MARGIN_MS` and skips its own poll.
+            if let Some(dirty) = app.try_state::<crate::sync::SyncDirty>() {
+                dirty.inner().0.notify_one();
+            }
         }
         Err(err) => {
             let status = match err {
@@ -908,6 +1027,7 @@ async fn poll_once(app: &AppHandle, client: &reqwest::Client) {
                 seven_day: if keep_prev { prev.seven_day.clone() } else { None },
                 status,
                 updated: if keep_prev { prev.updated } else { now },
+                source: if keep_prev { prev.source.clone() } else { None },
             });
             emit_usage_limits_updated(app);
         }
@@ -1162,6 +1282,49 @@ mod tests {
         assert!(state.request_refresh(), "past the floor, the poller is woken");
     }
 
+    fn reading(updated: i64, five_reset: Option<i64>, source: Option<&str>) -> UsageLimits {
+        UsageLimits {
+            five_hour: Some(LimitBucket { utilization: 0.4, resets_at: five_reset }),
+            seven_day: None,
+            status: UsageStatus::Ok,
+            updated,
+            source: source.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn a_peer_reading_falls_due_one_margin_after_its_owner_would_poll() {
+        let due = peer_reading_due_at(600, 30, &reading(NOW, None, Some("AIR")));
+        assert_eq!(due, NOW + 600_000 + PEER_READING_MARGIN_MS);
+    }
+
+    #[test]
+    fn a_peer_reading_taken_before_a_reset_falls_due_just_after_it() {
+        let reset = NOW + 5 * 60_000;
+        let due = peer_reading_due_at(600, 30, &reading(NOW, Some(reset), Some("AIR")));
+        assert_eq!(due, reset + 30_000 + PEER_READING_MARGIN_MS);
+    }
+
+    #[test]
+    fn a_peer_reading_replaces_only_an_older_one() {
+        let state = UsageLimitsState::new();
+        assert!(state.replace_with_peer_reading(reading(NOW - HOUR, None, Some("AIR"))), "an empty snapshot takes any reading");
+        state.replace(reading(NOW, None, None));
+        assert!(!state.replace_with_peer_reading(reading(NOW - 1, None, Some("AIR"))), "an older peer reading must not cover our newer poll");
+        assert!(!state.replace_with_peer_reading(reading(NOW, None, Some("AIR"))), "the same instant is not newer");
+        assert!(state.replace_with_peer_reading(reading(NOW + 1, None, Some("AIR"))));
+        assert_eq!(state.snapshot().source.as_deref(), Some("AIR"));
+    }
+
+    #[test]
+    fn a_peer_reading_replaces_a_snapshot_holding_no_buckets() {
+        // An expired token or missing credentials leaves no buckets and stamps
+        // `updated` with the failed attempt, which is not a reading at all.
+        let state = UsageLimitsState::new();
+        state.replace(UsageLimits { five_hour: None, seven_day: None, status: UsageStatus::AuthExpired, updated: NOW, source: None });
+        assert!(state.replace_with_peer_reading(reading(NOW - 60_000, None, Some("AIR"))));
+    }
+
     #[test]
     fn a_frozen_updated_does_not_open_the_gate() {
         // A transient failure keeps the previous buckets and deliberately leaves
@@ -1174,6 +1337,7 @@ mod tests {
             seven_day: None,
             status: UsageStatus::NetworkError,
             updated: now_ms() - 3_600_000,
+            source: None,
         });
         state.mark_poll_attempt();
         assert!(!state.request_refresh());

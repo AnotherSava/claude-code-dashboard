@@ -79,6 +79,10 @@ impl UsageCacheStore {
     ///
     /// `updated` is always the moment the reading was TAKEN, never now, so the
     /// age the UI shows stays honest however it is replayed.
+    ///
+    /// `source` is always `None`, including for a sample `store_peer_sample`
+    /// wrote, so a replayed peer reading is scheduled as this machine's own and
+    /// loses the peer margin once; that cost is accepted.
     pub fn replay(&self, status: UsageStatus) -> Option<UsageLimits> {
         let d = self.data.lock().unwrap();
         if d.updated == 0 || d.five_hour.is_none() {
@@ -89,20 +93,35 @@ impl UsageCacheStore {
             seven_day: d.seven_day.clone(),
             status,
             updated: d.updated,
+            source: None,
         })
     }
 
+    /// Store a reading this machine's own poll took.
     pub fn store_sample(&self, usage: &UsageLimits) {
+        // A reading means the endpoint is answering again, so any deadline it
+        // set is spent. This is the only thing that clears one early -- there is
+        // deliberately no separate clear method, since nothing but a successful
+        // poll or the clock can know the refusal is over.
+        self.write_sample(usage, true);
+    }
+
+    /// Store a reading another device's poll took. It leaves any deadline in
+    /// place: the peer polled with its own token from its own address, so its
+    /// success says nothing about whether the endpoint has stopped refusing us.
+    pub fn store_peer_sample(&self, usage: &UsageLimits) {
+        self.write_sample(usage, false);
+    }
+
+    fn write_sample(&self, usage: &UsageLimits, clears_block: bool) {
         {
             let mut d = self.data.lock().unwrap();
             d.five_hour = usage.five_hour.clone();
             d.seven_day = usage.seven_day.clone();
             d.updated = usage.updated;
-            // A reading means the endpoint is answering again, so any deadline
-            // it set is spent. This is the only thing that clears one early --
-            // there is deliberately no separate clear method, since nothing but
-            // a successful poll or the clock can know the refusal is over.
-            d.blocked_until = None;
+            if clears_block {
+                d.blocked_until = None;
+            }
         }
         self.save();
     }
@@ -193,6 +212,24 @@ mod tests {
     }
 
     #[test]
+    fn a_peer_sample_leaves_our_deadline_standing() {
+        let s = store();
+        s.block_for(600, NOW);
+        let sample = UsageLimits {
+            five_hour: Some(LimitBucket { utilization: 0.4, resets_at: None }),
+            seven_day: None,
+            status: UsageStatus::Ok,
+            updated: NOW,
+            source: Some("AIR".to_string()),
+        };
+        s.store_peer_sample(&sample);
+        assert_eq!(s.blocked_until(NOW), Some(NOW + 600_000), "a peer's success says nothing about our refusal");
+        assert_eq!(s.replay(UsageStatus::Ok).map(|r| r.updated), Some(NOW));
+        s.store_sample(&sample);
+        assert_eq!(s.blocked_until(NOW), None, "our own reading spends the deadline");
+    }
+
+    #[test]
     fn a_stored_sample_replays_as_stale_rather_than_fresh() {
         let s = store();
         let sample = UsageLimits {
@@ -200,6 +237,7 @@ mod tests {
             seven_day: None,
             status: UsageStatus::Ok,
             updated: NOW,
+            source: None,
         };
         s.store_sample(&sample);
         let back = s.replay(UsageStatus::NetworkError).expect("a stored sample replays");

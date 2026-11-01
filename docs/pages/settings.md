@@ -209,7 +209,7 @@ For the full classification logic see [Classification](development/classificatio
 ### Usage limit bars
 
 - `limit_bar_segments` — number of segments in the 5-hour / 7-day usage bars; higher is finer-grained.
-- `usage_limits_poll_interval_seconds` — how often to poll Anthropic for usage. Clamped to a 60-second minimum.
+- `usage_limits_poll_interval_seconds` — how often to poll Anthropic for usage. Clamped to a 60-second minimum. With [multi-device sync](#multi-device-sync) on, a reading another device has just taken counts as this device's poll, so only one device asks per interval.
 - `usage_reset_poll_delay_seconds` — how many seconds after a usage window resets to re-poll, so the 5-hour / 7-day bars refresh promptly instead of briefly showing the old full bar. 30 by default.
 - `tray_badge` — show a usage limit on the tray icon. Values: `"none"`; `"five_hour_light"` / `"seven_day_light"` (recolor the traffic-light icon by usage); `"five_hour_number"` / `"seven_day_number"` (show the percentage, all-red light at 100%). The hover tooltip always shows both figures. Set it from the tray's **Tray usage badge** submenu.
 - `tray_context_alert_enabled` — whether the tray icon flags high context usage at all (the **Show high context usage** tray checkbox; on by default). Turning it off keeps `tray_context_alert_percent` intact, so re-checking it restores the same threshold.

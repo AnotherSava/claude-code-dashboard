@@ -2034,6 +2034,9 @@ fn fetch_usage_range(app: AppHandle, device: String, origin_addr: String, since:
         if let Some(store) = app.try_state::<RemoteUsageStore>() {
             store.merge_device(&device, &records);
             tracing::debug!(device = %device, records = records.len(), since, "usage range pulled");
+            if let Some(newest) = records.iter().max_by_key(|r| r.ts) {
+                crate::usage_limits::adopt_peer_reading(&app, &device, newest);
+            }
             // Nudge an open Work-intensity window to re-fetch the merged chart.
             emit_usage_limits_updated(&app);
         }
