@@ -69,7 +69,7 @@
           "FRAME: drawn by Add-WindowFrame, which runs the screenshot skill's `winframe.py`: everything outside the content Windows clips 2px in is drawn from DWM's own model (12px corners at 144 DPI flattened into 8 chords as Direct2D does, a 1px antialiasing ramp, a 2px border at 144 DPI), with a lighter uniform ring, rgba(146,146,146,0.69), and no shadow, chosen on 2026-09-24 so the edge reads 180 on a white page and 105 on a dark one on every side. A captured Windows border is the border mixed with the drop shadow behind it, which is why its bottom reads darker than its top; the model draws the border alone. The capture records its DPI in the PNG and the frame is sized from it. The untouched capture is committed beside it, in docs/screenshots/raw/ under the same name."
         ]
       },
-      "verifiedAt": "76b44f3"
+      "verifiedAt": "85e790d"
     },
     {
       "id": "compact-mode-macos",
@@ -254,7 +254,7 @@
           "FRAME: drawn by Add-WindowFrame, which runs the screenshot skill's `winframe.py`: everything outside the content Windows clips 2px in is drawn from DWM's own model (a menu's own 6px corners at 144 DPI flattened into 4 chords, a 1px antialiasing ramp, a 2px border at 144 DPI), with a lighter uniform ring, rgba(146,146,146,0.69), and no shadow, chosen on 2026-09-24 so the edge reads 180 on a white page and 105 on a dark one on every side. A captured Windows border is the border mixed with the drop shadow behind it, which is why its bottom reads darker than its top; the model draws the border alone. The capture records its DPI in the PNG and the frame is sized from it. The untouched capture is committed beside it, in docs/screenshots/raw/ under the same name."
         ]
       },
-      "verifiedAt": "at-capture"
+      "verifiedAt": "85e790d"
     }
   ],
   "declinedGaps": [
