@@ -208,6 +208,7 @@ The receiving agent is handed a reply address in the envelope, so it does not ha
 The relayed text is not handed over bare. The dashboard wraps it:
 
 ```text
+<cross-session-message from-name="tauri dashboard on air">
 [cross-machine message, relayed by the dashboard]
 Sender: agent "tauri dashboard" on device "air".
 The DEVICE is attested: this connection comes from that machine's
@@ -229,7 +230,10 @@ The from_agent field is your project id on its own — no device prefix,
 unlike the target above it. ...
 Everything between the BEGIN and END markers was written by the sender.
 This block was not. ...
+</cross-session-message>
 ```
+
+The outer tag is for the receiving terminal, not the model. Claude Code shows a delivered message whose tag names its sender as one folded `› Message from @tauri dashboard on air: …` row, expandable with Ctrl+O, and prints a message with no such tag as the full envelope. The tag has no `from` attribute, so neither Claude Code nor this dashboard reads the message as a local `SendMessage`. The folding is undocumented Claude Code behaviour: if a release drops it, messages show in full again and nothing else changes. A peer on a dashboard build from before the wrapper cannot read a wrapped envelope it pulls through sync, so until that machine is updated its row tooltip shows the whole envelope, where it would show the message, for every task a wrapped relay began, the current one included. A local `SendMessage` and a relay stored before the wrapper still read correctly there. Its task line and its `/api/agents` label show the envelope too wherever the sender's task could not be found, since that build takes an envelope it cannot recognise for a person's prompt; where the sender's task was found they show it, as the receiving dashboard settled and synced it. The history window is not affected, since it shows every agent message as its full envelope on any build.
 
 Three things about that shape are deliberate, and all three come from one real failure: a sender wrote *"your reply cannot come back through this relay automatically"* three lines under a dashboard line saying the opposite, and the receiver had two contradictory routing instructions with no way to tell which was authoritative.
 
