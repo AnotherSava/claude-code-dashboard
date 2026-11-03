@@ -17,6 +17,8 @@ use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
+use crate::json_store;
+
 pub const FILE_NAME: &str = "agterm_workspaces.json";
 
 /// Where a project's agent session sat. A workspace belongs to one window, so
@@ -36,17 +38,7 @@ pub struct WorkspaceMemory {
 
 impl WorkspaceMemory {
     pub fn new(path: PathBuf) -> Self {
-        let data = match std::fs::read_to_string(&path) {
-            Ok(text) => serde_json::from_str(&text).unwrap_or_else(|e| {
-                tracing::warn!(?e, path = %path.display(), "unparseable workspace memory; starting empty");
-                BTreeMap::new()
-            }),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
-            Err(e) => {
-                tracing::warn!(?e, path = %path.display(), "failed to read workspace memory");
-                BTreeMap::new()
-            }
-        };
+        let data = json_store::load(&path, "workspace memory");
         Self { path, data: Mutex::new(data) }
     }
 
@@ -75,14 +67,7 @@ impl WorkspaceMemory {
     }
 
     fn save(&self, data: &BTreeMap<String, LastWorkspace>) {
-        match serde_json::to_string_pretty(data) {
-            Ok(json) => {
-                if let Err(e) = std::fs::write(&self.path, json) {
-                    tracing::warn!(?e, path = %self.path.display(), "failed to write workspace memory");
-                }
-            }
-            Err(e) => tracing::warn!(?e, "failed to serialize workspace memory"),
-        }
+        json_store::save(&self.path, data, "workspace memory");
     }
 }
 

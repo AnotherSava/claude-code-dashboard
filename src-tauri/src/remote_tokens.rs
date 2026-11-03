@@ -44,33 +44,12 @@ pub struct RemoteTokenStore {
     data: Mutex<HashMap<String, DeviceTokens>>,
 }
 
-/// Device names are hostnames from peers' configs — almost always already
-/// filesystem-safe, but never trusted: anything outside `[A-Za-z0-9._-]`
-/// becomes `_`.
-fn sanitize_filename(device: &str) -> String {
-    device.chars().map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') { c } else { '_' }).collect()
-}
-
 impl RemoteTokenStore {
     pub fn new(dir: PathBuf) -> Self {
-        let mut data = HashMap::new();
-        if let Ok(entries) = std::fs::read_dir(&dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().is_none_or(|e| e != "json") {
-                    continue;
-                }
-                match std::fs::read_to_string(&path).map_err(|e| e.to_string()).and_then(|c| serde_json::from_str::<DeviceTokens>(&c).map_err(|e| e.to_string())) {
-                    Ok(mut dt) if !dt.device.is_empty() => {
-                        dt.records.sort_by_key(|r| r.seq);
-                        data.insert(dt.device.clone(), dt);
-                    }
-                    Ok(_) => tracing::warn!(path = %path.display(), "remote token file without device name skipped"),
-                    Err(e) => tracing::warn!(%e, path = %path.display(), "failed to read remote tokens"),
-                }
-            }
+        let mut data = crate::json_store::load_per_device(&dir, "remote tokens", |dt: &DeviceTokens| &dt.device);
+        for dt in data.values_mut() {
+            dt.records.sort_by_key(|r| r.seq);
         }
-        tracing::debug!(devices = data.len(), "remote tokens loaded");
         Self { dir, data: Mutex::new(data) }
     }
 
@@ -101,19 +80,8 @@ impl RemoteTokenStore {
         }
         dt.records.sort_by_key(|r| r.seq);
 
-        let path = self.dir.join(format!("{}.json", sanitize_filename(device)));
-        if let Err(e) = std::fs::create_dir_all(&self.dir) {
-            tracing::warn!(?e, dir = %self.dir.display(), "failed to create remote tokens dir");
-            return accepted;
-        }
-        match serde_json::to_string(&*dt) {
-            Ok(json) => {
-                if let Err(e) = std::fs::write(&path, json) {
-                    tracing::warn!(?e, path = %path.display(), "failed to write remote tokens");
-                }
-            }
-            Err(e) => tracing::warn!(?e, "failed to serialize remote tokens"),
-        }
+        let path = crate::json_store::device_path(&self.dir, device);
+        crate::json_store::save_compact(&path, &*dt, "remote tokens");
         accepted
     }
 

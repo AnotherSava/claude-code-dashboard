@@ -34,33 +34,12 @@ pub struct RemoteUsageStore {
     data: Mutex<HashMap<String, DeviceUsage>>,
 }
 
-/// Device names are hostnames from peers' configs — almost always already
-/// filesystem-safe, but never trusted: anything outside `[A-Za-z0-9._-]`
-/// becomes `_`.
-fn sanitize_filename(device: &str) -> String {
-    device.chars().map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') { c } else { '_' }).collect()
-}
-
 impl RemoteUsageStore {
     pub fn new(dir: PathBuf) -> Self {
-        let mut data = HashMap::new();
-        if let Ok(entries) = std::fs::read_dir(&dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().is_none_or(|e| e != "json") {
-                    continue;
-                }
-                match std::fs::read_to_string(&path).map_err(|e| e.to_string()).and_then(|c| serde_json::from_str::<DeviceUsage>(&c).map_err(|e| e.to_string())) {
-                    Ok(mut du) if !du.device.is_empty() => {
-                        du.records.sort_by_key(|r| r.ts);
-                        data.insert(du.device.clone(), du);
-                    }
-                    Ok(_) => tracing::warn!(path = %path.display(), "remote usage file without device name skipped"),
-                    Err(e) => tracing::warn!(%e, path = %path.display(), "failed to read remote usage"),
-                }
-            }
+        let mut data = crate::json_store::load_per_device(&dir, "remote usage", |du: &DeviceUsage| &du.device);
+        for du in data.values_mut() {
+            du.records.sort_by_key(|r| r.ts);
         }
-        tracing::debug!(devices = data.len(), "remote usage loaded");
         Self { dir, data: Mutex::new(data) }
     }
 
@@ -89,19 +68,8 @@ impl RemoteUsageStore {
         }
         du.records.sort_by_key(|r| r.ts);
 
-        let path = self.dir.join(format!("{}.json", sanitize_filename(device)));
-        if let Err(e) = std::fs::create_dir_all(&self.dir) {
-            tracing::warn!(?e, dir = %self.dir.display(), "failed to create remote usage dir");
-            return;
-        }
-        match serde_json::to_string(&*du) {
-            Ok(json) => {
-                if let Err(e) = std::fs::write(&path, json) {
-                    tracing::warn!(?e, path = %path.display(), "failed to write remote usage");
-                }
-            }
-            Err(e) => tracing::warn!(?e, "failed to serialize remote usage"),
-        }
+        let path = crate::json_store::device_path(&self.dir, device);
+        crate::json_store::save_compact(&path, &*du, "remote usage");
     }
 
     /// Every device's records, flattened — for the chart-build union in

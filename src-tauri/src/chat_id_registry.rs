@@ -15,17 +15,7 @@ pub struct ChatIdRegistry {
 
 impl ChatIdRegistry {
     pub fn new(path: PathBuf) -> Self {
-        let data = if path.exists() {
-            match std::fs::read_to_string(&path) {
-                Ok(contents) => serde_json::from_str(&contents).unwrap_or_default(),
-                Err(e) => {
-                    tracing::warn!(?e, path = %path.display(), "failed to read chat id registry");
-                    HashMap::new()
-                }
-            }
-        } else {
-            HashMap::new()
-        };
+        let data: HashMap<String, String> = crate::json_store::load(&path, "chat id registry");
         tracing::debug!(sessions = data.len(), "chat id registry loaded");
         Self { path, data: Mutex::new(data) }
     }
@@ -100,29 +90,7 @@ impl ChatIdRegistry {
 
     fn save_to_disk(&self) {
         let data = self.data.lock().unwrap();
-        let json = match serde_json::to_string_pretty(&*data) {
-            Ok(json) => json,
-            Err(e) => {
-                tracing::warn!(?e, "failed to serialize chat id registry");
-                return;
-            }
-        };
-        // Atomic write: write a sibling temp file, then rename it over the
-        // target. rename is atomic on the same filesystem, so a crash or a
-        // concurrent reader never sees the truncated file a plain `fs::write`
-        // would leave mid-write — a torn file reloads as empty (`unwrap_or_default`)
-        // and silently drops every session→chat_id lock. The mutex is held
-        // through the rename so overlapping saves stay totally ordered; the last
-        // to finish reflects the latest map.
-        let tmp = self.path.with_extension("tmp");
-        if let Err(e) = std::fs::write(&tmp, json.as_bytes()) {
-            tracing::warn!(?e, path = %tmp.display(), "failed to write chat id registry");
-            return;
-        }
-        if let Err(e) = std::fs::rename(&tmp, &self.path) {
-            tracing::warn!(?e, path = %self.path.display(), "failed to persist chat id registry");
-            let _ = std::fs::remove_file(&tmp);
-        }
+        crate::json_store::save(&self.path, &*data, "chat id registry");
     }
 }
 

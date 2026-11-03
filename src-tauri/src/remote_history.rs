@@ -41,32 +41,9 @@ pub struct RemoteHistoryStore {
     data: Mutex<HashMap<String, DeviceDialogs>>,
 }
 
-/// Device names are hostnames from peers' configs — almost always already
-/// filesystem-safe, but never trusted: anything outside `[A-Za-z0-9._-]`
-/// becomes `_`.
-fn sanitize_filename(device: &str) -> String {
-    device.chars().map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') { c } else { '_' }).collect()
-}
-
 impl RemoteHistoryStore {
     pub fn new(dir: PathBuf) -> Self {
-        let mut data = HashMap::new();
-        if let Ok(entries) = std::fs::read_dir(&dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().is_none_or(|e| e != "json") {
-                    continue;
-                }
-                match std::fs::read_to_string(&path).map_err(|e| e.to_string()).and_then(|c| serde_json::from_str::<DeviceDialogs>(&c).map_err(|e| e.to_string())) {
-                    Ok(dd) if !dd.device.is_empty() => {
-                        data.insert(dd.device.clone(), dd);
-                    }
-                    Ok(_) => tracing::warn!(path = %path.display(), "remote history file without device name skipped"),
-                    Err(e) => tracing::warn!(%e, path = %path.display(), "failed to read remote history"),
-                }
-            }
-        }
-        tracing::debug!(devices = data.len(), "remote history loaded");
+        let data = crate::json_store::load_per_device(&dir, "remote history", |dd: &DeviceDialogs| &dd.device);
         Self { dir, data: Mutex::new(data) }
     }
 
@@ -117,19 +94,8 @@ impl RemoteHistoryStore {
     }
 
     fn write_device(&self, dd: &DeviceDialogs) {
-        let path = self.dir.join(format!("{}.json", sanitize_filename(&dd.device)));
-        if let Err(e) = std::fs::create_dir_all(&self.dir) {
-            tracing::warn!(?e, dir = %self.dir.display(), "failed to create remote history dir");
-            return;
-        }
-        match serde_json::to_string(&*dd) {
-            Ok(json) => {
-                if let Err(e) = std::fs::write(&path, json) {
-                    tracing::warn!(?e, path = %path.display(), "failed to write remote history");
-                }
-            }
-            Err(e) => tracing::warn!(?e, "failed to serialize remote history"),
-        }
+        let path = crate::json_store::device_path(&self.dir, &dd.device);
+        crate::json_store::save_compact(&path, dd, "remote history");
     }
 }
 

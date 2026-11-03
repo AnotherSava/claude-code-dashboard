@@ -212,14 +212,11 @@ fn cursor_path(app: &AppHandle) -> Option<PathBuf> {
 }
 
 fn load_cursor(path: &Path) -> ScanCursor {
-    std::fs::read_to_string(path).ok().and_then(|c| serde_json::from_str(&c).ok()).unwrap_or_default()
+    crate::json_store::load(path, "token scan cursor")
 }
 
 fn save_cursor(path: &Path, cursor: &ScanCursor) {
-    let Ok(json) = serde_json::to_string(cursor) else { return };
-    if let Err(e) = std::fs::write(path, json) {
-        tracing::warn!(?e, path = %path.display(), "failed to save token scan cursor");
-    }
+    crate::json_store::save_compact(path, cursor, "token scan cursor");
 }
 
 pub fn spawn(app: AppHandle) {

@@ -53,10 +53,7 @@ pub struct UsageCacheStore {
 
 impl UsageCacheStore {
     pub fn new(path: PathBuf) -> Self {
-        let data = std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|s| serde_json::from_str::<CacheFile>(&s).ok())
-            .unwrap_or_default();
+        let data: CacheFile = crate::json_store::load(&path, "usage cache");
         tracing::debug!(
             has_sample = data.updated != 0,
             blocked_until = ?data.blocked_until,
@@ -147,14 +144,7 @@ impl UsageCacheStore {
 
     fn save(&self) {
         let d = self.data.lock().unwrap();
-        match serde_json::to_string_pretty(&*d) {
-            Ok(json) => {
-                if let Err(e) = std::fs::write(&self.path, json) {
-                    tracing::warn!(?e, path = %self.path.display(), "failed to write usage cache");
-                }
-            }
-            Err(e) => tracing::warn!(?e, "failed to serialize usage cache"),
-        }
+        crate::json_store::save(&self.path, &*d, "usage cache");
     }
 }
 

@@ -53,10 +53,7 @@ impl AliveStamp {
     pub fn spawn_heartbeat(&self) {
         let path = self.path.clone();
         std::thread::spawn(move || loop {
-            let body = serde_json::to_string(&StampFile { at: now_ms() }).expect("a struct of one integer serializes");
-            if let Err(e) = std::fs::write(&path, body) {
-                tracing::warn!(error = %e, path = %path.display(), "could not write the alive stamp");
-            }
+            crate::json_store::save_compact(&path, &StampFile { at: now_ms() }, "alive stamp");
             std::thread::sleep(std::time::Duration::from_millis(HEARTBEAT_MS));
         });
     }

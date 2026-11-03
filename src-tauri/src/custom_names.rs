@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
+use crate::json_store;
 use crate::project_rename::{rename_key, KeyMove};
 use crate::state::AgentSession;
 
@@ -17,17 +18,7 @@ pub struct CustomNamesStore {
 
 impl CustomNamesStore {
     pub fn new(path: PathBuf) -> Self {
-        let data = if path.exists() {
-            match std::fs::read_to_string(&path) {
-                Ok(contents) => serde_json::from_str(&contents).unwrap_or_default(),
-                Err(e) => {
-                    tracing::warn!(?e, path = %path.display(), "failed to read custom names");
-                    HashMap::new()
-                }
-            }
-        } else {
-            HashMap::new()
-        };
+        let data: HashMap<String, String> = json_store::load(&path, "custom names");
         tracing::debug!(names = data.len(), "custom names loaded");
         Self {
             path,
@@ -76,16 +67,7 @@ impl CustomNamesStore {
 
     fn save_to_disk(&self) {
         let data = self.data.lock().unwrap();
-        match serde_json::to_string_pretty(&*data) {
-            Ok(json) => {
-                if let Err(e) = std::fs::write(&self.path, json) {
-                    tracing::warn!(?e, path = %self.path.display(), "failed to write custom names");
-                }
-            }
-            Err(e) => {
-                tracing::warn!(?e, "failed to serialize custom names");
-            }
-        }
+        json_store::save(&self.path, &*data, "custom names");
     }
 }
 

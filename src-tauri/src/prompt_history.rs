@@ -12,17 +12,7 @@ pub struct PromptHistoryStore {
 
 impl PromptHistoryStore {
     pub fn new(path: PathBuf) -> Self {
-        let data = if path.exists() {
-            match std::fs::read_to_string(&path) {
-                Ok(contents) => serde_json::from_str(&contents).unwrap_or_default(),
-                Err(e) => {
-                    tracing::warn!(?e, path = %path.display(), "failed to read prompt history");
-                    HashMap::new()
-                }
-            }
-        } else {
-            HashMap::new()
-        };
+        let data: HashMap<String, PersistedSession> = crate::json_store::load(&path, "prompt history");
         tracing::debug!(sessions = data.len(), "prompt history loaded");
         Self {
             path,
@@ -72,16 +62,7 @@ impl PromptHistoryStore {
 
     pub fn save_to_disk(&self) {
         let data = self.data.lock().unwrap();
-        match serde_json::to_string_pretty(&*data) {
-            Ok(json) => {
-                if let Err(e) = std::fs::write(&self.path, json) {
-                    tracing::warn!(?e, path = %self.path.display(), "failed to write prompt history");
-                }
-            }
-            Err(e) => {
-                tracing::warn!(?e, "failed to serialize prompt history");
-            }
-        }
+        crate::json_store::save(&self.path, &*data, "prompt history");
     }
 }
 

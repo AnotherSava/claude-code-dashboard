@@ -147,17 +147,7 @@ pub struct RenameLog {
 
 impl RenameLog {
     pub fn new(path: PathBuf) -> Self {
-        let data = match std::fs::read_to_string(&path) {
-            Ok(contents) => serde_json::from_str(&contents).unwrap_or_else(|e| {
-                tracing::warn!(?e, path = %path.display(), "failed to parse project renames");
-                Vec::new()
-            }),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-            Err(e) => {
-                tracing::warn!(?e, path = %path.display(), "failed to read project renames");
-                Vec::new()
-            }
-        };
+        let data = crate::json_store::load(&path, "project renames");
         Self { path, data: Mutex::new(data) }
     }
 
@@ -166,14 +156,7 @@ impl RenameLog {
         data.retain(|r| now - r.at < ANNOUNCE_MS);
         let at = data.last().map_or(now, |last| now.max(last.at + 1));
         data.push(ProjectRename { from: from.to_string(), to: to.to_string(), at });
-        match serde_json::to_string_pretty(&*data) {
-            Ok(json) => {
-                if let Err(e) = std::fs::write(&self.path, json) {
-                    tracing::warn!(?e, path = %self.path.display(), "failed to write project renames");
-                }
-            }
-            Err(e) => tracing::warn!(?e, "failed to serialize project renames"),
-        }
+        crate::json_store::save(&self.path, &*data, "project renames");
     }
 
     /// The renames still inside the announcement window, oldest first.
