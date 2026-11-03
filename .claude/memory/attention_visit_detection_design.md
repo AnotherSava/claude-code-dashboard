@@ -1,13 +1,20 @@
 ---
 name: attention-visit-detection-design
-description: Departure-marking behind a terminal adapter; an fsevent watch on agterm's window snapshot is the only credited departure source, the poll brings input
+description: Departure-marking behind a terminal adapter; an fsevent watch on agterm's window snapshot is the only credited departure source, the poll brings input; agterm 0.35+ ships session.selected, not yet adopted
 metadata:
   type: project
 ---
 
 Polling alone cannot do this. Sampling a *level* (`tree --json`'s `active` session) to detect an *edge* (the user left that tab) misses any visit shorter than the tick, and the tick is pure *discovery lag* rather than a chosen delay — so no interval closes it. Confirmed twice in production 2026-09-02: a finished session opened and left inside one interval stayed `Done`.
 
-**Two upstream asks were made of the agterm project and then withdrawn on 2026-09-02** — a selection-change event kind, and a one-shot `agtermctl events` that prints its cursor. Do not re-raise them. The event route only pays off if the dashboard *writes* `session status … --auto-reset`, since that is what makes a visit emit a `status` event; the glyph write is unwanted (see [[agterm-status-coexistence]]), so a one-shot read would arrive with nothing worth reading.
+**Two upstream asks were made of the agterm project and then withdrawn on 2026-09-02** — a selection-change event kind, and a one-shot `agtermctl events` that prints its cursor. **agterm shipped both anyway** (reported 2026-11-03 by the agterm session, read off upstream's bundled `reference.md` and CHANGELOG at v0.40.0; not yet adopted here):
+
+- `session.selected` (v0.35): `agtermctl events --kind session.selected [--json] [--run UUID --after SEQ]` or `on session.selected <cmd>` in hooks.conf. Payload: new `session`, its `name`, and `previous` (the id that lost selection). Fires for every cause (click, navigation, `session select`, a selected `session new`, reselection after a close); reselecting the same session or raising another window emits nothing. 4,096-event ring per app run, resumable by cursor. Could replace the snapshot-file watch below, removing the 300ms debounce loss and the extra `tree` call to name the departed session.
+- `lastSelectedAt` per session in `tree --json` (v0.39): epoch seconds of the last time the session became or stopped being its window's selection; persisted, absent for sessions restored from older builds. Lets one `tree` read see a visit between two polls.
+- `session close --undoable` (v0.39): idle close would get the ⌘W grace (⌘Z / Reopen Last Closed / `recent open`); falls back to a hard close when undo-after-closing is off, `result.undoable` says which.
+- `tree.changed` (v0.40) fires on `session context`/`info` changes and overlay open/close; `pane.focused` (v0.38) covers split-pane visits, which `session.selected` does not.
+
+The live app read 0.36.0 that day, so only `session.selected` was available until the next agterm upgrade. The withdrawn reasoning — that an event route needed the dashboard to write `session status … --auto-reset` (unwanted, see [[agterm-status-coexistence]]) — no longer applies, since `session.selected` needs no status write.
 
 **Mark on departure, not on arrival** (decided 2026-09-02). Leaving a finished session's tab is what marks it read — that is the moment you are done with it. Three consequences:
 
