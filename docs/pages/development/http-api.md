@@ -5,7 +5,7 @@ parent: Development
 nav_order: 4
 ---
 
-The widget listens on `http://127.0.0.1:9077` (default) for lifecycle events from external agents. One write endpoint, one envelope shape, adapter-dispatched on the server side — plus a read-only [agent roster](#agent-roster) an agent can query to see what is running, here and on the user's other machines, a [message relay](#cross-machine-messaging) for reaching one of those agents on another machine, [a route a local skill posts to](#post-apisession-clean) to report that its run left nothing to come back to, and [one that carries a project's data over](#post-apiprojectrename) when its folder is renamed, and two the local picker uses: [one that opens a project's session](#post-apisessionopen) and [one that lists the agterm tabs running Claude](#get-apisessiontabs).
+The widget listens on `http://127.0.0.1:9077` (default) for lifecycle events from external agents. One write endpoint, one envelope shape, adapter-dispatched on the server side — plus a read-only [agent roster](#agent-roster) an agent can query to see what is running, here and on the user's other machines, a [message relay](#cross-machine-messaging) for reaching one of those agents on another machine, [a route a local skill posts to](#post-apisession-clean) to report that its run left nothing to come back to, and [one that carries a project's data over](#post-apiprojectrename) when its folder is renamed, two the local picker uses: [one that opens a project's session](#post-apisessionopen) and [one that lists the agterm tabs running Claude](#get-apisessiontabs), and [a pair for dev servers](#post-apidev-server) a script announces and an agterm chord opens.
 
 A second, separate listener serves the [multi-device sync](#sync-api) API when enabled — the hook API below stays loopback-only and unauthenticated regardless.
 
@@ -403,6 +403,34 @@ Lists every agterm tab running Claude, across every open window, for the local p
 ```
 
 `tabs` is `null` when agterm could not be asked, and always on Windows. Carries the loopback `Host` gate on top of the `Origin` check. Not logged.
+
+## `POST /api/dev-server`
+
+Records a local dev server and the agterm session it was started from, so that session's sidebar row shows it for as long as it keeps answering. A script posts it once the server's port accepts connections:
+
+```json
+{ "port": 5173, "dir": "/Users/you/Projects/my-app", "session": "<AGTERM_SESSION_ID>" }
+```
+
+`session` is the session's own address from its environment, which only a process started inside the session has. `dir` is optional. One port is one server on this machine, so an announcement replaces whatever held the port before. Nothing announces a stop: every 15 seconds, and at once after an announcement, the dashboard connects to each announced port on both loopbacks, forgets one that refuses, and rewrites each session's line with a 45-second expiry, so a dashboard that stops leaves nothing claiming a server runs. A server whose session agterm says no longer exists is forgotten too. Announcements are kept in `dev_servers.json`, since a server outlives a dashboard restart. The check and the line exist only where the terminal has one to write, which today is agterm on macOS; elsewhere an announcement is recorded and nothing checks or shows it. Carries the loopback `Host` gate on top of the `Origin` check.
+
+| Status | Body | Meaning |
+|---     |---   |---      |
+| `200`  | `{"ok": true}` | recorded |
+| `400`  | `{"ok": false, "reason": "bad_request", …}` | the port is `0` or the session is empty |
+| `500`  | `{"ok": false, "reason": "state_unavailable", …}` | the dashboard is still starting |
+
+Logged as `decision = "dev_server"` with an `outcome` of `announced`; the checks log `stopped`, `session_gone` and `show_failed`, the last once per change of reason.
+
+## `GET /api/dev-server?session=<id>`
+
+Lists the dev servers announced from one session, newest first, for the agterm chord that opens one (`integrations/open-dev-server.py`):
+
+```json
+{ "servers": [ { "port": 5173, "dir": "/Users/you/Projects/my-app" } ] }
+```
+
+A server that has stopped stays listed until the next check forgets it, which is one pass: 15 seconds after the previous pass ended. Carries the loopback `Host` gate on top of the `Origin` check. Not logged.
 
 ## Sync API
 

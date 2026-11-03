@@ -100,12 +100,13 @@ Under the repo root `claude-code-dashboard/`:
     - `config_watcher.rs` — notify watcher for config.json hot-reload
     - `commands.rs` — Tauri commands + event emitters
     - `setup.rs` — embedded Python hook + settings.json snippet builder for onboarding
-    - `http_server.rs` — the loopback axum server: `/api/event`, `/api/agents`, `/api/message`, `/api/window`, `/api/session-clean`, `/api/project/rename`, `/api/session/open`, `/api/session/tabs`
+    - `http_server.rs` — the loopback axum server: `/api/event`, `/api/agents`, `/api/message`, `/api/window`, `/api/session-clean`, `/api/project/rename`, `/api/session/open`, `/api/session/tabs`, `/api/dev-server`
     - `sync.rs` — multi-device session sync: source- and token-gated listener, metadata push, receiver-driven pulls
     - `tailnet.rs` — asking Tailscale which machine a connection came from, instead of trusting its envelope
     - `subprocess.rs` — running a helper program to a deadline, with no console window on Windows
     - `peer_message.rs` — relaying one message to an agent on another machine, and the honesty rules around it
     - `session_launcher.rs` — starting a terminal session for a project that has none, for a relayed message or for the local picker (`integrations/pick-local-session.py`, through `POST /api/session/open`); it names no terminal, asking the platform's `terminals::TerminalAdapter` to launch the session (agterm's adapter on macOS, its workspace placement included), so a launcher for another terminal is that terminal's adapter implementing `launch`
+    - `dev_servers.rs` — dev servers announced from an agterm session, checked until they stop answering and shown on that session's sidebar row, in `dev_servers.json`
     - `workspace_memory.rs` — the agterm window and workspace each project's agent was last seen in, so a started session opens there, in `agterm_workspaces.json`
     - `session_restore.rs` — giving a live session its row back after a restart
     - `alive_stamp.rs` — the previous run's last heartbeat, which tells `session_restore` a session started while the dashboard was down
@@ -135,6 +136,7 @@ Under the repo root `claude-code-dashboard/`:
     - `remote_usage.rs` — per-device remote usage samples under `remote_usage/`
     - `prompt_history.rs` — per-session dialog persistence to `prompt_history.json`
     - `remote_history.rs` — per-device remote-session dialog persistence under `remote_history/`
+    - `json_store.rs` — loading and atomically saving the JSON files every store keeps in the app data directory, `config.json` excepted
     - `chat_id_registry.rs` — persisted `session_id → chat_id` lock in `session_chat_ids.json`
     - `custom_names.rs` — user-assigned display names persisted to `custom_names.json`
     - `terminal_title.rs` — mirrors session status onto terminal tab titles
@@ -144,7 +146,7 @@ Under the repo root `claude-code-dashboard/`:
     - `terminals/` — one adapter per terminal behind the `TerminalAdapter` seam, so nothing downstream names a terminal
       - `mod.rs` — the trait, the shared vocabulary, and the pure verdicts over it (`person_verdict`, `departure_stamp`, `read_front`)
       - `agterm.rs` / `agterm_facts.rs` — agterm's adapter, which also starts sessions, and the facts it reads from agterm and the system (macOS)
-      - `agterm_wire.rs` — agterm's `session context` protocol (the argv a write takes, the targets its tree reports, and the release that first served the verb) its `session close` argv with `close_refusal`, the rule that refuses a close, and `placement`, which picks the workspace a started session opens in (macOS)
+      - `agterm_wire.rs` — agterm's `session context` protocol (the argv a write takes, the targets its tree reports, and the release that first served the verb), the `session info` line naming a session's dev servers, its `session close` argv with `close_refusal`, the rule that refuses a close, and `placement`, which picks the workspace a started session opens in (macOS)
       - `agwinterm.rs` / `agwinterm_state.rs` / `agwinterm_wire.rs` — agwinterm's control pipe, its per-window state files, and its protocol, including `close_pane` and `composer_text`, the rules that refuse a close (Windows)
       - `tmux.rs` / `tmux_wire.rs` — the WSL tmux server holding remote sessions, an adapter that closes and starts them: it offers `idle_close` the sessions no terminal on this machine is showing and types `/exit` into one, and starts a detached session through the claude repo's `cc-session.sh` where `remote_session_script` is set (Windows)
       - `composer.rs` — where Claude Code's composer sits on a screen of text, and the `/exit` sequence typed into it, shared by every close that types into the agent
@@ -161,6 +163,7 @@ Under the repo root `claude-code-dashboard/`:
 - `scripts/dev.mjs` — fronts `npm run tauri`; settles the dev server's port and hands it to both Vite and the Tauri CLI
 - `integrations/claude_hook.py` — thin Claude Code hook that forwards the stdin payload to /api/event
 - `integrations/pick-local-session.py` — agterm-chord picker that opens a local project's session through `POST /api/session/open`, or raises its existing tab
+- `integrations/open-dev-server.py` — agterm-chord helper that opens the dev server started from the session as an overlay through `GET /api/dev-server`, or hides and shows the session's page overlay
 - `docs/` — this site
 - `.github/workflows/`
   - `build.yml` — CI: check + `cargo check --all-targets` with warnings denied + cargo test + frontend build on push/PR (Windows + macOS matrix)
@@ -170,7 +173,7 @@ Under the repo root `claude-code-dashboard/`:
 ### Where state lives at runtime
 
 - **In-memory** — `AppState` (local and remote sessions) and `ConfigState` (config) via `tauri::State`, alongside the other managed stores the frontend and the HTTP routes read.
-- **On disk** — `config.json`, `widget.jsonl`, `prompt_history.json`, `session_chat_ids.json`, `custom_names.json`, `agterm_workspaces.json`, `alive_stamp.json`, `project_renames.json`, `usage_history.jsonl`, `usage_cache.json`, `token_history.jsonl`, `token_scan_cursor.json`, and the `remote_history/`, `remote_usage/` and `remote_tokens/` directories under `app_data_dir()`:
+- **On disk** — `config.json`, `widget.jsonl`, `prompt_history.json`, `session_chat_ids.json`, `custom_names.json`, `agterm_workspaces.json`, `alive_stamp.json`, `project_renames.json`, `dev_servers.json`, `usage_history.jsonl`, `usage_cache.json`, `token_history.jsonl`, `token_scan_cursor.json`, and the `remote_history/`, `remote_usage/` and `remote_tokens/` directories under `app_data_dir()`:
   - Windows: `%APPDATA%\com.anothersava.claude-code-dashboard\`
   - macOS: `~/Library/Application Support/com.anothersava.claude-code-dashboard/`
 
