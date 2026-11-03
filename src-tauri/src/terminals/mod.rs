@@ -1043,6 +1043,38 @@ pub trait TerminalAdapter: Send {
         let _ = name;
         Err("this terminal cannot attach a hosted session".to_string())
     }
+
+    /// Whether [`show_servers`](Self::show_servers) can ever succeed here. A
+    /// fact about the adapter, answered without asking the terminal, so
+    /// `dev_servers` starts no worker where there is no line to write.
+    fn can_show_servers(&self) -> bool {
+        false
+    }
+
+    /// Show on a session that `ports` are dev servers started from it, or clear
+    /// that where `ports` is empty, the line going by itself after
+    /// `expire_after` unless shown again so a stopped dashboard leaves nothing
+    /// standing. `session` is the address the session's own environment gives a
+    /// process started in it (agterm's `AGTERM_SESSION_ID`), passed through
+    /// opaque: unlike every other key on this seam it was not minted by the
+    /// adapter but carried to the dashboard by the process that announced the
+    /// server.
+    ///
+    /// **May block.** The default refuses.
+    fn show_servers(&self, session: &str, ports: &[u16], expire_after: std::time::Duration) -> Result<ServersShown, String> {
+        let _ = (session, ports, expire_after);
+        Err("this terminal has no line to show a dev server on".to_string())
+    }
+}
+
+/// What [`TerminalAdapter::show_servers`] found. The terminal saying the
+/// session does not exist is an answer, not a failure: the session closed, so
+/// its servers have nowhere left to be shown, whereas a failure to ask is
+/// retried.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServersShown {
+    Shown,
+    NoSuchSession,
 }
 
 /// What [`TerminalAdapter::launch`] created.

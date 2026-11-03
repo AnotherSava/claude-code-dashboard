@@ -1,5 +1,5 @@
 use axum::{
-    extract::State,
+    extract::{Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -44,6 +44,7 @@ pub async fn run(app: AppHandle, port: u16) {
         .route("/api/project/rename", post(post_project_rename))
         .route("/api/session/open", post(post_session_open))
         .route("/api/session/tabs", get(get_session_tabs))
+        .route("/api/dev-server", post(post_dev_server).get(get_dev_server))
         .with_state(app);
 
     if let Err(e) = axum::serve(listener, router).await {
@@ -250,6 +251,53 @@ async fn get_session_tabs(State(app): State<AppHandle>, headers: HeaderMap) -> R
         None
     };
     Json(serde_json::json!({ "tabs": tabs })).into_response()
+}
+
+/// What `POST /api/dev-server` is told: a dev server that has just started
+/// answering, and the terminal session it was started from.
+#[derive(Deserialize)]
+struct DevServerAnnouncement {
+    port: u16,
+    #[serde(default)]
+    dir: String,
+    /// The session's own address, from its environment (`AGTERM_SESSION_ID`).
+    session: String,
+}
+
+/// Record a dev server the deploy skill's `deploy-dev-server.sh` started, so
+/// its session shows it until it stops (see [`crate::dev_servers`]). Loopback
+/// `Host` required, like every route a local script calls.
+async fn post_dev_server(State(app): State<AppHandle>, headers: HeaderMap, Json(req): Json<DevServerAnnouncement>) -> Response {
+    if let Some(detail) = csrf_refusal(&headers, true) {
+        return csrf_refused(detail).into_response();
+    }
+    let session = req.session.trim();
+    if req.port == 0 || session.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"ok": false, "reason": "bad_request", "detail": "a port and a session are both required"}))).into_response();
+    }
+    let Some(store) = app.try_state::<crate::dev_servers::DevServers>() else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"ok": false, "reason": "state_unavailable", "detail": "the dashboard is still starting"}))).into_response();
+    };
+    tracing::info!(decision = "dev_server", outcome = "announced", port = req.port, dir = %req.dir, session = %session, "dev server announced");
+    store.announce(crate::dev_servers::DevServer { port: req.port, dir: req.dir.trim().to_string(), session: session.to_string(), announced_at: now_ms() });
+    Json(serde_json::json!({"ok": true})).into_response()
+}
+
+#[derive(Deserialize)]
+struct DevServerQuery {
+    session: String,
+}
+
+/// The dev servers announced from one session, newest first, for the agterm
+/// chord that opens one (`integrations/open-dev-server.py`). A stopped server
+/// stays listed until the next check forgets it, at most one pass.
+async fn get_dev_server(State(app): State<AppHandle>, headers: HeaderMap, Query(q): Query<DevServerQuery>) -> Response {
+    if let Some(detail) = csrf_refusal(&headers, true) {
+        return csrf_refused(detail).into_response();
+    }
+    let servers = app.try_state::<crate::dev_servers::DevServers>().map(|s| s.for_session(q.session.trim())).unwrap_or_default();
+    let servers: Vec<_> = servers.iter().map(|s| serde_json::json!({"port": s.port, "dir": s.dir})).collect();
+    Json(serde_json::json!({ "servers": servers })).into_response()
 }
 
 /// What `POST /api/window` is being asked to do.

@@ -92,6 +92,16 @@ On a Mac with agterm you can bind a chord to a picker of your projects: the fold
 command "Local session"  cmd+shift+o  /usr/bin/env python3 /path/to/claude-code-dashboard/integrations/pick-local-session.py
 ```
 
+## See and open a running dev server
+
+A script that starts a local dev server from an agterm session can tell the dashboard about it, and that session's sidebar row then shows a green **▶ dev server** line with its port for as long as the server keeps answering. The script makes one request once the server is up, posting `{"port": 5173, "dir": "<project folder>", "session": "$AGTERM_SESSION_ID"}` to `http://127.0.0.1:9077/api/dev-server`. Servers started any other way are not shown.
+
+A chord opens the server over its session as an overlay, with its page scripts running and logins kept between openings. Pressing it again hides the page, and once more brings it back. Add a line like this to agterm's `keymap.conf`:
+
+```
+command "Dev server"  cmd+shift+s  /usr/bin/env python3 /path/to/claude-code-dashboard/integrations/open-dev-server.py
+```
+
 ## Focus on the task
 
 While Claude is blocked on you (BLOCK), the row shows the question or approval request, so you know what it needs. Once you answer and Claude resumes (WORK), the row goes back to showing your **original request** rather than the *yes* you typed — so a quick approval or a *continue* never replaces your task on screen. The work timer pauses during BLOCK — replaced by a timer counting how long Claude has been blocked on you — and resumes once the agent continues working on the task. A new top-level prompt starts a fresh task from any resting state.

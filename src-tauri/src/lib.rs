@@ -8,10 +8,12 @@ mod commands;
 mod config;
 mod config_watcher;
 mod custom_names;
+mod dev_servers;
 mod http_server;
 mod idle;
 mod idle_awake;
 mod idle_close;
+mod json_store;
 mod label_policy;
 mod lid_awake;
 mod liveness;
@@ -315,6 +317,7 @@ pub fn run() {
             // them, silently.
             terminals::stale_check::spawn(app.handle().clone());
             terminals::labels::spawn(app.handle().clone());
+            dev_servers::spawn(app.handle().clone());
 
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
@@ -477,6 +480,9 @@ pub fn run() {
     ));
     app.manage(project_rename::RenameLog::new(
         app_data.join("project_renames.json"),
+    ));
+    app.manage(dev_servers::DevServers::new(
+        app_data.join(dev_servers::FILE_NAME),
     ));
     app.manage(std::sync::Arc::new(workspace_memory::WorkspaceMemory::new(
         app_data.join(workspace_memory::FILE_NAME),

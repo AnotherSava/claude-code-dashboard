@@ -1,5 +1,6 @@
-//! agterm's `session context` protocol, and the `session close` argv with the
-//! rule that refuses a close ([`close_refusal`]), as pure functions.
+//! agterm's `session context` protocol, the `session info` line that names a
+//! session's dev servers, and the `session close` argv with the rule that
+//! refuses a close ([`close_refusal`]), as pure functions.
 //!
 //! The mirror of [`super::agwinterm_wire`], and gated the same way — compiled on
 //! macOS and in a test build everywhere — so the argv building, the projection
@@ -127,6 +128,55 @@ pub(crate) fn close_argv(window: &str, session: &str) -> Vec<String> {
     vec!["session".into(), "close".into(), "--target".into(), session.into(), "--window".into(), window.into(), "--json".into()]
 }
 
+/// What [`servers_line`] starts with, so the line begins under the session's
+/// name rather than under the status glyph before it. agterm offers no indent,
+/// so the offset is made of characters: three figure spaces (U+2007) measured
+/// on 0.40.0 to put the `▶` on the name's first pixel, where ordinary or
+/// no-break spaces fall short and two em spaces overshoot.
+const SERVERS_INDENT: &str = "\u{2007}\u{2007}\u{2007}";
+
+/// The info line naming a session's running dev servers: a green `▶`, then
+/// the ports, sorted by the caller. Inline markdown, so it is sent with
+/// `--markdown`; a port is digits only, so nothing in it needs escaping.
+pub(crate) fn servers_line(ports: &[u16]) -> String {
+    let noun = if ports.len() == 1 { "dev server" } else { "dev servers" };
+    let list: Vec<String> = ports.iter().map(|p| format!(":{p}")).collect();
+    format!("{SERVERS_INDENT}^[▶](color: \"green\") {noun} {}", list.join(" "))
+}
+
+/// The argv that sets `session`'s info line to [`servers_line`], expiring by
+/// itself after `hide_after_secs` unless set again. `--` goes last, as in
+/// [`context_argv`]; measured on 0.40.0 to serve this verb the same way.
+///
+/// No `--window`: agterm resolves a session id across windows, and the id
+/// arrives from the session's own environment with no window beside it.
+pub(crate) fn servers_argv(session: &str, ports: &[u16], hide_after_secs: u64) -> Vec<String> {
+    vec![
+        "session".into(),
+        "info".into(),
+        "--markdown".into(),
+        "--hide-after".into(),
+        hide_after_secs.to_string(),
+        "--target".into(),
+        session.into(),
+        "--json".into(),
+        "--".into(),
+        servers_line(ports),
+    ]
+}
+
+/// The argv that clears `session`'s info line.
+pub(crate) fn servers_clear_argv(session: &str) -> Vec<String> {
+    vec!["session".into(), "info".into(), "--clear".into(), "--target".into(), session.into(), "--json".into()]
+}
+
+/// Whether agterm's refusal says the session does not exist, which is
+/// knowledge that it closed rather than a failure to ask. agterm 0.40.0 answers
+/// an unknown `--target` with `no such session: <id>`.
+pub(crate) fn names_no_session(error: &str) -> bool {
+    error.starts_with("no such session")
+}
+
 /// Why this session must not be closed, or `None` when it may. `node` is the
 /// session's `tree --json` node.
 ///
@@ -229,6 +279,29 @@ mod tests {
 
     fn last(name: &str) -> LastWorkspace {
         LastWorkspace { window: "W".into(), workspace: "S1".into(), name: name.into() }
+    }
+
+    #[test]
+    fn a_servers_line_names_every_port_with_its_noun() {
+        assert_eq!(servers_line(&[5173]), format!("{SERVERS_INDENT}^[▶](color: \"green\") dev server :5173"));
+        assert_eq!(servers_line(&[3000, 5173]), format!("{SERVERS_INDENT}^[▶](color: \"green\") dev servers :3000 :5173"));
+    }
+
+    #[test]
+    fn the_servers_line_is_the_last_argument_after_every_option() {
+        let argv = servers_argv("S", &[5173], 45);
+        let dash = argv.iter().position(|a| a == "--").unwrap();
+        assert_eq!(dash, argv.len() - 2, "only the text follows `--`");
+        assert_eq!(argv[argv.len() - 1], servers_line(&[5173]));
+        assert!(argv[..dash].windows(2).any(|w| w == ["--hide-after", "45"]));
+        assert!(argv[..dash].windows(2).any(|w| w == ["--target", "S"]));
+    }
+
+    #[test]
+    fn only_an_unknown_session_reads_as_closed() {
+        assert!(names_no_session("no such session: 1234"));
+        assert!(!names_no_session("agtermctl timed out"));
+        assert!(!names_no_session("agtermctl not found"));
     }
 
     #[test]

@@ -200,6 +200,24 @@ impl TerminalAdapter for AgtermAdapter {
         true
     }
 
+    /// agterm's `session info` line, which is runtime-only and expires by
+    /// itself. An agterm older than the verb refuses every write, and the
+    /// `dev_server` log line carries that refusal; nothing is gated on the
+    /// version because a server is only ever announced from inside a session.
+    fn can_show_servers(&self) -> bool {
+        true
+    }
+
+    fn show_servers(&self, session: &str, ports: &[u16], expire_after: std::time::Duration) -> Result<super::ServersShown, String> {
+        let argv = if ports.is_empty() { wire::servers_clear_argv(session) } else { wire::servers_argv(session, ports, expire_after.as_secs()) };
+        let args: Vec<&str> = argv.iter().map(String::as_str).collect();
+        match crate::agterm::agtermctl_checked(&args) {
+            Ok(_) => Ok(super::ServersShown::Shown),
+            Err(e) if wire::names_no_session(&e) => Ok(super::ServersShown::NoSuchSession),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Close one session. agterm ends every process in it, the agent included,
     /// so nothing else has to be stopped first. A primary pane no longer running
     /// the agent refuses the close ([`wire::close_refusal`]), read fresh because
