@@ -175,8 +175,8 @@ def main() -> int:
         errors.append("screenshots.json: two entries share an id")
 
     # `verifiedAt` is either a commit sha or the sentinel `at-capture`; absent
-    # means never examined. The skill's references/screenshot-manifest.md defines
-    # all three and why the sentinel exists — in short, the sha of the commit that
+    # means never examined. The docs-screenshot skill's
+    # references/screenshot-manifest.md defines all three and why the sentinel exists — in short, the sha of the commit that
     # CARRIES a shot cannot be written while composing that commit, so recording
     # one would otherwise cost a second commit per change.
     #
