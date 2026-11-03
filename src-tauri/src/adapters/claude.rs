@@ -748,7 +748,7 @@ fn opens_with_benign_offer(sentence: &str, benign_openers: &[String]) -> bool {
 /// `?` (possibly after a trailing option list); the last paragraph contains a
 /// known hand-back phrase (permission-seeking or a direct second-person
 /// question); the last paragraph issues a hand-back request for input
-/// (`Paste …` / `Please provide …` / `Confirm …`); or the last paragraph
+/// (`Paste …` / `Please provide …` / `Confirm …` / `Reply …`); or the last paragraph
 /// *opens* with a question that a concluding statement then follows.
 ///
 /// Test-only wrapper over [`question_reason`] — production code calls
@@ -939,8 +939,11 @@ fn handback_before_trailing_outro(text: &str, rules: QuestionRules) -> bool {
 /// "Please see …" don't register as questions. `confirm ` (trailing space, so
 /// `confirmed` doesn't match) catches approval prompts phrased without a `?` —
 /// "Confirm to tag v1.2.0, or request edits." — which the `?`-gated
-/// `PERMISSION_SEEKING` entry can't see.
-const HANDBACK_OPENERS: &[&str] = &["paste ", "please provide ", "confirm "];
+/// `PERMISSION_SEEKING` entry can't see. `reply ` catches the skill prompts that
+/// name the word to answer with — "Reply `go` to finish.", "Reply recommended to
+/// take every suggestion as marked, …" — and trailing space keeps `replying` /
+/// `replied` out.
+const HANDBACK_OPENERS: &[&str] = &["paste ", "please provide ", "confirm ", "reply "];
 
 /// True when the last paragraph issues a sentence-initial hand-back request —
 /// "Paste the output …", "Please provide the model name …" — meaning the agent
@@ -1997,6 +2000,18 @@ mod tests {
         ));
         // "Confirmed ..." is a statement, not a hand-back — trailing space keeps it out.
         assert!(!is_a_question("Confirmed: the fix works on both platforms.", NO_RULES));
+    }
+
+    #[test]
+    fn reply_request_is_blocked() {
+        // A /wrap-up summary: the hand-back sits mid-paragraph, with a statement after it.
+        assert!(is_a_question(
+            "The gate (build, lint and tests) passed on the current tree. Reply `go` to finish. With nothing to commit, that moves straight to the deploy, publish and release offers.",
+            NO_RULES
+        ));
+        assert!(is_a_question("Reply deploy, publish, both, or neither.", NO_RULES));
+        assert!(!is_a_question("I replied to the issue and closed it.", NO_RULES));
+        assert!(!is_a_question("Replying here would duplicate the thread, so I left it.", NO_RULES));
     }
 
     #[test]
