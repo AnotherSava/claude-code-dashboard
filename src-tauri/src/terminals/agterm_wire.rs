@@ -298,6 +298,11 @@ mod tests {
     }
 
     #[test]
+    fn a_clear_names_the_session_and_carries_no_text() {
+        assert_eq!(servers_clear_argv("S"), ["session", "info", "--clear", "--target", "S", "--json"]);
+    }
+
+    #[test]
     fn only_an_unknown_session_reads_as_closed() {
         assert!(names_no_session("no such session: 1234"));
         assert!(!names_no_session("agtermctl timed out"));

@@ -1071,6 +1071,8 @@ pub trait TerminalAdapter: Send {
 /// session does not exist is an answer, not a failure: the session closed, so
 /// its servers have nowhere left to be shown, whereas a failure to ask is
 /// retried.
+// Constructed only by the agterm adapter, and by the dev_servers tests.
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServersShown {
     Shown,
