@@ -139,6 +139,24 @@
       "verifiedAt": "0d2cf5a"
     },
     {
+      "id": "dev-server-line-macos",
+      "files": [
+        "dev-server-line-macos.png"
+      ],
+      "shows": "macOS. The top of agterm's sidebar: the common workspace and the ai-dashboard session row, with the green ▶ dev server :1420 line the dashboard writes under it",
+      "capture": {
+        "command": "python3 docs/screenshots/capture/dev-server-line-macos.py --publishable common ai-dashboard",
+        "steps": [
+          "macOS with agterm, run from inside the agterm session whose row gets the line; there is no Windows half, since the line is agterm's `session info` and the feature is macOS-only.",
+          "Subject anchor: this repo's own session, the ai-dashboard row, first in the common workspace, with a throwaway server on 1420 (this project's registered Vite port). The script starts that server, announces it through POST /api/dev-server, waits for agterm to report the line, and stops the server afterwards, after which the dashboard clears the line on its next probe.",
+          "Every name from the top of the sidebar through that row is vetted against --publishable, workspace headers included; `common` is a workspace header, not a project.",
+          "agterm's window must be key when DocShot takes it, or its traffic lights come out grey and check-figures.py cannot recognise the frame as macOS. The script refuses that case. Observed 2026-11-04: after one capture agterm stayed frontmost with no key window until it was clicked again, so click into agterm right before each run.",
+          "The crop is the sidebar width from agterm's tree, from the window's top edge down to the gap under the row's card; the right and bottom sides are cuts, and hairline.py traces the edge from the alpha."
+        ]
+      },
+      "verifiedAt": "at-capture"
+    },
+    {
       "id": "history-window-windows",
       "files": [
         "history-window-windows.png"

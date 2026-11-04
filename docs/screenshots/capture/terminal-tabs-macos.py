@@ -82,7 +82,6 @@ repeats either.
 import argparse
 import json
 import re
-import subprocess
 import sys
 from pathlib import Path
 
@@ -94,19 +93,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
 import dashboard as dash  # noqa: E402
 
 FIGURE = "terminal-tabs-macos"
-AGTERM = "Agterm"          # the CGWindowOwnerName of agterm's windows
 AGTERM_STATE = Path.home() / "Library" / "Application Support" / "agterm" / "windows"
 SNAPSHOT_VERSION = 1       # the only layout this script knows how to read
 
-# The map `status_glyph` writes, from `src-tauri/src/terminal_title.rs`, whose
-# inverse `parse_title` lives beside it so the two halves cannot drift. A leading
-# token that is not one of these is a title this dashboard did not write.
-#
-# Seven entries for six statuses: the glyph names a status *and*, for a finished
-# session, whether the user has read it, so 🟢 and ⚪ are both `Done` and are
-# named apart here. The spread check counts them as two, which is what it is for
-# — they are two glyphs in the frame.
-GLYPHS = {"⚫": "clean", "🔵": "working", "⏳": "waiting", "✋": "blocked", "🟢": "done unread", "⚪": "done read", "🔴": "error"}
 CONTEXT_SUFFIX = re.compile(r"\[(\d+)%\]")
 
 COMMITTED_PT = (277, 404)  # the frame being replaced, in logical points
@@ -124,50 +113,6 @@ PLAUSIBLE_PT = (120, 480)  # a sidebar width outside this is a broken measuremen
 
 # ------------------------------------------------------------------ agterm, read
 
-def agtermctl(*args: str) -> dict:
-    """Run one READ-ONLY agtermctl command and return its parsed answer.
-
-    Every call this script makes is a query — `window list` and `tree`. It never
-    creates, selects, closes, resizes or types, because the staging is the
-    operator's and a rearranged terminal is not the one they were looking at.
-
-    PATH first and the bundle second, the reverse of `src-tauri/src/agterm.rs`:
-    that lookup starts at the bundle because a Tauri app on macOS inherits no
-    shell profile, while this runs from a terminal that does. The timeout is
-    there for the same reason the dashboard's is — agtermctl talks to a control
-    socket and a wedged agterm would otherwise hold this forever.
-
-    THE ANSWER IS READ BEFORE THE EXIT CODE, which is the opposite of the usual
-    order and is what makes a refusal legible. Every agterm-side refusal is an
-    object on stdout — `{"ok": false, "error": "…"}` — with a non-zero exit and
-    nothing on stderr at all. That is agterm's stated contract ("the process exit
-    code is non-zero when `ok` is false"), and the review probed it with a stale
-    `--window` id: exit 1, that object on stdout, stderr empty. So branching on
-    the exit code first reports every refusal as a sentence that ends in an empty
-    stderr, with the diagnosis discarded and the `ok` branch unreachable. The
-    exit code is worth reading only where there is no JSON to read instead.
-    """
-    candidates = ["agtermctl", "/Applications/agterm.app/Contents/MacOS/agtermctl", "/opt/homebrew/bin/agtermctl", "/usr/local/bin/agtermctl"]
-    for binary in candidates:
-        try:
-            r = subprocess.run([binary, *args, "--json"], capture_output=True, timeout=10)
-        except FileNotFoundError:
-            continue
-        except subprocess.TimeoutExpired as e:
-            raise dash.CaptureError(f"agtermctl {' '.join(args)} did not answer within 10s. Is agterm wedged?") from e
-        out, err = r.stdout.decode("utf-8", "replace").strip(), r.stderr.decode("utf-8", "replace").strip()
-        try:
-            answer = json.loads(out)
-        except json.JSONDecodeError as e:
-            raise dash.CaptureError(f"agtermctl {' '.join(args)} exited {r.returncode} without a JSON answer: {err or out or 'it wrote nothing at all'}. Is agterm running?") from e
-        if not answer.get("ok"):
-            raise dash.CaptureError(f"agterm refused `{' '.join(args)}`: {answer.get('error') or answer}")
-        if r.returncode != 0:
-            raise dash.CaptureError(f"agtermctl {' '.join(args)} reported success and then exited {r.returncode}, which contradicts its own contract; this will not read past it. stderr: {err or '(empty)'}")
-        return answer.get("result", {})
-    raise dash.CaptureError("agtermctl is not on PATH and is not in agterm's bundle. Install it from agterm's Help > Install Command Line Tool.")
-
-
 def pick_window(want: str | None) -> dict:
     """The open agterm window to photograph, or a refusal naming the alternatives.
 
@@ -175,7 +120,7 @@ def pick_window(want: str | None) -> dict:
     reason `dash.find_window` refuses it: a capture script that quietly picks a
     window photographs the wrong sidebar and nobody notices for a release.
     """
-    windows = [w for w in agtermctl("window", "list").get("windows", []) if w.get("open") is not False]
+    windows = [w for w in dash.agtermctl("window", "list").get("windows", []) if w.get("open") is not False]
     if want:
         windows = [w for w in windows if w["id"].lower().startswith(want.lower()) or w.get("name", "").lower() == want.lower()]
     if not windows:
@@ -189,83 +134,28 @@ def pick_window(want: str | None) -> dict:
     return window
 
 
-def rendered(tree: dict) -> tuple[list[dict], list[tuple[str, dict]]]:
-    """The workspace headers and session rows the sidebar is actually drawing.
-
-    agterm's own rule, from its reference: a workspace row renders iff
-    `sidebarVisible && sidebarMode == "tree" && (!workspaceFilter || focused)`,
-    and a collapsed workspace draws its header without its sessions. Applying it
-    is what keeps the checks below about what is in the frame rather than about
-    what agterm happens to hold — counting a collapsed workspace's glyphs toward
-    the spread would be a claim about a picture nobody can see.
-    """
-    filtered = bool(tree.get("workspaceFilter"))
-    headers, rows = [], []
-    for workspace in tree.get("workspaces", []):
-        if filtered and not workspace.get("focused"):
-            continue
-        headers.append(workspace)
-        if workspace.get("collapsed"):
-            continue
-        rows.extend((workspace.get("name", ""), session) for session in workspace.get("sessions", []))
-    return headers, rows
-
-
-def read_title(label: str) -> tuple[str | None, str]:
-    """Split a sidebar label into the reading its glyph names and the rest of it.
-
-    The rule is `parse_title` in `src-tauri/src/terminal_title.rs`. An
-    unrecognized leading token yields no status rather than a guess: a title this
-    dashboard did not write says nothing about a row.
-    """
-    head, _, rest = label.strip().partition(" ")
-    status = GLYPHS.get(head)
-    return (status, rest.strip()) if status else (None, label.strip())
-
-
-def names(rest: str, label: str) -> bool:
-    """Whether a title's text is the one written for a row called `label`.
-
-    Kept to the letter of `TitleReading::names`. It matches on a token boundary
-    instead of stripping the known ` [N%]` and ` ⚠` suffixes, which is what stops
-    it rotting when `build_title` grows a third one — and it is why a public
-    `bga-assistant` does not vouch for a `bga-assistant-private` row.
-    """
-    return rest == label or rest.startswith(label + " ")
-
-
-def vet(headers: list[dict], rows: list[tuple[str, dict]], public: list[str], min_glyphs: int, min_percent: int) -> list[dict]:
+def vet(headers: list[dict], rows: list[tuple[dict, dict]], public: list[str], min_glyphs: int, min_percent: int) -> list[dict]:
     """Refuse anything that would make this the wrong picture, before touching the machine.
 
     Three separate refusals, in the order they matter. A private name in frame is
     unrecoverable once published; a missing glyph spread or a missing percentage
     is a frame that illustrates nothing, and both of those look fine.
 
-    The name check applies `dash.assert_publishable`'s rule through `names` rather
-    than calling it. That helper compares a project name for equality, and a
-    sidebar label carries whatever suffixes `build_title` appended, so the
-    comparison here has to be the token-boundary one; a workspace header, which
-    carries none, is compared for equality exactly as the helper would. The list
-    itself is still the lib's — `--publishable` defaults to `dash.PUBLISHABLE_PROJECTS`.
+    The name check is `dash.private_sidebar_names`, shared with the other agterm
+    figure: a sidebar label carries whatever suffixes `build_title` appended, so it
+    is compared on a token boundary, while a workspace header, which carries none,
+    is compared for equality. `--publishable` defaults to `dash.PUBLISHABLE_PROJECTS`.
     """
     read = []
     for workspace, session in rows:
-        # The `name` field is agterm's own derived sidebar label — the custom name
-        # when one is set, the OSC title otherwise. The dashboard never sets a
-        # custom name on a session it starts, because that would permanently
-        # outrank the title it writes and leave the row with no glyph at all.
-        label = session.get("name") or session.get("title") or ""
-        status, rest = read_title(label)
+        label = dash.sidebar_label(session)
+        status, rest = dash.read_title(label)
         percent = CONTEXT_SUFFIX.search(rest)
-        read.append({"workspace": workspace, "label": label, "status": status, "rest": rest, "percent": int(percent.group(1)) if percent else None})
+        read.append({"workspace": workspace.get("name", ""), "label": label, "status": status, "rest": rest, "percent": int(percent.group(1)) if percent else None})
 
     # Workspace headers are names in the frame exactly as session rows are, so
     # they are vetted the same way rather than waved through for being chrome.
-    # Reported as the text the rule compared, i.e. the label without its glyph,
-    # rather than as the whole row: it is the half of the row an entry has to
-    # vouch for, and the glyph is noise in a message about names.
-    private = [w.get("name", "") for w in headers if w.get("name", "") not in public]
-    private += [r["rest"] for r in read if not any(names(r["rest"], p) for p in public)]
+    private = dash.private_sidebar_names([w.get("name", "") for w in headers], [r["label"] for r in read], public)
     if private:
         raise dash.CaptureError(
             f"{len(private)} name(s) in the sidebar are not on --publishable: {', '.join(repr(p) for p in private)} (an entry is that name without any [N%] or ⚠ suffix). "
@@ -378,27 +268,13 @@ def main() -> int:
 
 def capture(args: argparse.Namespace) -> int:
     window = pick_window(args.window)
-    tree = agtermctl("tree", "--window", window["id"]).get("tree", {})
-    if not tree.get("sidebarVisible"):
-        raise dash.CaptureError(f"agterm's sidebar is hidden in window {window['id']}. This figure is the sidebar; show it from the toggle at the right of agterm's title bar and run again.")
-    if tree.get("sidebarMode") != "tree":
-        raise dash.CaptureError(f"agterm's sidebar is in {tree.get('sidebarMode')!r} mode, which draws a flat flagged list with no workspace rows. Switch it back to the tree.")
-    # A third render condition, separate from the two above because agterm's
-    # reference describes it separately: `surface zoom` fills the window with one
-    # terminal and hides the sidebar, while `sidebarVisible` is the read side of
-    # the `sidebar` command alone. Whether zooming also drops `sidebarVisible`
-    # was NOT tested — testing it means zooming a surface, which is driving the
-    # operator's terminal — so this stands on its own rather than on that guess.
-    # Without it a zoomed window passes both gates and the crop takes the
-    # leftmost strip of terminal text, saved to the committed path as "the
-    # sidebar": exactly the plausible wrong picture there is no `--force` for.
-    if tree.get("zoomedSurface"):
-        raise dash.CaptureError(f"A terminal surface is zoomed in window {window['id']} ({tree['zoomedSurface']!r}), which fills the window and hides the sidebar, so there is no sidebar on screen to photograph. Exit the zoom and run again.")
+    tree = dash.agtermctl("tree", "--window", window["id"]).get("tree", {})
+    dash.require_sidebar_drawn(tree, window["id"])
 
-    headers, rows = rendered(tree)
+    headers, rows = dash.sidebar_rows(tree)
     read = vet(headers, rows, args.publishable, args.min_glyphs, args.min_percent)
     for row in read:
-        glyph = next((g for g, s in GLYPHS.items() if s == row["status"]), " ")
+        glyph = next((g for g, s in dash.GLYPHS.items() if s == row["status"]), " ")
         print(f"  {row['workspace']:<10} {glyph} {row['label']}" + ("" if row["status"] else "   <- no title from this dashboard; the row shows no glyph"))
 
     # Read before anything is hidden or photographed, like the vetting above: a
@@ -412,15 +288,11 @@ def capture(args: argparse.Namespace) -> int:
     # The selected session's label is what agterm publishes as the window's title,
     # so matching on it ties the pixels to the tree that was just vetted — and it
     # keeps agterm's other on-screen surfaces (the quick terminal, a settings
-    # window) from tying with the one we want. Read from the whole tree rather
-    # than from the rendered rows, since the selected session can sit inside a
-    # collapsed workspace; with no answer at all the match falls back to the owner
-    # alone, which `find_window` refuses if that is ambiguous.
-    sessions = [s for w in tree.get("workspaces", []) for s in w.get("sessions", [])]
-    selected = next((s.get("name") for s in sessions if s.get("active")), None)
+    # window) from tying with the one we want.
+    selected = dash.selected_label(tree)
     raw = dash.probe_path(f"{FIGURE}-raw")
     with dash.widget_hidden():
-        win = dash.find_window(AGTERM, title=selected)
+        win = dash.find_window(dash.AGTERM, title=selected)
         dash.capture_window(win, raw)
 
     with Image.open(raw) as opened:

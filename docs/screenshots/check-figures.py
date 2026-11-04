@@ -86,7 +86,9 @@ def arg(name: str, blob: str) -> str | None:
 # floor is what actually identifies "a saturated red/amber/green dot".
 # Red straddles 0deg -- the measured light is (253,45,53), which is hue 358, not
 # hue 2 -- so hues above 330 are read as negative and the red band spans zero.
-HUE_BANDS = ((-14, 14), (40, 60), (105, 150))   # red, amber, green, in degrees
+# Green reaches down to 95 because agterm 0.40.0 draws its green light at
+# (97,181,60), hue 102, measured on dev-server-line-macos.png.
+HUE_BANDS = ((-14, 14), (40, 60), (95, 150))    # red, amber, green, in degrees
 SAT_MIN, VAL_MIN = 0.55, 0.45
 BAND_H, BAND_W = 80, 400
 MIN_RUN = 4                  # a dot, not a stray antialiased pixel

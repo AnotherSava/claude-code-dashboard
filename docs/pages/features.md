@@ -96,6 +96,8 @@ command "Local session"  cmd+shift+o  /usr/bin/env python3 /path/to/claude-code-
 
 A script that starts a local dev server from an agterm session can tell the dashboard about it, and that session's sidebar row then shows a green **▶ dev server** line with its port for as long as the server keeps answering. The script makes one request once the server is up, posting `{"port": 5173, "dir": "<project folder>", "session": "$AGTERM_SESSION_ID"}` to `http://127.0.0.1:9077/api/dev-server`. Servers started any other way are not shown.
 
+{% include figure.html id="dev-server-line" only="macos" alt="agterm's sidebar with the ai-dashboard session row and, under its name, a green play marker followed by dev server :1420" %}
+
 A chord opens the server over its session as an overlay, with its page scripts running and logins kept between openings. Pressing it again hides the page, and once more brings it back. Add a line like this to agterm's `keymap.conf`:
 
 ```
