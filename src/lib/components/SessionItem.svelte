@@ -126,15 +126,17 @@
   )
   const tokColor = $derived(tokenColor(session, config))
   const shouldPulse = $derived(session.status === 'blocked' || session.status === 'error')
-  // Agent-name color by canary status: green (confirmed adhering), amber (set up
-  // but not yet confirmed), red (drifted), default near-white (not set up).
+  // Agent-name color by canary status: green (confirmed adhering), amber (a turn
+  // finished without the marker before it was ever seen), red (drifted), default
+  // near-white (not set up, or no turn finished yet, which every session passes
+  // through after a start or a /clear and so is not worth a warning colour).
   // How many live sessions answer to this row's name. A null from the backend is
   // "not established", never "unique", so it must not render as a warning — but it
   // must not render as an all-clear either, which is why nothing else on the row
   // claims the name is unambiguous.
   const sharedBy = $derived(session.name_shared_by ?? 1)
   const canaryClass = $derived(
-    !session.canary || session.canary === 'off' ? '' : `canary-${session.canary}`,
+    !session.canary || session.canary === 'off' || session.canary === 'awaiting' ? '' : `canary-${session.canary}`,
   )
 
   function formatClock(ms: number): string {
@@ -328,12 +330,13 @@
     flex: 0 1 auto;
     min-width: 0;
   }
-  /* Canary status on the agent name: green = confirmed adhering, amber = set up
-     but not yet confirmed, red = drifted, default (#e8e8ea above) = not set up. */
+  /* Canary status on the agent name: green = confirmed adhering, amber = a turn
+     missed the marker before it was ever seen, red = drifted, default (#e8e8ea
+     above) = not set up or no turn finished yet. */
   .id.canary-alive {
     color: #86efac;
   }
-  .id.canary-pending {
+  .id.canary-missed {
     color: #d9b44a;
   }
   .id.canary-dead {

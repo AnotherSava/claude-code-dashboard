@@ -7,6 +7,7 @@ use crate::membership::{Left, Members, Membership};
 use crate::prompt_history::PromptHistoryStore;
 use crate::setup;
 use crate::state::{AgentSession, AppState, Attention, BoundaryKind, Canary};
+use crate::nonce_store::Confirmation;
 use crate::telegram::TelegramNotifier;
 use crate::usage_limits::{UsageLimitsState, UsageView};
 use serde::Serialize;
@@ -41,24 +42,20 @@ fn resolved_snapshot_versioned(app: &AppHandle) -> (u64, Vec<AgentSession>) {
     }
     // Stamp the canary status for local rows from the live nonce store so the
     // frontend can color the agent name. `Alive` requires the marker to have been
-    // *observed* at least once (the nonce's `seen` bit) — a set-up-but-unconfirmed
-    // session is `Pending`, not `Alive`, so the green never over-claims. A disabled
+    // *observed* at least once, so the green never over-claims; before that a
+    // session is `Awaiting` its first finished turn, or `Missed` once a completion
+    // turn has ended without the marker. A disabled
     // feature, a pre-feature session, or a post-restart row (in-memory nonce lost)
     // all read `Off`. Remote rows stay `Off` — this device isn't running the canary
     // for them.
     if let (Some(ns), Some(cfg_state)) = (app.try_state::<crate::nonce_store::NonceStore>(), app.try_state::<ConfigState>()) {
         let enabled = cfg_state.config.lock().unwrap().instruction_canary_enabled;
         for s in sessions.iter_mut().filter(|s| s.origin.is_none()) {
-            s.canary = match ns.get(&s.id) {
-                Some((_, seen)) if enabled => {
-                    if s.instruction_drift {
-                        Canary::Dead
-                    } else if seen {
-                        Canary::Alive
-                    } else {
-                        Canary::Pending
-                    }
-                }
+            s.canary = match ns.confirmation(&s.id) {
+                Some(_) if enabled && s.instruction_drift => Canary::Dead,
+                Some(Confirmation::Seen) if enabled => Canary::Alive,
+                Some(Confirmation::Missed) if enabled => Canary::Missed,
+                Some(Confirmation::Awaiting) if enabled => Canary::Awaiting,
                 _ => Canary::Off,
             };
         }

@@ -116,7 +116,7 @@ pub enum Attention {
 /// the dashboard (stamped for local rows by `commands::resolved_snapshot`; read by
 /// `SessionItem.svelte`). Ordered by certainty: `Alive` is only claimed once the
 /// marker has actually been observed, so a set-up-but-unconfirmed session reads
-/// `Pending` rather than falsely vouching green.
+/// `Awaiting` or `Missed` rather than falsely vouching green.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Canary {
@@ -124,11 +124,14 @@ pub enum Canary {
     /// feature, or an app restart lost the in-memory nonce).
     #[default]
     Off,
-    /// Set up but not yet confirmed — the marker has not been observed on any turn
-    /// yet, so we can't vouch it's working (the instruction may never have reached
-    /// the model). Deliberately distinct from `Alive`: no false certainty before
-    /// the agent has echoed the marker at least once.
-    Pending,
+    /// Set up, and no turn has been judged yet. Every session passes through
+    /// this between its start (or `/clear`) and its first finished turn, so it
+    /// draws like `Off` rather than as a warning.
+    Awaiting,
+    /// Set up, and a completion turn ended without the marker before it was ever
+    /// observed: the instruction may never have reached the model. Distinct from
+    /// `Dead`, which needs prior adherence.
+    Missed,
     /// Set up and confirmed adhering — the marker has been observed and the latest
     /// checkable turn still carried it.
     Alive,

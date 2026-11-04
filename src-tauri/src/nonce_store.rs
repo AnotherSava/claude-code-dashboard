@@ -15,6 +15,9 @@
 //! set, so a session whose `SessionStart` response was lost (the marker
 //! instruction never reached the model) can't manufacture a permanent false
 //! drift, and only a genuine mid-session drop after prior adherence flags.
+//! Before that, a completion turn that ends without the marker records a miss
+//! ([`Confirmation::Missed`]), which is what tells a session whose instruction
+//! went astray from one that simply has not finished a turn yet.
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
@@ -25,12 +28,24 @@ use std::sync::Mutex;
 /// Monotonic salt so two mints in the same millisecond still differ.
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// A session's nonce plus whether its marker has been observed yet this session
-/// (the "confirmed adherent" bit that arms drift detection).
+/// How far a session's marker has been observed since its nonce was minted, or
+/// since the row last started following another session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Confirmation {
+    /// No turn has been judged yet, which is the expected state of every
+    /// session between its start (or `/clear`) and its first finished turn.
+    Awaiting,
+    /// A completion turn ended without the marker before it was ever seen: the
+    /// instruction may never have reached the model.
+    Missed,
+    /// The marker has been observed at least once, which arms drift detection.
+    Seen,
+}
+
 #[derive(Clone, Debug)]
 struct NonceEntry {
     nonce: String,
-    seen: bool,
+    confirmation: Confirmation,
 }
 
 #[derive(Default)]
@@ -43,7 +58,7 @@ impl NonceStore {
         Self::default()
     }
 
-    /// Mint a fresh 4-hex nonce for `chat_id` (resetting `seen`), replacing any
+    /// Mint a fresh 4-hex nonce for `chat_id` (back to `Awaiting`), replacing any
     /// prior one, and return it. Derived — non-cryptographically, since this is a
     /// rote-echo tripwire and not a secret — from chat_id + `now_ms` + a process
     /// counter, so consecutive sessions (even a same-cwd `/clear`) never reuse a
@@ -59,13 +74,18 @@ impl NonceStore {
         self.entries
             .lock()
             .unwrap()
-            .insert(chat_id.to_string(), NonceEntry { nonce: nonce.clone(), seen: false });
+            .insert(chat_id.to_string(), NonceEntry { nonce: nonce.clone(), confirmation: Confirmation::Awaiting });
         nonce
     }
 
     /// The current `(nonce, seen)` for `chat_id`, if one was minted this session.
     pub fn get(&self, chat_id: &str) -> Option<(String, bool)> {
-        self.entries.lock().unwrap().get(chat_id).map(|e| (e.nonce.clone(), e.seen))
+        self.entries.lock().unwrap().get(chat_id).map(|e| (e.nonce.clone(), e.confirmation == Confirmation::Seen))
+    }
+
+    /// How far `chat_id`'s marker has been confirmed, if it has a nonce.
+    pub fn confirmation(&self, chat_id: &str) -> Option<Confirmation> {
+        self.entries.lock().unwrap().get(chat_id).map(|e| e.confirmation)
     }
 
     /// Record that this session's marker has been observed, arming drift
@@ -73,7 +93,18 @@ impl NonceStore {
     /// undelivered instruction. Idempotent; no-op if the session has no nonce.
     pub fn mark_seen(&self, chat_id: &str) {
         if let Some(e) = self.entries.lock().unwrap().get_mut(chat_id) {
-            e.seen = true;
+            e.confirmation = Confirmation::Seen;
+        }
+    }
+
+    /// Record that a completion turn ended without the marker while it had never
+    /// been seen. A no-op once the marker has been seen, since a later drop is
+    /// drift and the `Stop` check judges it as such.
+    pub fn mark_missed(&self, chat_id: &str) {
+        if let Some(e) = self.entries.lock().unwrap().get_mut(chat_id) {
+            if e.confirmation == Confirmation::Awaiting {
+                e.confirmation = Confirmation::Missed;
+            }
         }
     }
 
@@ -83,7 +114,7 @@ impl NonceStore {
     /// emit it, so until it does its dropped marker is held rather than flagged.
     pub fn unconfirm(&self, chat_id: &str) {
         if let Some(e) = self.entries.lock().unwrap().get_mut(chat_id) {
-            e.seen = false;
+            e.confirmation = Confirmation::Awaiting;
         }
     }
 
@@ -124,6 +155,31 @@ mod tests {
         s.mark_seen("proj");
         let second = s.mint("proj", 2000);
         assert_eq!(s.get("proj"), Some((second, false)), "re-mint replaces the token and clears seen");
+    }
+
+    #[test]
+    fn a_miss_is_recorded_only_before_the_marker_is_seen() {
+        let s = NonceStore::new();
+        s.mint("proj", 1000);
+        assert_eq!(s.confirmation("proj"), Some(Confirmation::Awaiting), "a fresh nonce awaits its first turn");
+        s.mark_missed("proj");
+        assert_eq!(s.confirmation("proj"), Some(Confirmation::Missed));
+        s.mark_seen("proj");
+        s.mark_missed("proj");
+        assert_eq!(s.confirmation("proj"), Some(Confirmation::Seen), "a drop after confirmation is drift, not a miss");
+        s.mint("proj", 2000);
+        assert_eq!(s.confirmation("proj"), Some(Confirmation::Awaiting), "a re-mint forgets the miss");
+        s.mark_missed("nope");
+        assert_eq!(s.confirmation("nope"), None, "nothing is minted by a miss");
+    }
+
+    #[test]
+    fn unconfirm_returns_a_missed_session_to_awaiting() {
+        let s = NonceStore::new();
+        s.mint("proj", 1000);
+        s.mark_missed("proj");
+        s.unconfirm("proj");
+        assert_eq!(s.confirmation("proj"), Some(Confirmation::Awaiting), "the new main has not finished a turn yet");
     }
 
     #[test]

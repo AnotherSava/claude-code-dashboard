@@ -496,8 +496,8 @@ struct EventResponse {
 /// and `compact` keep the model's prior context — its ORIGINAL marker
 /// instruction is still live — so reuse the session's existing nonce; minting
 /// there would inject a second, conflicting marker the model won't adopt,
-/// permanently mismatching the expected nonce (the "stuck Pending on resume"
-/// bug). If a resume has no retained nonce (the app restarted mid-session), the
+/// permanently mismatching the expected nonce, so the row never confirms: it
+/// reads `Awaiting`, then `Missed` at the first completion turn. If a resume has no retained nonce (the app restarted mid-session), the
 /// marker the model is already emitting is unknowable, so return `None` rather
 /// than mint a conflict — the row reads `Off` until its next fresh start.
 ///
@@ -507,10 +507,10 @@ struct EventResponse {
 /// mints, since a mint replaces the marker the main is emitting and its next
 /// `Stop` would read as drift.
 fn session_start_nonce(ns: &NonceStore, chat_id: &str, source: &str, now_ms: i64, may_mint: bool) -> Option<String> {
-    // `fork` belongs with the other two and was missing: a `--fork-session`
-    // start carries its parent's context *and* the marker instruction already in
-    // it, so minting a fresh nonce there strands the row Pending on a marker the
-    // model will never emit — the exact failure the paragraph above describes.
+    // A `--fork-session` start carries its parent's context *and* the marker
+    // instruction already in it, so minting a fresh nonce there leaves the row
+    // waiting on a marker the model will never emit — the failure the paragraph
+    // above describes.
     if !may_mint || matches!(source, "resume" | "compact" | "fork") {
         ns.get(chat_id).map(|(nonce, _seen)| nonce)
     } else {
@@ -549,8 +549,11 @@ enum DriftAction {
     Clear,
     /// Marker dropped on a *completion* turn after prior adherence — surface drift.
     Confirm,
-    /// Don't touch the flag: either an unconfirmed session (`!seen`, instruction may
-    /// be undelivered), or a dropped marker on a *handback* turn we defer to the
+    /// Marker dropped on a *completion* turn before it was ever seen. The flag is
+    /// left alone, since the instruction may never have reached the model, and the
+    /// miss is recorded so the agent name reads amber rather than plain.
+    Missed,
+    /// Don't touch the flag: a dropped marker on a *handback* turn, deferred to the
     /// next completion turn so a mid-workflow skill turn can't false-alarm.
     Hold,
 }
@@ -560,14 +563,15 @@ enum DriftAction {
 /// the drop is deferred (`Hold`) and re-judged next turn — the model mid-workflow
 /// (e.g. a `/commit` reflection ending on a question) legitimately drops the hidden
 /// marker and picks it back up once the workflow ends, so confirming there would be
-/// a false alarm. `seen` gates everything: an unconfirmed session is always held.
+/// a false alarm. `seen` gates the flag: an unconfirmed session never confirms
+/// drift, and records a miss on a completion turn only, for the same reason.
 fn drift_action(present: bool, seen: bool, is_handback: bool) -> (DriftAction, &'static str) {
     if present {
         (DriftAction::Clear, "adherence marker present")
-    } else if !seen {
-        (DriftAction::Hold, "marker absent but never confirmed (instruction may be undelivered); holding")
     } else if is_handback {
         (DriftAction::Hold, "handback turn dropped the marker; deferring to the next completion turn")
+    } else if !seen {
+        (DriftAction::Missed, "completion turn without the marker before it was ever confirmed (instruction may be undelivered)")
     } else {
         (DriftAction::Confirm, "completion turn dropped the marker after prior adherence")
     }
@@ -1951,6 +1955,10 @@ fn apply_event_in(app: &AppHandle, req: &EventRequest, placed: Option<String>) -
                         let changed = match action {
                             DriftAction::Clear => state.set_drift(&chat_id, false, now),
                             DriftAction::Confirm => state.set_drift(&chat_id, true, now),
+                            DriftAction::Missed => {
+                                ns.mark_missed(&chat_id);
+                                false
+                            }
                             DriftAction::Hold => false,
                         };
                         let drifted = state.drift_confirmed(&chat_id);
@@ -2724,8 +2732,8 @@ mod tests {
     #[test]
     fn a_forked_session_reuses_its_parents_nonce() {
         // A `--fork-session` start carries its parent's context *and* the marker
-        // instruction already in it, so minting a fresh nonce strands the row
-        // Pending on a marker the model will never emit.
+        // instruction already in it, so minting a fresh nonce leaves the row
+        // `Awaiting`, then `Missed`, on a marker the model will never emit.
         let ns = NonceStore::default();
         let minted = session_start_nonce(&ns, "a", "startup", 1_000, true).expect("minted");
         for source in ["resume", "compact", "fork"] {
@@ -2919,9 +2927,10 @@ mod tests {
     }
 
     #[test]
-    fn drift_unconfirmed_absence_is_held_never_flagged() {
-        // `!seen`: the instruction may never have reached the model — hold, don't flag.
-        assert_eq!(drift_action(false, false, false).0, DriftAction::Hold);
+    fn drift_unconfirmed_absence_records_a_miss_never_flags() {
+        // `!seen`: the instruction may never have reached the model — never flag.
+        // A completion turn records the miss; a handback is deferred like any other.
+        assert_eq!(drift_action(false, false, false).0, DriftAction::Missed);
         assert_eq!(drift_action(false, false, true).0, DriftAction::Hold);
     }
 
@@ -2964,7 +2973,7 @@ mod tests {
         // The regression this guards: a `resume` re-fires SessionStart, but the
         // model keeps its prior context (and original marker), so the nonce must
         // NOT rotate — else the backend expects a marker the model never emits and
-        // the row is stuck Pending forever.
+        // the row never confirms, reading `Missed` from the first completion turn.
         let ns = NonceStore::new();
         let first = session_start_nonce(&ns, "proj", "startup", 1000, true).unwrap();
         ns.mark_seen("proj"); // confirmed adherent (green)

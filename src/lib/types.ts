@@ -35,10 +35,11 @@ export interface AgentSession {
   // ⚠ badge alongside the state pill. Absent for rows from older backends.
   instruction_drift?: boolean
   // Instruction-adherence canary status, coloring the agent name: 'alive' = set up
-  // and confirmed adhering (green), 'dead' = set up but drifted (red), 'pending' =
-  // set up but not yet confirmed — the marker hasn't been observed, so aliveness is
-  // unknown (amber), 'off' = not set up (default). Absent for rows from older backends.
-  canary?: 'off' | 'pending' | 'alive' | 'dead'
+  // and confirmed adhering (green), 'dead' = set up but drifted (red), 'missed' = a
+  // finished turn lacked the marker before it was ever observed, so the instruction
+  // may not have arrived (amber), 'awaiting' = set up with no turn finished yet and
+  // 'off' = not set up (both default). Absent for rows from older backends.
+  canary?: 'off' | 'awaiting' | 'missed' | 'alive' | 'dead'
   // How many live sessions on this machine answer to this row's name. 1 is the
   // ordinary case; above 1 means several terminal tabs carry the same caption, so
   // the dashboard cannot tell them apart and this row may be merging more than one
