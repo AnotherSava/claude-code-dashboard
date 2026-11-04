@@ -525,9 +525,9 @@ def capture_config(original: dict, fx: dict) -> dict:
       `sync.listen` off unless the fixture pushes rows of its own: a real peer's
       rows would otherwise join the widget. When it is on, `check_shown` still
       refuses a frame a real peer's push has reached.
-    - `instruction_canary_enabled` off: a replayed row would read amber, the "not
-      yet seen" canary colour, which the downloadable build never shows because it
-      ships the canary off.
+    - `instruction_canary_enabled` off: a replayed row that finishes a turn without
+      the marker would read amber, the missed-marker canary colour, which the
+      downloadable build never shows because it ships the canary off.
     - `high_alert` off and no `notifications`: a replayed BLOCK or DONE could ping
       the phone. Telegram has no on/off switch, so its block is left out.
 

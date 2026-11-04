@@ -1941,9 +1941,10 @@ fn apply_event_in(app: &AppHandle, req: &EventRequest, placed: Option<String>) -
                         // "starts to skip": flag drift only once the session has
                         // PROVEN it can emit the marker (`seen`). An unconfirmed
                         // session — e.g. one whose SessionStart response was lost, so
-                        // the marker instruction never reached the model — is held
-                        // unflagged, so a delivery miss can't manufacture a permanent
-                        // false drift; only a drop *after* prior adherence flags.
+                        // the marker instruction never reached the model — is never
+                        // flagged, so a delivery miss can't manufacture a permanent
+                        // false drift; a completion turn records a miss instead (amber),
+                        // and only a drop *after* prior adherence flags.
                         // Two-tier: a drop on a `Blocked` handback (the model mid-
                         // workflow — e.g. a `/commit` reflection ending on a question)
                         // is deferred, not confirmed, and re-judged next turn (see
