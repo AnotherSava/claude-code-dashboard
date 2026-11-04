@@ -12,7 +12,7 @@ Show the dashboard's history for an agent as a page in the right pane of a split
     agtermctl session overlay open --url "http://127.0.0.1:<dashboard-port>/<history-route>" --chromeless --persistent --pane right --target "$AGT_SESSION_ID"
 
 - Trigger: agterm's title-bar context text has no click handler, so clicking it needs an upstream agterm change. Until then, use a `command` line in ~/.config/agterm/keymap.conf with a chord, passing `{AGT_SESSION_ID}`, or a button in the dashboard UI.
-- Depends on the agterm-ids proposal sent to this session on 2026-11-03 (`AGTERM_SESSION_ID` in each hook event body), so the dashboard can map an agterm session to its row. That proposal is the open memo "Carry the terminal's own session/pane address from the hook to each row, behind the adapter seam".
+- Depends on the agterm-ids proposal sent to this session on 2026-11-03 (`AGTERM_SESSION_ID` in each hook event body), so the dashboard can map an agterm session to its row. That proposal is the open memo carry-the-terminal-s-own-session-pane-address-from-the-hook.md; the open memo map-a-registry-session-to-its-agterm-tab-by-reading-the.md reaches the same mapping by reading the agent's environment instead, and either one meets this dependency.
 - `--chromeless` is allowed only for a loopback host, which the dashboard's server is.
 - Closing the page leaves a plain shell in the right pane, so the command should also close the split (`agtermctl session split close`), or the toggle should close both together.
 - A pane overlay is refused when the right pane already holds one (`pane overlay already open`), and when the split is hidden (`pane not visible`).
