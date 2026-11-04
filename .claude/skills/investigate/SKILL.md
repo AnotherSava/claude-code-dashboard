@@ -111,7 +111,10 @@ or `id`), and a `reason`:
   - `still_outstanding` — the turn settled BLOCK or WAIT, so something is open.
     The canonical case is a `/pull` nested inside `/commit`, where the commit
     plan's own approval question lands in the same turn.
-  - `not_relayed` — a human typed the prompt that began the turn.
+  - `not_relayed` — no relayed exchange was under way: a person or another
+    agent began it, an earlier turn of the exchange already settled, or a
+    restart dropped it. A person's answer to the relayed pull's own question
+    does not end it.
   - `not_clean_before` — the session had work parked in it when the request
     arrived.
   A `recorded` `pull_claim` with no `pull_clean` at all means a later prompt

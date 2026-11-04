@@ -532,8 +532,9 @@ fn canary_instruction(ns: &NonceStore, chat_id: &str, source: &str, now_ms: i64,
 /// Whether a `/pull` run's clean claim from `claimant` may land on a row whose
 /// main session is `main`. A chat_id is cwd-derived, so every session in that
 /// directory addresses one row; a claim from one that does not drive the row
-/// would settle work the main has parked there — `status_before_working` keeps
-/// its older `Idle` across a `Working` → `Working` prompt — and CLEAN then hides
+/// would settle work the main has parked there — the relayed exchange records
+/// `status_before_working`, which keeps its older `Idle` across a `Working` →
+/// `Working` prompt — and CLEAN then hides
 /// it, the hiding-unread-work direction. Refused only where a main is known and
 /// differs, so a row with no main (none elected, or nothing since a restart)
 /// still accepts.
@@ -1065,7 +1066,11 @@ enum CleanRefusal {
     /// The turn settled as anything but `Done` — canonically BLOCK or WAIT, each
     /// of which says something is still outstanding.
     StillOutstanding(Status),
-    /// A human typed the prompt that began this turn.
+    /// No relayed exchange is under way: a prompt not relayed by a peer began a
+    /// turn on a row that was not blocked (a fresh task the user started included),
+    /// an agent's `SendMessage` began this turn, an earlier turn of the exchange
+    /// settled finished, or a restart dropped the in-memory exchange. A person's
+    /// answer to the relayed pull's own question does not end it.
     NotRelayed,
     /// The session had work parked in it when the request arrived.
     NotCleanBefore(Status),
@@ -1092,27 +1097,33 @@ impl CleanRefusal {
 ///    `/pull` skill knows, because only it saw whether anything conflicted and
 ///    whether anything was left for the user. It posts that judgment; this
 ///    dashboard never second-guesses it.
-/// 2. **A peer asked, rather than the human** — `turn_from_relay`, which only
-///    this dashboard knows, because it minted the preamble the arriving prompt
-///    carries. It is here because the user's rule is about servicing *someone
-///    else's* request: a session the human drove to a clean tree is finished
-///    work they may well want to see, and CLEAN hides a row.
-/// 3. **The session was already clean when the request arrived** —
-///    `status_before_working`, the user's own "if it was in clean state before
-///    this request". A pull that interrupts real work leaves that work sitting
-///    there, so the row is not clean however little the pull itself did.
+/// 2. **A peer asked, rather than the human** — `relay_exchange_from` being
+///    set, which only this dashboard knows, because it minted the preamble the
+///    arriving prompt carries. It follows the exchange the relay opened rather
+///    than the one turn, so a pull that stopped to ask the user and finished in
+///    the turn their answer began still counts as the peer's request. It is
+///    here because the user's rule is about servicing *someone else's*
+///    request: a session the human drove to a clean tree is finished work they
+///    may well want to see, and CLEAN hides a row.
+/// 3. **The session was already clean when the request arrived** — the status
+///    `relay_exchange_from` recorded when the relay began the exchange, the
+///    user's own "if it was in clean state before this request". A pull that
+///    interrupts real work leaves that work sitting there, so the row is not
+///    clean however little the pull itself did.
 ///
 /// # Why only `Done`
 ///
 /// `Blocked` and `Waiting` are refused outright rather than being folded into the
 /// test. Both say something is still outstanding — a question on screen, work
 /// still running — and no claim about a pull can speak to either. (`/pull` step 10
-/// declines to signal where the *turn* goes on to ask the user anything, not
-/// merely where the pull itself did, so the two rules agree. This one does not
-/// rely on that: a refusal here is free, and the skill's discipline is not ours
-/// to depend on. The case that settled the wording — a `/pull` nested inside
-/// `/commit`, posting a claim 46 seconds before the commit plan's own approval
-/// question — was refused here first.)
+/// declines to signal where the turn asks the user anything, and also after a
+/// question the pull put to the user, which this rule now accepts in the turn the
+/// answer begins; a run that follows the skill to the letter therefore settles
+/// `Done` there. The `Blocked` gate does not rely on the skill: a refusal here is
+/// free, and the skill's discipline is not ours to depend on. The case that
+/// settled the wording — a `/pull` nested inside `/commit`, posting a claim 46
+/// seconds before the commit plan's own approval question — was refused here
+/// first.)
 ///
 /// `Idle` → `Idle` is not special-cased: a row already clean needs no upgrade,
 /// and the `Done` gate declines it for free.
@@ -1121,13 +1132,11 @@ fn pull_declared_clean(settling: Status, facts: Option<crate::state::CleanClaimF
     if settling != Status::Done {
         return Err(Some(CleanRefusal::StillOutstanding(settling)));
     }
-    if !f.turn_from_relay {
-        return Err(Some(CleanRefusal::NotRelayed));
+    match f.relay_exchange_from {
+        None => Err(Some(CleanRefusal::NotRelayed)),
+        Some(Status::Idle) => Ok(()),
+        Some(before) => Err(Some(CleanRefusal::NotCleanBefore(before))),
     }
-    if f.status_before_working != Status::Idle {
-        return Err(Some(CleanRefusal::NotCleanBefore(f.status_before_working)));
-    }
-    Ok(())
 }
 
 /// The label a `Stop` should settle BLOCK under instead of DONE or WAIT, because
@@ -2098,7 +2107,7 @@ mod tests {
             attended_at: None,
             content_seen_at: None,
             origin_label: None,
-            turn_from_relay: false,
+            relay_exchange_from: None,
             held_question: None,
             delegated_task: None,
             message_line: None,
@@ -2614,7 +2623,7 @@ mod tests {
     #[test]
     fn a_pull_settles_clean_only_when_all_three_facts_agree() {
         use crate::state::CleanClaimFacts;
-        let facts = |claimed, relay, before| Some(CleanClaimFacts { claimed, turn_from_relay: relay, status_before_working: before });
+        let facts = |claimed, relay: bool, before| Some(CleanClaimFacts { claimed, relay_exchange_from: relay.then_some(before) });
 
         assert_eq!(pull_declared_clean(Status::Done, facts(true, true, Status::Idle)), Ok(()));
 
@@ -2673,7 +2682,7 @@ mod tests {
         state.apply_set(prompt(true), 2_000, &[], None);
         assert!(state.record_clean_claim("r", 3_000));
         let held = state.clean_claim_facts("r").unwrap();
-        assert_eq!(held, crate::state::CleanClaimFacts { claimed: true, turn_from_relay: true, status_before_working: Status::Idle });
+        assert_eq!(held, crate::state::CleanClaimFacts { claimed: true, relay_exchange_from: Some(Status::Idle) });
         assert_eq!(pull_declared_clean(Status::Done, Some(held)), Ok(()));
 
         // No `Stop` arrives; the user types something instead. The claim was about
@@ -2681,9 +2690,53 @@ mod tests {
         state.apply_set(prompt(false), 4_000, &[], None);
         let after = state.clean_claim_facts("r").unwrap();
         assert!(!after.claimed, "a new turn drops the stale claim");
-        assert!(!after.turn_from_relay, "and records who began this turn instead");
+        assert_eq!(after.relay_exchange_from, None, "and the user's prompt mid-turn ends the relayed exchange");
         // Silence, not a refusal: the claim is gone, so there is nothing to refuse.
         assert_eq!(pull_declared_clean(Status::Done, Some(after)), Err(None));
+    }
+
+    #[test]
+    fn a_relayed_pull_that_asked_the_user_still_settles_clean() {
+        // The 2026-11-04 case, through the real transitions: a relayed `/pull`
+        // on a clean row stops to ask the user, their answer begins a new turn,
+        // and that turn finishes the pull clean.
+        use crate::state::{SetInput, TurnOrigin};
+        let state = AppState::default();
+        let event = |status, origin: Option<TurnOrigin>| SetInput {
+            id: "r".into(),
+            status,
+            label: Some("pull".into()),
+            source: None,
+            model: None,
+            input_tokens: None,
+            dialog_entry: None,
+            waiting_backstop_armed: false,
+            turn_begun_by: origin,
+            delegated_task: None,
+            message_line: None,
+            message_is_reply: None,
+        };
+        let settle = |status| SetInput { label: None, ..event(status, None) };
+
+        state.apply_set(settle(Status::Idle), 1_000, &[], None);
+        state.apply_set(event(Status::Working, Some(TurnOrigin::Peer)), 2_000, &[], None);
+        state.apply_set(settle(Status::Blocked), 3_000, &[], None);
+        state.apply_set(event(Status::Working, Some(TurnOrigin::Person)), 4_000, &[], None);
+        assert!(state.record_clean_claim("r", 5_000));
+        assert_eq!(pull_declared_clean(Status::Done, state.clean_claim_facts("r")), Ok(()), "the answer's turn belongs to the relayed exchange");
+
+        // That turn settles, and the exchange is over: a task the user starts on
+        // the finished row is theirs, even one that ends in a clean pull.
+        state.apply_set(settle(Status::Done), 6_000, &[], None);
+        state.apply_set(event(Status::Working, Some(TurnOrigin::Person)), 7_000, &[], None);
+        assert!(state.record_clean_claim("r", 8_000));
+        assert_eq!(pull_declared_clean(Status::Done, state.clean_claim_facts("r")), Err(Some(CleanRefusal::NotRelayed)));
+
+        // A question the user's own turn asked is no relayed exchange either.
+        state.apply_set(settle(Status::Blocked), 9_000, &[], None);
+        state.apply_set(event(Status::Working, Some(TurnOrigin::Person)), 10_000, &[], None);
+        assert!(state.record_clean_claim("r", 11_000));
+        assert_eq!(pull_declared_clean(Status::Done, state.clean_claim_facts("r")), Err(Some(CleanRefusal::NotRelayed)));
     }
 
     #[test]

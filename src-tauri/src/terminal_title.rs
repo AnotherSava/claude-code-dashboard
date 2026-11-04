@@ -1765,7 +1765,7 @@ mod tests {
             attended_at: None,
             content_seen_at: None,
             origin_label: None,
-            turn_from_relay: false,
+            relay_exchange_from: None,
             held_question: None,
             delegated_task: None,
             message_line: None,

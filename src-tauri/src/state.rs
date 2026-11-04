@@ -452,24 +452,40 @@ pub struct AgentSession {
     /// persists it — the next push re-delivers it.
     #[serde(skip)]
     pub origin_label: Option<String>,
-    /// Whether the turn currently in flight was begun by a relayed peer message
-    /// rather than by something a human typed — written by `apply_set` on every
-    /// prompt, from `SetInput::turn_begun_by` being `Some(TurnOrigin::Peer)`.
+    /// What this row was before a relayed peer message began the exchange the
+    /// turn now in flight belongs to — `None` whenever no such exchange is under
+    /// way. `http_server::pull_declared_clean` reads it as two facts at once: that
+    /// a peer asked, and whether the session was clean when it did.
     ///
-    /// It is about *this turn* and is written when the prompt that began the turn
-    /// arrives, which is the whole reason it is not stamped when the frame is
-    /// written into the session's inbox:
-    /// across 115 measured `peer_write`s, 16 produced no arriving prompt at all
-    /// and 4 arrived in one burst 3.8 to 8.1 hours later, so a stamp left waiting
-    /// for "the next turn" to collect it would be collected by a turn that had
-    /// nothing to do with it — a human-typed one, hours later.
+    /// An exchange is wider than one turn because a relayed request may pause to
+    /// ask the user: `/pull` stops to ask before unlocking transcrypt, the turn
+    /// settles BLOCK, and the user's answer arrives as a new prompt. Measured
+    /// 2026-11-04: that answer's turn finished the pull clean and was refused
+    /// CLEAN, because a per-turn flag had already recorded the answer's turn as
+    /// the user's. So `apply_set` writes it on every prompt as follows: a relay
+    /// starts an exchange, recording `status_before_working`; a prompt from the
+    /// user or a notification landing on a BLOCK row continues the one under way,
+    /// since that is the shape of an answer; any other prompt ends it. A turn
+    /// settling DONE, ERROR or CLEAN ends it too, so a task the user starts on a
+    /// finished row is never part of it.
+    ///
+    /// A prompt typed on a BLOCK row is taken as the answer without reading it.
+    /// The cost of a wrong guess is bounded by the claim it gates: only a `/pull`
+    /// run reporting a clean finish redeems it, and a user who set the question
+    /// aside for an unrelated task has asked for no pull.
+    ///
+    /// The identification is made when the prompt arrives, not when the frame is
+    /// written into the session's inbox: across 115 measured `peer_write`s, 16
+    /// produced no arriving prompt at all and 4 arrived in one burst 3.8 to 8.1
+    /// hours later, so a stamp left waiting for "the next turn" would be
+    /// collected by a turn that had nothing to do with it.
     ///
     /// Internal bookkeeping — never serialized to the frontend, to sync, or to
     /// disk (mirrors `status_before_working`), so a restart loses it and the row
-    /// falls back to not-relayed, which is the direction that declines to make a
+    /// falls back to no exchange, which is the direction that declines to make a
     /// CLEAN claim rather than inventing one.
     #[serde(skip)]
-    pub turn_from_relay: bool,
+    pub relay_exchange_from: Option<Status>,
     /// The label of a question this row was blocked on when something other than
     /// the user began the turn now in flight — a notification Claude Code
     /// submitted on its own account ([`TurnOrigin::Notification`]) or another
@@ -488,7 +504,7 @@ pub struct AgentSession {
     /// the turn (a tool approval) keeps it, and so does a WAIT, since a held
     /// `Stop` settles BLOCK and the next notification captures it again.
     ///
-    /// In memory only, like `turn_from_relay`: a restart loses it, and the row
+    /// In memory only, like `relay_exchange_from`: a restart loses it, and the row
     /// then settles as the turn's own `Stop` says.
     #[serde(skip)]
     pub held_question: Option<String>,
@@ -957,10 +973,9 @@ impl AgentSession {
 pub struct CleanClaimFacts {
     /// A `/pull` run has posted `POST /api/session-clean` during this turn.
     pub claimed: bool,
-    /// This turn was begun by a relayed peer message.
-    pub turn_from_relay: bool,
-    /// What the row was immediately before this turn began.
-    pub status_before_working: Status,
+    /// What the row was before the relayed exchange this turn belongs to began,
+    /// `None` where no peer asked — see `AgentSession::relay_exchange_from`.
+    pub relay_exchange_from: Option<Status>,
 }
 
 /// What began a turn, read off the prompt that arrived.
@@ -1011,8 +1026,8 @@ pub struct SetInput {
     /// `Option` that only a prompt fills, is what keeps who began the turn
     /// separate from the status: `log_watcher`'s promote also sets `Working`, and
     /// reading the origin off the status would let a promotion mid-turn silently
-    /// rewrite who started it. `apply_set` reads it twice: `Peer` sets
-    /// `AgentSession::turn_from_relay`, and any origin but `Person` landing on a
+    /// rewrite who started it. `apply_set` reads it twice: it moves
+    /// `AgentSession::relay_exchange_from`, and any origin but `Person` landing on a
     /// BLOCK row captures `AgentSession::held_question`.
     ///
     /// `apply_set` acts on `Some` regardless of the transition, unlike
@@ -1287,7 +1302,7 @@ impl AppState {
                 // being a prompt (`Some`) rather than on the transition, because a
                 // second prompt before any `Stop` is `Working` → `Working`: gating
                 // this on the transition above left the first turn's claim and its
-                // relay flag in place for the next turn to redeem.
+                // relay exchange in place for the next turn to redeem.
                 //
                 // `/pull` posts from inside the turn it reports on, so a claim
                 // still here when another prompt lands is one whose `Stop` never
@@ -1296,11 +1311,16 @@ impl AppState {
                 // is the revocation rule falling out of the ordering rather than
                 // needing a timer.
                 if let Some(origin) = input.turn_begun_by {
-                    existing.turn_from_relay = origin == TurnOrigin::Peer;
+                    existing.relay_exchange_from = match origin {
+                        TurnOrigin::Peer => Some(existing.status_before_working),
+                        TurnOrigin::Person | TurnOrigin::Notification if prior == Status::Blocked => existing.relay_exchange_from,
+                        _ => None,
+                    };
                     existing.clean_claim_at = None;
                     existing.held_question = (origin.is_not_the_user() && prior == Status::Blocked).then(|| existing.label.clone());
                 } else if matches!(input.status, Status::Done | Status::Error | Status::Idle) {
                     existing.held_question = None;
+                    existing.relay_exchange_from = None;
                 }
 
                 let crate::label_policy::Selected { label: new_label, original_prompt: new_original_prompt, delegated_task: new_delegated_task, message_line: new_message_line } =
@@ -1600,11 +1620,11 @@ fn new_session(
         attended_at: None,
         content_seen_at: None,
         origin_label: None,
-        // Carried where the event that creates the row is itself a prompt. The
-        // row is still refused a CLEAN settle, because `status_before_working`
-        // on a row this process has never seen before cannot say it was clean —
-        // but the fact that is knowable is recorded rather than flattened.
-        turn_from_relay: input.turn_begun_by == Some(TurnOrigin::Peer),
+        // Carried where the event that creates the row is itself a relayed
+        // prompt, from the `Done` above: a row this process has never seen
+        // before cannot say it was clean, so the exchange is recorded and still
+        // refused a CLEAN settle.
+        relay_exchange_from: (input.turn_begun_by == Some(TurnOrigin::Peer)).then_some(Status::Done),
         held_question: None,
         clean_claim_at: None,
         read: false,
@@ -1656,6 +1676,7 @@ impl AppState {
         s.state_entered_at = now_ms;
         s.waiting_backstop_armed = false;
         s.clean_claim_at = None;
+        s.relay_exchange_from = None;
         s.input_tokens = None;
         append_boundary(s, BoundaryKind::Ended, now_ms);
         s.updated = now_ms;
@@ -1745,10 +1766,9 @@ impl AppState {
         let sessions = self.sessions.lock().unwrap();
         sessions.iter().find(|s| s.id == id).map(|s| CleanClaimFacts {
             claimed: s.clean_claim_at.is_some(),
-            turn_from_relay: s.turn_from_relay,
-            // The main agent's own status, so a subagent prompt overlaying the
-            // row cannot make its pre-turn state unreadable.
-            status_before_working: s.status_before_working,
+            // Recorded from the main agent's own status, so a subagent prompt
+            // overlaying the row cannot make its pre-exchange state unreadable.
+            relay_exchange_from: s.relay_exchange_from,
         })
     }
 
@@ -3481,7 +3501,7 @@ why did this become the task?");
             attended_at: None,
             content_seen_at: None,
             origin_label: None,
-            turn_from_relay: false,
+            relay_exchange_from: None,
             held_question: None,
             delegated_task: None,
             message_line: None,
@@ -3760,7 +3780,7 @@ why did this become the task?");
             attended_at: None,
             content_seen_at: None,
             origin_label: None,
-            turn_from_relay: false,
+            relay_exchange_from: None,
             held_question: None,
             delegated_task: None,
             message_line: None,
