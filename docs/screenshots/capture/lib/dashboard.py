@@ -124,27 +124,35 @@ def window(**body) -> dict:
     will not scroll a window or frame a shot, so anything beyond show/size/place
     stays in the per-frame script where it can be read.
     """
-    url = f"http://127.0.0.1:{dashboard_port()}/api/window"
+    return json.loads(post("/api/window", body, what=body.get("action")).decode("utf-8"))
+
+
+def post(path: str, body: dict, what: str | None = None) -> bytes:
+    """POST a JSON body to the running dashboard and return the response body.
+
+    `what` names the request in a refusal. A non-2xx comes back as `HTTPError`,
+    so its reason is read out of the error's body; anything else that stops the
+    request is the dashboard not answering at all.
+    """
     req = urllib.request.Request(
-        url,
+        f"http://127.0.0.1:{dashboard_port()}{path}",
         data=json.dumps(body).encode("utf-8"),
         headers={"Content-Type": "application/json"},   # no Origin; see the module docstring
         method="POST",
     )
+    label = f"{path} ({what})" if what else path
     try:
         with urllib.request.urlopen(req, timeout=10) as r:
-            return json.loads(r.read().decode("utf-8"))
+            return r.read()
     except urllib.error.HTTPError as e:
-        # A refusal is a non-2xx, so the reason has to be read out of the body
-        # rather than off the parsed response.
         reason = ""
         try:
             reason = json.loads(e.read().decode("utf-8")).get("reason", "")
         except Exception:
             pass
-        raise CaptureError(f"The dashboard refused {body.get('action')}: HTTP {e.code}{f' ({reason})' if reason else ''}") from e
+        raise CaptureError(f"The dashboard refused POST {label}: HTTP {e.code}{f' ({reason})' if reason else ''}") from e
     except urllib.error.URLError as e:
-        raise CaptureError(f"POST /api/window failed on port {dashboard_port()} ({body.get('action')}): {e}. Is the dashboard running?") from e
+        raise CaptureError(f"POST {label} failed on port {dashboard_port()}: {e}. Is the dashboard running?") from e
 
 
 def agents() -> dict:
@@ -548,12 +556,7 @@ def post_event(event: str, payload: dict) -> None:
     tab through, and a fixture row has no tab, so none of the user's is retitled.
     """
     body = {"client": "claude", "event": event, "payload": {"hook_event_name": event, **payload}, "console_pids": []}
-    req = urllib.request.Request(f"http://127.0.0.1:{dashboard_port()}/api/event", data=json.dumps(body).encode("utf-8"), headers={"Content-Type": "application/json"}, method="POST")
-    try:
-        with urllib.request.urlopen(req, timeout=10) as r:
-            r.read()
-    except urllib.error.URLError as e:
-        raise CaptureError(f"POST /api/event ({event}) failed on port {dashboard_port()}: {e}. Is the dashboard running?") from e
+    post("/api/event", body, what=event)
 
 
 def _row_payload(fx: dict, row: dict, scratch: Path) -> dict:

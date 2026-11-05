@@ -44,7 +44,6 @@ import socket
 import sys
 import threading
 import time
-import urllib.request
 from pathlib import Path
 
 from PIL import Image
@@ -98,11 +97,7 @@ def serve(port: int) -> http.server.ThreadingHTTPServer:
 
 
 def announce(port: int, session: str) -> None:
-    body = json.dumps({"port": port, "dir": str(dash.REPO), "session": session}).encode()
-    req = urllib.request.Request(f"http://127.0.0.1:{dash.dashboard_port()}/api/dev-server", data=body, headers={"Content-Type": "application/json"}, method="POST")
-    with urllib.request.urlopen(req, timeout=5) as r:
-        if r.status >= 300:
-            raise dash.CaptureError(f"The dashboard refused the announce: HTTP {r.status}")
+    dash.post("/api/dev-server", {"port": port, "dir": str(dash.REPO), "session": session}, what="announce")
 
 
 def wait_for_line(window_id: str, session_id: str, port: int) -> None:
