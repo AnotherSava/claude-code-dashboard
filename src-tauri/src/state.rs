@@ -760,6 +760,19 @@ fn show_gate(s: &mut AgentSession) {
     s.state_entered_at = blocked_since;
 }
 
+/// A DONE, ERROR or CLEAN settle ends the turn in flight, and with it the relayed
+/// exchange (`AgentSession::relay_exchange_from`) and any question the turn was
+/// carrying (`AgentSession::held_question`). Every writer that settles a row's
+/// main agent outside a prompt calls this — `apply_set`, `AppState::hand_over`,
+/// `AppState::revert_cancelled_turn` and `AppState::settle_stale_waiting` — so a
+/// row settled by a backstop cannot carry a stale exchange into a later BLOCK.
+fn end_exchange_on_settle(s: &mut AgentSession, status: Status) {
+    if matches!(status, Status::Done | Status::Error | Status::Idle) {
+        s.held_question = None;
+        s.relay_exchange_from = None;
+    }
+}
+
 /// Run a main-agent write against the row's own state rather than the
 /// subagent-prompt overlay on top of it.
 ///
@@ -1318,9 +1331,8 @@ impl AppState {
                     };
                     existing.clean_claim_at = None;
                     existing.held_question = (origin.is_not_the_user() && prior == Status::Blocked).then(|| existing.label.clone());
-                } else if matches!(input.status, Status::Done | Status::Error | Status::Idle) {
-                    existing.held_question = None;
-                    existing.relay_exchange_from = None;
+                } else {
+                    end_exchange_on_settle(existing, input.status);
                 }
 
                 let crate::label_policy::Selected { label: new_label, original_prompt: new_original_prompt, delegated_task: new_delegated_task, message_line: new_message_line } =
@@ -1656,8 +1668,9 @@ impl AppState {
     /// answered, so the row settles `Done` — the evidence-free sink — and its
     /// dialog gets an `Ended` separator, since the next thing it shows is another
     /// conversation. Every open subagent prompt goes with the gate (they were the
-    /// departed session's), and so do the clean claim, the shell-task backstop and
-    /// the context reading, all of which describe that session.
+    /// departed session's), and so do the clean claim, the shell-task backstop,
+    /// the context reading, the relayed exchange (`relay_exchange_from`) and the
+    /// held question (`held_question`), all of which describe that session.
     ///
     /// `None` when the row is gone, which is the ordinary state inside a
     /// `/clear` gap.
@@ -1676,7 +1689,7 @@ impl AppState {
         s.state_entered_at = now_ms;
         s.waiting_backstop_armed = false;
         s.clean_claim_at = None;
-        s.relay_exchange_from = None;
+        end_exchange_on_settle(s, Status::Done);
         s.input_tokens = None;
         append_boundary(s, BoundaryKind::Ended, now_ms);
         s.updated = now_ms;
@@ -1733,6 +1746,7 @@ impl AppState {
                 Status::Idle => Status::Done,
                 prior => prior,
             };
+            end_exchange_on_settle(s, s.status);
             s.state_entered_at = now_ms;
             s.updated = now_ms;
             Some((s.status, gated))
@@ -1798,6 +1812,7 @@ impl AppState {
             return false;
         }
         s.status = Status::Done;
+        end_exchange_on_settle(s, Status::Done);
         s.state_entered_at = now_ms;
         s.updated = now_ms;
         true
@@ -2719,6 +2734,19 @@ mod tests {
         assert_eq!(s.label, "run tests", "the task label carries over into Done");
         assert_eq!(s.state_entered_at, 600_000);
         assert_eq!(s.updated, 600_000);
+    }
+
+    /// The WAIT backstop is a DONE settle like a `Stop`'s, so it ends a relayed
+    /// exchange: a person's later prompt on a BLOCK row must not continue it.
+    #[test]
+    fn settle_stale_waiting_ends_a_relayed_exchange() {
+        let state = AppState::new();
+        let relayed = SetInput { turn_begun_by: Some(TurnOrigin::Peer), ..set("a", Status::Working, "please pull") };
+        state.apply_set(relayed, 0, NO_CONTINUATIONS, None);
+        state.apply_set(set("a", Status::Waiting, "please pull"), 1_000, NO_CONTINUATIONS, None);
+        assert!(state.clean_claim_facts("a").unwrap().relay_exchange_from.is_some());
+        assert!(state.settle_stale_waiting("a", 1_000, 600_000));
+        assert_eq!(state.clean_claim_facts("a").unwrap().relay_exchange_from, None);
     }
 
     #[test]

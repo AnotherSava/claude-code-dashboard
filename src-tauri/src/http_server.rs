@@ -1116,10 +1116,10 @@ impl CleanRefusal {
 /// `Blocked` and `Waiting` are refused outright rather than being folded into the
 /// test. Both say something is still outstanding — a question on screen, work
 /// still running — and no claim about a pull can speak to either. (`/pull` step 10
-/// declines to signal where the turn asks the user anything, and also after a
-/// question the pull put to the user, which this rule now accepts in the turn the
-/// answer begins; a run that follows the skill to the letter therefore settles
-/// `Done` there. The `Blocked` gate does not rely on the skill: a refusal here is
+/// declines to signal in a turn that ends on a question to the user, and signals
+/// at the end of the answer turn that finishes the pull, which this rule accepts
+/// as part of the relayed exchange, so that turn settles `Idle`. The `Blocked`
+/// gate does not rely on the skill: a refusal here is
 /// free, and the skill's discipline is not ours to depend on. The case that
 /// settled the wording — a `/pull` nested inside `/commit`, posting a claim 46
 /// seconds before the commit plan's own approval question — was refused here
