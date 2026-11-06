@@ -20,7 +20,7 @@ A desktop app for Windows and macOS — a compact always-on-top widget that list
 - **Sessions survive a restart** — update or reboot the widget and your agents are still listed, each at the status it was on, so a session parked on a question isn't invisible until you happen to go looking.
 - **Multi-device sync** — track sessions running on your other devices the same way as local ones, and let your agents message each other across machines — starting a session on the other side if nothing is running there.
 - **Open a project from agterm** (macOS) — bind a chord to a picker of your projects; the one you pick opens in the agterm workspace it was in last time, or its tab comes to the front if it is already running.
-- **See and open a running dev server** (macOS) — a dev server started from an agterm session shows on that session's sidebar row while it keeps answering, and a chord opens its page over the session.
+- **See and open a running dev server** (macOS) — a dev server started from an agterm session, or by an agent on your other machine you reach through a `⇄` tab, shows on that session's sidebar row while it keeps answering, and a chord opens its page over the session.
 - **Keep awake while working** (macOS) — the Mac won't fall asleep out from under a running agent, so stepping away mid-task doesn't kill it. On by default.
 - **Keep awake with the lid closed** (macOS) — carry the laptop to another room mid-task without the Mac sleeping and stopping the agent, for a bounded window you set.
 - **Focus on the task** — once Claude resumes after a question, the row shows your original request, not the *yes* you typed.

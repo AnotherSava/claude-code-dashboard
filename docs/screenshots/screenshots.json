@@ -144,6 +144,7 @@
         "dev-server-line-macos.png"
       ],
       "shows": "macOS. The top of agterm's sidebar: the common workspace and the ai-dashboard session row, with the green ▶ dev server :1420 line the dashboard writes under it",
+      "policy": "confirm",
       "capture": {
         "command": "python3 docs/screenshots/capture/dev-server-line-macos.py --publishable common ai-dashboard",
         "steps": [
@@ -154,7 +155,7 @@
           "The crop is the sidebar width from agterm's tree, from the window's top edge down to the gap under the row's card; the right and bottom sides are cuts, and hairline.py traces the edge from the alpha."
         ]
       },
-      "verifiedAt": "at-capture"
+      "verifiedAt": "6d43bcc"
     },
     {
       "id": "history-window-windows",

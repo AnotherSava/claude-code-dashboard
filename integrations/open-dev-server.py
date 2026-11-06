@@ -1,9 +1,10 @@
-"""Open the dev server started from this agterm session as an overlay over it, or hide and show it.
+"""Open the newest dev server this agterm session shows as an overlay over it, or hide and show it.
 
 Bound to a chord in agterm's keymap, which runs the command line detached with no terminal and
 exports the session the chord fired in as `AGT_SESSION_ID`. The dashboard knows which servers were
-started from that session, because the deploy skill's `deploy-dev-server.sh` announces each one
-(`POST /api/dev-server`); this asks it (`GET /api/dev-server`) and opens the newest.
+started from that session, and which the other machine's row it renders as a `⇄` tab runs, because
+the deploy skill's `deploy-dev-server.sh` announces each one (`POST /api/dev-server`), on that
+machine for a peer's; this asks it (`GET /api/dev-server`) and opens the newest.
 
 The page opens at the URL the dashboard gives: `localhost` for a server started on this Mac, and
 for one the other machine's session started — this being its `⇄` tab — the tailnet address that
