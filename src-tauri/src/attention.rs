@@ -458,11 +458,7 @@ pub fn observe(app: &AppHandle, id: &str, at_ms: i64, source: AttentionSource) -
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::Status;
-
-    fn row(id: &str, status: Status, state_entered_at: i64, attended_at: Option<i64>) -> AgentSession {
-        crate::state::test_row(id, status, state_entered_at, attended_at)
-    }
+    use crate::state::{test_row as row, Status};
 
     fn named(title: Option<&str>, cwd: Option<&str>) -> TerminalSession {
         TerminalSession { title: title.map(str::to_string), cwd: cwd.map(str::to_string) }

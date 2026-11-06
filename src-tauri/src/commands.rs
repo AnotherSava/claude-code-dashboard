@@ -1519,9 +1519,7 @@ mod tests {
         assert_eq!(shared(&rows, &[("web", 1)])[0], 1);
     }
 
-    fn row(id: &str, status: Status, state_entered_at: i64, attended_at: Option<i64>) -> AgentSession {
-        crate::state::test_row(id, status, state_entered_at, attended_at)
-    }
+    use crate::state::test_row as row;
 
     #[test]
     fn a_finished_row_reads_unread_until_it_is_read() {
