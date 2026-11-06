@@ -218,6 +218,14 @@ impl TerminalAdapter for AgtermAdapter {
         }
     }
 
+    /// Every session [`label_targets`](Self::label_targets) lists, addressed by
+    /// the session half of its key: agterm's own session id, which is what
+    /// `AGTERM_SESSION_ID` holds and `session info --target` takes.
+    fn server_targets(&self) -> Option<Vec<super::ServerTarget>> {
+        let targets = self.label_targets()?;
+        Some(targets.into_iter().filter_map(|t| Some(super::ServerTarget { session: wire::split_key(&t.key)?.1.to_string(), title: t.title })).collect())
+    }
+
     /// Close one session. agterm ends every process in it, the agent included,
     /// so nothing else has to be stopped first. A primary pane no longer running
     /// the agent refuses the close ([`wire::close_refusal`]), read fresh because

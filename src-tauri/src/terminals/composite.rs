@@ -216,6 +216,12 @@ impl TerminalAdapter for Composite {
         let child = self.children.iter().find(|c| c.can_show_servers()).ok_or_else(|| "no terminal in this set can show a dev server".to_string())?;
         child.show_servers(session, ports, expire_after)
     }
+
+    /// The child `show_servers` is routed to, so every address listed is one
+    /// that child will take back.
+    fn server_targets(&self) -> Option<Vec<super::ServerTarget>> {
+        self.children.iter().find(|c| c.can_show_servers())?.server_targets()
+    }
 }
 
 #[cfg(test)]

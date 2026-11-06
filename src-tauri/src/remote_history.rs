@@ -69,7 +69,7 @@ impl RemoteHistoryStore {
         let dd = data.entry(device.to_string()).or_default();
         dd.device = device.to_string();
         for r in &fresh {
-            let moved = rename_key(&mut dd.dialogs, &format!("{device}/{}", r.from), &format!("{device}/{}", r.to));
+            let moved = rename_key(&mut dd.dialogs, &crate::sync::namespaced_id(device, &r.from), &crate::sync::namespaced_id(device, &r.to));
             if moved == KeyMove::Conflict {
                 tracing::warn!(device, from = %r.from, to = %r.to, "a peer's renamed project already has a dialog under its new id here; both kept");
             }

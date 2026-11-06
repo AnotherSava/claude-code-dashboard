@@ -96,9 +96,32 @@ const DEBOUNCE_MS: u64 = 300;
 const HEARTBEAT_SECS: u64 = 30;
 /// Drop a remote device after this long without a push (3 missed heartbeats).
 const REMOTE_TTL_MS: i64 = 90_000;
-/// Poked by `commands::emit_sessions_updated` on every state transition; the
-/// pusher debounces and ships local sessions to all peers.
+/// Poked through [`poke`] on every local state transition and wherever else
+/// a peer should hear sooner than the heartbeat; the pusher debounces and
+/// ships local sessions to all peers.
 pub struct SyncDirty(pub Arc<Notify>);
+
+/// Ask the pusher for a push now rather than at the heartbeat. Only for a
+/// change made here: a remote-driven one must not poke, or two devices answer
+/// each other's pushes forever (see `commands::emit_sessions_updated_remote`).
+pub fn poke(app: &AppHandle) {
+    if let Some(dirty) = app.try_state::<SyncDirty>() {
+        dirty.inner().0.notify_one();
+    }
+}
+
+/// The id a peer's row is filed under here: the sender's own id behind its
+/// device name. [`raw_id`] is the inverse.
+pub fn namespaced_id(device: &str, raw: &str) -> String {
+    format!("{device}/{raw}")
+}
+
+/// The sender's own id inside `id`, where `id` is filed under `device`. Split
+/// by the device already known rather than on the first `/`, since
+/// `device_name` is a user-editable config string that may hold one itself.
+pub fn raw_id<'a>(id: &'a str, device: &str) -> Option<&'a str> {
+    id.strip_prefix(device)?.strip_prefix('/')
+}
 
 /// Wire shape for `POST /api/sync`.
 #[derive(Serialize, Deserialize, Debug)]
@@ -148,6 +171,12 @@ pub struct SyncPush {
     /// unknown route. `serde(default)` for the reason `token_tip` has one.
     #[serde(default)]
     pub renames: Vec<crate::project_rename::ProjectRename>,
+    /// The dev servers announced here that carry a row, so a peer can show
+    /// them on the tab it renders that row in (`crate::dev_servers`). Only
+    /// servers whose port still answered here; `serde(default)` for the reason
+    /// `token_tip` has one.
+    #[serde(default)]
+    pub dev_servers: Vec<crate::dev_servers::SharedServer>,
 }
 
 /// One live session from a peer's Claude Code registry.
@@ -508,7 +537,7 @@ fn ingest(
     for item in sessions {
         let mut s = item.session;
         let raw_id = s.id.clone();
-        s.id = format!("{device}/{raw_id}");
+        s.id = namespaced_id(device, &raw_id);
         s.origin = Some(device.to_string());
         s.display_name = None; // receiver's custom names win at emit time
         // The sender's own verdict, which `commands::stamp_read` then ORs with
@@ -592,7 +621,7 @@ async fn post_sync(
             // This machine's own name for the peer's row is keyed by the
             // namespaced id too, so it moves with the dialog.
             if let Some(names) = app.try_state::<crate::custom_names::CustomNamesStore>() {
-                names.rename(&format!("{device}/{}", r.from), &format!("{device}/{}", r.to));
+                names.rename(&namespaced_id(device, &r.from), &namespaced_id(device, &r.to));
             }
             tracing::info!(device = %device, from = %r.from, to = %r.to, "a peer renamed a project; its stored dialog and name here moved to the new id");
         }
@@ -602,6 +631,9 @@ async fn post_sync(
     let token_tip = push.token_tip;
     let device_name = push.device_name.clone();
     let registry_sessions = push.registry_sessions.take();
+    if let Some(servers) = app.try_state::<crate::dev_servers::DevServers>() {
+        servers.set_remote(&push.device_name, std::mem::take(&mut push.dev_servers));
+    }
     let pulls = {
         let mut remote = state.remote.lock().unwrap();
         let prev = remote.get(&push.device_name);
@@ -723,13 +755,12 @@ async fn post_attention(State(app): State<AppHandle>, Json(report): Json<Attenti
 /// watermark this module removed for going stale silently.
 pub fn report_attention(app: &AppHandle, id: &str, attended_at: i64) {
     let Some(state) = app.try_state::<AppState>() else { return };
-    // Split by the device the row is filed under rather than on the first `/`,
-    // the rule `resolve_fetch_target` follows and for its reason: `device_name`
-    // is a user-editable config string that may contain a slash of its own.
+    // Split by the device the row is filed under, the rule
+    // `resolve_fetch_target` follows too.
     let Some((device, raw_id, origin_addr)) = ({
         let remote = state.remote.lock().unwrap();
         remote.iter().find_map(|(device, d)| {
-            let raw = id.strip_prefix(device.as_str())?.strip_prefix('/')?;
+            let raw = raw_id(id, device)?;
             d.sessions.iter().any(|s| s.id == id).then(|| (device.clone(), raw.to_string(), d.origin_addr.clone()))
         })
     }) else {
@@ -1632,6 +1663,7 @@ fn build_push(
     registry: Option<&[crate::session_registry::LiveSession]>,
     record_attention: bool,
     renames: Vec<crate::project_rename::ProjectRename>,
+    dev_servers: Vec<crate::dev_servers::SharedServer>,
 ) -> SyncPush {
     SyncPush {
         device_name: device_name.to_string(),
@@ -1668,6 +1700,7 @@ fn build_push(
                 .collect()
         }),
         renames,
+        dev_servers,
     }
 }
 
@@ -1710,7 +1743,8 @@ async fn push_all(app: &AppHandle, client: &reqwest::Client) {
         .try_state::<crate::session_registry::SessionRegistry>()
         .and_then(|r| r.live_sessions(cfg.projects_root.as_deref(), now_ms()));
     let renames = app.try_state::<crate::project_rename::RenameLog>().map(|log| log.recent(now_ms())).unwrap_or_default();
-    let push = build_push(&cfg.sync.device_name, cfg.sync.listen_port, &sessions, usage_tip, token_tip, registry.as_deref(), cfg.attention_tracking, renames);
+    let dev_servers = app.try_state::<crate::dev_servers::DevServers>().map(|s| s.shared()).unwrap_or_default();
+    let push = build_push(&cfg.sync.device_name, cfg.sync.listen_port, &sessions, usage_tip, token_tip, registry.as_deref(), cfg.attention_tracking, renames, dev_servers);
     // Cycle breadcrumb: push cadence should never silently stop while peers
     // are configured — if the failure logs go quiet, this shows whether the
     // pusher loop itself is still alive.
@@ -1818,9 +1852,9 @@ fn resolve_fetch_target(
 ) -> Option<(String, String, String)> {
     remote
         .iter()
-        .filter(|(d, _)| session_id.starts_with(&format!("{d}/")))
-        .max_by_key(|(d, _)| d.len())
-        .map(|(d, dev)| (d.clone(), session_id[d.len() + 1..].to_string(), dev.origin_addr.clone()))
+        .filter_map(|(d, dev)| Some((d, raw_id(session_id, d)?, dev)))
+        .max_by_key(|(d, _, _)| d.len())
+        .map(|(d, raw, dev)| (d.clone(), raw.to_string(), dev.origin_addr.clone()))
 }
 
 /// Wire shape for the `history_loading` event the history window listens to.
@@ -2009,7 +2043,7 @@ fn fetch_dialog_range(app: AppHandle, device: String, origin_addr: String, pull:
         let Some(state) = app.try_state::<AppState>() else {
             return;
         };
-        let id = format!("{device}/{}", pull.raw_id);
+        let id = namespaced_id(&device, &pull.raw_id);
         // Logged for the range arriving, not for it changing anything, so a
         // pull that turns out to be a no-op is still visible.
         tracing::debug!(session = %id, entries = entries.len(), since = pull.since, "dialog range pulled");
@@ -2342,7 +2376,7 @@ mod tests {
         // field beside `session`, while the `session` itself is the raw
         // `AppState` row, where `read` is false because only the display path
         // stamps it.
-        let push = build_push("desktop", 9078, &[read_row("proj")], 0, 0, None, true, Vec::new());
+        let push = build_push("desktop", 9078, &[read_row("proj")], 0, 0, None, true, Vec::new(), Vec::new());
         assert!(push.sessions[0].attended, "the sender decided it, so the sender says so");
         assert!(!push.sessions[0].session.read, "the raw row carries no verdict");
         let json = serde_json::to_value(&push.sessions[0].session).expect("serialize");
@@ -2353,7 +2387,7 @@ mod tests {
     fn an_unread_row_advertises_nothing() {
         let mut unread = read_row("proj");
         unread.attended_at = None;
-        assert!(!build_push("desktop", 9078, &[unread], 0, 0, None, true, Vec::new()).sessions[0].attended);
+        assert!(!build_push("desktop", 9078, &[unread], 0, 0, None, true, Vec::new(), Vec::new()).sessions[0].attended);
     }
 
     #[test]
@@ -2363,7 +2397,7 @@ mod tests {
         // says unread and the peer's row brightens again with it.
         let mut row = read_row("proj");
         row.dialog.push(entry(DialogRole::Assistant, "a later answer", 900));
-        assert!(!build_push("desktop", 9078, &[row], 0, 0, None, true, Vec::new()).sessions[0].attended);
+        assert!(!build_push("desktop", 9078, &[row], 0, 0, None, true, Vec::new(), Vec::new()).sessions[0].attended);
     }
 
     #[test]
@@ -2372,7 +2406,7 @@ mod tests {
         // `session_restore` re-stamps `attended_at` off a ⚪ tab with no gate of
         // its own, so a row can hold a stamp this dashboard is itself drawing
         // as unread.
-        assert!(!build_push("desktop", 9078, &[read_row("proj")], 0, 0, None, false, Vec::new()).sessions[0].attended);
+        assert!(!build_push("desktop", 9078, &[read_row("proj")], 0, 0, None, false, Vec::new(), Vec::new()).sessions[0].attended);
     }
 
     #[test]
@@ -2428,7 +2462,7 @@ mod tests {
     fn the_senders_own_label_rides_the_push_only_where_it_differs() {
         let mut renamed = read_row("tauri-dashboard");
         renamed.display_name = Some("ai-dashboard".into());
-        let push = build_push("desktop", 9078, &[renamed, read_row("plain")], 0, 0, None, true, Vec::new());
+        let push = build_push("desktop", 9078, &[renamed, read_row("plain")], 0, 0, None, true, Vec::new(), Vec::new());
         assert_eq!(push.sessions[0].origin_label.as_deref(), Some("ai-dashboard"));
         assert_eq!(push.sessions[1].origin_label, None, "an unrenamed row shows the id, which the receiver derives");
     }
@@ -2482,7 +2516,7 @@ mod tests {
             "laptop".to_string(),
             RemoteDevice { sessions: vec![remote], last_seen: 0, origin_addr: String::new(), registry_sessions: None, identity: crate::tailnet::Attestation::Claimed },
         );
-        let push = build_push("desktop", 9078, &state.snapshot(), 0, 0, None, true, Vec::new());
+        let push = build_push("desktop", 9078, &state.snapshot(), 0, 0, None, true, Vec::new(), Vec::new());
         assert!(push.sessions.is_empty(), "the remote row is not ours to advertise");
     }
 
@@ -2494,7 +2528,7 @@ mod tests {
             "proj",
             vec![entry(DialogRole::User, "old", 10), entry(DialogRole::User, "new", 100)],
         )];
-        let push = build_push("desktop", 9078, &sessions, 4242, 77, None, true, Vec::new());
+        let push = build_push("desktop", 9078, &sessions, 4242, 77, None, true, Vec::new(), Vec::new());
         assert_eq!(push.device_name, "desktop");
         assert_eq!(push.listen_port, 9078);
         assert!(push.sessions[0].session.dialog.is_empty(), "no dialog content on the wire");
@@ -2516,7 +2550,7 @@ mod tests {
             records: vec![crate::session_registry::RecordKey { pid: 4_242, session_id: Some("abc".into()) }, crate::session_registry::RecordKey { pid: 4_243, session_id: Some("def".into()) }],
             newest_start_ms: None,
         }];
-        let push = build_push("desktop", 9078, &[], 0, 0, Some(&regs), true, Vec::new());
+        let push = build_push("desktop", 9078, &[], 0, 0, Some(&regs), true, Vec::new(), Vec::new());
         let rows = push.registry_sessions.expect("registry rows ride the push");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].chat_id, "transcripts", "un-namespaced; the receiver stamps its own prefix");
@@ -2526,7 +2560,7 @@ mod tests {
 
         // An unreadable registry must stay `None` all the way across, or the
         // peer reads "that machine is running nothing" from our failure to look.
-        assert!(build_push("desktop", 9078, &[], 0, 0, None, true, Vec::new()).registry_sessions.is_none());
+        assert!(build_push("desktop", 9078, &[], 0, 0, None, true, Vec::new(), Vec::new()).registry_sessions.is_none());
     }
 
     #[test]
@@ -2558,7 +2592,7 @@ mod tests {
     #[test]
     fn renames_ride_the_push_as_raw_ids() {
         let renames = vec![crate::project_rename::ProjectRename { from: "my-app".into(), to: "my-app-renamed".into(), at: 1 }];
-        let push = build_push("desktop", 9078, &[], 0, 0, None, true, renames.clone());
+        let push = build_push("desktop", 9078, &[], 0, 0, None, true, renames.clone(), Vec::new());
         let back: SyncPush = serde_json::from_str(&serde_json::to_string(&push).unwrap()).unwrap();
         assert_eq!(back.renames, renames, "un-namespaced; the receiver adds the sender's device itself");
     }
@@ -2585,7 +2619,7 @@ mod tests {
     #[test]
     fn build_push_empty_dialog_tips_zero() {
         let sessions = vec![session("proj", Vec::new())];
-        assert_eq!(build_push("desktop", 9078, &sessions, 0, 0, None, true, Vec::new()).sessions[0].dialog_tip, 0);
+        assert_eq!(build_push("desktop", 9078, &sessions, 0, 0, None, true, Vec::new(), Vec::new()).sessions[0].dialog_tip, 0);
     }
 
     #[test]
@@ -2594,8 +2628,8 @@ mod tests {
         // there is no per-peer bookkeeping that can go stale, and re-sending is
         // free. A peer that missed ten cycles is caught up by the next one.
         let sessions = vec![session("proj", vec![entry(DialogRole::User, "u", 10)])];
-        let a = build_push("desktop", 9078, &sessions, 7, 3, None, true, Vec::new());
-        let b = build_push("desktop", 9078, &sessions, 7, 3, None, true, Vec::new());
+        let a = build_push("desktop", 9078, &sessions, 7, 3, None, true, Vec::new(), Vec::new());
+        let b = build_push("desktop", 9078, &sessions, 7, 3, None, true, Vec::new(), Vec::new());
         assert_eq!(serde_json::to_string(&a).unwrap(), serde_json::to_string(&b).unwrap());
     }
 

@@ -656,20 +656,9 @@ mod tests {
     }
 
     /// A finished, unread row, as `attention::resolve_row` judges it.
-    fn unread_row(id: &str) -> crate::state::AgentSession {
-        let state = crate::state::AppState::new();
-        state.apply_set(
-            crate::state::SetInput { delegated_task: None, message_line: None, message_is_reply: None, id: id.into(), status: crate::state::Status::Done, label: None, source: None, model: None, input_tokens: None, dialog_entry: None, waiting_backstop_armed: false, turn_begun_by: None },
-            0,
-            &[],
-            None,
-        );
-        state.snapshot().pop().expect("row")
-    }
-
     #[test]
     fn a_departed_session_is_named_by_its_own_title_and_by_nothing_else() {
-        let rows = [unread_row("claude")];
+        let rows = [crate::state::test_row("claude", crate::state::Status::Done, 0, None)];
         let (_, d) = stepped(Some(&tracking(CLAUDE, None)), &selecting(DASH, &[DASH, CLAUDE]), 5_000);
         let d = d.expect("a departure");
         let resolve = |tree: &Value| {

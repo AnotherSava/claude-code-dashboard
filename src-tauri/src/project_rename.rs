@@ -381,9 +381,7 @@ pub fn rename_project(app: &AppHandle, old_path: &str, new_path: &str, now: i64)
         }
     }
     if !renamed.is_empty() {
-        if let Some(dirty) = app.try_state::<crate::sync::SyncDirty>() {
-            dirty.0.notify_one();
-        }
+        crate::sync::poke(app);
     }
 
     let report = RenameReport { ids: reports, cleared_rows: present.len(), live_sessions_checked: live_ids.is_some() };

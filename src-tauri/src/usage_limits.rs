@@ -1050,9 +1050,7 @@ async fn poll_once(app: &AppHandle, client: &reqwest::Client) {
             emit_usage_limits_updated(app);
             // Push now rather than at the next heartbeat, so a peer has this
             // reading well inside `PEER_READING_MARGIN_MS` and skips its own poll.
-            if let Some(dirty) = app.try_state::<crate::sync::SyncDirty>() {
-                dirty.inner().0.notify_one();
-            }
+            crate::sync::poke(app);
         }
         Err(err) => {
             let status = match err {

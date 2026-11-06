@@ -590,7 +590,7 @@ pub(crate) fn live_session_count(app: &AppHandle, chat_id: &str) -> Option<usize
             .map(|s| {
                 // An id with no anchor belongs to the row its cwd derives, which is
                 // this group's own `chat_id` — the same fallback `row_id` makes.
-                s.session_ids().filter(|sid| anchored(sid).as_deref().unwrap_or(&s.chat_id) == chat_id).count()
+                s.session_ids().filter(|sid| crate::session_registry::row_for([*sid], &s.chat_id, &anchored) == chat_id).count()
                     // A group whose records carry no session id at all still counts
                     // as its derived row: session ids are best-effort, `sessions()`
                     // is the record count.

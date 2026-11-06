@@ -278,8 +278,9 @@ impl LiveSession {
 
 /// The row a set of sessions writes to: the anchored id where `ChatIdRegistry`
 /// has pinned one of them, else `derived`. The one rule behind
-/// [`LiveSession::row_id`] and [`record_row`].
-fn row_for<'a>(session_ids: impl IntoIterator<Item = &'a str>, derived: &str, anchored: &dyn Fn(&str) -> Option<String>) -> String {
+/// [`LiveSession::row_id`], [`record_row`] and every caller that names a row
+/// from a Claude Code session id it was handed (a clean claim, a dev server).
+pub(crate) fn row_for<'a>(session_ids: impl IntoIterator<Item = &'a str>, derived: &str, anchored: &dyn Fn(&str) -> Option<String>) -> String {
     session_ids.into_iter().find_map(anchored).unwrap_or_else(|| derived.to_string())
 }
 

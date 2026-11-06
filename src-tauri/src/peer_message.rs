@@ -271,7 +271,7 @@ pub fn resolve_message_target(target: &str, local_ids: &[String], remote_devices
     let mut devices: Vec<&String> = remote_devices.iter().collect();
     devices.sort_by_key(|d| std::cmp::Reverse(d.len()));
     for device in devices {
-        if let Some(project) = target.strip_prefix(&format!("{device}/")) {
+        if let Some(project) = crate::sync::raw_id(target, device) {
             if project.is_empty() || project.trim() != project {
                 return TargetResolution::NotAnAddress;
             }
@@ -284,7 +284,7 @@ pub fn resolve_message_target(target: &str, local_ids: &[String], remote_devices
     // `local_ids`, so nothing is running for it — which is a start, not a
     // brokered delivery, and a different answer from the live case above.
     if let Some(me) = self_device.filter(|d| !d.is_empty()) {
-        if let Some(project) = target.strip_prefix(&format!("{me}/")).filter(|p| !p.is_empty() && p.trim() == *p) {
+        if let Some(project) = crate::sync::raw_id(target, me).filter(|p| !p.is_empty() && p.trim() == *p) {
             // The bare-name check above compared the *whole* target, so a live
             // session addressed the long way round has not been seen yet.
             // Without this it would read as idle and be offered a start beside

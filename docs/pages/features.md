@@ -94,11 +94,13 @@ command "Local session"  cmd+shift+o  /usr/bin/env python3 /path/to/claude-code-
 
 ## See and open a running dev server
 
-A script that starts a local dev server from an agterm session can tell the dashboard about it, and that session's sidebar row then shows a green **▶ dev server** line with its port for as long as the server keeps answering. The script makes one request once the server is up, posting `{"port": 5173, "dir": "<project folder>", "session": "$AGTERM_SESSION_ID"}` to `http://127.0.0.1:9077/api/dev-server`. Servers started any other way are not shown.
+A script that starts a dev server can tell the dashboard about it, and the agterm session it was started from then shows a green **▶ dev server** line with its port for as long as the server keeps answering. The script makes one request once the server is up, posting `{"port": 5173, "dir": "<project folder>", "session": "$AGTERM_SESSION_ID"}` to `http://127.0.0.1:9077/api/dev-server`. Servers no script announces are not shown.
+
+With sync on, a dev server an agent starts on your other machine shows the same way on the Mac, on the `⇄` tab you reach that agent through. For that the script also sends the agent's Claude Code session and the tailnet address it published the server at (see the [HTTP API](development/http-api#post-apidev-server)).
 
 {% include figure.html id="dev-server-line" only="macos" alt="agterm's sidebar with the ai-dashboard session row and, under its name, a green play marker followed by dev server :1420" %}
 
-A chord opens the server over its session as an overlay, with its page scripts running and logins kept between openings. Pressing it again hides the page, and once more brings it back. Add a line like this to agterm's `keymap.conf`:
+A chord opens the server over its session as an overlay, with its page scripts running and logins kept between openings. Pressing it again hides the page, and once more brings it back. A server from the other machine opens at its tailnet address; one that has no tailnet address is shown but cannot be opened, and the chord says so. Add a line like this to agterm's `keymap.conf`:
 
 ```
 command "Dev server"  cmd+shift+s  /usr/bin/env python3 /path/to/claude-code-dashboard/integrations/open-dev-server.py

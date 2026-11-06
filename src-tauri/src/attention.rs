@@ -156,7 +156,7 @@ pub fn should_poll(sessions: &[AgentSession]) -> bool {
 /// machine's dashboard wrote, behind `terminal_title::REMOTE_BADGE`. Leaving
 /// them out is what used to make such a tab unnameable — and worse, what made
 /// its title fall through to the local row of the same name.
-fn all_rows(app: &AppHandle) -> Vec<AgentSession> {
+pub(crate) fn all_rows(app: &AppHandle) -> Vec<AgentSession> {
     let Some(state) = app.try_state::<AppState>() else { return Vec::new() };
     let mut sessions = state.snapshot();
     sessions.extend(state.remote_snapshot());
@@ -285,7 +285,7 @@ fn remote_labels(sessions: &[AgentSession]) -> Vec<(&str, &str)> {
     let mut out = Vec::new();
     for s in sessions.iter().filter(|s| s.origin.is_some()) {
         let mut names: Vec<&str> = vec![s.display_label()];
-        if let Some(raw) = s.origin.as_deref().and_then(|o| s.id.strip_prefix(o)).and_then(|r| r.strip_prefix('/')) {
+        if let Some(raw) = s.origin.as_deref().and_then(|o| crate::sync::raw_id(&s.id, o)) {
             names.push(raw);
         }
         if let Some(origin) = s.origin_label.as_deref() {
@@ -461,29 +461,7 @@ mod tests {
     use crate::state::Status;
 
     fn row(id: &str, status: Status, state_entered_at: i64, attended_at: Option<i64>) -> AgentSession {
-        let state = AppState::new();
-        state.apply_set(
-            crate::state::SetInput {
-                id: id.into(),
-                status,
-                label: None,
-                source: None,
-                model: None,
-                input_tokens: None,
-                dialog_entry: None,
-                waiting_backstop_armed: false,
-                turn_begun_by: None,
-                delegated_task: None,
-                message_line: None,
-                message_is_reply: None,
-            },
-            state_entered_at,
-            &[],
-            None,
-        );
-        let mut s = state.snapshot().pop().expect("row");
-        s.attended_at = attended_at;
-        s
+        crate::state::test_row(id, status, state_entered_at, attended_at)
     }
 
     fn named(title: Option<&str>, cwd: Option<&str>) -> TerminalSession {
@@ -599,8 +577,7 @@ mod tests {
     /// A synced row as this machine holds it: namespaced, origin-stamped, and
     /// optionally renamed here.
     fn synced(device: &str, raw: &str, renamed: Option<&str>) -> AgentSession {
-        let mut s = row(&format!("{device}/{raw}"), Status::Done, 0, None);
-        s.origin = Some(device.into());
+        let mut s = crate::state::test_synced_row(device, raw, 0);
         s.display_name = renamed.map(str::to_string);
         s
     }

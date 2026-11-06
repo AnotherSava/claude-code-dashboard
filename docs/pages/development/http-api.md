@@ -406,31 +406,38 @@ Lists every agterm tab running Claude, across every open window, for the local p
 
 ## `POST /api/dev-server`
 
-Records a local dev server and the agterm session it was started from, so that session's sidebar row shows it for as long as it keeps answering. A script posts it once the server's port accepts connections:
+Records a dev server on this machine, the terminal session it was started from and the dashboard row it belongs to, so the session's sidebar row shows it for as long as it keeps answering, and so does the other machine's `⇄` tab for that row. A script posts it once the server's port accepts connections:
 
 ```json
-{ "port": 5173, "dir": "/Users/you/Projects/my-app", "session": "<AGTERM_SESSION_ID>" }
+{ "port": 5173, "dir": "/Users/you/Projects/my-app", "session": "<AGTERM_SESSION_ID>", "claude_session": "<CLAUDE_CODE_SESSION_ID>", "url": "https://my-box.example.ts.net:8443" }
 ```
 
-`session` is the session's own address from its environment, which only a process started inside the session has. `dir` is optional. One port is one server on this machine, so an announcement replaces whatever held the port before. Nothing announces a stop: every 15 seconds, and at once after an announcement, the dashboard connects to each announced port on both loopbacks, forgets one that refuses, and rewrites each session's line with a 45-second expiry, so a dashboard that stops leaves nothing claiming a server runs. A server whose session agterm says no longer exists is forgotten too. Announcements are kept in `dev_servers.json`, since a server outlives a dashboard restart. The check and the line exist only where the terminal has one to write, which today is agterm on macOS; elsewhere an announcement is recorded and nothing checks or shows it. Carries the loopback `Host` gate on top of the `Origin` check.
+Every field but `port` is optional. `session` is the terminal session's own address from its environment, which only a process started inside an agterm session has. `claude_session` is the Claude Code session that ran the script; it names the row exactly, through the row that session is anchored to, and `dir` derives the row where it is not anchored. `url` is the address that opens the server from another machine, the tailnet front the script published. An announcement needs a session or a row to show the server on.
+
+One port is one server on this machine, so an announcement replaces whatever held the port before. Nothing announces a stop: every 15 seconds, and at once after an announcement, the dashboard connects to each announced port on both loopbacks and forgets one that refuses. Where the terminal has a line to write, which today is agterm on macOS, it then rewrites each session's line with a 45-second expiry, so a dashboard that stops leaves nothing claiming a server runs, and forgets a server whose session agterm says no longer exists. Announcements are kept in `dev_servers.json`, since a server outlives a dashboard restart.
+
+A server recorded with a row rides the [sync push](#post-apisync) to the user's other machines, which never check its port themselves. There the dashboard finds each agterm tab whose `⇄`-badged title names that synced row, and puts the server's port on that tab's line too. Carries the loopback `Host` gate on top of the `Origin` check.
 
 | Status | Body | Meaning |
 |---     |---   |---      |
 | `200`  | `{"ok": true}` | recorded |
-| `400`  | `{"ok": false, "reason": "bad_request", …}` | the port is `0` or the session is empty |
+| `400`  | `{"ok": false, "reason": "bad_request", …}` | the port is `0`, or the announcement names neither a session nor a row |
 | `500`  | `{"ok": false, "reason": "state_unavailable", …}` | the dashboard is still starting |
 
 Logged as `decision = "dev_server"` with an `outcome` of `announced`; the checks log `stopped`, `session_gone` and `show_failed`, the last once per change of reason.
 
 ## `GET /api/dev-server?session=<id>`
 
-Lists the dev servers announced from one session, newest first, for the agterm chord that opens one (`integrations/open-dev-server.py`):
+Lists the dev servers one session can open, for the agterm chord that opens one (`integrations/open-dev-server.py`): those announced from it, newest first, then those of the other machine's row it renders as a `⇄` tab, newest first:
 
 ```json
-{ "servers": [ { "port": 5173, "dir": "/Users/you/Projects/my-app" } ] }
+{ "servers": [
+  { "port": 5173, "device": null, "open": "http://localhost:5173" },
+  { "port": 3000, "device": "my-desktop", "open": "https://my-desktop.example.ts.net:8443" }
+] }
 ```
 
-A server that has stopped stays listed until the next check forgets it, which is one pass: 15 seconds after the previous pass ended. Carries the loopback `Host` gate on top of the `Origin` check. Not logged.
+`device` is the machine the server runs on, `null` for this one. `open` is the URL that opens it from here: `localhost` for a server of this machine, the tailnet address the other machine's script published for one of its servers, and `null` where it published none, so that server is shown but cannot be opened from here. A server that has stopped stays listed until the next check forgets it, which is one pass: 15 seconds after the previous pass ended. Carries the loopback `Host` gate on top of the `Origin` check. Not logged.
 
 ## Sync API
 
@@ -454,6 +461,9 @@ A peer pushes its local sessions. The body is a full snapshot of the sender's se
   ],
   "renames": [
     { "from": "my-app", "to": "my-app-renamed", "at": 1791082748306 }
+  ],
+  "dev_servers": [
+    { "row": "my-app", "port": 5173, "url": "https://my-laptop.example.ts.net:8443", "announced_at": 1791082748306 }
   ]
 }
 ```
@@ -465,6 +475,8 @@ The push carries **no dialog, usage or token content** — only a full metadata 
 `attended` is the one judgment that rides the push outright rather than as a tip: whether the sender's own user has read that finished row, which the receiver stamps onto the row's `read` flag so a session reads the same on both dashboards. A tip would hand the *verdict* to the receiver, and the only thing it could derive one from is the dialog this push deliberately strips — so it would answer from a lagging copy and call work read that the origin still calls unread. The sender is authoritative for its own sessions, so it decides this too, from its own full dialog and its own `attention_tracking`. The receiver stores it verbatim and keeps no bookkeeping of its own: a withdrawn verdict simply arrives as `false` on the next cycle, and whether this dashboard draws it is its own `attention_tracking`'s business, applied where it renders. The timestamp behind it is never sent, and nothing in this API reports when a human last sat at a machine.
 
 `renames` lists the projects the sender [renamed](#post-apiprojectrename) in the last 30 days, as raw ids, oldest first. Before seeding dialogs, the receiver applies each rename it has not applied yet, in order of `at`: its stored copy of `{device_name}/{from}` and its own custom name for that row move to `{device_name}/{to}`, and where a dialog under the new id is already held both are kept. It remembers the newest `at` applied per device, so the repetition on every push, which lets a peer that was offline catch up, never re-applies a rename to an id that has come back into use. A peer on an older build ignores the field.
+
+`dev_servers` lists the [dev servers](#post-apidev-server) the sender announced with a row whose port still answered there, each under the sender's raw row id, with the tailnet `url` that opens it, or `null`. The receiver replaces its list for that device wholesale on every push and shows the ports on the `⇄` tab rendering that row; it never checks them, since they run on the sender. `announced_at` is on the sender's clock and only orders that sender's servers. A peer on an older build sends nothing and shows nothing.
 
 `origin_label` is the name the sender's own terminal tab carries for that session, present only where the sender renamed it. It is not a name to display — the receiver's own rename still wins there — but a tab on the receiver that reaches the sender's agent over SSH or tmux carries *that* string, so without it the receiver could not join such a tab to the row it names. `null` where the sender has not renamed the row, whose tab then shows an id the receiver already derives.
 

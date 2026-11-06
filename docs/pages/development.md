@@ -106,7 +106,7 @@ Under the repo root `claude-code-dashboard/`:
     - `subprocess.rs` — running a helper program to a deadline, with no console window on Windows
     - `peer_message.rs` — relaying one message to an agent on another machine, and the honesty rules around it
     - `session_launcher.rs` — starting a terminal session for a project that has none, for a relayed message or for the local picker (`integrations/pick-local-session.py`, through `POST /api/session/open`); it names no terminal, asking the platform's `terminals::TerminalAdapter` to launch the session (agterm's adapter on macOS, its workspace placement included), so a launcher for another terminal is that terminal's adapter implementing `launch`
-    - `dev_servers.rs` — dev servers announced from an agterm session, checked until they stop answering and shown on that session's sidebar row, in `dev_servers.json`
+    - `dev_servers.rs` — announced dev servers, checked until they stop answering and shown on the agterm session they were started from, or on the other machine's `⇄` tab for their row through the sync push, in `dev_servers.json`
     - `workspace_memory.rs` — the agterm window and workspace each project's agent was last seen in, so a started session opens there, in `agterm_workspaces.json`
     - `session_restore.rs` — giving a live session its row back after a restart
     - `alive_stamp.rs` — the previous run's last heartbeat, which tells `session_restore` a session started while the dashboard was down
@@ -163,7 +163,7 @@ Under the repo root `claude-code-dashboard/`:
 - `scripts/dev.mjs` — fronts `npm run tauri`; settles the dev server's port and hands it to both Vite and the Tauri CLI
 - `integrations/claude_hook.py` — thin Claude Code hook that forwards the stdin payload to /api/event
 - `integrations/pick-local-session.py` — agterm-chord picker that opens a local project's session through `POST /api/session/open`, or raises its existing tab
-- `integrations/open-dev-server.py` — agterm-chord helper that opens the dev server started from the session as an overlay through `GET /api/dev-server`, or hides and shows the session's page overlay
+- `integrations/open-dev-server.py` — agterm-chord helper that opens the newest dev server the session shows as an overlay through `GET /api/dev-server`, at `localhost` or at the other machine's published tailnet address, or hides and shows the session's page overlay
 - `docs/` — this site
 - `.github/workflows/`
   - `build.yml` — CI: check + `cargo check --all-targets` with warnings denied + cargo test + frontend build on push/PR (Windows + macOS matrix)

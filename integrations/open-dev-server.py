@@ -5,9 +5,11 @@ exports the session the chord fired in as `AGT_SESSION_ID`. The dashboard knows 
 started from that session, because the deploy skill's `deploy-dev-server.sh` announces each one
 (`POST /api/dev-server`); this asks it (`GET /api/dev-server`) and opens the newest.
 
-The page opens on `localhost`, which the overlay resolves on this Mac, with its JavaScript on (an
-overlay runs none by default, and a dev server is an app), the navigation buttons, and the shared
-persistent browser store, so a login survives the overlay closing.
+The page opens at the URL the dashboard gives: `localhost` for a server started on this Mac, and
+for one the other machine's session started — this being its `⇄` tab — the tailnet address that
+machine's deploy published, since `localhost` would name this Mac. It opens with its JavaScript on
+(an overlay runs none by default, and a dev server is an app), the navigation buttons, and the
+shared persistent browser store, so a login survives the overlay closing.
 
 Pressed again, the chord toggles the session's page overlay instead of opening a second one, which
 agterm refuses while one is open or hidden. Any page overlay counts, not only a dev server's: with
@@ -84,7 +86,10 @@ def main() -> int:
         return _fail(f"the dashboard did not answer: {e}", session)
     if not servers:
         return _fail("no dev server is running from this session", session)
-    url = f"http://localhost:{servers[0]['port']}"
+    newest = servers[0]
+    url = newest.get("open")
+    if not url:
+        return _fail(f"the dev server on {newest.get('device')} (port {newest['port']}) has no tailnet address to open it from here", session)
     answer = _agtermctl_json("session", "overlay", "open", "--url", url, "--js", "--navigation", "--persistent", "--target", session)
     return 0 if answer.get("ok") else _fail(f"agterm would not open {url}: {answer.get('error')}", session)
 

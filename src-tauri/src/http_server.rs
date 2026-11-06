@@ -120,10 +120,9 @@ fn apply_session_clean(app: &AppHandle, req: SessionCleanRequest) -> Response {
     // event, so it has no row for a claim to attach to either, and the `cwd`
     // derivation below is what finds the row in the ordinary case where the
     // anchor and the derivation agree.
-    let chat_id = app
-        .try_state::<ChatIdRegistry>()
-        .and_then(|r| r.anchored(&req.session_id))
-        .unwrap_or_else(|| adapters::claude::derive_chat_id(req.cwd.as_deref(), cfg.projects_root.as_deref()));
+    let anchors = app.try_state::<ChatIdRegistry>();
+    let derived = adapters::claude::derive_chat_id(req.cwd.as_deref(), cfg.projects_root.as_deref());
+    let chat_id = crate::session_registry::row_for([req.session_id.as_str()], &derived, &|sid| anchors.as_ref().and_then(|r| r.anchored(sid)));
 
     let row_lock = app.try_state::<crate::commands::RowLocks>().map(|locks| locks.row(&chat_id));
     let _row_guard = row_lock.as_deref().map(crate::commands::RowLocks::hold);
@@ -254,32 +253,59 @@ async fn get_session_tabs(State(app): State<AppHandle>, headers: HeaderMap) -> R
 }
 
 /// What `POST /api/dev-server` is told: a dev server that has just started
-/// answering, and the terminal session it was started from.
+/// answering, and where it came from.
 #[derive(Deserialize)]
 struct DevServerAnnouncement {
     port: u16,
     #[serde(default)]
     dir: String,
-    /// The session's own address, from its environment (`AGTERM_SESSION_ID`).
-    session: String,
+    /// The terminal session's own address, from its environment
+    /// (`AGTERM_SESSION_ID`), where the deploy ran in one.
+    #[serde(default)]
+    session: Option<String>,
+    /// The Claude Code session that ran the deploy (`CLAUDE_CODE_SESSION_ID`),
+    /// which names the row exactly where the directory would only derive it.
+    #[serde(default)]
+    claude_session: Option<String>,
+    /// The tailnet address the deploy published for the server.
+    #[serde(default)]
+    url: Option<String>,
+}
+
+/// Which row a server belongs to: the row its Claude Code session is anchored
+/// to, else the one its directory derives, else none where it named neither.
+fn dev_server_row(app: &AppHandle, req: &DevServerAnnouncement) -> Option<String> {
+    let anchors = app.try_state::<ChatIdRegistry>();
+    let anchored = |sid: &str| anchors.as_ref().and_then(|r| r.anchored(sid));
+    let session = req.claude_session.as_deref().map(str::trim);
+    let dir = req.dir.trim();
+    if dir.is_empty() {
+        return session.and_then(anchored);
+    }
+    let root = app.try_state::<ConfigState>().and_then(|c| c.snapshot().projects_root);
+    Some(crate::session_registry::row_for(session, &adapters::claude::derive_chat_id(Some(dir), root.as_deref()), &anchored))
 }
 
 /// Record a dev server the deploy skill's `deploy-dev-server.sh` started, so
-/// its session shows it until it stops (see [`crate::dev_servers`]). Loopback
-/// `Host` required, like every route a local script calls.
+/// its session — or another machine's tab rendering its row — shows it until
+/// it stops (see [`crate::dev_servers`]). Loopback `Host` required, like every
+/// route a local script calls.
 async fn post_dev_server(State(app): State<AppHandle>, headers: HeaderMap, Json(req): Json<DevServerAnnouncement>) -> Response {
     if let Some(detail) = csrf_refusal(&headers, true) {
         return csrf_refused(detail).into_response();
     }
-    let session = req.session.trim();
-    if req.port == 0 || session.is_empty() {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"ok": false, "reason": "bad_request", "detail": "a port and a session are both required"}))).into_response();
+    let session = req.session.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+    let row = dev_server_row(&app, &req);
+    if req.port == 0 || (session.is_none() && row.is_none()) {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"ok": false, "reason": "bad_request", "detail": "a port, and a session or a directory to show it on, are required"}))).into_response();
     }
     let Some(store) = app.try_state::<crate::dev_servers::DevServers>() else {
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"ok": false, "reason": "state_unavailable", "detail": "the dashboard is still starting"}))).into_response();
     };
-    tracing::info!(decision = "dev_server", outcome = "announced", port = req.port, dir = %req.dir, session = %session, "dev server announced");
-    store.announce(crate::dev_servers::DevServer { port: req.port, dir: req.dir.trim().to_string(), session: session.to_string(), announced_at: now_ms() });
+    let url = req.url.as_deref().map(str::trim).filter(|u| !u.is_empty()).map(str::to_string);
+    tracing::info!(decision = "dev_server", outcome = "announced", port = req.port, dir = %req.dir, session = ?session, row = ?row, url = ?url, "dev server announced");
+    store.announce(crate::dev_servers::DevServer { port: req.port, dir: req.dir.trim().to_string(), session, row, url, announced_at: now_ms() });
+    crate::sync::poke(&app);
     Json(serde_json::json!({"ok": true})).into_response()
 }
 
@@ -288,15 +314,17 @@ struct DevServerQuery {
     session: String,
 }
 
-/// The dev servers announced from one session, newest first, for the agterm
-/// chord that opens one (`integrations/open-dev-server.py`). A stopped server
-/// stays listed until the next check forgets it, at most one pass.
+/// The dev servers one session can open, for the agterm chord
+/// (`integrations/open-dev-server.py`): those started from it, newest first,
+/// then those of the other machine's row it renders. `open` is the URL to load,
+/// `null` for a peer's server that published no tailnet address. A stopped
+/// server stays listed until the next check forgets it, at most one pass.
 async fn get_dev_server(State(app): State<AppHandle>, headers: HeaderMap, Query(q): Query<DevServerQuery>) -> Response {
     if let Some(detail) = csrf_refusal(&headers, true) {
         return csrf_refused(detail).into_response();
     }
     let servers = app.try_state::<crate::dev_servers::DevServers>().map(|s| s.for_session(q.session.trim())).unwrap_or_default();
-    let servers: Vec<_> = servers.iter().map(|s| serde_json::json!({"port": s.port, "dir": s.dir})).collect();
+    let servers: Vec<_> = servers.iter().map(|s| serde_json::json!({"port": s.port, "device": s.device, "open": s.open})).collect();
     Json(serde_json::json!({ "servers": servers })).into_response()
 }
 
@@ -910,7 +938,7 @@ fn agent_roster(
                 None => (this_device.map(str::to_string), s.id.clone(), None),
                 Some(origin) => {
                     let seen = last_seen.get(origin)?;
-                    let project = s.id.strip_prefix(&format!("{origin}/")).unwrap_or(&s.id).to_string();
+                    let project = crate::sync::raw_id(&s.id, origin).unwrap_or(&s.id).to_string();
                     (Some(origin.to_string()), project, Some(age_since(*seen)))
                 }
             };
@@ -998,7 +1026,7 @@ fn agent_roster(
             rows.iter()
                 .filter(|s| !hook_rows.contains(&(Some(device.as_str()), s.chat_id.as_str())))
                 .map(|s| RegistryRow {
-                    id: format!("{device}/{}", s.chat_id),
+                    id: crate::sync::namespaced_id(device, &s.chat_id),
                     project: s.chat_id.clone(),
                     device: Some(device.clone()),
                     name: sole_name(s.sessions, s.name.as_deref()),
@@ -1470,7 +1498,7 @@ async fn post_message(State(app): State<AppHandle>, headers: HeaderMap, Json(req
     // unidentified caller gets `None` rather than a plausible address: the
     // envelope then says there is no reply address, which is the truth, instead
     // of printing one that would fail an exact match one hop later.
-    let reply_to = (from_agent != "unknown").then(|| format!("{this_device}/{from_agent}"));
+    let reply_to = (from_agent != "unknown").then(|| crate::sync::namespaced_id(this_device, from_agent));
 
     let envelope = crate::sync::MessageEnvelope {
         origin_device: this_device.to_string(),

@@ -1322,9 +1322,7 @@ pub fn emit_sessions_updated(app: &AppHandle) {
     // the poke itself would: receive → poke → push our locals back → the peer
     // receives and pokes its own pusher, ping-ponging full snapshots at the
     // debounce period forever.
-    if let Some(dirty) = app.try_state::<crate::sync::SyncDirty>() {
-        dirty.inner().0.notify_one();
-    }
+    crate::sync::poke(app);
 }
 
 /// UI-only refresh for remote-driven changes (received sync push, remote TTL
@@ -1522,29 +1520,7 @@ mod tests {
     }
 
     fn row(id: &str, status: Status, state_entered_at: i64, attended_at: Option<i64>) -> AgentSession {
-        let state = AppState::new();
-        state.apply_set(
-            crate::state::SetInput {
-                id: id.into(),
-                status,
-                label: None,
-                source: None,
-                model: None,
-                input_tokens: None,
-                dialog_entry: None,
-                waiting_backstop_armed: false,
-                turn_begun_by: None,
-                delegated_task: None,
-                message_line: None,
-                message_is_reply: None,
-            },
-            state_entered_at,
-            &[],
-            None,
-        );
-        let mut s = state.snapshot().pop().expect("row");
-        s.attended_at = attended_at;
-        s
+        crate::state::test_row(id, status, state_entered_at, attended_at)
     }
 
     #[test]

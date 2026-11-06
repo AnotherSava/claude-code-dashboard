@@ -2173,6 +2173,45 @@ pub fn merge_dialog_entries(dialog: &mut Vec<DialogEntry>, incoming: &[DialogEnt
     changed
 }
 
+/// A row as `apply_set` creates it, for the tests of every module that reads
+/// rows: a bare status entered at `state_entered_at`, read at `attended_at`.
+#[cfg(test)]
+pub(crate) fn test_row(id: &str, status: Status, state_entered_at: i64, attended_at: Option<i64>) -> AgentSession {
+    let state = AppState::new();
+    state.apply_set(
+        SetInput {
+            id: id.into(),
+            status,
+            label: None,
+            source: None,
+            model: None,
+            input_tokens: None,
+            dialog_entry: None,
+            waiting_backstop_armed: false,
+            turn_begun_by: None,
+            delegated_task: None,
+            message_line: None,
+            message_is_reply: None,
+        },
+        state_entered_at,
+        &[],
+        None,
+    );
+    let mut s = state.snapshot().pop().expect("row");
+    s.attended_at = attended_at;
+    s
+}
+
+/// A `Done` row as `sync::ingest` stores it from `device`: the namespaced id
+/// and the `origin` stamp. The other fields `ingest` sets are left to the test
+/// that needs them.
+#[cfg(test)]
+pub(crate) fn test_synced_row(device: &str, raw: &str, state_entered_at: i64) -> AgentSession {
+    let mut s = test_row(&crate::sync::namespaced_id(device, raw), Status::Done, state_entered_at, None);
+    s.origin = Some(device.into());
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2475,11 +2514,7 @@ mod tests {
     }
 
     fn seed_remote(state: &AppState, id: &str, state_entered_at: i64, newest_reply: Option<i64>) {
-        let holder = AppState::new();
-        holder.apply_set(set_no_label(id, Status::Done), state_entered_at, NO_CONTINUATIONS, None);
-        let mut s = holder.snapshot().pop().expect("row");
-        s.id = format!("laptop/{id}");
-        s.origin = Some("laptop".into());
+        let mut s = test_synced_row("laptop", id, state_entered_at);
         if let Some(ts) = newest_reply {
             s.dialog.push(DialogEntry { role: DialogRole::Assistant, text: "a reply".into(), timestamp: ts, status: Status::Done, task_start: false, boundary: None });
         }

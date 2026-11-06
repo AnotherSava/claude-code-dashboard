@@ -1065,6 +1065,29 @@ pub trait TerminalAdapter: Send {
         let _ = (session, ports, expire_after);
         Err("this terminal has no line to show a dev server on".to_string())
     }
+
+    /// Every session [`show_servers`](Self::show_servers) could write to,
+    /// addressed as it addresses them, with the title that joins the session to
+    /// a row. What lets `dev_servers` find the tab rendering another machine's
+    /// session, which announced nothing here because its agent runs over there.
+    /// `None` is "could not look just now" and is retried at the next pass.
+    ///
+    /// **May block.** The default lists nothing.
+    fn server_targets(&self) -> Option<Vec<ServerTarget>> {
+        None
+    }
+}
+
+/// One session [`TerminalAdapter::server_targets`] reports.
+// Constructed only by the agterm adapter, and by the dev_servers tests.
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServerTarget {
+    /// The session's environment address, the one [`TerminalAdapter::show_servers`]
+    /// takes (agterm's `AGTERM_SESSION_ID`).
+    pub session: String,
+    /// The primary pane's program title, as [`LabelTarget::title`] reports it.
+    pub title: Option<String>,
 }
 
 /// What [`TerminalAdapter::show_servers`] found. The terminal saying the
