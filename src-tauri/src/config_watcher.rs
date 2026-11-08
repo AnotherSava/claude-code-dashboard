@@ -116,6 +116,7 @@ pub fn spawn(app: AppHandle, path: PathBuf) {
                 crate::tray::sync_lid_awake_title(&app, new_cfg.lid_awake_minutes);
             }
             apply_config_to_window(&app, &new_cfg, Some(&prior));
+            crate::tray::sync_config_checks(&app, &new_cfg);
             // Re-render the tray badge in case `tray_badge` changed externally.
             crate::tray_badge::refresh(&app);
             let _ = app.emit("config_updated", &new_cfg);

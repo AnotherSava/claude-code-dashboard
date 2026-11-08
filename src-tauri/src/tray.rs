@@ -6,7 +6,7 @@ use tauri::{
 use tauri_plugin_autostart::ManagerExt;
 
 use crate::commands::emit_config_updated;
-use crate::config::{AutoResize, ConfigState, HistoryFontSize, LidAwakeMode, TrayBadge};
+use crate::config::{AutoResize, Config, ConfigState, HistoryFontSize, LidAwakeMode, TrayBadge};
 
 const MENU_SHOW_HIDE: &str = "show_hide";
 const MENU_ALWAYS_ON_TOP: &str = "always_on_top";
@@ -58,6 +58,70 @@ pub fn sync_lid_awake_title(app: &AppHandle, minutes: u64) {
     }
 }
 
+/// Move every check-mark that mirrors a `config.json` value to that value,
+/// after a reload. Each tray click sets its own tick inline, and still must:
+/// `save_to_disk` writes the file and `config_watcher` then skips the event as
+/// one it already holds, so this reaches only an edit made outside the tray.
+/// Takes no handle mutex, since `set_checked` waits on the main thread and a
+/// mutex a sync command can also take would make that wait a deadlock. The lid
+/// submenu is left to `sync_lid_awake_state`, whose tick shows a running hold
+/// that no config value carries.
+pub fn sync_config_checks(app: &AppHandle, cfg: &Config) {
+    if let Some(handles) = app.try_state::<TrayHandles>() {
+        for check in CONFIG_CHECKS {
+            let _ = (check.handle)(&handles).set_checked((check.get)(cfg));
+        }
+    }
+    sync_auto_resize_checks(app, cfg.auto_resize);
+    sync_history_font_checks(app, cfg.history_font_size);
+    sync_tray_badge_checks(app, cfg.tray_badge);
+}
+
+/// One boolean `config.json` field and the tray check-mark that mirrors it.
+/// `setup` reads the initial tick through `get`, `toggle_config_check` flips the
+/// field through `set`, and `sync_config_checks` walks `CONFIG_CHECKS`, so a
+/// checkbox defined here is kept in step in all three places.
+#[derive(Clone, Copy)]
+struct ConfigCheck {
+    handle: fn(&TrayHandles) -> &CheckMenuItem<Wry>,
+    get: fn(&Config) -> bool,
+    set: fn(&mut Config, bool),
+}
+
+const ALWAYS_ON_TOP: ConfigCheck = ConfigCheck { handle: |h| &h.always_on_top, get: |c| c.always_on_top, set: |c, v| c.always_on_top = v };
+const SAVE_POSITION: ConfigCheck = ConfigCheck { handle: |h| &h.save_position, get: |c| c.save_window_position, set: |c, v| c.save_window_position = v };
+const TERMINAL_TITLES: ConfigCheck = ConfigCheck { handle: |h| &h.terminal_titles, get: |c| c.terminal_titles, set: |c, v| c.terminal_titles = v };
+const COMPACT_MODE: ConfigCheck = ConfigCheck { handle: |h| &h.compact_mode, get: |c| c.compact_mode, set: |c, v| c.compact_mode = v };
+const IDLE_AWAKE: ConfigCheck = ConfigCheck { handle: |h| &h.idle_awake, get: |c| c.idle_awake, set: |c, v| c.idle_awake = v };
+const CONTEXT_ALERT: ConfigCheck = ConfigCheck { handle: |h| &h.context_alert, get: |c| c.tray_context_alert_enabled, set: |c, v| c.tray_context_alert_enabled = v };
+const HIGH_ALERT: ConfigCheck = ConfigCheck { handle: |h| &h.high_alert, get: |c| c.high_alert, set: |c, v| c.high_alert = v };
+
+const CONFIG_CHECKS: [ConfigCheck; 7] = [ALWAYS_ON_TOP, SAVE_POSITION, TERMINAL_TITLES, COMPACT_MODE, IDLE_AWAKE, CONTEXT_ALERT, HIGH_ALERT];
+
+/// Write `value` into the check's config field, persist it, tick the tray item
+/// and tell the frontend. The tick is set here rather than left to
+/// `sync_config_checks`, since `config_watcher` skips the write `save_to_disk`
+/// just made.
+fn set_config_check(app: &AppHandle, check: ConfigCheck, value: bool) {
+    if let Some(state) = app.try_state::<ConfigState>() {
+        state.with_mut(|c| (check.set)(c, value));
+        let _ = state.save_to_disk();
+    }
+    if let Some(handles) = app.try_state::<TrayHandles>() {
+        let _ = (check.handle)(&handles).set_checked(value);
+    }
+    emit_config_updated(app);
+}
+
+/// Flip the check's config field from its current value, returning false where
+/// no config is managed and nothing was flipped.
+fn toggle_config_check(app: &AppHandle, check: ConfigCheck) -> bool {
+    let Some(state) = app.try_state::<ConfigState>() else { return false };
+    let new_state = !(check.get)(&state.snapshot());
+    set_config_check(app, check, new_state);
+    true
+}
+
 /// Tray menu item handles kept in managed state so menu handlers can update
 /// check-marks after toggling the underlying setting.
 pub struct TrayHandles {
@@ -101,13 +165,12 @@ pub struct TrayHandles {
 pub fn setup(app: &AppHandle) -> tauri::Result<()> {
     let show_hide = MenuItem::with_id(app, MENU_SHOW_HIDE, "Show / Hide", true, None::<&str>)?;
 
-    let (aot_initial, save_pos_initial, auto_resize_initial, term_titles_initial, compact_mode_initial) = app
-        .try_state::<ConfigState>()
-        .map(|s| {
-            let c = s.snapshot();
-            (c.always_on_top, c.save_window_position, c.auto_resize, c.terminal_titles, c.compact_mode)
-        })
-        .unwrap_or((true, false, AutoResize::None, true, false));
+    let cfg_initial = app.try_state::<ConfigState>().map(|s| s.snapshot()).unwrap_or_default();
+    let auto_resize_initial = cfg_initial.auto_resize;
+    let aot_initial = (ALWAYS_ON_TOP.get)(&cfg_initial);
+    let save_pos_initial = (SAVE_POSITION.get)(&cfg_initial);
+    let term_titles_initial = (TERMINAL_TITLES.get)(&cfg_initial);
+    let compact_mode_initial = (COMPACT_MODE.get)(&cfg_initial);
     let always_on_top = CheckMenuItem::with_id(
         app, MENU_ALWAYS_ON_TOP, "Always on top", true, aot_initial, None::<&str>,
     )?;
@@ -224,26 +287,17 @@ pub fn setup(app: &AppHandle) -> tauri::Result<()> {
         .items(&[&lid_awake_on_battery, &lid_awake_always])
         .build()?;
 
-    let idle_awake_initial = app
-        .try_state::<ConfigState>()
-        .map(|s| s.snapshot().idle_awake)
-        .unwrap_or(true);
+    let idle_awake_initial = (IDLE_AWAKE.get)(&cfg_initial);
     let idle_awake = CheckMenuItem::with_id(
         app, MENU_IDLE_AWAKE, "Keep awake while working", true, idle_awake_initial, None::<&str>,
     )?;
 
-    let context_alert_initial = app
-        .try_state::<ConfigState>()
-        .map(|s| s.snapshot().tray_context_alert_enabled)
-        .unwrap_or(true);
+    let context_alert_initial = (CONTEXT_ALERT.get)(&cfg_initial);
     let context_alert = CheckMenuItem::with_id(
         app, MENU_CONTEXT_ALERT, "Show high context usage", true, context_alert_initial, None::<&str>,
     )?;
 
-    let high_alert_initial = app
-        .try_state::<ConfigState>()
-        .map(|s| s.snapshot().high_alert)
-        .unwrap_or(false);
+    let high_alert_initial = (HIGH_ALERT.get)(&cfg_initial);
     let high_alert = CheckMenuItem::with_id(
         app, MENU_HIGH_ALERT, "High alert", true, high_alert_initial, None::<&str>,
     )?;
@@ -440,56 +494,24 @@ fn toggle_always_on_top(app: &AppHandle) {
     };
     let new_state = !window.is_always_on_top().unwrap_or(false);
     let _ = window.set_always_on_top(new_state);
-    if let Some(state) = app.try_state::<ConfigState>() {
-        state.with_mut(|c| c.always_on_top = new_state);
-        let _ = state.save_to_disk();
-    }
-    if let Some(handles) = app.try_state::<TrayHandles>() {
-        let _ = handles.always_on_top.set_checked(new_state);
-    }
-    emit_config_updated(app);
+    set_config_check(app, ALWAYS_ON_TOP, new_state);
 }
 
 fn toggle_save_position(app: &AppHandle) {
-    let Some(state) = app.try_state::<ConfigState>() else {
-        return;
-    };
-    let new_state = !state.snapshot().save_window_position;
-    state.with_mut(|c| c.save_window_position = new_state);
-    let _ = state.save_to_disk();
-    if let Some(handles) = app.try_state::<TrayHandles>() {
-        let _ = handles.save_position.set_checked(new_state);
-    }
-    emit_config_updated(app);
+    toggle_config_check(app, SAVE_POSITION);
 }
 
 fn toggle_terminal_titles(app: &AppHandle) {
-    let Some(state) = app.try_state::<ConfigState>() else {
+    if !toggle_config_check(app, TERMINAL_TITLES) {
         return;
-    };
-    let new_state = !state.snapshot().terminal_titles;
-    state.with_mut(|c| c.terminal_titles = new_state);
-    let _ = state.save_to_disk();
-    if let Some(handles) = app.try_state::<TrayHandles>() {
-        let _ = handles.terminal_titles.set_checked(new_state);
     }
-    emit_config_updated(app);
     // Apply immediately: the sync inside re-pushes titles on enable and
     // blanks them on disable, instead of waiting for the next state change.
     crate::commands::emit_sessions_updated(app);
 }
 
 fn toggle_compact_mode(app: &AppHandle) {
-    let Some(state) = app.try_state::<ConfigState>() else {
-        return;
-    };
-    let new_state = !state.snapshot().compact_mode;
-    state.with_mut(|c| c.compact_mode = new_state);
-    let _ = state.save_to_disk();
-    if let Some(handles) = app.try_state::<TrayHandles>() {
-        let _ = handles.compact_mode.set_checked(new_state);
-    }
-    emit_config_updated(app);
+    toggle_config_check(app, COMPACT_MODE);
 }
 
 fn select_auto_resize_mode(app: &AppHandle, mode: AutoResize) {
@@ -672,14 +694,9 @@ pub fn sync_lid_awake_state(app: &AppHandle, mode: LidAwakeMode, manual_remainin
 }
 
 fn toggle_idle_awake(app: &AppHandle) {
-    let Some(state) = app.try_state::<ConfigState>() else { return };
-    let new_state = !state.snapshot().idle_awake;
-    state.with_mut(|c| c.idle_awake = new_state);
-    let _ = state.save_to_disk();
-    if let Some(handles) = app.try_state::<TrayHandles>() {
-        let _ = handles.idle_awake.set_checked(new_state);
+    if !toggle_config_check(app, IDLE_AWAKE) {
+        return;
     }
-    emit_config_updated(app);
     // Take or drop the assertion now rather than at the next tick. The config
     // watcher cannot do it for us: it skips a write whose serialized value it
     // already holds, which is exactly the write `save_to_disk` just made.
@@ -687,31 +704,18 @@ fn toggle_idle_awake(app: &AppHandle) {
 }
 
 fn toggle_context_alert(app: &AppHandle) {
-    let Some(state) = app.try_state::<ConfigState>() else { return };
-    let new_state = !state.snapshot().tray_context_alert_enabled;
-    state.with_mut(|c| c.tray_context_alert_enabled = new_state);
-    let _ = state.save_to_disk();
-    if let Some(handles) = app.try_state::<TrayHandles>() {
-        let _ = handles.context_alert.set_checked(new_state);
+    if !toggle_config_check(app, CONTEXT_ALERT) {
+        return;
     }
-    emit_config_updated(app);
     // Repaint the icon immediately so the alert appears/clears without waiting
     // for the next usage poll or state change.
     crate::tray_badge::refresh(app);
 }
 
 fn toggle_high_alert(app: &AppHandle) {
-    let Some(state) = app.try_state::<ConfigState>() else { return };
-    let new_state = !state.snapshot().high_alert;
-    state.with_mut(|c| c.high_alert = new_state);
-    let _ = state.save_to_disk();
-    if let Some(handles) = app.try_state::<TrayHandles>() {
-        let _ = handles.high_alert.set_checked(new_state);
-    }
     // The notification reconciler reads `high_alert` from the config snapshot
-    // on its next tick, so persisting is enough — no immediate refresh needed
-    // (unlike the tray badge / context alert, which repaint the icon).
-    emit_config_updated(app);
+    // on its next tick, so persisting is enough.
+    toggle_config_check(app, HIGH_ALERT);
 }
 
 /// Fit the tray badge to whether the plan has a 5h limit: without one, the two
