@@ -1288,10 +1288,10 @@ pub fn emit_sessions_updated(app: &AppHandle) {
     // The ticket rides with the snapshot to both publishers that order
     // themselves against other emits — `terminal_title::sync` for tab titles and
     // `publish_sessions` for the frontend; see `AppState::snapshot_versioned`.
-    // Nothing here serializes the emits themselves: a
-    // lock held across this body would cover `tray_badge::refresh` and
-    // `lid_awake::sync`, both of which block on the Tauri main thread, while the
-    // main thread reaches this same function through `set_chat_name`,
+    // Nothing here serializes the emits themselves: a lock held across this body
+    // would cover `tray_badge::refresh` and `lid_awake::sync`, both of which
+    // block on the Tauri main thread, while the main thread reaches this same
+    // function through `set_chat_name`,
     // `attention::observe` and the tray menu — which is a mutual wait that
     // freezes the app, measured and rejected on 2026-09-18.
     let (seq, sessions) = display_snapshot_versioned(app);

@@ -106,8 +106,8 @@ pub struct TerminalTitles {
     /// stale snapshot stays wrong until some later emit happens to move it —
     /// three minutes, on the occasion this was measured. The frontend payload has
     /// the same exposure through a quiet stretch and orders on the same ticket
-    /// (`commands::publish_sessions`). Two emits therefore have
-    /// to agree on which of them is newer, and a title cache cannot answer that:
+    /// (`commands::publish_sessions`). Two emits therefore have to agree on
+    /// which of them is newer, and a title cache cannot answer that:
     /// it compares a title against the one it last wrote, never against when the
     /// row behind it was read.
     applied: Mutex<u64>,
