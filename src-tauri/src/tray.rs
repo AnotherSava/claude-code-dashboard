@@ -75,6 +75,9 @@ pub fn sync_config_checks(app: &AppHandle, cfg: &Config) {
     sync_auto_resize_checks(app, cfg.auto_resize);
     sync_history_font_checks(app, cfg.history_font_size);
     sync_tray_badge_checks(app, cfg.tray_badge);
+    // Reads `start_minimized` from `ConfigState`, which `config_watcher` has
+    // already replaced with `cfg` before calling here.
+    sync_autostart_checks(app);
 }
 
 /// One boolean `config.json` field and the tray check-mark that mirrors it.
