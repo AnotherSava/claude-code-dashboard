@@ -234,6 +234,12 @@
     return `${pad(d.getHours())}:${pad(d.getMinutes())}`
   }
 
+  // One prompt recorded twice arrives as two identical user entries 9-41ms
+  // apart (measured in prompt_history.json, every case an agent message); a
+  // prompt the user genuinely sent twice is seconds apart (2.3s at the
+  // closest), so the window separates the two and a repeat stays visible.
+  const DUPLICATE_WINDOW_MS = 1000
+
   function deduplicatedDialog(): DialogEntry[] {
     if (!session && persisted.length === 0) return []
     const d = session ? session.dialog : persisted
@@ -241,8 +247,7 @@
       if (entry.role !== 'user') return true
       const next = d[i + 1]
       if (!next || next.role !== 'user') return true
-      const prefixLen = Math.min(entry.text.length, 10)
-      return entry.text.slice(0, prefixLen) !== next.text.slice(0, prefixLen)
+      return entry.text !== next.text || next.timestamp - entry.timestamp >= DUPLICATE_WINDOW_MS
     })
   }
 
