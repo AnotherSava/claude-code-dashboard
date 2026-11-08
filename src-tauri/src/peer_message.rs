@@ -594,6 +594,11 @@ pub enum AgentMessage {
         /// Whether the header carries [`REPLY_LINE`]: the sender answered a
         /// message this row's agent sent.
         is_reply: bool,
+        /// `<agent> on <device>` off the header's sender line. The claimed and
+        /// the attested form read alike here, so a reader of this value cannot
+        /// tell an `UNVERIFIED` sender from one whose device was attested; the
+        /// agent half is never checked in either.
+        sender: Option<String>,
         body: String,
     },
 }
@@ -603,6 +608,16 @@ impl AgentMessage {
     pub fn body(&self) -> &str {
         match self {
             AgentMessage::Local { body, .. } | AgentMessage::Relayed { body, .. } => body,
+        }
+    }
+
+    /// Who sent the message, as its envelope names them: the `from-name` of a
+    /// local `SendMessage`, or a relay's sender line. `None` where the envelope
+    /// names nobody.
+    pub fn sender(&self) -> Option<&str> {
+        match self {
+            AgentMessage::Local { name, .. } => name.as_deref(),
+            AgentMessage::Relayed { sender, .. } => sender.as_deref(),
         }
     }
 
@@ -700,7 +715,7 @@ fn parse_relayed(prompt: &str) -> Option<AgentMessage> {
     }
     let header = &prompt[..at];
     let task = header.split_once(TASK_LINE).map(|(_, t)| t.split('\n').next().unwrap_or("")).map(|t| t.split_once(REPLY_LINE).map_or(t, |(t, _)| t).trim()).filter(|t| !t.is_empty()).map(str::to_string);
-    Some(AgentMessage::Relayed { task, is_reply: header.contains(REPLY_LINE), body: body.trim().to_string() })
+    Some(AgentMessage::Relayed { task, is_reply: header.contains(REPLY_LINE), sender: header_sender(header), body: body.trim().to_string() })
 }
 
 /// The relay envelope inside a [`RELAY_WRAP_OPEN`] wrapper, the prompt itself
@@ -726,6 +741,18 @@ fn wrap_name(agent: &str, device: &str) -> String {
 /// with one of them, as the envelopes written before the fence did.
 const SENDER_LINES: [&str; 2] = ["Claimed sender: agent \"", "Sender: agent \""];
 
+/// The sender line of a relay's header, read as `<agent> on <device>`. Found
+/// by substring rather than by line, so the whitespace-collapsed copy reads the
+/// same. Both values went through [`header_safe`], so neither can hold the `"`
+/// the line is split on, and no other header field can carry a sender line's
+/// opening quote.
+fn header_sender(header: &str) -> Option<String> {
+    let rest = SENDER_LINES.iter().filter_map(|p| header.find(p).map(|at| &header[at + p.len()..])).next()?;
+    let (agent, rest) = rest.split_once("\" on device \"")?;
+    let (device, _) = rest.split_once('"')?;
+    Some(format!("{agent} on {device}"))
+}
+
 /// An envelope written before the fence existed, which older histories still
 /// hold: the preamble, a header opening on one of [`SENDER_LINES`], a blank
 /// line, and the sender's text, with no task line and no trailer. The sender
@@ -738,7 +765,7 @@ fn parse_pre_fence(after_preamble: &str) -> Option<AgentMessage> {
         return None;
     }
     let body = header.split_once("\n\n").map_or("", |(_, b)| b);
-    Some(AgentMessage::Relayed { task: None, is_reply: false, body: body.trim().to_string() })
+    Some(AgentMessage::Relayed { task: None, is_reply: false, sender: header_sender(header), body: body.trim().to_string() })
 }
 
 /// Whether the copy of a relay's `from_task` read back off the envelope header
@@ -1407,6 +1434,36 @@ mod tests {
         assert_ne!(ids.next(), ids.next(), "a second send inside the same millisecond still differs");
     }
 
+    /// The history window names a relay's sender off the header's sender line,
+    /// in both its claimed and its attested form, and takes the body from inside
+    /// the fence alone.
+    #[test]
+    fn a_relay_names_its_sender_from_the_sender_line() {
+        for attestation in [crate::tailnet::Attestation::Claimed, crate::tailnet::Attestation::Attested] {
+            let content = build_content(&Relayed { attestation, ..relayed("claude", "pull the repo", Some("air/claude")) });
+            let message = parse_agent_message(&content).expect("a built relay parses");
+            assert_eq!(message.sender(), Some("claude on air"), "{content}");
+            assert_eq!(message.body(), "pull the repo");
+        }
+    }
+
+    #[test]
+    fn a_local_message_names_its_sender() {
+        let local = parse_agent_message(LOCAL_ENVELOPE).expect("a local envelope parses");
+        assert_eq!(local.sender(), Some("claude-db"));
+    }
+
+    #[test]
+    fn dialog_messages_index_only_the_agent_written_prompts() {
+        use crate::state::{DialogEntry, DialogRole, Status};
+        let entry = |role, text: &str| DialogEntry { role, text: text.to_string(), timestamp: 0, status: Status::Done, task_start: false, boundary: None };
+        let relay = build_content(&relayed("claude", "pull the repo", Some("air/claude")));
+        let dialog = [entry(DialogRole::User, "fix the bug"), entry(DialogRole::Assistant, &relay), entry(DialogRole::User, &relay), entry(DialogRole::User, LOCAL_ENVELOPE)];
+        let found = crate::state::dialog_messages(&dialog);
+        assert_eq!(found.iter().map(|m| (m.index, m.sender.as_deref())).collect::<Vec<_>>(), [(2, Some("claude on air")), (3, Some("claude-db"))]);
+        assert_eq!(found[0].body, "pull the repo");
+    }
+
     fn relayed<'a>(agent: &'a str, text: &'a str, reply_to: Option<&'a str>) -> Relayed<'a> {
         Relayed {
             origin_device: "air",
@@ -1740,13 +1797,13 @@ mod tests {
     fn a_relayed_message_reads_back_what_build_content_wrote() {
         let r = Relayed { from_task: Some("add a title-bar caption to agwinterm"), in_reply_to: Some("chrome-7-1"), ..relayed("tauri-dashboard", "placeholder body\nsecond line", Some("chrome/tauri-dashboard")) };
         let content = build_content(&r);
-        let expected = AgentMessage::Relayed { task: Some("add a title-bar caption to agwinterm".into()), is_reply: true, body: "placeholder body\nsecond line".into() };
+        let expected = AgentMessage::Relayed { task: Some("add a title-bar caption to agwinterm".into()), is_reply: true, sender: Some("tauri-dashboard on air".into()), body: "placeholder body\nsecond line".into() };
         assert_eq!(parse_agent_message(&content), Some(expected));
         // Collapsed, the reply line that follows the task is what ends it.
         let collapsed = content.split_whitespace().collect::<Vec<_>>().join(" ");
-        assert_eq!(parse_agent_message(&collapsed), Some(AgentMessage::Relayed { task: Some("add a title-bar caption to agwinterm".into()), is_reply: true, body: "placeholder body second line".into() }));
+        assert_eq!(parse_agent_message(&collapsed), Some(AgentMessage::Relayed { task: Some("add a title-bar caption to agwinterm".into()), is_reply: true, sender: Some("tauri-dashboard on air".into()), body: "placeholder body second line".into() }));
         // No task recorded by the sending dashboard, and no message answered.
-        let Some(AgentMessage::Relayed { task, is_reply, body }) = parse_agent_message(&build_content(&relayed("x", "hi", None))) else { panic!("relayed") };
+        let Some(AgentMessage::Relayed { task, is_reply, body, .. }) = parse_agent_message(&build_content(&relayed("x", "hi", None))) else { panic!("relayed") };
         assert_eq!((task, is_reply, body.as_str()), (None, false, "hi"));
     }
 
@@ -1802,7 +1859,7 @@ mod tests {
         let content = build_content(&Relayed { from_task: Some("re-shoot the macOS figures"), ..relayed("what-is-next", "please pull", None) });
         assert!(content.starts_with("<cross-session-message from-name=\"what-is-next on air\">\n[cross-machine message"), "{content}");
         assert!(content.trim_end().ends_with(LOCAL_MESSAGE_CLOSE));
-        let expected = Some(AgentMessage::Relayed { task: Some("re-shoot the macOS figures".into()), is_reply: false, body: "please pull".into() });
+        let expected = Some(AgentMessage::Relayed { task: Some("re-shoot the macOS figures".into()), is_reply: false, sender: Some("what-is-next on air".into()), body: "please pull".into() });
         assert_eq!(parse_agent_message(&content), expected);
         let unwrapped = content.strip_prefix("<cross-session-message from-name=\"what-is-next on air\">\n").and_then(|c| c.trim_end().strip_suffix(LOCAL_MESSAGE_CLOSE)).expect("wrapped");
         assert_eq!(parse_agent_message(unwrapped), expected, "an envelope stored before the wrapper");
@@ -1844,9 +1901,9 @@ mod tests {
     #[test]
     fn a_pre_fence_envelope_still_reads_as_a_relayed_message() {
         let old = format!("{RELAY_PREAMBLE}\nSender: agent \"claude\" on device \"CHROME\".\n\nplease pull the dashboard repo");
-        assert_eq!(parse_agent_message(&old), Some(AgentMessage::Relayed { task: None, is_reply: false, body: "please pull the dashboard repo".into() }));
+        assert_eq!(parse_agent_message(&old), Some(AgentMessage::Relayed { task: None, is_reply: false, sender: Some("claude on CHROME".into()), body: "please pull the dashboard repo".into() }));
         let collapsed = old.split_whitespace().collect::<Vec<_>>().join(" ");
-        assert_eq!(parse_agent_message(&collapsed), Some(AgentMessage::Relayed { task: None, is_reply: false, body: String::new() }), "collapsed, nothing splits the text off");
+        assert_eq!(parse_agent_message(&collapsed), Some(AgentMessage::Relayed { task: None, is_reply: false, sender: Some("claude on CHROME".into()), body: String::new() }), "collapsed, nothing splits the text off");
     }
 
     /// The header copy of `from_task` is redacted and quote-stripped for the

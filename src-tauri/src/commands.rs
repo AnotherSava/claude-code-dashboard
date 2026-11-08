@@ -162,6 +162,7 @@ pub(crate) fn display_snapshot_versioned(app: &AppHandle) -> (u64, Vec<AgentSess
     for s in sessions.iter_mut() {
         s.row_line = s.row_line();
         s.task_lines = s.task_lines();
+        s.dialog_messages = crate::state::dialog_messages(&s.dialog);
     }
     (seq, sessions)
 }
@@ -1291,9 +1292,9 @@ pub fn emit_sessions_updated(app: &AppHandle) {
     // Nothing here serializes the emits themselves: a lock held across this body
     // would cover `tray_badge::refresh` and `lid_awake::sync`, both of which
     // block on the Tauri main thread, while the main thread reaches this same
-    // function through `set_chat_name`,
-    // `attention::observe` and the tray menu — which is a mutual wait that
-    // freezes the app, measured and rejected on 2026-09-18.
+    // function through `set_chat_name`, `attention::observe` and the tray menu
+    // — which is a mutual wait that freezes the app, measured and rejected on
+    // 2026-09-18.
     let (seq, sessions) = display_snapshot_versioned(app);
     // Every state transition flows through this emit, so it doubles as the
     // single trigger for terminal tab-title reconciliation — the tab tracks
@@ -1439,11 +1440,18 @@ pub fn reveal_main(app: &AppHandle) {
 /// upserts the assistant's reply into the row before it is written out. This is
 /// the fallback, not the source.
 #[tauri::command]
-pub fn get_persisted_dialog(id: String, app: AppHandle) -> Vec<crate::state::DialogEntry> {
-    app.try_state::<PromptHistoryStore>()
-        .and_then(|store| store.get(&id))
-        .map(|s| s.dialog)
-        .unwrap_or_default()
+pub fn get_persisted_dialog(id: String, app: AppHandle) -> PersistedDialog {
+    let dialog = app.try_state::<PromptHistoryStore>().and_then(|store| store.get(&id)).map(|s| s.dialog).unwrap_or_default();
+    let messages = crate::state::dialog_messages(&dialog);
+    PersistedDialog { dialog, messages }
+}
+
+/// A row's stored dialog for the history window, with its agent messages read
+/// out as a live row's are on `AgentSession::dialog_messages`.
+#[derive(serde::Serialize)]
+pub struct PersistedDialog {
+    dialog: Vec<crate::state::DialogEntry>,
+    messages: Vec<crate::state::DialogMessage>,
 }
 
 #[cfg(test)]

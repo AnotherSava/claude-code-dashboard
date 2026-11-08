@@ -3,7 +3,7 @@
   import { invoke } from '@tauri-apps/api/core'
   import { listen, type UnlistenFn } from '@tauri-apps/api/event'
   import { closeWindow, getConfig, getPersistedDialog, getSessions, onConfigUpdated, onHistoryLoading, onSessionsUpdated, setHistoryFontSize } from './lib/api'
-  import type { AgentSession, DialogEntry, HistoryFontSize } from './lib/types'
+  import type { AgentSession, DialogEntry, DialogMessage, HistoryFontSize, PersistedDialog } from './lib/types'
 
   const SIZE_ORDER: HistoryFontSize[] = ['smallest', 'small', 'regular', 'large', 'largest']
   const SIZE_PX: Record<HistoryFontSize, number> = { smallest: 11, small: 12, regular: 14, large: 16, largest: 18 }
@@ -140,9 +140,10 @@
 
   let sessionId = $state<string | null>(null)
   let session = $state<AgentSession | null>(null)
+  const NO_PERSISTED: PersistedDialog = { dialog: [], messages: [] }
   // The stored dialog, used only when no live row exists for this id. Cleared
   // the moment one does, so a live session is never rendered from a stale copy.
-  let persisted = $state<DialogEntry[]>([])
+  let persisted = $state<PersistedDialog>(NO_PERSISTED)
   let fontSize = $state<HistoryFontSize>('regular')
   let error = $state<string | null>(null)
   // Session id whose remote-dialog catch-up fetch is in flight (see
@@ -168,9 +169,9 @@
         // the hook stream, so every conversation is unreadable after a restart
         // until its session next acts — while the dialog sits complete on disk.
         persisted = await getPersistedDialog(id)
-        error = persisted.length ? null : `session "${id}" not found`
+        error = persisted.dialog.length ? null : `session "${id}" not found`
       } else {
-        persisted = []
+        persisted = NO_PERSISTED
       }
     } catch (e) {
       error = String(e)
@@ -200,14 +201,14 @@
           // Resolve first, decide after. Setting the error up front and clearing
           // it when the fetch lands would flash "session removed" over a
           // conversation that was never gone.
-          if (persisted.length === 0) {
+          if (persisted.dialog.length === 0) {
             getPersistedDialog(sessionId).then((d) => {
               persisted = d
-              if (d.length === 0) error = 'session removed'
+              if (d.dialog.length === 0) error = 'session removed'
             })
           }
         } else {
-          persisted = []
+          persisted = NO_PERSISTED
         }
       })
 
@@ -240,15 +241,24 @@
   // closest), so the window separates the two and a repeat stays visible.
   const DUPLICATE_WINDOW_MS = 1000
 
-  function deduplicatedDialog(): DialogEntry[] {
-    if (!session && persisted.length === 0) return []
-    const d = session ? session.dialog : persisted
-    return d.filter((entry, i) => {
-      if (entry.role !== 'user') return true
+  interface ShownEntry {
+    entry: DialogEntry
+    // Set where another agent wrote the prompt: shown as its sender and body,
+    // with the envelope's routing text left out.
+    message?: DialogMessage
+  }
+
+  function deduplicatedDialog(): ShownEntry[] {
+    if (!session && persisted.dialog.length === 0) return []
+    const d = session ? session.dialog : persisted.dialog
+    const messages = new Map((session ? session.dialog_messages ?? [] : persisted.messages).map((m) => [m.index, m]))
+    const shown: ShownEntry[] = []
+    d.forEach((entry, i) => {
       const next = d[i + 1]
-      if (!next || next.role !== 'user') return true
-      return entry.text !== next.text || next.timestamp - entry.timestamp >= DUPLICATE_WINDOW_MS
+      const duplicate = entry.role === 'user' && next?.role === 'user' && entry.text === next.text && next.timestamp - entry.timestamp < DUPLICATE_WINDOW_MS
+      if (!duplicate) shown.push({ entry, message: messages.get(i) })
     })
+    return shown
   }
 
   let dialog = $derived(deduplicatedDialog())
@@ -287,23 +297,24 @@
 
 {#if error}
   <div class="msg">{error}</div>
-{:else if session || persisted.length > 0}
+{:else if session || persisted.dialog.length > 0}
   {#if catchingUp && dialog.length > 0}
     <div class="loading-banner">Loading full history...</div>
   {/if}
   <div class="entries" bind:this={entriesEl} onscroll={onEntriesScroll} style:font-size="{SIZE_PX[fontSize]}px">
     <div class="entries-inner">
-      {#each dialog as entry, i}
+      {#each dialog as { entry, message }, i}
         {#if entry.role === 'separator'}
           <div class="separator"><hr /></div>
         {:else}
-          {@const lines = entry.text.split('\n')}
+          {@const lines = (message ? message.body : entry.text).split('\n')}
           {@const fold = expanded.has(i) ? null : computeFold(lines)}
           {@const displayLines = fold ? [...fold.head, '\x00collapse', ...fold.tail] : lines}
           {@const segments = segmentLines(displayLines)}
-          <div class="entry" class:sticky={entry.task_start} class:assistant={entry.role === 'assistant'}>
+          <div class="entry" class:sticky={entry.task_start} class:assistant={entry.role === 'assistant'} class:agent={message !== undefined}>
             <span class="ts">{formatClock(entry.timestamp)}</span>
             <span class="text">
+              {#if message}<span class="sender">{message.sender ? `from ${message.sender}` : 'from another agent'}</span>{/if}
               {#each segments as seg}
                 {#if seg.kind === 'table' && seg.table}
                   <table class="box-table">
@@ -408,6 +419,14 @@
   .box-table th {
     opacity: 0.7;
     font-weight: 500;
+  }
+  .agent .text {
+    color: #9ccfd8;
+  }
+  .sender {
+    display: block;
+    color: #6b9aa3;
+    font-size: 0.9em;
   }
   .assistant .text {
     font-style: italic;

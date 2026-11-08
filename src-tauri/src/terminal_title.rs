@@ -107,9 +107,9 @@ pub struct TerminalTitles {
     /// three minutes, on the occasion this was measured. The frontend payload has
     /// the same exposure through a quiet stretch and orders on the same ticket
     /// (`commands::publish_sessions`). Two emits therefore have to agree on
-    /// which of them is newer, and a title cache cannot answer that:
-    /// it compares a title against the one it last wrote, never against when the
-    /// row behind it was read.
+    /// which of them is newer, and a title cache cannot answer that: it compares
+    /// a title against the one it last wrote, never against when the row behind
+    /// it was read.
     applied: Mutex<u64>,
     /// Consecutive failed writes per row — no console would attach, or one did
     /// and refused the title — which decides when [`sync`] asks for a retry pass
@@ -1774,6 +1774,7 @@ mod tests {
             name_shared_by: None,
             row_line: None,
             task_lines: Vec::new(),
+            dialog_messages: Vec::new(),
             subagent_gate: None,
             terminal_stale_at: None,
         }

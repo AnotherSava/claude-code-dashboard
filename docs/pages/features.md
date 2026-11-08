@@ -146,7 +146,7 @@ The row shows the session's live context usage, updated as Claude works. The cou
 
 ## History window
 
-Hover a session row for a quick tooltip listing its task prompts so far — one per line, with the current task marked. For the whole story, click the text below a session's name to open a History window — a chronological recap of your prompts and Claude's reply to each, with a separator marking the start of a new session. Useful for scrolling back through a long-running conversation without leaving the dashboard. The window opens maximized on the dashboard's screen; with **Save window position** enabled it reopens where you last left it.
+Hover a session row for a quick tooltip listing its task prompts so far — one per line, with the current task marked. For the whole story, click the text below a session's name to open a History window — a chronological recap of your prompts and Claude's reply to each, with a separator marking the start of a new session. A message another agent sent the session shows in its own colour, as the name the sender gave and what they wrote, without the routing text around it. Useful for scrolling back through a long-running conversation without leaving the dashboard. The window opens maximized on the dashboard's screen; with **Save window position** enabled it reopens where you last left it.
 
 {% include figure.html id="history-window" alt="The History window, showing prompts and Claude's replies in order" %}
 

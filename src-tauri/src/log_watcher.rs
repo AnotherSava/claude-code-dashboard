@@ -1179,6 +1179,7 @@ mod tests {
             name_shared_by: None,
             row_line: None,
             task_lines: Vec::new(),
+            dialog_messages: Vec::new(),
             subagent_gate: None,
             terminal_stale_at: None,
         }

@@ -1,7 +1,7 @@
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow'
-import type { AgentSession, Config, DialogEntry, SetupState, TokenWeekChart, UsageLimits } from './types'
+import type { AgentSession, Config, PersistedDialog, SetupState, TokenWeekChart, UsageLimits } from './types'
 
 export function getSessions(): Promise<AgentSession[]> {
   return invoke<AgentSession[]>('get_sessions')
@@ -185,6 +185,6 @@ export function onHistoryLoading(
 // conversation that is complete on disk — a session the restore could not vouch
 // for, one on a platform with no terminal adapter, or simply one that has ended —
 // and without this the history window would have nothing to show for any of them.
-export function getPersistedDialog(id: string): Promise<DialogEntry[]> {
-  return invoke<DialogEntry[]>('get_persisted_dialog', { id })
+export function getPersistedDialog(id: string): Promise<PersistedDialog> {
+  return invoke<PersistedDialog>('get_persisted_dialog', { id })
 }

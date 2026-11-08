@@ -71,6 +71,22 @@ export interface AgentSession {
   // task line does, never as the envelope its dialog entry holds. Stamped by the
   // Rust display path beside `row_line`.
   task_lines?: TaskLine[]
+  // `AgentSession::dialog_messages` in Rust: the dialog's prompts another agent
+  // wrote, read out of their envelopes there so the grammar has one parser.
+  // Stamped by the Rust display path beside `row_line`.
+  dialog_messages?: DialogMessage[]
+}
+
+export interface DialogMessage {
+  // Position of the entry in the dialog it was read from.
+  index: number
+  sender: string | null
+  body: string
+}
+
+export interface PersistedDialog {
+  dialog: DialogEntry[]
+  messages: DialogMessage[]
 }
 
 export interface RowLine {

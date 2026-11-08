@@ -197,6 +197,28 @@ pub struct DialogEntry {
     pub boundary: Option<BoundaryKind>,
 }
 
+/// A prompt in a dialog that another agent wrote: the entry it is, who sent
+/// it, and what the sender wrote with the envelope removed.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DialogMessage {
+    /// The entry's position in the dialog it was read from.
+    pub index: usize,
+    /// The sender as its envelope names it — a local session's name, or
+    /// `<agent> on <device>` for a relay — and `None` where it names none.
+    pub sender: Option<String>,
+    pub body: String,
+}
+
+/// Every user entry of `dialog` that is an agent message, in dialog order.
+pub fn dialog_messages(dialog: &[DialogEntry]) -> Vec<DialogMessage> {
+    dialog
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.role == DialogRole::User)
+        .filter_map(|(index, e)| crate::peer_message::parse_agent_message(&e.text).map(|m| DialogMessage { index, sender: m.sender().map(str::to_string), body: m.body().to_string() }))
+        .collect()
+}
+
 /// Built by the adapter, converted to a full [`DialogEntry`] by `apply_set`
 /// (which adds `timestamp` and `status`).
 #[derive(Clone, Debug)]
@@ -606,6 +628,16 @@ pub struct AgentSession {
     /// [`row_line`](Self::row_line), for the same reasons.
     #[serde(default)]
     pub task_lines: Vec<TaskLine>,
+    /// The dialog's prompts that another agent wrote, read out of their
+    /// envelopes, the [`dialog_messages`] verdict over `dialog`. The history
+    /// window shows each as its sender and body, the routing text hidden, and
+    /// reads it here because the envelope grammar lives in `peer_message` and a
+    /// second parser in TypeScript would drift from it.
+    ///
+    /// Empty in `AppState` and stamped by `commands::display_snapshot` beside
+    /// [`row_line`](Self::row_line), for the same reasons.
+    #[serde(default)]
+    pub dialog_messages: Vec<DialogMessage>,
     /// The subagent permission prompts open on this row, and the main agent's
     /// own state underneath them. `None` whenever no subagent is waiting on a
     /// dialog, which is nearly always.
@@ -1645,6 +1677,7 @@ fn new_session(
         name_shared_by: None,
         row_line: None,
         task_lines: Vec::new(),
+        dialog_messages: Vec::new(),
         subagent_gate: None,
     };
     (session, has_new_entry || dialog_restored)
@@ -3575,6 +3608,7 @@ why did this become the task?");
             name_shared_by: None,
             row_line: None,
             task_lines: Vec::new(),
+            dialog_messages: Vec::new(),
             subagent_gate: None,
         });
     }
@@ -3854,6 +3888,7 @@ why did this become the task?");
             name_shared_by: None,
             row_line: None,
             task_lines: Vec::new(),
+            dialog_messages: Vec::new(),
             subagent_gate: None,
         }
     }
