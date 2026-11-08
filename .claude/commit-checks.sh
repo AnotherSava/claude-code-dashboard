@@ -30,8 +30,18 @@
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
-echo "==> python ~/.claude/conventions/check.py ."
-python ~/.claude/conventions/check.py .
+# The steps that read `~/.claude` need the developer's dotfiles, which a
+# contributor's clone has none of. Where the whole tree is missing they print
+# NOT COVERED rather than failing on a path the contributor was never meant to
+# have. The test is on the parent directories and never on the files the steps
+# run, so a script the dotfiles rename or drop still fails the gate, which is
+# the failure the skill-script check exists to catch.
+if [ -d ~/.claude/conventions ]; then
+  echo "==> python ~/.claude/conventions/check.py ."
+  python ~/.claude/conventions/check.py .
+else
+  echo "==> conventions check: NOT COVERED — ~/.claude/conventions is absent, so the adopted conventions were not measured"
+fi
 
 echo "==> npm run check"
 npm run check
@@ -90,8 +100,12 @@ npm run build
 # path, which surfaces only at the shutter, after a window has been staged. It
 # runs before the figure check because a capture that cannot run at all is a
 # worse finding than a figure that has drifted.
-echo "==> python docs/screenshots/check-skill-scripts.py"
-python docs/screenshots/check-skill-scripts.py
+if [ -d ~/.claude/skills ]; then
+  echo "==> python docs/screenshots/check-skill-scripts.py"
+  python docs/screenshots/check-skill-scripts.py
+else
+  echo "==> check-skill-scripts.py: NOT COVERED — ~/.claude/skills is absent, so the capture scripts' shared paths were not checked"
+fi
 
 # The same exception, one level deeper. The Windows captures dot-source the
 # skill's capture library and call its functions, parameters and [WinCapture]
@@ -101,8 +115,12 @@ python docs/screenshots/check-skill-scripts.py
 # macOS the gate says it did not run rather than passing.
 case "$OSTYPE" in
   msys*|cygwin*)
-    echo "==> pwsh check-capture-scripts.ps1"
-    pwsh -NoProfile -NonInteractive -File ~/.claude/skills/screenshot/scripts/check-capture-scripts.ps1 ;;
+    if [ -d ~/.claude/skills ]; then
+      echo "==> pwsh check-capture-scripts.ps1"
+      pwsh -NoProfile -NonInteractive -File ~/.claude/skills/screenshot/scripts/check-capture-scripts.ps1
+    else
+      echo "==> check-capture-scripts.ps1: NOT COVERED — ~/.claude/skills is absent"
+    fi ;;
   *) echo "==> check-capture-scripts.ps1: NOT COVERED on $OSTYPE — the Windows capture scripts' names are checked on Windows only" ;;
 esac
 
