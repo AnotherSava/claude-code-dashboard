@@ -102,11 +102,11 @@ pub struct TerminalTitles {
     landings: Mutex<HashMap<String, Landing>>,
     /// The newest `AppState::snapshot_versioned` ticket [`sync`] has written from.
     ///
-    /// A tab title is the one thing this dashboard publishes that outlives the
-    /// emit which wrote it: the frontend repaints on the next emit whatever
-    /// happened, but a console title just sits there, so a glyph written from a
+    /// A console title just sits there once written, so a glyph written from a
     /// stale snapshot stays wrong until some later emit happens to move it —
-    /// three minutes, on the occasion this was measured. Two emits therefore have
+    /// three minutes, on the occasion this was measured. The frontend payload has
+    /// the same exposure through a quiet stretch and orders on the same ticket
+    /// (`commands::publish_sessions`). Two emits therefore have
     /// to agree on which of them is newer, and a title cache cannot answer that:
     /// it compares a title against the one it last wrote, never against when the
     /// row behind it was read.

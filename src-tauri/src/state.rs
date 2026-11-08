@@ -1211,12 +1211,14 @@ impl AppState {
     /// It exists because a snapshot and the thing built from it are not taken and
     /// published atomically: `commands::emit_sessions_updated` reads here and then
     /// races other emits for the locks downstream, so the emit holding the *older*
-    /// snapshot could publish last. Where that publication is corrected by the
-    /// next emit, the reordering costs nothing and this is ignorable. Where it is
-    /// not — a terminal tab title outlives this process, so a wrong glyph sits
-    /// there until some later emit happens to move it, measured at three minutes
-    /// on 2026-09-18 — the consumer compares this ticket against the newest it has
-    /// applied and stands down when its own is older. See `terminal_title::sync`.
+    /// snapshot could publish last. No publication can count on the next emit to
+    /// correct it, since a quiet stretch may bring none: a terminal tab title
+    /// outlives this process, so a wrong glyph sits there until some later emit
+    /// happens to move it, measured at three minutes on 2026-09-18, and the
+    /// widget would show a stale row for as long. So each consumer compares this
+    /// ticket against the newest it has applied and stands down when its own is
+    /// older. See `terminal_title::sync` and `commands::publish_sessions`, whose
+    /// payload `onSessionsUpdated` in `src/lib/api.ts` orders on.
     pub fn snapshot_versioned(&self) -> (u64, Vec<AgentSession>) {
         let sessions = self.sessions.lock().unwrap();
         // Relaxed is enough: the ordering this establishes is the mutex's, not

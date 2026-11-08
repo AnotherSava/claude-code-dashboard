@@ -1285,9 +1285,10 @@ pub(crate) fn local_rows(sessions: &[AgentSession]) -> Vec<AgentSession> {
 }
 
 pub fn emit_sessions_updated(app: &AppHandle) {
-    // The ticket rides with the snapshot as far as the one publisher that has to
-    // order itself against other emits — see `AppState::snapshot_versioned` and
-    // `terminal_title::sync`. Nothing here serializes the emits themselves: a
+    // The ticket rides with the snapshot to both publishers that order
+    // themselves against other emits — `terminal_title::sync` for tab titles and
+    // `publish_sessions` for the frontend; see `AppState::snapshot_versioned`.
+    // Nothing here serializes the emits themselves: a
     // lock held across this body would cover `tray_badge::refresh` and
     // `lid_awake::sync`, both of which block on the Tauri main thread, while the
     // main thread reaches this same function through `set_chat_name`,
@@ -1314,7 +1315,7 @@ pub fn emit_sessions_updated(app: &AppHandle) {
     // Per-session context usage feeds the tray's context-alert border, so this
     // emit chokepoint also keeps the tray icon in step as token counts change.
     crate::tray_badge::refresh(app);
-    let _ = app.emit("sessions_updated", sessions);
+    publish_sessions(app, seq, sessions);
     // ...and it doubles again as the sync-push trigger: the pusher debounces
     // pokes and ships *local* sessions to peers. Remote-driven changes must go
     // through `emit_sessions_updated_remote` instead — the *content* of a
@@ -1332,7 +1333,25 @@ pub fn emit_sessions_updated(app: &AppHandle) {
 /// Also skips terminal-title reconciliation: remote rows never own a local
 /// terminal, and the local subset is untouched by definition.
 pub fn emit_sessions_updated_remote(app: &AppHandle) {
-    let _ = app.emit("sessions_updated", display_snapshot(app));
+    let (seq, sessions) = display_snapshot_versioned(app);
+    publish_sessions(app, seq, sessions);
+}
+
+/// Send the frontend a `sessions_updated` payload. The one place that event is
+/// emitted, so every emit carries the ticket `onSessionsUpdated` orders on.
+fn publish_sessions(app: &AppHandle, seq: u64, sessions: Vec<AgentSession>) {
+    let _ = app.emit("sessions_updated", SessionsUpdate { seq, sessions });
+}
+
+/// The `sessions_updated` payload. Two emits can be in flight at once and the
+/// one holding the older snapshot can publish last, so each carries the
+/// `AppState::snapshot_versioned` ticket and `onSessionsUpdated` in
+/// `src/lib/api.ts` drops a payload older than one it has already shown — the
+/// same ordering `terminal_title::sync` applies to tab titles.
+#[derive(serde::Serialize, Clone)]
+struct SessionsUpdate {
+    seq: u64,
+    sessions: Vec<AgentSession>,
 }
 
 pub fn emit_config_updated(app: &AppHandle) {

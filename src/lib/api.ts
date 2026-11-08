@@ -136,10 +136,19 @@ export function setWindowSize(
   return invoke('set_window_size', { label, logicalWidth, logicalHeight, recenter })
 }
 
+// Two backend emits can race, and the one holding the older snapshot can
+// arrive last. Each carries the ticket its snapshot was minted under
+// (`SessionsUpdate` in commands.rs), so an older payload than one already
+// handed over is dropped rather than shown over a newer state.
 export function onSessionsUpdated(
   handler: (sessions: AgentSession[]) => void,
 ): Promise<UnlistenFn> {
-  return listen<AgentSession[]>('sessions_updated', (evt) => handler(evt.payload))
+  let newest = 0
+  return listen<{ seq: number; sessions: AgentSession[] }>('sessions_updated', (evt) => {
+    if (evt.payload.seq < newest) return
+    newest = evt.payload.seq
+    handler(evt.payload.sessions)
+  })
 }
 
 export function onConfigUpdated(
