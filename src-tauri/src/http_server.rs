@@ -257,7 +257,7 @@ async fn post_session_command(State(app): State<AppHandle>, headers: HeaderMap, 
     let anchors = app.try_state::<ChatIdRegistry>();
     let (command, row) = match session_command::resolve(&req, &rows, |sid| anchors.as_ref().and_then(|r| r.anchored(sid))) {
         Ok(found) => found,
-        Err(r) => return refuse("", req.command.trim(), r),
+        Err((row, r)) => return refuse(&row, req.command.trim(), r),
     };
     let text = command.text();
     let Some(adapter) = crate::terminals::for_platform(&app).filter(|a| a.can_type_command()) else {

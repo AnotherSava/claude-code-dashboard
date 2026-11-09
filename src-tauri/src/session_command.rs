@@ -105,20 +105,22 @@ impl Refusal {
 /// The command and the local row a request names, or why it names none.
 /// `rows` is every row the dashboard shows, synced ones included, so a
 /// project on another machine is told so rather than reported missing.
-/// `anchored` resolves a session id to its row.
-pub fn resolve(req: &CommandRequest, rows: &[AgentSession], anchored: impl Fn(&str) -> Option<String>) -> Result<(Command, String), Refusal> {
-    let command = Command::parse(&req.command).ok_or(Refusal::UnknownCommand)?;
+/// `anchored` resolves a session id to its row. A refusal carries the row
+/// the request named, empty where it named none, for the answer's `row`.
+pub fn resolve(req: &CommandRequest, rows: &[AgentSession], anchored: impl Fn(&str) -> Option<String>) -> Result<(Command, String), (String, Refusal)> {
+    let command = Command::parse(&req.command).ok_or((String::new(), Refusal::UnknownCommand))?;
     let nonblank = |s: &Option<String>| s.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
     let row = match (nonblank(&req.project), nonblank(&req.session_id)) {
         (Some(project), None) => project,
-        (None, Some(sid)) => anchored(&sid).ok_or(Refusal::NoSuchSession)?,
-        _ => return Err(Refusal::NoTarget),
+        (None, Some(sid)) => anchored(&sid).ok_or((String::new(), Refusal::NoSuchSession))?,
+        _ => return Err((String::new(), Refusal::NoTarget)),
     };
-    let session = rows.iter().find(|s| s.id == row).ok_or(Refusal::NoSuchSession)?;
+    let refused = |r: Refusal| (row.clone(), r);
+    let session = rows.iter().find(|s| s.id == row).ok_or_else(|| refused(Refusal::NoSuchSession))?;
     if session.origin.is_some() {
-        return Err(Refusal::NotLocal);
+        return Err(refused(Refusal::NotLocal));
     }
-    still_free(Some(session.base_status()))?;
+    still_free(Some(session.base_status())).map_err(refused)?;
     Ok((command, row))
 }
 
@@ -186,6 +188,19 @@ mod tests {
         CommandRequest { project: project.map(Into::into), session_id: session_id.map(Into::into), command: command.into() }
     }
 
+    /// [`resolve`] with the row a refusal carries dropped.
+    fn res(req: &CommandRequest, rows: &[AgentSession], anchored: impl Fn(&str) -> Option<String>) -> Result<(Command, String), Refusal> {
+        resolve(req, rows, anchored).map_err(|(_, r)| r)
+    }
+
+    #[test]
+    fn a_refusal_carries_the_row_the_request_named() {
+        let named = |project: &str, rows: &[AgentSession]| resolve(&req(Some(project), None, "/clear"), rows, none).unwrap_err().0;
+        assert_eq!(named("web", &[row("web", Status::Working)]), "web");
+        assert_eq!(named("api", &[row("web", Status::Done)]), "api");
+        assert_eq!(resolve(&req(Some("web"), None, "/rm"), &[row("web", Status::Working)], none).unwrap_err().0, "");
+    }
+
     fn none(_: &str) -> Option<String> {
         None
     }
@@ -194,38 +209,38 @@ mod tests {
     fn a_command_off_the_allowlist_is_refused_before_anything_is_looked_up() {
         let rows = [row("web", Status::Done)];
         for command in ["/compact", "hello", "", "/clear please"] {
-            let err = resolve(&req(Some("web"), None, command), &rows, none).unwrap_err();
+            let err = res(&req(Some("web"), None, command), &rows, none).unwrap_err();
             assert_eq!(err, Refusal::UnknownCommand, "{command:?}");
             assert!(err.is_bad_request());
         }
-        assert_eq!(resolve(&req(Some("nowhere"), None, "/rm"), &rows, none), Err(Refusal::UnknownCommand));
+        assert_eq!(res(&req(Some("nowhere"), None, "/rm"), &rows, none), Err(Refusal::UnknownCommand));
     }
 
     #[test]
     fn exactly_one_name_is_required() {
         let rows = [row("web", Status::Done)];
-        assert_eq!(resolve(&req(None, None, "/clear"), &rows, none), Err(Refusal::NoTarget));
-        assert_eq!(resolve(&req(Some("web"), Some("s1"), "/clear"), &rows, none), Err(Refusal::NoTarget));
-        assert_eq!(resolve(&req(Some("  "), None, "/clear"), &rows, none), Err(Refusal::NoTarget));
+        assert_eq!(res(&req(None, None, "/clear"), &rows, none), Err(Refusal::NoTarget));
+        assert_eq!(res(&req(Some("web"), Some("s1"), "/clear"), &rows, none), Err(Refusal::NoTarget));
+        assert_eq!(res(&req(Some("  "), None, "/clear"), &rows, none), Err(Refusal::NoTarget));
     }
 
     #[test]
     fn a_project_or_an_anchored_session_names_a_local_row() {
         let rows = [row("web", Status::Done)];
-        assert_eq!(resolve(&req(Some("web"), None, "/clear"), &rows, none), Ok((Command::Clear, "web".into())));
-        assert_eq!(resolve(&req(None, Some("s1"), "exit"), &rows, |sid| (sid == "s1").then(|| "web".to_string())), Ok((Command::Exit, "web".into())));
-        assert_eq!(resolve(&req(None, Some("s2"), "/clear"), &rows, none), Err(Refusal::NoSuchSession));
-        assert_eq!(resolve(&req(Some("api"), None, "/clear"), &rows, none), Err(Refusal::NoSuchSession));
+        assert_eq!(res(&req(Some("web"), None, "/clear"), &rows, none), Ok((Command::Clear, "web".into())));
+        assert_eq!(res(&req(None, Some("s1"), "exit"), &rows, |sid| (sid == "s1").then(|| "web".to_string())), Ok((Command::Exit, "web".into())));
+        assert_eq!(res(&req(None, Some("s2"), "/clear"), &rows, none), Err(Refusal::NoSuchSession));
+        assert_eq!(res(&req(Some("api"), None, "/clear"), &rows, none), Err(Refusal::NoSuchSession));
     }
 
     #[test]
     fn a_remote_or_working_row_is_refused() {
         let mut remote = row("AIR/web", Status::Done);
         remote.origin = Some("AIR".into());
-        assert_eq!(resolve(&req(Some("AIR/web"), None, "/clear"), &[remote], none), Err(Refusal::NotLocal));
-        assert_eq!(resolve(&req(Some("web"), None, "/clear"), &[row("web", Status::Working)], none), Err(Refusal::Busy));
+        assert_eq!(res(&req(Some("AIR/web"), None, "/clear"), &[remote], none), Err(Refusal::NotLocal));
+        assert_eq!(res(&req(Some("web"), None, "/clear"), &[row("web", Status::Working)], none), Err(Refusal::Busy));
         for status in [Status::Done, Status::Idle, Status::Blocked, Status::Waiting, Status::Error] {
-            assert!(resolve(&req(Some("web"), None, "/clear"), &[row("web", status)], none).is_ok(), "{status:?}");
+            assert!(res(&req(Some("web"), None, "/clear"), &[row("web", status)], none).is_ok(), "{status:?}");
         }
     }
 
@@ -234,7 +249,7 @@ mod tests {
         let mut gated = row("web", Status::Blocked);
         let base = crate::state::BaseState { status: Status::Working, label: String::new(), waiting_backstop_armed: false, state_entered_at: 0 };
         gated.subagent_gate = Some(crate::state::SubagentGate { base, blocked_since: 0, pending: Vec::new() });
-        assert_eq!(resolve(&req(Some("web"), None, "/clear"), &[gated], none), Err(Refusal::Busy));
+        assert_eq!(res(&req(Some("web"), None, "/clear"), &[gated], none), Err(Refusal::Busy));
     }
 
     #[test]
