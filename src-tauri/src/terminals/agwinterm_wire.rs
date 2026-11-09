@@ -213,7 +213,7 @@ pub fn session_node<'a>(result: &'a Value, id: &str) -> Option<&'a Value> {
 /// The pane a close types `/exit` into: the session's focused pane, the one its
 /// `title` is read from.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ClosePane {
+pub struct Pane {
     /// The pane's id. agwinterm resolves a session id to the pane that carries
     /// it, which in a split need not be the focused one, so a split names the
     /// focused pane by its own id.
@@ -231,7 +231,7 @@ pub struct ClosePane {
 /// selected session of agwinterm's frontmost window is left alone. A draft in
 /// the composer is checked separately, from the pane's text
 /// ([`composer_text`]), since the tree does not carry it.
-pub fn typing_pane(node: &Value, in_front: bool) -> Result<ClosePane, String> {
+pub fn typing_pane(node: &Value, in_front: bool) -> Result<Pane, String> {
     if in_front && node.get("active").and_then(Value::as_bool) == Some(true) {
         return Err("the session is on screen in agwinterm's frontmost window".to_string());
     }
@@ -246,7 +246,7 @@ pub fn typing_pane(node: &Value, in_front: bool) -> Result<ClosePane, String> {
         Some(ids) => ids.get(index).and_then(Value::as_str).ok_or("the tree names no focused pane")?.to_string(),
         None => node.get("id").and_then(Value::as_str).ok_or("the session has no id")?.to_string(),
     };
-    Ok(ClosePane { id, index })
+    Ok(Pane { id, index })
 }
 
 /// The pane to type `/exit` into, or why session `node` must not be closed:
@@ -261,7 +261,7 @@ pub fn typing_pane(node: &Value, in_front: bool) -> Result<ClosePane, String> {
 /// is closed only where its other pane is a bare shell: agwinterm closes a
 /// session without confirming, and whatever ran beside the agent would go with
 /// it.
-pub fn close_pane(node: &Value, in_front: bool) -> Result<ClosePane, String> {
+pub fn close_pane(node: &Value, in_front: bool) -> Result<Pane, String> {
     let pane = typing_pane(node, in_front)?;
     if !node.get("title").and_then(Value::as_str).is_some_and(crate::terminal_title::shows_clean_here) {
         return Err("the session's title no longer shows it CLEAN".to_string());
@@ -485,7 +485,7 @@ mod tests {
 
     #[test]
     fn a_clean_agent_in_a_single_pane_is_typed_into_by_its_session_id() {
-        assert_eq!(close_pane(&clean_agent(), true), Ok(ClosePane { id: "S".into(), index: 0 }));
+        assert_eq!(close_pane(&clean_agent(), true), Ok(Pane { id: "S".into(), index: 0 }));
     }
 
     #[test]
@@ -494,7 +494,7 @@ mod tests {
         n["paneIds"] = json!(["S", "P2"]);
         n["focusedPane"] = json!(1);
         n["foregroundShells"] = json!(["pwsh", null]);
-        assert_eq!(close_pane(&n, false), Ok(ClosePane { id: "P2".into(), index: 1 }));
+        assert_eq!(close_pane(&n, false), Ok(Pane { id: "P2".into(), index: 1 }));
     }
 
     #[test]
@@ -539,7 +539,7 @@ mod tests {
         };
         let mut n = clean_agent();
         split(&mut n);
-        assert_eq!(typing_pane(&n, false), Ok(ClosePane { id: "P2".into(), index: 1 }), "a busy pane beside the agent is not touched by typing");
+        assert_eq!(typing_pane(&n, false), Ok(Pane { id: "P2".into(), index: 1 }), "a busy pane beside the agent is not touched by typing");
     }
 
     /// A `session text --styles` result from plain row texts, each one run;

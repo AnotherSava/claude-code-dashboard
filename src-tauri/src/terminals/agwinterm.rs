@@ -211,7 +211,7 @@ impl AgwintermAdapter {
     /// and that pane. The typing, into a composer read by
     /// [`wire::composer_text`], is [`super::composer::type_command`]'s, the
     /// sequence the tmux adapter types too.
-    fn type_into<'k>(&self, key: &'k str, command: Command, pick: fn(&serde_json::Value, bool) -> Result<wire::ClosePane, String>) -> Result<(&'k str, &'k str, wire::ClosePane), String> {
+    fn type_into<'k>(&self, key: &'k str, command: Command, pick: fn(&serde_json::Value, bool) -> Result<wire::Pane, String>) -> Result<(&'k str, &'k str, wire::Pane), String> {
         let (window, session) = wire::split_key(key).ok_or_else(|| format!("label key {key:?} is not a window and a session"))?;
         let in_front = wire::active_window(&self.call(&wire::windows_req(), READ_DEADLINE)?).as_deref() == Some(window);
         let tree = self.call(&wire::tree_req(window), READ_DEADLINE)?;
