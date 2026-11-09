@@ -1,9 +1,10 @@
 //! Where Claude Code's composer is on a screen of text, and what it holds.
 //!
-//! Shared by every adapter whose close types `/exit` into the agent: each reads
-//! the pane its own way, with Claude Code's faint placeholder runs already left
-//! out, and hands the rows here, so the rule for finding the composer, and the
-//! sequence that types into it, exist once whichever terminal drew it.
+//! Shared by every adapter that types a command into the agent — `/exit` for a
+//! close, or what `POST /api/session/command` asks for: each reads the pane its
+//! own way, with Claude Code's faint placeholder runs already left out, and
+//! hands the rows here, so the rule for finding the composer, and the sequence
+//! that types into it, exist once whichever terminal drew it.
 
 use std::time::Duration;
 
@@ -26,47 +27,78 @@ pub fn composer_in(lines: &[String]) -> Option<String> {
     Some(text.trim().to_string())
 }
 
-/// The pause between the keystrokes of a close, long enough for Claude Code to
-/// take each as typing rather than as one paste.
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+/// The pause between the keystrokes of every typed command, a close's `/exit`
+/// included, long enough for Claude Code to take each as typing rather than as
+/// one paste.
 pub const KEY_PAUSE: Duration = Duration::from_millis(600);
 
 /// How long a close waits for the agent to exit after `/exit`, and how often it
 /// looks.
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub const EXIT_WAIT: Duration = Duration::from_secs(30);
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub const EXIT_POLL: Duration = Duration::from_millis(500);
 
-/// What a close sends into the session, which each terminal spells its own way.
+/// The built-in commands this dashboard will type into a session. An
+/// allowlist, because typing into a person's terminal is safe only for text
+/// whose effect is known: anything else would be a prompt sent on their behalf.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Command {
+    /// `/clear`, which ends the conversation and starts a fresh one in place.
+    Clear,
+    /// `/exit`, which ends the agent; what a close types.
+    Exit,
+}
+
+impl Command {
+    /// The command `text` names, `/clear` or `/exit`, with or without the
+    /// slash, or `None` for anything off the allowlist.
+    pub fn parse(text: &str) -> Option<Command> {
+        match text.trim().strip_prefix('/').unwrap_or(text.trim()) {
+            "clear" => Some(Command::Clear),
+            "exit" => Some(Command::Exit),
+            _ => None,
+        }
+    }
+
+    /// What is typed into the composer.
+    pub fn text(self) -> &'static str {
+        match self {
+            Command::Clear => "/clear",
+            Command::Exit => "/exit",
+        }
+    }
+}
+
+/// What typing a command sends into the session, which each terminal spells
+/// its own way.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Keys {
-    /// The text `/exit`, typed rather than pasted.
-    Exit,
+    /// The command's text, typed rather than pasted.
+    Command(Command),
     /// The Enter key.
     Enter,
 }
 
-/// Type `/exit` into an empty composer and press Enter once the composer reads
-/// exactly that, through the terminal's own `read` of the composer and `send`
-/// of keys, waiting `pause` between the two.
+/// Type `command` into an empty composer and press Enter once the composer
+/// reads exactly its text, through the terminal's own `read` of the composer
+/// and `send` of keys, waiting `pause` between the two.
 ///
 /// Every refusal here keeps keystrokes off a person: a draft may be someone
 /// typing (from this machine or, through tmux, from another), no composer means
-/// something other than an agent waiting for input is on screen, and a
-/// composer that does not read back `/exit` means something else took the
-/// typing, so Enter would submit it. Waiting for the agent to exit is the
-/// caller's, since each terminal sees that differently.
-pub fn type_exit(mut read: impl FnMut() -> Result<Option<String>, String>, mut send: impl FnMut(Keys) -> Result<(), String>, pause: Duration) -> Result<(), String> {
+/// something other than an agent waiting for input is on screen (a question
+/// dialog replaces it), and a composer that does not read back the command
+/// means something else took the typing, so Enter would submit it. What
+/// follows (a close waiting for the agent to exit) is the caller's, since each
+/// terminal sees that differently.
+pub fn type_command(command: Command, mut read: impl FnMut() -> Result<Option<String>, String>, mut send: impl FnMut(Keys) -> Result<(), String>, pause: Duration) -> Result<(), String> {
     match read()? {
         Some(draft) if draft.is_empty() => {}
         Some(_) => return Err("the composer holds a draft, so someone may be typing into the session".to_string()),
         None => return Err("no Claude Code composer is on screen in the session's pane".to_string()),
     }
-    send(Keys::Exit)?;
+    send(Keys::Command(command))?;
     std::thread::sleep(pause);
-    if read()?.as_deref() != Some("/exit") {
-        return Err("the composer changed while /exit was being typed, so Enter was not pressed".to_string());
+    if read()?.as_deref() != Some(command.text()) {
+        return Err(format!("the composer changed while {} was being typed, so Enter was not pressed", command.text()));
     }
     send(Keys::Enter)
 }
@@ -75,21 +107,44 @@ pub fn type_exit(mut read: impl FnMut() -> Result<Option<String>, String>, mut s
 mod tests {
     use super::*;
 
-    /// Run [`type_exit`] against composer readings answered in turn, and
-    /// return its result with the keys it sent.
-    fn run(readings: &[Option<&str>]) -> (Result<(), String>, Vec<Keys>) {
+    /// Run [`type_command`] for `command` against composer readings answered
+    /// in turn, and return its result with the keys it sent.
+    fn run_command(command: Command, readings: &[Option<&str>]) -> (Result<(), String>, Vec<Keys>) {
         let mut readings = readings.iter().map(|r| r.map(str::to_string));
         let mut sent = Vec::new();
-        let result = type_exit(|| Ok(readings.next().expect("read more often than expected")), |k| {
+        let result = type_command(command, || Ok(readings.next().expect("read more often than expected")), |k| {
             sent.push(k);
             Ok(())
         }, Duration::ZERO);
         (result, sent)
     }
 
+    fn run(readings: &[Option<&str>]) -> (Result<(), String>, Vec<Keys>) {
+        run_command(Command::Exit, readings)
+    }
+
     #[test]
     fn an_empty_composer_gets_exit_then_enter() {
-        assert_eq!(run(&[Some(""), Some("/exit")]), (Ok(()), vec![Keys::Exit, Keys::Enter]));
+        assert_eq!(run(&[Some(""), Some("/exit")]), (Ok(()), vec![Keys::Command(Command::Exit), Keys::Enter]));
+    }
+
+    #[test]
+    fn clear_is_typed_and_must_read_back_as_clear() {
+        assert_eq!(run_command(Command::Clear, &[Some(""), Some("/clear")]), (Ok(()), vec![Keys::Command(Command::Clear), Keys::Enter]));
+        let (result, sent) = run_command(Command::Clear, &[Some(""), Some("/exit")]);
+        assert!(result.unwrap_err().contains("/clear was being typed"));
+        assert_eq!(sent, [Keys::Command(Command::Clear)]);
+    }
+
+    #[test]
+    fn only_the_allowlisted_commands_parse() {
+        assert_eq!(Command::parse("/clear"), Some(Command::Clear));
+        assert_eq!(Command::parse(" clear "), Some(Command::Clear));
+        assert_eq!(Command::parse("/exit"), Some(Command::Exit));
+        for other in ["/compact", "/clear now", "/clear\n/exit", "//clear", "", "/", "fix the build", "/CLEAR"] {
+            assert_eq!(Command::parse(other), None, "{other:?}");
+        }
+        assert_eq!(Command::Clear.text(), "/clear");
     }
 
     #[test]
@@ -107,18 +162,18 @@ mod tests {
         for after in [Some("/exitx"), Some(""), None] {
             let (result, sent) = run(&[Some(""), after]);
             assert!(result.unwrap_err().contains("Enter was not pressed"), "{after:?}");
-            assert_eq!(sent, [Keys::Exit], "{after:?}");
+            assert_eq!(sent, [Keys::Command(Command::Exit)], "{after:?}");
         }
     }
 
     #[test]
     fn a_failed_read_or_send_stops_the_close() {
         let mut sent = Vec::new();
-        assert_eq!(type_exit(|| Err("pipe gone".to_string()), |k| {
+        assert_eq!(type_command(Command::Exit, || Err("pipe gone".to_string()), |k| {
             sent.push(k);
             Ok(())
         }, Duration::ZERO), Err("pipe gone".to_string()));
         assert!(sent.is_empty());
-        assert_eq!(type_exit(|| Ok(Some(String::new())), |_| Err("refused".to_string()), Duration::ZERO), Err("refused".to_string()));
+        assert_eq!(type_command(Command::Exit, || Ok(Some(String::new())), |_| Err("refused".to_string()), Duration::ZERO), Err("refused".to_string()));
     }
 }

@@ -2002,6 +2002,13 @@ impl AppState {
         sessions.iter().find(|s| s.id == id).map(|s| (s.status, s.state_entered_at))
     }
 
+    /// A row's [`AgentSession::base_status`], read under the lock: what
+    /// `POST /api/session/command` re-checks just before it types.
+    pub fn base_status_of(&self, id: &str) -> Option<Status> {
+        let sessions = self.sessions.lock().unwrap();
+        sessions.iter().find(|s| s.id == id).map(AgentSession::base_status)
+    }
+
     /// A local row's [`AgentSession::content_at`], or `None` when no such row
     /// exists here.
     ///

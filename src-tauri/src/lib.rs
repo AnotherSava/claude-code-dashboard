@@ -30,6 +30,7 @@ mod prompt_origin;
 mod remote_history;
 mod remote_tokens;
 mod remote_usage;
+mod session_command;
 mod session_launcher;
 mod session_registry;
 mod session_restore;

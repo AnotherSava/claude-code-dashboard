@@ -63,7 +63,8 @@ use std::time::{Duration, Instant};
 
 use tauri::AppHandle;
 
-use super::{LabelBudget, LabelTarget, LabelWrite, TerminalAdapter};
+use super::{CloseTarget, LabelBudget, LabelTarget, LabelWrite, TerminalAdapter};
+use crate::state::AgentSession;
 use crate::terminal_title::{title_names, Named};
 
 /// How long requests have to stop arriving before the worker acts, so a `/clear`
@@ -169,6 +170,32 @@ pub struct DesiredLabel {
     /// The [`one_line`] of the row's task, or `None` when the row has none, which
     /// clears the context. Fitted to each target's budget by [`plan`].
     pub context: Option<String>,
+}
+
+impl DesiredLabel {
+    /// `s` as the join ranks it, under the name `build_title` writes on its tab.
+    /// Every caller of [`join`] builds its rows here, so the label a title is
+    /// matched against cannot drift from the one written.
+    pub fn for_row(s: &AgentSession, context: Option<String>) -> Self {
+        DesiredLabel { row: s.id.clone(), label: s.display_label().to_string(), context }
+    }
+}
+
+/// Why [`session_of`] found no session for a row: no title names it.
+pub const NO_SESSION: &str = "no_session";
+/// The join refused a row whose label another row carries too.
+pub const SAME_LABEL: &str = "same_label";
+/// The join refused a row more than one session's title names.
+pub const SHARED_TITLE: &str = "shared_title";
+
+/// The sentence explaining a [`session_of`] refusal slug, for every caller that
+/// reports one, so a log line and an API refusal word the same outcome alike.
+pub fn join_refusal(slug: &str) -> &'static str {
+    match slug {
+        SAME_LABEL => "its tab's title names this row and another carrying the same label",
+        SHARED_TITLE => "more than one tab's title names this row",
+        _ => "no terminal session's title names this row",
+    }
 }
 
 /// The rows to label, from one snapshot.
@@ -548,7 +575,7 @@ pub(crate) fn join<'a>(rows: &'a [DesiredLabel], titles: &[Option<&str>], declin
             Some(Named::Drawn(drawn)) => {
                 for r in &drawn {
                     if !declined.iter().any(|d| d.row == r.row) {
-                        declined.push(Declined { row: r.row.clone(), reason: "same_label", n: drawn.len() });
+                        declined.push(Declined { row: r.row.clone(), reason: SAME_LABEL, n: drawn.len() });
                     }
                 }
                 Claim::Ours
@@ -558,7 +585,7 @@ pub(crate) fn join<'a>(rows: &'a [DesiredLabel], titles: &[Option<&str>], declin
     for r in rows {
         let n = claims.iter().filter(|c| matches!(c, Claim::Row(x) if x.row == r.row)).count();
         if n > 1 {
-            declined.push(Declined { row: r.row.clone(), reason: "shared_title", n });
+            declined.push(Declined { row: r.row.clone(), reason: SHARED_TITLE, n });
             for c in claims.iter_mut().filter(|c| matches!(c, Claim::Row(x) if x.row == r.row)) {
                 *c = Claim::Ours;
             }
@@ -566,6 +593,25 @@ pub(crate) fn join<'a>(rows: &'a [DesiredLabel], titles: &[Option<&str>], declin
     }
 
     claims
+}
+
+/// The one session among `targets` whose title [`join`] gives to `row`, or the
+/// slug saying why there is none: `no_session` where no title names it, else
+/// the join's own refusal (`same_label`, `shared_title`). `rows` is every local
+/// row, since a title is ranked against all of them: a title naming
+/// `bga assistant` must go to that row and not to `bga`.
+///
+/// The lookup a caller acting on one row's session takes — `idle_close`
+/// closing it, `POST /api/session/command` typing into it — so both find the
+/// session the labeller writes that row's context line to.
+pub(crate) fn session_of<'t>(rows: &[DesiredLabel], targets: &'t [CloseTarget], row: &str) -> Result<&'t CloseTarget, &'static str> {
+    let mut declined = Vec::new();
+    let titles: Vec<Option<&str>> = targets.iter().map(|t| t.title.as_deref()).collect();
+    let claims = join(rows, &titles, &mut declined);
+    if let Some(d) = declined.iter().find(|d| d.row == row) {
+        return Err(d.reason);
+    }
+    targets.iter().zip(&claims).find(|(_, c)| matches!(c, Claim::Row(r) if r.row == row)).map(|(t, _)| t).ok_or(NO_SESSION)
 }
 
 #[cfg(test)]

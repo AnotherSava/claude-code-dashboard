@@ -100,7 +100,10 @@
 //! defaults; `label_targets` is called by `labels`' long-lived worker and by
 //! `idle_close`'s, each on its own instance and connection, `write_label` only
 //! by the first and `close_session` only by the second, and the only caller of
-//! `watch` and `poll` is `attention`'s. Constructing one does no I/O. The one static is the foreground
+//! `watch` and `poll` is `attention`'s. `POST /api/session/command` builds a
+//! throwaway adapter per request and asks `close_targets` and `type_command` on
+//! that instance's own connection, so its typing can run beside a close
+//! `idle_close` is typing on its connection. Constructing one does no I/O. The one static is the foreground
 //! hook's, which a callback with no state of its own has to write somewhere.
 //!
 //! **Every read and write has a deadline.** agwinterm serves the pipe with no
@@ -112,8 +115,10 @@
 //!
 //! **Closing** types into the session rather than closing its tab, because the
 //! tab usually holds only a `wsl … tmux attach` client onto the agent's pane;
-//! [`super::agwinterm_wire::close_pane`] has the rules that keep the keystrokes
-//! off anything but a CLEAN agent's composer.
+//! [`super::agwinterm_wire::typing_pane`] has the rules every typed command
+//! keeps off anything but an agent's composer, and
+//! [`super::agwinterm_wire::close_pane`] adds the ones that make it a CLEAN
+//! agent's.
 
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -128,7 +133,7 @@ use std::time::{Duration, Instant};
 
 use super::agwinterm_state::{self as state, Frontmost, Watch, TERMINAL as NAME};
 use super::agwinterm_wire as wire;
-use super::composer::{Keys, EXIT_POLL, EXIT_WAIT, KEY_PAUSE};
+use super::composer::{Command, Keys, EXIT_POLL, EXIT_WAIT, KEY_PAUSE};
 use super::{Front, LabelTarget, LabelWrite, LastInput, Observation, Selection, TerminalAdapter, TerminalSession};
 
 /// How long `ping`, `window.list` and `tree` get to answer. `tree` is served on
@@ -198,6 +203,36 @@ impl AgwintermAdapter {
         let app_dir = std::env::var_os("LOCALAPPDATA").map(|base| PathBuf::from(base).join(&app_id));
         let pipe = Mutex::new(Pipe { path, conn: None, down: None, link: None });
         Self { shared: Arc::new(Shared { pipe, app_id, app_dir, watch: Mutex::new(Watch::default()), watching: OnceLock::new() }), attach_script }
+    }
+
+    /// Type `command` into the session behind `key`, into the pane `pick`
+    /// chooses from its tree node ([`wire::typing_pane`], or
+    /// [`wire::close_pane`] for a close), and answer the window, the session
+    /// and that pane. The typing, into a composer read by
+    /// [`wire::composer_text`], is [`super::composer::type_command`]'s, the
+    /// sequence the tmux adapter types too.
+    fn type_into<'k>(&self, key: &'k str, command: Command, pick: fn(&serde_json::Value, bool) -> Result<wire::ClosePane, String>) -> Result<(&'k str, &'k str, wire::ClosePane), String> {
+        let (window, session) = wire::split_key(key).ok_or_else(|| format!("label key {key:?} is not a window and a session"))?;
+        let in_front = wire::active_window(&self.call(&wire::windows_req(), READ_DEADLINE)?).as_deref() == Some(window);
+        let tree = self.call(&wire::tree_req(window), READ_DEADLINE)?;
+        let node = wire::session_node(&tree, session).ok_or_else(|| format!("session {session} is no longer in window {window}"))?;
+        let pane = pick(node, in_front)?;
+        let composer = || self.call(&wire::styled_text_req(window, &pane.id), READ_DEADLINE).map(|t| wire::composer_text(&t));
+        let send = |keys| {
+            let text = match keys {
+                Keys::Command(c) => c.text(),
+                Keys::Enter => "\r",
+            };
+            self.call(&wire::type_req(window, &pane.id, text), WRITE_DEADLINE).map(|_| ())
+        };
+        super::composer::type_command(command, composer, send, KEY_PAUSE)?;
+        Ok((window, session, pane))
+    }
+
+    /// One request on the shared pipe, its failure as the sentence a caller
+    /// reports.
+    fn call(&self, req: &str, deadline: Duration) -> Result<serde_json::Value, String> {
+        self.shared.pipe.lock().unwrap().call(req, deadline).map_err(|f| f.reason())
     }
 }
 
@@ -568,7 +603,7 @@ impl TerminalAdapter for AgwintermAdapter {
             LabelWrite::Context(text) => wire::context_req(window, target, text),
             LabelWrite::ClearContext => wire::clear_context_req(window, target),
         };
-        self.shared.pipe.lock().unwrap().call(&req, WRITE_DEADLINE).map(|_| ()).map_err(|f| f.reason())
+        self.call(&req, WRITE_DEADLINE).map(|_| ())
     }
 
     fn can_close(&self) -> bool {
@@ -577,33 +612,18 @@ impl TerminalAdapter for AgwintermAdapter {
 
     /// End the agent with `/exit`, then close its tab once the pane is back at
     /// a shell. Why typing rather than closing, and what refuses it, is
-    /// [`wire::close_pane`]'s doc, and the typing, into a composer read by
-    /// [`wire::composer_text`], is [`super::composer::type_exit`]'s, the
-    /// sequence the tmux adapter's close types too. A pane that has not
-    /// fallen back to a shell within [`EXIT_WAIT`] leaves its tab open and the
-    /// close reported as failed, since closing the tab then would detach a
-    /// client from an agent that is still running. A tree read that fails while
-    /// waiting is retried until then, since `/exit` has already been typed.
+    /// [`wire::close_pane`]'s doc, and the typing is [`Self::type_into`]'s. A
+    /// pane that has not fallen back to a shell within [`EXIT_WAIT`] leaves its
+    /// tab open and the close reported as failed, since closing the tab then
+    /// would detach a client from an agent that is still running. A tree read
+    /// that fails while waiting is retried until then, since `/exit` has
+    /// already been typed.
     fn close_session(&self, key: &str) -> Result<(), String> {
-        let (window, session) = wire::split_key(key).ok_or_else(|| format!("label key {key:?} is not a window and a session"))?;
-        let call = |req: &str, deadline: Duration| self.shared.pipe.lock().unwrap().call(req, deadline).map_err(|f| f.reason());
-        let in_front = wire::active_window(&call(&wire::windows_req(), READ_DEADLINE)?).as_deref() == Some(window);
-        let tree = call(&wire::tree_req(window), READ_DEADLINE)?;
-        let node = wire::session_node(&tree, session).ok_or_else(|| format!("session {session} is no longer in window {window}"))?;
-        let pane = wire::close_pane(node, in_front)?;
-        let composer = || call(&wire::styled_text_req(window, &pane.id), READ_DEADLINE).map(|t| wire::composer_text(&t));
-        let send = |keys| {
-            let text = match keys {
-                Keys::Exit => "/exit",
-                Keys::Enter => "\r",
-            };
-            call(&wire::type_req(window, &pane.id, text), WRITE_DEADLINE).map(|_| ())
-        };
-        super::composer::type_exit(composer, send, KEY_PAUSE)?;
+        let (window, session, pane) = self.type_into(key, Command::Exit, wire::close_pane)?;
         let until = Instant::now() + EXIT_WAIT;
         loop {
             std::thread::sleep(EXIT_POLL);
-            let tree = match call(&wire::tree_req(window), READ_DEADLINE) {
+            let tree = match self.call(&wire::tree_req(window), READ_DEADLINE) {
                 Ok(tree) => tree,
                 Err(e) if Instant::now() >= until => return Err(format!("typed /exit, but agwinterm could not be read to see whether the agent exited: {e}")),
                 Err(_) => continue,
@@ -616,7 +636,17 @@ impl TerminalAdapter for AgwintermAdapter {
                 Some(_) => {}
             }
         }
-        call(&wire::close_req(window, session), WRITE_DEADLINE).map(|_| ())
+        self.call(&wire::close_req(window, session), WRITE_DEADLINE).map(|_| ())
+    }
+
+    fn can_type_command(&self) -> bool {
+        true
+    }
+
+    /// The command, typed into the pane [`wire::typing_pane`] chooses, with
+    /// nothing after it.
+    fn type_command(&self, key: &str, command: Command) -> Result<(), String> {
+        self.type_into(key, command, wire::typing_pane).map(|_| ())
     }
 
     fn can_attach_hosted(&self) -> bool {
@@ -630,7 +660,7 @@ impl TerminalAdapter for AgwintermAdapter {
     fn attach_hosted(&self, name: &str) -> Result<(), String> {
         let script = self.attach_script.as_deref().ok_or("config.remote_session_script is not set")?;
         let req = wire::new_session_req(&wire::attach_command(script, name));
-        self.shared.pipe.lock().unwrap().call(&req, WRITE_DEADLINE).map(|_| ()).map_err(|f| f.reason())
+        self.call(&req, WRITE_DEADLINE).map(|_| ())
     }
 }
 

@@ -100,12 +100,13 @@ Under the repo root `claude-code-dashboard/`:
     - `config_watcher.rs` — notify watcher for config.json hot-reload
     - `commands.rs` — Tauri commands + event emitters
     - `setup.rs` — embedded Python hook + settings.json snippet builder for onboarding
-    - `http_server.rs` — the loopback axum server: `/api/event`, `/api/agents`, `/api/message`, `/api/window`, `/api/session-clean`, `/api/project/rename`, `/api/session/open`, `/api/session/tabs`, `/api/dev-server`
+    - `http_server.rs` — the loopback axum server: `/api/event`, `/api/agents`, `/api/message`, `/api/window`, `/api/session-clean`, `/api/project/rename`, `/api/session/open`, `/api/session/command`, `/api/session/tabs`, `/api/dev-server`
     - `sync.rs` — multi-device session sync: source- and token-gated listener, metadata push, receiver-driven pulls
     - `tailnet.rs` — asking Tailscale which machine a connection came from, instead of trusting its envelope
     - `subprocess.rs` — running a helper program to a deadline, with no console window on Windows
     - `peer_message.rs` — relaying one message to an agent on another machine, and the honesty rules around it
     - `session_launcher.rs` — starting a terminal session for a project that has none, for a relayed message or for the local picker (`integrations/pick-local-session.py`, through `POST /api/session/open`); it names no terminal, asking the platform's `terminals::TerminalAdapter` to launch the session (agterm's adapter on macOS, its workspace placement included), so a launcher for another terminal is that terminal's adapter implementing `launch`
+    - `session_command.rs` — which local session `POST /api/session/command` types an allowlisted built-in command (`/clear`, `/exit`) into, found by the same title join the idle close uses, and every refusal before the terminal is touched; the typing is the adapter's `type_command`
     - `dev_servers.rs` — announced dev servers, checked until they stop answering and shown on the agterm session they were started from, or on the other machine's `⇄` tab for their row through the sync push, in `dev_servers.json`
     - `workspace_memory.rs` — the agterm window and workspace each project's agent was last seen in, so a started session opens there, in `agterm_workspaces.json`
     - `session_restore.rs` — giving a live session its row back after a restart
@@ -147,9 +148,9 @@ Under the repo root `claude-code-dashboard/`:
       - `mod.rs` — the trait, the shared vocabulary, and the pure verdicts over it (`person_verdict`, `departure_stamp`, `read_front`)
       - `agterm.rs` / `agterm_facts.rs` — agterm's adapter, which also starts sessions, and the facts it reads from agterm and the system (macOS)
       - `agterm_wire.rs` — agterm's `session context` protocol (the argv a write takes, the targets its tree reports, and the release that first served the verb), the `session info` line naming a session's dev servers, its `session close` argv with `close_refusal`, the rule that refuses a close, and `placement`, which picks the workspace a started session opens in (macOS)
-      - `agwinterm.rs` / `agwinterm_state.rs` / `agwinterm_wire.rs` — agwinterm's control pipe, its per-window state files, and its protocol, including `close_pane` and `composer_text`, the rules that refuse a close (Windows)
-      - `tmux.rs` / `tmux_wire.rs` — the WSL tmux server holding remote sessions, an adapter that closes and starts them: it offers `idle_close` the sessions no terminal on this machine is showing and types `/exit` into one, and starts a detached session through the claude repo's `cc-session.sh` where `remote_session_script` is set (Windows)
-      - `composer.rs` — where Claude Code's composer sits on a screen of text, and the `/exit` sequence typed into it, shared by every close that types into the agent
+      - `agwinterm.rs` / `agwinterm_state.rs` / `agwinterm_wire.rs` — agwinterm's control pipe, its per-window state files, and its protocol, including `typing_pane`, the rules that refuse any typed command, `close_pane`, which adds the ones that refuse a close, and `composer_text` (Windows)
+      - `tmux.rs` / `tmux_wire.rs` — the WSL tmux server holding remote sessions, an adapter that closes and starts them: it offers `idle_close` the sessions no terminal on this machine is showing and types `/exit` into one, or a command `POST /api/session/command` asks for, and starts a detached session through the claude repo's `cc-session.sh` where `remote_session_script` is set (Windows)
+      - `composer.rs` — where Claude Code's composer sits on a screen of text, and the allowlisted `Command` (`/clear`, `/exit`) typed into it by `type_command`, shared by every close and by `POST /api/session/command`
       - `windows.rs` / `wt_tabs.rs` — Windows Terminal and the Windows console, and the UI Automation read of what a tab really holds
       - `composite.rs` — presents several terminals on one platform as one adapter
       - `labels.rs` — writes each row's task into a terminal's own per-session context line

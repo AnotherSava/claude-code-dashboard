@@ -173,6 +173,17 @@ impl TerminalAdapter for Composite {
         self.children.iter().any(|c| c.can_close())
     }
 
+    /// Routed to the child that minted the key, as `close_session` is.
+    fn type_command(&self, key: &str, command: super::composer::Command) -> Result<(), String> {
+        let (target, inner) = self.child_for(key)?;
+        target.type_command(inner, command)
+    }
+
+    /// True when any child can type, as `can_close` is.
+    fn can_type_command(&self) -> bool {
+        self.children.iter().any(|c| c.can_type_command())
+    }
+
     fn can_launch(&self) -> bool {
         self.children.iter().any(|c| c.can_launch())
     }
@@ -284,6 +295,13 @@ mod tests {
             self.writes.lock().unwrap().push((format!("close {key}"), LabelWrite::ClearContext));
             Ok(())
         }
+        fn can_type_command(&self) -> bool {
+            self.closes
+        }
+        fn type_command(&self, key: &str, command: crate::terminals::composer::Command) -> Result<(), String> {
+            self.writes.lock().unwrap().push((format!("{} {key}", command.text()), LabelWrite::ClearContext));
+            Ok(())
+        }
         fn can_launch(&self) -> bool {
             self.launches
         }
@@ -377,6 +395,17 @@ mod tests {
         assert_eq!(writes.lock().unwrap()[0].0, "close w1/p1");
         assert!(c.close_session("kitty|w1/p1").is_err());
         assert!(!composite(vec![Fake { name: "windows", ..Fake::default() }]).can_close());
+    }
+
+    #[test]
+    fn a_typed_command_reaches_the_child_that_minted_the_key() {
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let c = composite(vec![Fake { name: "windows", ..Fake::default() }, Fake { name: "tmux", closes: true, writes: writes.clone(), ..Fake::default() }]);
+        assert!(c.can_type_command());
+        c.type_command("tmux|cc-x", crate::terminals::composer::Command::Clear).unwrap();
+        assert_eq!(writes.lock().unwrap()[0].0, "/clear cc-x");
+        assert!(c.type_command("kitty|cc-x", crate::terminals::composer::Command::Clear).is_err());
+        assert!(!composite(vec![Fake { name: "windows", ..Fake::default() }]).can_type_command());
     }
 
     #[test]

@@ -40,7 +40,7 @@ use crate::commands::now_ms;
 use crate::config::ConfigState;
 use crate::state::{AppState, Status};
 use crate::terminal_title::parse_title;
-use crate::terminals::labels::{join, Claim, DesiredLabel};
+use crate::terminals::labels::{join_refusal, session_of, DesiredLabel, NO_SESSION};
 use crate::terminals::{CloseTarget, TerminalAdapter};
 
 /// How often rows are checked. The window is an hour by default, so a minute's
@@ -70,22 +70,21 @@ impl Verdict {
     fn slug(&self) -> &'static str {
         match self {
             Verdict::Close(_) => "close",
-            Verdict::NoSession => "no_session",
+            Verdict::NoSession => NO_SESSION,
             Verdict::TabNotIdle => "tab_not_idle",
             Verdict::Declined(reason) => reason,
         }
     }
 
     /// The log line's human `reason`.
-    fn reason(&self) -> &'static str {
+    fn reason(&self) -> String {
         match self {
             // What else a close ends, the tab included, is the adapter's:
             // see `TerminalAdapter::close_session`.
-            Verdict::Close(_) => "clean past the window; closed the session",
-            Verdict::NoSession => "clean past the window, but no terminal session's title names this row",
-            Verdict::TabNotIdle => "clean past the window, but its tab is showing another status, so it is not following the row",
-            Verdict::Declined("same_label") => "clean past the window, but its tab's title names this row and another carrying the same label",
-            Verdict::Declined(_) => "clean past the window, but more than one tab's title names this row",
+            Verdict::Close(_) => "clean past the window; closed the session".to_string(),
+            Verdict::NoSession => format!("clean past the window, but {}", join_refusal(NO_SESSION)),
+            Verdict::TabNotIdle => "clean past the window, but its tab is showing another status, so it is not following the row".to_string(),
+            Verdict::Declined(reason) => format!("clean past the window, but {}", join_refusal(reason)),
         }
     }
 }
@@ -94,25 +93,20 @@ impl Verdict {
 /// not, because the join ranks a title against all of them: a title naming
 /// `bga assistant` must go to that row and not to a due `bga`.
 fn pick(rows: &[DesiredLabel], targets: &[CloseTarget], due: &HashSet<&str>) -> Vec<(String, Verdict)> {
-    let mut declined = Vec::new();
-    let titles: Vec<Option<&str>> = targets.iter().map(|t| t.title.as_deref()).collect();
-    let claims = join(rows, &titles, &mut declined);
-    let mut out: Vec<(String, Verdict)> = Vec::new();
-    for row in rows.iter().filter(|r| due.contains(r.row.as_str())) {
-        let verdict = if let Some(d) = declined.iter().find(|d| d.row == row.row) {
-            Verdict::Declined(d.reason)
-        } else {
-            match targets.iter().zip(&claims).find(|(_, c)| matches!(c, Claim::Row(r) if r.row == row.row)) {
-                None => Verdict::NoSession,
-                Some((t, _)) => match t.title.as_deref().and_then(parse_title) {
+    rows.iter()
+        .filter(|r| due.contains(r.row.as_str()))
+        .map(|row| {
+            let verdict = match session_of(rows, targets, &row.row) {
+                Err(NO_SESSION) => Verdict::NoSession,
+                Err(reason) => Verdict::Declined(reason),
+                Ok(t) => match t.title.as_deref().and_then(parse_title) {
                     Some(reading) if reading.status == Status::Idle => Verdict::Close(t.key.clone()),
                     _ => Verdict::TabNotIdle,
                 },
-            }
-        };
-        out.push((row.row.clone(), verdict));
-    }
-    out
+            };
+            (row.row.clone(), verdict)
+        })
+        .collect()
 }
 
 pub fn spawn(app: AppHandle) {
@@ -142,7 +136,7 @@ fn tick(app: &AppHandle, adapter: &dyn TerminalAdapter, logged: &mut HashMap<Str
         tracing::debug!(terminal = adapter.name(), "idle close: the terminal could not be asked; retrying next tick");
         return;
     };
-    let rows: Vec<DesiredLabel> = local.iter().map(|s| DesiredLabel { row: s.id.clone(), label: s.display_label().to_string(), context: None }).collect();
+    let rows: Vec<DesiredLabel> = local.iter().map(|s| DesiredLabel::for_row(s, None)).collect();
 
     for (row, verdict) in pick(&rows, &targets, &due) {
         let Some(session) = local.iter().find(|s| s.id == row) else { continue };
@@ -153,7 +147,7 @@ fn tick(app: &AppHandle, adapter: &dyn TerminalAdapter, logged: &mut HashMap<Str
                 continue;
             }
             if logged.insert(row.clone(), verdict.slug()) != Some(verdict.slug()) {
-                tracing::info!(chat_id = %row, decision = "idle_close", outcome = verdict.slug(), terminal = adapter.name(), reason = verdict.reason(), "decision");
+                tracing::info!(chat_id = %row, decision = "idle_close", outcome = verdict.slug(), terminal = adapter.name(), reason = verdict.reason().as_str(), "decision");
             }
             continue;
         };
@@ -167,7 +161,7 @@ fn tick(app: &AppHandle, adapter: &dyn TerminalAdapter, logged: &mut HashMap<Str
         match adapter.close_session(&key) {
             Ok(()) => {
                 logged.insert(row.clone(), "closed");
-                tracing::info!(chat_id = %row, decision = "idle_close", outcome = "closed", terminal = adapter.name(), %key, idle_ms, window_ms = window, reason = Verdict::Close(key.clone()).reason(), "decision");
+                tracing::info!(chat_id = %row, decision = "idle_close", outcome = "closed", terminal = adapter.name(), %key, idle_ms, window_ms = window, reason = Verdict::Close(key.clone()).reason().as_str(), "decision");
             }
             Err(error) => {
                 if logged.insert(row.clone(), "close_failed") != Some("close_failed") {
@@ -181,6 +175,7 @@ fn tick(app: &AppHandle, adapter: &dyn TerminalAdapter, logged: &mut HashMap<Str
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::terminals::labels::{SAME_LABEL, SHARED_TITLE};
 
     const WINDOW: u64 = 3_600_000;
 
@@ -199,8 +194,8 @@ mod tests {
 
     #[test]
     fn every_verdict_gives_its_own_reason() {
-        let all = [Verdict::Close("k".into()), Verdict::NoSession, Verdict::TabNotIdle, Verdict::Declined("same_label"), Verdict::Declined("shared_title")];
-        let reasons: HashSet<&str> = all.iter().map(Verdict::reason).collect();
+        let all = [Verdict::Close("k".into()), Verdict::NoSession, Verdict::TabNotIdle, Verdict::Declined(SAME_LABEL), Verdict::Declined(SHARED_TITLE)];
+        let reasons: HashSet<String> = all.iter().map(Verdict::reason).collect();
         assert_eq!(reasons.len(), all.len());
     }
 

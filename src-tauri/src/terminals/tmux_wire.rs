@@ -87,10 +87,23 @@ pub fn close_refusal(session: &TmuxSession) -> Option<String> {
     if shown_here(session) {
         return Some("a terminal on this machine is attached to the session now, so that terminal closes it".to_string());
     }
+    if let Some(refusal) = command_refusal(session) {
+        return Some(refusal);
+    }
     match session.pane_titles.as_slice() {
         [title] if crate::terminal_title::shows_clean_here(title) => None,
-        [_] => Some("the session's title no longer shows it CLEAN".to_string()),
-        panes => Some(format!("the tmux session holds {} panes, and /exit would reach only one of them", panes.len())),
+        _ => Some("the session's title no longer shows it CLEAN".to_string()),
+    }
+}
+
+/// Why a command must not be typed into `session`, or `None`. `send-keys` to
+/// `=name:` reaches the session's active pane, which with more than one is not
+/// known to be the agent's. A terminal here attached to the session is no
+/// reason to refuse: the keys reach the same pane whoever types them.
+pub fn command_refusal(session: &TmuxSession) -> Option<String> {
+    match session.pane_titles.len() {
+        1 => None,
+        n => Some(format!("the tmux session holds {n} panes, and the keys would reach only one of them")),
     }
 }
 
@@ -231,6 +244,12 @@ mod tests {
     fn a_split_session_is_refused() {
         assert_eq!(close_refusal(&session("cc-x", &["⚫ x"], &["mac"])), None);
         assert!(close_refusal(&session("cc-x", &["⚫ x", "bash"], &["mac"])).unwrap().contains("2 panes"));
+    }
+
+    #[test]
+    fn a_command_needs_one_pane_and_nothing_else() {
+        assert_eq!(command_refusal(&session("cc-x", &["🟢 x"], &["windows"])), None, "neither the status nor a client here refuses typing");
+        assert!(command_refusal(&session("cc-x", &["🟢 x", "bash"], &[])).unwrap().contains("2 panes"));
     }
 
     #[test]

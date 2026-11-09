@@ -1,5 +1,6 @@
 //! The WSL tmux server holding the claude repo's remote sessions, as an
-//! adapter that closes and starts them.
+//! adapter that closes and starts them, and types an allowlisted command into
+//! one.
 //!
 //! A remote session is a native `claude.exe` in a tmux pane, and it can run
 //! with no terminal on this machine attached at all: the Mac's `⇄` tab is
@@ -25,6 +26,11 @@
 //! to check afterwards: a pane with no client has no surface to go unrealized,
 //! and the script owns the session's name.
 //!
+//! It also types `/clear` or `/exit` into a session for
+//! `POST /api/session/command` (`type_command`), through the same composer
+//! sequence the close uses, refused by [`super::tmux_wire::command_refusal`]
+//! rather than by the close's CLEAN checks.
+//!
 //! The rest of the seam answers nothing: restore reads each session's console
 //! title through the console adapter already, tmux has no context line, and
 //! which tab a person reads is a question for the terminals that draw them.
@@ -40,7 +46,7 @@
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use super::composer::{Keys, EXIT_POLL, EXIT_WAIT, KEY_PAUSE};
+use super::composer::{self, Keys, EXIT_POLL, EXIT_WAIT, KEY_PAUSE};
 use super::tmux_wire::{self as wire, TmuxSession};
 use super::{CloseTarget, Observation, TerminalAdapter, TerminalSession};
 use crate::subprocess::RunFailure;
@@ -104,8 +110,29 @@ fn tmux(args: &[&str]) -> Result<String, String> {
 }
 
 /// What the session's composer holds, or `None` when none is on screen.
-fn composer(pane: &str) -> Result<Option<String>, String> {
-    tmux(&["capture-pane", "-e", "-p", "-t", pane]).map(|c| super::composer::composer_in(&wire::plain_lines(&c)))
+fn composer_of(pane: &str) -> Result<Option<String>, String> {
+    tmux(&["capture-pane", "-e", "-p", "-t", pane]).map(|c| composer::composer_in(&wire::plain_lines(&c)))
+}
+
+/// Type `command` into tmux session `key`'s pane, once the session, freshly
+/// listed, passes `refusal`. The typing is [`composer::type_command`]'s, the
+/// sequence agwinterm types too.
+fn type_into(key: &str, command: composer::Command, refusal: fn(&TmuxSession) -> Option<String>) -> Result<(), String> {
+    let session = list()?.into_iter().find(|s| s.name == key).ok_or_else(|| format!("tmux session {key} is gone"))?;
+    if let Some(refusal) = refusal(&session) {
+        return Err(refusal);
+    }
+    // `=name:` names the session's pane exactly; a bare name matches by
+    // prefix, and `=name` alone is not resolved by pane-level commands.
+    let pane = format!("={key}:");
+    let send = |keys| {
+        let args: &[&str] = match keys {
+            Keys::Command(c) => &["-l", c.text()],
+            Keys::Enter => &["Enter"],
+        };
+        tmux(&[&["send-keys", "-t", pane.as_str()], args].concat()).map(|_| ())
+    };
+    composer::type_command(command, || composer_of(&pane), send, KEY_PAUSE)
 }
 
 impl TerminalAdapter for TmuxAdapter {
@@ -131,26 +158,11 @@ impl TerminalAdapter for TmuxAdapter {
         }
     }
 
-    /// Types `/exit` into the session's one pane the way
-    /// [`super::composer::type_exit`] does for every close, once the session
-    /// still passes [`wire::close_refusal`], and waits for tmux to destroy the
-    /// session, which it does when the agent exits cleanly.
+    /// Types `/exit` into the session's one pane ([`type_into`]) once the
+    /// session still passes [`wire::close_refusal`], and waits for tmux to
+    /// destroy the session, which it does when the agent exits cleanly.
     fn close_session(&self, key: &str) -> Result<(), String> {
-        let session = list()?.into_iter().find(|s| s.name == key).ok_or_else(|| format!("tmux session {key} is gone"))?;
-        if let Some(refusal) = wire::close_refusal(&session) {
-            return Err(refusal);
-        }
-        // `=name:` names the session's pane exactly; a bare name matches by
-        // prefix, and `=name` alone is not resolved by pane-level commands.
-        let pane = format!("={key}:");
-        let send = |keys| {
-            let args: &[&str] = match keys {
-                Keys::Exit => &["-l", "/exit"],
-                Keys::Enter => &["Enter"],
-            };
-            tmux(&[&["send-keys", "-t", pane.as_str()], args].concat()).map(|_| ())
-        };
-        super::composer::type_exit(|| composer(&pane), send, KEY_PAUSE)?;
+        type_into(key, composer::Command::Exit, wire::close_refusal)?;
         let target = format!("={key}");
         let until = Instant::now() + EXIT_WAIT;
         loop {
@@ -168,6 +180,16 @@ impl TerminalAdapter for TmuxAdapter {
 
     fn can_close(&self) -> bool {
         true
+    }
+
+    fn can_type_command(&self) -> bool {
+        true
+    }
+
+    /// The command, typed into the session's one pane once it passes
+    /// [`wire::command_refusal`], with nothing after it.
+    fn type_command(&self, key: &str, command: composer::Command) -> Result<(), String> {
+        type_into(key, command, wire::command_refusal)
     }
 
     fn can_launch(&self) -> bool {

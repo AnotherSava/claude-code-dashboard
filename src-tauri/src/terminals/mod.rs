@@ -111,13 +111,16 @@ pub mod agwinterm;
 /// every platform so the parsing is exercised on a Mac too.
 #[cfg(any(target_os = "windows", test))]
 pub mod agwinterm_wire;
-/// Where Claude Code's composer sits on a screen of text, shared by every close
-/// that types into the agent. Compiled where such a close exists, and for tests.
-#[cfg(any(target_os = "windows", test))]
+/// Where Claude Code's composer sits on a screen of text, and the allowlisted
+/// commands typed into it, shared by every adapter that types into the agent.
+/// Compiled everywhere, since [`TerminalAdapter::type_command`] names its
+/// [`composer::Command`]; only Windows has an adapter that types.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub mod composer;
 /// The WSL tmux server that holds the claude repo's remote sessions, reached
 /// through `wsl.exe`, as an adapter that closes the sessions no Windows
-/// terminal is showing and starts one where nothing runs.
+/// terminal is showing, starts one where nothing runs, and types an
+/// allowlisted command into one.
 #[cfg(target_os = "windows")]
 pub mod tmux;
 /// tmux's answers as pure functions: the session list and its clients, and a
@@ -984,6 +987,31 @@ pub trait TerminalAdapter: Send {
     /// fact about the adapter, answered without asking the terminal, so
     /// `idle_close` starts no worker where every close would be refused.
     fn can_close(&self) -> bool {
+        false
+    }
+
+    /// Type one allowlisted built-in command into the agent in the session
+    /// behind `key` and press Enter, or say why not; nothing else follows it.
+    /// `key` is a [`CloseTarget::key`] this adapter minted, since a session is
+    /// found for typing by the same title join it is closed by.
+    ///
+    /// It types into the agent's composer through
+    /// [`composer::type_command`], so it refuses wherever that does — a draft,
+    /// no composer on screen, a composer that does not read the command back —
+    /// and wherever the terminal can tell the keys would land somewhere else.
+    /// What a close refuses beyond that (the row no longer CLEAN, another
+    /// pane the close would end) is the close's alone.
+    ///
+    /// **May block** for several seconds, the pause between the command and
+    /// Enter included. The default refuses.
+    fn type_command(&self, key: &str, command: composer::Command) -> Result<(), String> {
+        let _ = (key, command);
+        Err("this terminal cannot type into a session".to_string())
+    }
+
+    /// Whether [`type_command`](Self::type_command) can ever succeed here. A
+    /// fact about the adapter, answered without asking the terminal.
+    fn can_type_command(&self) -> bool {
         false
     }
 

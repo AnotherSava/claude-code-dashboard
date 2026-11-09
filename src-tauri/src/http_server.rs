@@ -19,6 +19,7 @@ use crate::membership::{self, Admission, Departure, EventFacts, Left, Members, M
 use crate::nonce_store::NonceStore;
 use crate::peer_message::{self, Outcome, Receipt};
 use crate::prompt_history::PromptHistoryStore;
+use crate::session_command;
 use crate::session_launcher;
 use crate::session_registry::{Activity, LiveSession, SessionRegistry};
 use crate::state::{AgentSession, AppState, BoundaryKind, SettleScope, Status};
@@ -43,6 +44,7 @@ pub async fn run(app: AppHandle, port: u16) {
         .route("/api/session-clean", post(post_session_clean))
         .route("/api/project/rename", post(post_project_rename))
         .route("/api/session/open", post(post_session_open))
+        .route("/api/session/command", post(post_session_command))
         .route("/api/session/tabs", get(get_session_tabs))
         .route("/api/dev-server", post(post_dev_server).get(get_dev_server))
         .with_state(app);
@@ -227,6 +229,59 @@ async fn post_session_open(State(app): State<AppHandle>, headers: HeaderMap, Jso
         attach_started(&app, &project, name).await;
     }
     answer(status, outcome, &project, reason, detail)
+}
+
+/// Type an allowlisted built-in command (`/clear`, `/exit`) into a local
+/// session's composer, for a coordinating agent that can message a session but
+/// cannot make it run a built-in command. Which session, and every refusal
+/// before the terminal is touched, is [`session_command`]'s; the typing is the
+/// adapter's [`crate::terminals::TerminalAdapter::type_command`], which refuses
+/// a draft, a missing composer and a failed read-back.
+///
+/// Answers `outcome` of `typed` or `refused` with a `reason` slug and a human
+/// `detail`, and the `row` it resolved where it got that far. A refusal types
+/// nothing. `typed` means Enter was pressed on a composer that read back the
+/// command, not that the command has finished running. Loopback `Host`
+/// required: it types into a person's terminal.
+async fn post_session_command(State(app): State<AppHandle>, headers: HeaderMap, Json(req): Json<session_command::CommandRequest>) -> Response {
+    if let Some(detail) = csrf_refusal(&headers, true) {
+        return csrf_refused(detail).into_response();
+    }
+    let answer = |status: StatusCode, outcome: &str, row: &str, reason: &str, detail: &str| (status, Json(serde_json::json!({"outcome": outcome, "row": row, "reason": reason, "detail": detail}))).into_response();
+    let refuse = |row: &str, command: &str, r: session_command::Refusal| {
+        tracing::info!(chat_id = %row, decision = "session_command", outcome = "refused", reason = r.slug(), command, detail = %r.detail(), "session command refused");
+        let status = if r.is_bad_request() { StatusCode::BAD_REQUEST } else { StatusCode::CONFLICT };
+        answer(status, "refused", row, r.slug(), &r.detail())
+    };
+    let rows = crate::commands::resolved_snapshot(&app);
+    let anchors = app.try_state::<ChatIdRegistry>();
+    let (command, row) = match session_command::resolve(&req, &rows, |sid| anchors.as_ref().and_then(|r| r.anchored(sid))) {
+        Ok(found) => found,
+        Err(r) => return refuse("", req.command.trim(), r),
+    };
+    let text = command.text();
+    let Some(adapter) = crate::terminals::for_platform(&app).filter(|a| a.can_type_command()) else {
+        return refuse(&row, text, session_command::Refusal::Unsupported);
+    };
+    let typed_row = row.clone();
+    let state_app = app.clone();
+    let typed = tokio::task::spawn_blocking(move || {
+        let targets = adapter.close_targets().ok_or(session_command::Refusal::TerminalUnreadable)?;
+        let key = session_command::target_key(&rows, &targets, &typed_row)?;
+        // A prompt that arrived while the terminal was being read starts a turn
+        // the command would be queued behind.
+        session_command::still_free(state_app.try_state::<AppState>().and_then(|st| st.base_status_of(&typed_row)))?;
+        adapter.type_command(&key, command).map_err(session_command::Refusal::Typing)
+    })
+    .await;
+    match typed {
+        Ok(Ok(())) => {
+            tracing::info!(chat_id = %row, decision = "session_command", outcome = "typed", command = text, "session command typed");
+            answer(StatusCode::OK, "typed", &row, "", "typed and submitted")
+        }
+        Ok(Err(r)) => refuse(&row, text, r),
+        Err(e) => refuse(&row, text, session_command::Refusal::Typing(format!("the typing task failed: {e}"))),
+    }
 }
 
 /// Every agterm tab running the agent, for the local picker

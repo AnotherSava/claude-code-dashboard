@@ -222,47 +222,55 @@ pub struct ClosePane {
     pub index: usize,
 }
 
-/// The pane to type into, or why session `node` must not be closed.
+/// The pane to type a command into, or why nothing may be typed into session
+/// `node`.
 ///
-/// A close types into the agent rather than ending a process, because on this
-/// machine the agent often runs in a WSL tmux pane the tab only attaches to:
-/// closing the tab detaches the client and leaves the agent running, while a
-/// clean `/exit` ends the agent and lets tmux tear its session down. Typing is
-/// what makes these refusals necessary. It must reach the agent's composer: an
-/// overlay over the session takes its input, and a focused pane that is a bare
-/// shell is a prompt that would run the text as a command. It must not reach a
-/// person mid-sentence, so the selected session of agwinterm's frontmost window
-/// is left alone. And the title it was chosen by must still say CLEAN, since
-/// the agent may have moved on since the label read. A draft in the composer
-/// is checked separately, from the pane's text ([`composer_text`]), since the
-/// tree does not carry it.
-///
-/// The close then ends the whole session, so a split is closed only where its
-/// other pane is a bare shell: agwinterm closes a session without confirming,
-/// and whatever ran beside the agent would go with it.
-pub fn close_pane(node: &Value, in_front: bool) -> Result<ClosePane, String> {
+/// Typing must reach the agent's composer: an overlay over the session takes
+/// its input, and a focused pane that is a bare shell is a prompt that would
+/// run the text as a command. It must not reach a person mid-sentence, so the
+/// selected session of agwinterm's frontmost window is left alone. A draft in
+/// the composer is checked separately, from the pane's text
+/// ([`composer_text`]), since the tree does not carry it.
+pub fn typing_pane(node: &Value, in_front: bool) -> Result<ClosePane, String> {
     if in_front && node.get("active").and_then(Value::as_bool) == Some(true) {
         return Err("the session is on screen in agwinterm's frontmost window".to_string());
     }
     if covered(node) {
         return Err("an overlay covers the session and would take the input".to_string());
     }
-    if !node.get("title").and_then(Value::as_str).is_some_and(crate::terminal_title::shows_clean_here) {
-        return Err("the session's title no longer shows it CLEAN".to_string());
-    }
     let index = node.get("focusedPane").and_then(Value::as_u64).unwrap_or(0) as usize;
     if agent_gone(node, index) {
         return Err("the focused pane is a bare shell, so the agent is no longer running there".to_string());
-    }
-    let panes = node.get("paneIds").and_then(Value::as_array).map_or(1, Vec::len);
-    if (0..panes).any(|i| i != index && !agent_gone(node, i)) {
-        return Err("another pane in the session is running something the close would end".to_string());
     }
     let id = match node.get("paneIds").and_then(Value::as_array) {
         Some(ids) => ids.get(index).and_then(Value::as_str).ok_or("the tree names no focused pane")?.to_string(),
         None => node.get("id").and_then(Value::as_str).ok_or("the session has no id")?.to_string(),
     };
     Ok(ClosePane { id, index })
+}
+
+/// The pane to type `/exit` into, or why session `node` must not be closed:
+/// every [`typing_pane`] refusal, and two of the close's own.
+///
+/// A close types into the agent rather than ending a process, because on this
+/// machine the agent often runs in a WSL tmux pane the tab only attaches to:
+/// closing the tab detaches the client and leaves the agent running, while a
+/// clean `/exit` ends the agent and lets tmux tear its session down. The title
+/// it was chosen by must still say CLEAN, since the agent may have moved on
+/// since the label read. And the close then ends the whole session, so a split
+/// is closed only where its other pane is a bare shell: agwinterm closes a
+/// session without confirming, and whatever ran beside the agent would go with
+/// it.
+pub fn close_pane(node: &Value, in_front: bool) -> Result<ClosePane, String> {
+    let pane = typing_pane(node, in_front)?;
+    if !node.get("title").and_then(Value::as_str).is_some_and(crate::terminal_title::shows_clean_here) {
+        return Err("the session's title no longer shows it CLEAN".to_string());
+    }
+    let panes = node.get("paneIds").and_then(Value::as_array).map_or(1, Vec::len);
+    if (0..panes).any(|i| i != pane.index && !agent_gone(node, i)) {
+        return Err("another pane in the session is running something the close would end".to_string());
+    }
+    Ok(pane)
 }
 
 /// Whether pane `index` of session `node` has fallen back to a shell with no
@@ -511,6 +519,27 @@ mod tests {
         };
         assert!(refused(&|n| split(n, Value::Null), false), "the other pane runs something the close would end");
         assert!(!refused(&|n| split(n, json!("pwsh")), false), "a bare shell beside the agent may go");
+    }
+
+    #[test]
+    fn a_command_keeps_the_typing_refusals_and_drops_the_close_ones() {
+        let refused = |edit: &dyn Fn(&mut Value), in_front: bool| {
+            let mut n = clean_agent();
+            edit(&mut n);
+            typing_pane(&n, in_front).is_err()
+        };
+        assert!(refused(&|n| n["active"] = json!(true), true), "on screen in the frontmost window");
+        assert!(refused(&|n| n["overlay"] = json!(true), false));
+        assert!(refused(&|n| n["foregroundShells"] = json!(["pwsh"]), false), "a bare shell would run the command");
+        assert!(!refused(&|n| n["title"] = json!("🟢 web"), false), "a command does not need the row CLEAN");
+        let split = |n: &mut Value| {
+            n["paneIds"] = json!(["S", "P2"]);
+            n["focusedPane"] = json!(1);
+            n["foregroundShells"] = json!([null, null]);
+        };
+        let mut n = clean_agent();
+        split(&mut n);
+        assert_eq!(typing_pane(&n, false), Ok(ClosePane { id: "P2".into(), index: 1 }), "a busy pane beside the agent is not touched by typing");
     }
 
     /// A `session text --styles` result from plain row texts, each one run;

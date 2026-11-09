@@ -918,7 +918,7 @@ fn desired_labels(enabled: bool, sessions: &[AgentSession]) -> Vec<DesiredLabel>
     if !enabled {
         return Vec::new();
     }
-    sessions.iter().map(|s| DesiredLabel { row: s.id.clone(), label: s.display_label().to_string(), context: s.shown_task().and_then(|t| one_line(&t)) }).collect()
+    sessions.iter().map(|s| DesiredLabel::for_row(s, s.shown_task().and_then(|t| one_line(&t)))).collect()
 }
 
 /// Reconcile terminal tab titles with the current sessions. Called from
