@@ -420,7 +420,7 @@ Before any key is sent, the dashboard reads the session's composer and refuses w
 | `409`  | `refused` | `no_session`, `same_label`, `shared_title` | no tab title names the row, or more than one does |
 | `409`  | `refused` | `typing_refused` | the terminal refused: a draft, no composer, the session in front, an overlay, a bare shell in the pane, a tmux session with several panes, or a read-back that did not match; `detail` says which |
 
-Every answer is `{"outcome", "row", "reason", "detail"}`, with `row` empty where the request named no row. Logged as `decision = "session_command"` with the row, the `outcome`, the `command` and, on a refusal, the `reason`.
+Every answer is `{"outcome", "row", "reason", "detail"}`, with `row` empty where the request named no row, or was refused before its target was read (`unknown_command`, `no_target`). Logged as `decision = "session_command"` with the row, the `outcome`, the `command` and, on a refusal, the `reason`.
 
 ## `GET /api/session/tabs`
 

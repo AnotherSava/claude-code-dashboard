@@ -106,7 +106,8 @@ impl Refusal {
 /// `rows` is every row the dashboard shows, synced ones included, so a
 /// project on another machine is told so rather than reported missing.
 /// `anchored` resolves a session id to its row. A refusal carries the row
-/// the request named, empty where it named none, for the answer's `row`.
+/// the request named, for the answer's `row`: empty where it named none, or
+/// where the command or the naming is refused before the target is read.
 pub fn resolve(req: &CommandRequest, rows: &[AgentSession], anchored: impl Fn(&str) -> Option<String>) -> Result<(Command, String), (String, Refusal)> {
     let command = Command::parse(&req.command).ok_or((String::new(), Refusal::UnknownCommand))?;
     let nonblank = |s: &Option<String>| s.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
