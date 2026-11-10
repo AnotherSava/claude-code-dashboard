@@ -135,13 +135,20 @@ pub(crate) fn close_argv(window: &str, session: &str) -> Vec<String> {
 /// no-break spaces fall short and two em spaces overshoot.
 const SERVERS_INDENT: &str = "\u{2007}\u{2007}\u{2007}";
 
+/// [`SERVERS_INDENT`] for a title that carries the remote badge, whose `⇄ `
+/// moves the name 31 px further right at 2×. Five figure spaces and a hair
+/// space (U+200A), measured on 0.40.0 to put the `▶` 1 px short of the name;
+/// a second hair space or a thin space overshoots by 1 px.
+const BADGED_SERVERS_INDENT: &str = "\u{2007}\u{2007}\u{2007}\u{2007}\u{2007}\u{200A}";
+
 /// The info line naming a session's running dev servers: a green `▶`, then
 /// the ports, sorted by the caller. Inline markdown, so it is sent with
 /// `--markdown`; a port is digits only, so nothing in it needs escaping.
-pub(crate) fn servers_line(ports: &[u16]) -> String {
+pub(crate) fn servers_line(ports: &[u16], badged: bool) -> String {
     let noun = if ports.len() == 1 { "dev server" } else { "dev servers" };
     let list: Vec<String> = ports.iter().map(|p| format!(":{p}")).collect();
-    format!("{SERVERS_INDENT}^[▶](color: \"green\") {noun} {}", list.join(" "))
+    let indent = if badged { BADGED_SERVERS_INDENT } else { SERVERS_INDENT };
+    format!("{indent}^[▶](color: \"green\") {noun} {}", list.join(" "))
 }
 
 /// The argv that sets `session`'s info line to [`servers_line`], expiring by
@@ -150,7 +157,7 @@ pub(crate) fn servers_line(ports: &[u16]) -> String {
 ///
 /// No `--window`: agterm resolves a session id across windows, and the id
 /// arrives from the session's own environment with no window beside it.
-pub(crate) fn servers_argv(session: &str, ports: &[u16], hide_after_secs: u64) -> Vec<String> {
+pub(crate) fn servers_argv(session: &str, ports: &[u16], badged: bool, hide_after_secs: u64) -> Vec<String> {
     vec![
         "session".into(),
         "info".into(),
@@ -161,7 +168,7 @@ pub(crate) fn servers_argv(session: &str, ports: &[u16], hide_after_secs: u64) -
         session.into(),
         "--json".into(),
         "--".into(),
-        servers_line(ports),
+        servers_line(ports, badged),
     ]
 }
 
@@ -283,16 +290,17 @@ mod tests {
 
     #[test]
     fn a_servers_line_names_every_port_with_its_noun() {
-        assert_eq!(servers_line(&[5173]), format!("{SERVERS_INDENT}^[▶](color: \"green\") dev server :5173"));
-        assert_eq!(servers_line(&[3000, 5173]), format!("{SERVERS_INDENT}^[▶](color: \"green\") dev servers :3000 :5173"));
+        assert_eq!(servers_line(&[5173], false), format!("{SERVERS_INDENT}^[▶](color: \"green\") dev server :5173"));
+        assert_eq!(servers_line(&[3000, 5173], false), format!("{SERVERS_INDENT}^[▶](color: \"green\") dev servers :3000 :5173"));
     }
 
     #[test]
     fn the_servers_line_is_the_last_argument_after_every_option() {
-        let argv = servers_argv("S", &[5173], 45);
+        let argv = servers_argv("S", &[5173], false, 45);
         let dash = argv.iter().position(|a| a == "--").unwrap();
         assert_eq!(dash, argv.len() - 2, "only the text follows `--`");
-        assert_eq!(argv[argv.len() - 1], servers_line(&[5173]));
+        assert_eq!(argv[argv.len() - 1], servers_line(&[5173], false));
+        assert_eq!(servers_line(&[3940], true), format!("{BADGED_SERVERS_INDENT}^[▶](color: \"green\") dev server :3940"));
         assert!(argv[..dash].windows(2).any(|w| w == ["--hide-after", "45"]));
         assert!(argv[..dash].windows(2).any(|w| w == ["--target", "S"]));
     }
@@ -449,4 +457,5 @@ mod tests {
         let focus_on_split = node(serde_json::json!({ "splitFocused": true, "splitForeground": ["npm", "run", "dev"] }));
         assert_eq!(close_refusal(&focus_on_split), None);
     }
+
 }

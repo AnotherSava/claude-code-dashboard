@@ -223,9 +223,9 @@ impl TerminalAdapter for Composite {
 
     /// The first child that can show servers, as `launch` is routed. The
     /// session address is unprefixed, since the dashboard did not mint it.
-    fn show_servers(&self, session: &str, ports: &[u16], expire_after: std::time::Duration) -> Result<super::ServersShown, String> {
+    fn show_servers(&self, session: &str, ports: &[u16], badged: bool, expire_after: std::time::Duration) -> Result<super::ServersShown, String> {
         let child = self.children.iter().find(|c| c.can_show_servers()).ok_or_else(|| "no terminal in this set can show a dev server".to_string())?;
-        child.show_servers(session, ports, expire_after)
+        child.show_servers(session, ports, badged, expire_after)
     }
 
     /// The child `show_servers` is routed to, so every address listed is one

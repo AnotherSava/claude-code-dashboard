@@ -208,8 +208,8 @@ impl TerminalAdapter for AgtermAdapter {
         true
     }
 
-    fn show_servers(&self, session: &str, ports: &[u16], expire_after: std::time::Duration) -> Result<super::ServersShown, String> {
-        let argv = if ports.is_empty() { wire::servers_clear_argv(session) } else { wire::servers_argv(session, ports, expire_after.as_secs()) };
+    fn show_servers(&self, session: &str, ports: &[u16], badged: bool, expire_after: std::time::Duration) -> Result<super::ServersShown, String> {
+        let argv = if ports.is_empty() { wire::servers_clear_argv(session) } else { wire::servers_argv(session, ports, badged, expire_after.as_secs()) };
         let args: Vec<&str> = argv.iter().map(String::as_str).collect();
         match crate::agterm::agtermctl_checked(&args) {
             Ok(_) => Ok(super::ServersShown::Shown),

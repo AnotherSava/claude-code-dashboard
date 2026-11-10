@@ -316,16 +316,18 @@ fn pass(store: &DevServers, adapter: Option<&dyn TerminalAdapter>, rows: impl Fn
             ports.sort_unstable();
             ports.dedup();
         }
+        // A tab is in `tabs` only when its title wore the remote badge.
+        let badged: BTreeSet<String> = tabs.keys().cloned().collect();
         store.set_tabs(tabs);
         let cleared: Vec<String> = shown.iter().filter(|s| !wanted.contains_key(*s)).cloned().collect();
         for session in cleared {
             // A clear that fails leaves the line to expire by itself.
-            let _ = adapter.show_servers(&session, &[], EXPIRE);
+            let _ = adapter.show_servers(&session, &[], false, EXPIRE);
             shown.remove(&session);
             failing.remove(&session);
         }
         for (session, ports) in &wanted {
-            match adapter.show_servers(session, ports, EXPIRE) {
+            match adapter.show_servers(session, ports, badged.contains(session), EXPIRE) {
                 Ok(ServersShown::Shown) => {
                     shown.insert(session.clone());
                     failing.remove(session);
@@ -385,6 +387,7 @@ mod tests {
     /// An adapter that records every write and answers from a script.
     struct Recorder {
         writes: Mutex<Vec<(String, Vec<u16>)>>,
+        badged: Mutex<Vec<String>>,
         gone: Vec<String>,
         targets: Vec<ServerTarget>,
     }
@@ -399,8 +402,11 @@ mod tests {
         fn poll(&mut self, _now_ms: i64) -> Vec<crate::terminals::Observation> {
             Vec::new()
         }
-        fn show_servers(&self, session: &str, ports: &[u16], _expire_after: Duration) -> Result<ServersShown, String> {
+        fn show_servers(&self, session: &str, ports: &[u16], badged: bool, _expire_after: Duration) -> Result<ServersShown, String> {
             self.writes.lock().unwrap().push((session.to_string(), ports.to_vec()));
+            if badged {
+                self.badged.lock().unwrap().push(session.to_string());
+            }
             Ok(if self.gone.iter().any(|g| g == session) { ServersShown::NoSuchSession } else { ServersShown::Shown })
         }
         fn server_targets(&self) -> Option<Vec<ServerTarget>> {
@@ -409,7 +415,7 @@ mod tests {
     }
 
     fn recorder(gone: Vec<String>, targets: Vec<ServerTarget>) -> Recorder {
-        Recorder { writes: Mutex::new(Vec::new()), gone, targets }
+        Recorder { writes: Mutex::new(Vec::new()), badged: Mutex::new(Vec::new()), gone, targets }
     }
 
     fn store_with(servers: Vec<DevServer>) -> (DevServers, PathBuf) {
@@ -468,6 +474,7 @@ mod tests {
         let mut shown = BTreeSet::new();
         assert!(!pass(&store, Some(&adapter), || vec![synced("CHROME", "scheduler")], &mut shown, &mut HashMap::new()));
         assert!(adapter.writes.lock().unwrap().contains(&("T1".to_string(), vec![3000, 5173])));
+        assert_eq!(*adapter.badged.lock().unwrap(), vec!["T1".to_string()], "a tab rendering a peer's row is written as badged");
         let offered = store.for_session("T1");
         assert_eq!(offered.iter().map(|o| (o.port, o.open.clone())).collect::<Vec<_>>(), vec![(3000, None), (5173, Some("https://x.ts.net:8443".to_string()))], "newest first, opened at the published address only");
         assert!(offered.iter().all(|o| o.device.as_deref() == Some("CHROME")));

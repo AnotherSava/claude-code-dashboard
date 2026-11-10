@@ -1086,11 +1086,14 @@ pub trait TerminalAdapter: Send {
     /// process started in it (agterm's `AGTERM_SESSION_ID`), passed through
     /// opaque: unlike every other key on this seam it was not minted by the
     /// adapter but carried to the dashboard by the process that announced the
-    /// server.
+    /// server. `badged` says the session's title carries
+    /// `terminal_title::REMOTE_BADGE` in front of its status glyph, which puts
+    /// its name further right, so a line meant to start under the name has to
+    /// start further right too.
     ///
     /// **May block.** The default refuses.
-    fn show_servers(&self, session: &str, ports: &[u16], expire_after: std::time::Duration) -> Result<ServersShown, String> {
-        let _ = (session, ports, expire_after);
+    fn show_servers(&self, session: &str, ports: &[u16], badged: bool, expire_after: std::time::Duration) -> Result<ServersShown, String> {
+        let _ = (session, ports, badged, expire_after);
         Err("this terminal has no line to show a dev server on".to_string())
     }
 
