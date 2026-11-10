@@ -209,8 +209,9 @@ or `id`), and a `reason`:
   in the row's trail: grep `widget.jsonl` for `"decision":"dev_server"` and
   match it to the row by its `port`. It usually follows within a second, or
   up to 15s later for a server still shutting down.
-  `outcome` is `stopped`, `stop_failed` (with `failed`), `none_left` (nothing
-  was still running) or `unreadable` (the process table could not be read). It
+  `outcome` is `stopped`, `stop_failed` (with `failed`, the refused kills whose
+  process was still running afterwards or could not be checked), `none_left`
+  (nothing was still running) or `unreadable` (the process table could not be read). It
   comes from the same departure as a `session_clear` or `reap_exited`, written
   from a thread of its own, so it can land on either side of that line; with
   `reap_exited_sessions` off the row stays and it follows the `member_leave`.
