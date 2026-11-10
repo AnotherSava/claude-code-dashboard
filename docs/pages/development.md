@@ -102,12 +102,12 @@ Under the repo root `claude-code-dashboard/`:
     - `setup.rs` — embedded Python hook + settings.json snippet builder for onboarding
     - `http_server.rs` — the loopback axum server: `/api/event`, `/api/agents`, `/api/message`, `/api/window`, `/api/session-clean`, `/api/project/rename`, `/api/session/open`, `/api/session/command`, `/api/session/tabs`, `/api/dev-server`
     - `sync.rs` — multi-device session sync: source- and token-gated listener, metadata push, receiver-driven pulls
-    - `tailnet.rs` — asking Tailscale which machine a connection came from, instead of trusting its envelope
+    - `tailnet.rs` — asking Tailscale which machine a connection came from, instead of trusting its envelope, and removing the tailnet front of a dev server that has stopped
     - `subprocess.rs` — running a helper program to a deadline, with no console window on Windows
     - `peer_message.rs` — relaying one message to an agent on another machine, and the honesty rules around it
     - `session_launcher.rs` — starting a terminal session for a project that has none, for a relayed message or for the local picker (`integrations/pick-local-session.py`, through `POST /api/session/open`); it names no terminal, asking the platform's `terminals::TerminalAdapter` to launch the session (agterm's adapter on macOS, its workspace placement included), so a launcher for another terminal is that terminal's adapter implementing `launch`
     - `session_command.rs` — which local session `POST /api/session/command` types an allowlisted built-in command (`/clear`, `/exit`) into, found by the same title join the idle close uses, and every refusal before the terminal is touched; the typing is the adapter's `type_command`
-    - `dev_servers.rs` — announced dev servers, checked until they stop answering and shown on the agterm session they were started from, or on the other machine's `⇄` tab for their row through the sync push, in `dev_servers.json`
+    - `dev_servers.rs` — announced dev servers, checked until they stop answering, when their tailnet front is removed, and shown on the agterm session they were started from, or on the other machine's `⇄` tab for their row through the sync push, in `dev_servers.json`
     - `workspace_memory.rs` — the agterm window and workspace each project's agent was last seen in, so a started session opens there, in `agterm_workspaces.json`
     - `session_restore.rs` — giving a live session its row back after a restart
     - `alive_stamp.rs` — the previous run's last heartbeat, which tells `session_restore` a session started while the dashboard was down
@@ -116,7 +116,7 @@ Under the repo root `claude-code-dashboard/`:
     - `membership.rs` — which live sessions belong to a row and which one (its main) drives it
     - `liveness.rs` — process-liveness primitives, and the process table with each process's parent
     - `liveness_reaper.rs` — drops row members whose Claude process exited without a `SessionEnd`, and removes a row once its last member is gone; its process table also records each agent's descendants for `session_leftovers.rs`
-    - `session_leftovers.rs` — stops what a session left running once its row's last member is gone: the dev servers announced for the row, and each agent's descendants as the reaper's last process table showed them
+    - `session_leftovers.rs` — stops what a session left running once its row's last member is gone: the dev servers announced for the row with their tailnet fronts, and each agent's descendants as the reaper's last process table showed them
     - `waiting_settle.rs` — settles a `waiting` row to `done` once its killed background task can no longer report
     - `idle_close.rs` — closes a session, and the terminal tab it runs in where one on this machine shows it, once it has sat clean past `idle_close_ms`
     - `subagent_gate.rs` — the subagent permission-prompt overlay, and finding the gated call's result that releases it

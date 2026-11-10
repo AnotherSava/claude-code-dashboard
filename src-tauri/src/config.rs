@@ -155,8 +155,9 @@ pub struct Config {
     /// restart.
     pub reap_exited_sessions: bool,
     /// Stop what a session leaves running once its row's last session ends,
-    /// however it ended: the dev servers announced for the row, and whatever
-    /// else the agent started that outlives it. Read by `session_leftovers`
+    /// however it ended: the dev servers announced for the row, with the
+    /// tailnet fronts their deploys published, and whatever else the agent
+    /// started that outlives it. Read by `session_leftovers`
     /// at each end. Off leaves them running.
     pub stop_session_processes: bool,
     /// Track which finished sessions the user has actually looked at, so a row

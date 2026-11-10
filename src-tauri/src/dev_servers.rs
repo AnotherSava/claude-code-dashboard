@@ -14,7 +14,8 @@
 //!
 //! Nothing announces a stop: the server runs detached and outlives the script.
 //! So a worker checks every announced port each [`PASS`] and forgets one that
-//! no longer accepts a connection, clearing its line. A redeploy kills the old
+//! no longer accepts a connection, clearing its line and removing the tailnet
+//! front its deploy published, which would otherwise go on holding its port. A redeploy kills the old
 //! server before starting the new one, so a pass landing in that gap forgets
 //! it and the new server's announcement brings it back a few seconds later.
 //!
@@ -119,16 +120,17 @@ struct Held {
     /// session address, with the device they run on. What the chord is answered
     /// from on a `⇄` tab.
     tabs: BTreeMap<String, (String, Vec<SharedServer>)>,
-    /// Something to show changed since the worker last woke. Kept beside the
-    /// list rather than left to the condvar, so one that arrives while a pass
-    /// is running still cuts the next wait short.
-    announced: bool,
+    /// A pass is wanted before the timed one: a server was announced, a
+    /// peer's list changed, or servers were stopped. Kept beside the list
+    /// rather than left to the condvar, so a wake that arrives while a pass is
+    /// running still cuts the next wait short.
+    pass_wanted: bool,
 }
 
 impl DevServers {
     pub fn new(path: PathBuf) -> Self {
         let data = json_store::load(&path, "dev server list");
-        Self { path, held: Mutex::new(Held { servers: data, remote: HashMap::new(), tabs: BTreeMap::new(), announced: false }), wake: Condvar::new() }
+        Self { path, held: Mutex::new(Held { servers: data, remote: HashMap::new(), tabs: BTreeMap::new(), pass_wanted: false }), wake: Condvar::new() }
     }
 
     /// Record a server and wake the worker, so its line appears now rather
@@ -137,8 +139,7 @@ impl DevServers {
         let mut held = self.held.lock().unwrap();
         announce(&mut held.servers, server);
         self.save(&held.servers);
-        held.announced = true;
-        self.wake.notify_all();
+        self.wake_locked(&mut held);
     }
 
     /// Replace one peer's servers with what its push lists, waking the worker
@@ -154,8 +155,7 @@ impl DevServers {
         } else {
             held.remote.insert(device.to_string(), servers);
         }
-        held.announced = true;
-        self.wake.notify_all();
+        self.wake_locked(&mut held);
     }
 
     /// The servers this machine announced that a peer can show: those
@@ -165,12 +165,23 @@ impl DevServers {
         held.servers.iter().filter_map(|s| Some(SharedServer { row: s.row.clone()?, port: s.port, url: s.url.clone(), announced_at: s.announced_at })).collect()
     }
 
-    /// The port and published tailnet URL of each server this machine
-    /// recorded for `row`, for [`crate::session_leftovers`] to stop and
-    /// unpublish once that row's last session ends.
-    pub fn servers_of_row(&self, row: &str) -> Vec<(u16, Option<String>)> {
+    /// The port of each server this machine recorded for `row`, for
+    /// [`crate::session_leftovers`] to stop once that row's last session ends.
+    pub fn ports_of_row(&self, row: &str) -> Vec<u16> {
         let held = self.held.lock().unwrap();
-        held.servers.iter().filter(|s| s.row.as_deref() == Some(row)).map(|s| (s.port, s.url.clone())).collect()
+        held.servers.iter().filter(|s| s.row.as_deref() == Some(row)).map(|s| s.port).collect()
+    }
+
+    /// Wake the worker for a pass now, after something stopped servers.
+    pub fn recheck(&self) {
+        self.wake_locked(&mut self.held.lock().unwrap());
+    }
+
+    /// Ask the worker for a pass now. Every early wake goes through here, since
+    /// [`Self::wait`] reads the flag it sets.
+    fn wake_locked(&self, held: &mut Held) {
+        held.pass_wanted = true;
+        self.wake.notify_all();
     }
 
     /// The servers started from `session`, newest first, then the peer
@@ -217,12 +228,12 @@ impl DevServers {
         changed
     }
 
-    /// Sleep until something to show changes or `timeout`, whichever comes
-    /// first.
+    /// Sleep until [`Self::wake_locked`] asks for a pass or `timeout`,
+    /// whichever comes first.
     fn wait(&self, timeout: Duration) {
         let held = self.held.lock().unwrap();
-        let mut held = self.wake.wait_timeout_while(held, timeout, |h| !h.announced).unwrap().0;
-        held.announced = false;
+        let mut held = self.wake.wait_timeout_while(held, timeout, |h| !h.pass_wanted).unwrap().0;
+        held.pass_wanted = false;
     }
 
     fn save(&self, data: &[DevServer]) {
@@ -309,7 +320,13 @@ fn pass(store: &DevServers, adapter: Option<&dyn TerminalAdapter>, rows: impl Fn
     let servers = store.snapshot();
     let (alive, stopped): (Vec<DevServer>, Vec<DevServer>) = servers.into_iter().partition(|s| port_answers(s.port));
     for s in &stopped {
-        tracing::info!(decision = "dev_server", outcome = "stopped", port = s.port, dir = %s.dir, session = ?s.session, "dev server stopped answering");
+        // The front would otherwise go on proxying to a port nothing listens
+        // on, and holding its port on the wildcard address, once the record
+        // that names it is forgotten; a redeploy publishes it again.
+        let front = s.url.as_deref().map(|url| crate::tailnet::unserve_front(url, s.port));
+        let unpublished = front.as_ref().and_then(|r| r.as_ref().ok().copied().flatten());
+        let front_error = front.and_then(Result::err);
+        tracing::info!(decision = "dev_server", outcome = "stopped", port = s.port, dir = %s.dir, session = ?s.session, ?unpublished, ?front_error, "dev server stopped answering");
     }
     let mut gone: Vec<(Option<String>, u16)> = stopped.iter().map(|s| (s.session.clone(), s.port)).collect();
     if let Some(adapter) = adapter {

@@ -202,8 +202,13 @@ or `id`), and a `reason`:
   purpose, not stuck.
 - `session_leftovers` — the row's last session left, and the dashboard stopped
   what it had left running: whatever listened on the dev-server ports recorded
-  for the row, and the agent's descendants as the reaper last saw them, then
-  removed each server's tailnet front (`unpublished` lists the front ports).
+  for the row, and the agent's descendants as the reaper last saw them. Each
+  stopped server's tailnet front is removed afterwards when the dev-server
+  check forgets it, logged on its own `dev_server` `stopped` line
+  (`unpublished` or `front_error`). That line carries no chat_id, so it is not
+  in the row's trail: grep `widget.jsonl` for `"decision":"dev_server"` and
+  match it to the row by its `port`. It usually follows within a second, or
+  up to 15s later for a server still shutting down.
   `outcome` is `stopped`, `stop_failed` (with `failed`), `none_left` (nothing
   was still running) or `unreadable` (the process table could not be read). It
   comes from the same departure as a `session_clear` or `reap_exited`, written
