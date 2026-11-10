@@ -186,6 +186,14 @@ pub(crate) fn typing_refusal(node: &serde_json::Value, front: super::Front) -> O
     close_refusal(node)
 }
 
+/// Whether the agent has gone from the session after `/exit`: its primary pane
+/// is back at a bare shell, which a session the dashboard started `exec`s and
+/// a hand-started one returns to. Another program in front is not the agent's
+/// leftovers, so it is not closed.
+pub(crate) fn agent_gone(node: &serde_json::Value) -> bool {
+    super::agterm_facts::occupant(Some(node)) == super::Occupant::Shell
+}
+
 /// What [`servers_line`] starts with, so the line begins under the session's
 /// name rather than under the status glyph before it. agterm offers no indent,
 /// so the offset is made of characters: three figure spaces (U+2007) measured
@@ -542,5 +550,12 @@ mod tests {
         assert!(typing_refusal(&covered, crate::terminals::Front::No).unwrap().contains("overlay"));
         let shell = node(serde_json::json!({ "hasSplit": false, "foreground": null, "foregroundShell": "zsh" }));
         assert_eq!(typing_refusal(&shell, crate::terminals::Front::No), close_refusal(&shell));
+    }
+    #[test]
+    fn only_a_bare_shell_left_in_the_primary_pane_reads_as_the_agent_gone() {
+        assert!(!agent_gone(&node(serde_json::json!({}))), "the agent still running");
+        assert!(agent_gone(&node(serde_json::json!({ "foreground": ["-zsh", "-i"] }))));
+        assert!(!agent_gone(&node(serde_json::json!({ "foreground": ["npm", "run", "dev"] }))), "another program is not the agent's leftovers");
+        assert!(!agent_gone(&node(serde_json::json!({ "foreground": null }))), "an unknown occupant keeps waiting");
     }
 }

@@ -229,6 +229,28 @@ impl AgwintermAdapter {
         Ok((window, session, pane))
     }
 
+    /// Wait for the agent in `pane` to exit after `/exit` was typed, then close
+    /// the session's tab, which otherwise stays `[exited]` or on a bare shell.
+    fn close_after_exit(&self, window: &str, session: &str, pane: &wire::Pane) -> Result<(), String> {
+        let until = Instant::now() + EXIT_WAIT;
+        loop {
+            std::thread::sleep(EXIT_POLL);
+            let tree = match self.call(&wire::tree_req(window), READ_DEADLINE) {
+                Ok(tree) => tree,
+                Err(e) if Instant::now() >= until => return Err(format!("typed /exit, but agwinterm could not be read to see whether the agent exited: {e}")),
+                Err(_) => continue,
+            };
+            match wire::session_node(&tree, session) {
+                // Closed already, by its user or by its root exiting.
+                None => return Ok(()),
+                Some(node) if wire::agent_gone(node, pane.index) => break,
+                Some(_) if Instant::now() >= until => return Err(format!("typed /exit, but the pane had neither fallen back to a shell nor exited after {}s; its tab is left open", EXIT_WAIT.as_secs())),
+                Some(_) => {}
+            }
+        }
+        self.call(&wire::close_req(window, session), WRITE_DEADLINE).map(|_| ())
+    }
+
     /// One request on the shared pipe, its failure as the sentence a caller
     /// reports.
     fn call(&self, req: &str, deadline: Duration) -> Result<serde_json::Value, String> {
@@ -621,33 +643,23 @@ impl TerminalAdapter for AgwintermAdapter {
     /// then, since `/exit` has already been typed.
     fn close_session(&self, key: &str) -> Result<(), String> {
         let (window, session, pane) = self.type_into(key, Command::Exit, wire::close_pane)?;
-        let until = Instant::now() + EXIT_WAIT;
-        loop {
-            std::thread::sleep(EXIT_POLL);
-            let tree = match self.call(&wire::tree_req(window), READ_DEADLINE) {
-                Ok(tree) => tree,
-                Err(e) if Instant::now() >= until => return Err(format!("typed /exit, but agwinterm could not be read to see whether the agent exited: {e}")),
-                Err(_) => continue,
-            };
-            match wire::session_node(&tree, session) {
-                // Closed already, by its user or by its root exiting.
-                None => return Ok(()),
-                Some(node) if wire::agent_gone(node, pane.index) => break,
-                Some(_) if Instant::now() >= until => return Err(format!("typed /exit, but the pane had neither fallen back to a shell nor exited after {}s; its tab is left open", EXIT_WAIT.as_secs())),
-                Some(_) => {}
-            }
-        }
-        self.call(&wire::close_req(window, session), WRITE_DEADLINE).map(|_| ())
+        self.close_after_exit(window, session, &pane)
     }
 
     fn can_type_command(&self) -> bool {
         true
     }
 
-    /// The command, typed into the pane [`wire::typing_pane`] chooses, with
-    /// nothing after it.
+    /// The command, typed into the pane [`wire::typing_pane`] chooses. After
+    /// `/exit` the tab is closed once the agent has gone, as a close does
+    /// ([`Self::close_after_exit`]), since a tab left `[exited]` or on a bare
+    /// shell is what nobody asking for `/exit` wants.
     fn type_command(&self, key: &str, command: Command) -> Result<(), String> {
-        self.type_into(key, command, wire::typing_pane).map(|_| ())
+        let (window, session, pane) = self.type_into(key, command, wire::typing_pane)?;
+        match command {
+            Command::Exit => self.close_after_exit(window, session, &pane),
+            Command::Clear => Ok(()),
+        }
     }
 
     fn can_attach_hosted(&self) -> bool {

@@ -251,7 +251,10 @@ impl TerminalAdapter for AgtermAdapter {
     /// refusals read off a fresh `tree`: the session selected in the window in
     /// front, an overlay over it, a primary pane no longer running the agent.
     /// agterm's text is plain, so the composer is read without the faint runs
-    /// the other terminals drop; see [`wire::composer_text`].
+    /// the other terminals drop; see [`wire::composer_text`]. After `/exit` the
+    /// session is closed once the agent has gone ([`close_after_exit`]), since
+    /// [`AGTERM_COMMAND`] leaves a shell behind that nobody asking for `/exit`
+    /// wants.
     fn type_command(&self, key: &str, command: super::composer::Command) -> Result<(), String> {
         let (window, session) = wire::split_key(key).ok_or_else(|| format!("not a key this adapter minted: {key}"))?;
         let windows = facts::windows(crate::agterm::agtermctl(&["window", "list", "--json"]).as_ref());
@@ -270,7 +273,11 @@ impl TerminalAdapter for AgtermAdapter {
             };
             run(wire::type_argv(window, session, text)).map(|_| ())
         };
-        super::composer::type_command(command, composer, send, super::composer::KEY_PAUSE)
+        super::composer::type_command(command, composer, send, super::composer::KEY_PAUSE)?;
+        match command {
+            super::composer::Command::Exit => close_after_exit(window, session),
+            super::composer::Command::Clear => Ok(()),
+        }
     }
 
     fn can_launch(&self) -> bool {
@@ -777,6 +784,32 @@ pub struct Reading {
 /// Pure and fixture-pinned: the shape this depends on is agterm's private state,
 /// so a schema change should break a test here rather than silently make every
 /// session look unattended.
+/// Wait for the agent to leave `session` after `/exit` was typed, then close
+/// the session, ending the shell [`AGTERM_COMMAND`] leaves behind and whatever
+/// else the session holds, as an idle close does. A session gone already is
+/// done; one whose primary pane does not fall back to a bare shell within
+/// [`super::composer::EXIT_WAIT`] is left open and reported.
+#[cfg(target_os = "macos")]
+fn close_after_exit(window: &str, session: &str) -> Result<(), String> {
+    let until = std::time::Instant::now() + super::composer::EXIT_WAIT;
+    loop {
+        std::thread::sleep(super::composer::EXIT_POLL);
+        let tree = match crate::agterm::agtermctl_checked(&["tree", "--json", "--window", window]) {
+            Ok(tree) => tree,
+            Err(e) if std::time::Instant::now() >= until => return Err(format!("typed /exit, but agterm could not be read to see whether the agent exited: {e}")),
+            Err(_) => continue,
+        };
+        match crate::agterm::session_node(&tree, session) {
+            None => return Ok(()),
+            Some(node) if wire::agent_gone(node) => break,
+            Some(_) if std::time::Instant::now() >= until => return Err(format!("typed /exit, but the session's primary pane had not fallen back to a shell after {}s; it is left open", super::composer::EXIT_WAIT.as_secs())),
+            Some(_) => {}
+        }
+    }
+    let argv = wire::close_argv(window, session);
+    crate::agterm::agtermctl_checked(&argv.iter().map(String::as_str).collect::<Vec<_>>()).map(|_| ())
+}
+
 pub fn parse_reading(tree: &Value) -> Option<Reading> {
     let active = crate::agterm::session_nodes(tree).find(|s| s.get("active").and_then(Value::as_bool) == Some(true))?;
     Some(Reading { session_id: active.get("id").and_then(Value::as_str)?.to_string(), selected: session_from_node(active), occupant: facts::occupant(Some(active)), cover: facts::cover(Some(active)) })
