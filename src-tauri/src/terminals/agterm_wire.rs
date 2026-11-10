@@ -188,10 +188,12 @@ pub(crate) fn typing_refusal(node: &serde_json::Value, front: super::Front) -> O
 
 /// Whether the agent has gone from the session after `/exit`: its primary pane
 /// is back at a bare shell, which a session the dashboard started `exec`s and
-/// a hand-started one returns to. Another program in front is not the agent's
-/// leftovers, so it is not closed.
+/// a hand-started one returns to, or runs nothing at all, which is how
+/// `tree` reports a pane whose command was `claude` itself once it exits
+/// (`foreground: null`, observed on 0.40.0). Another program in front is not
+/// the agent's leftovers, so it is not closed.
 pub(crate) fn agent_gone(node: &serde_json::Value) -> bool {
-    super::agterm_facts::occupant(Some(node)) == super::Occupant::Shell
+    matches!(super::agterm_facts::occupant(Some(node)), super::Occupant::Shell | super::Occupant::Unknown("no_foreground"))
 }
 
 /// What [`servers_line`] starts with, so the line begins under the session's
@@ -552,10 +554,11 @@ mod tests {
         assert_eq!(typing_refusal(&shell, crate::terminals::Front::No), close_refusal(&shell));
     }
     #[test]
-    fn only_a_bare_shell_left_in_the_primary_pane_reads_as_the_agent_gone() {
+    fn a_bare_shell_or_an_exited_pane_reads_as_the_agent_gone() {
         assert!(!agent_gone(&node(serde_json::json!({}))), "the agent still running");
         assert!(agent_gone(&node(serde_json::json!({ "foreground": ["-zsh", "-i"] }))));
+        assert!(agent_gone(&node(serde_json::json!({ "foreground": null }))), "a pane whose command was claude exits with it");
+        assert!(agent_gone(&node(serde_json::json!({ "foreground": [] }))));
         assert!(!agent_gone(&node(serde_json::json!({ "foreground": ["npm", "run", "dev"] }))), "another program is not the agent's leftovers");
-        assert!(!agent_gone(&node(serde_json::json!({ "foreground": null }))), "an unknown occupant keeps waiting");
     }
 }
