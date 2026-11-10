@@ -3,10 +3,11 @@
 //! Shared by every adapter that types a command into the agent — `/exit` for a
 //! close, or what `POST /api/session/command` asks for: each reads the pane its
 //! own way, with Claude Code's faint placeholder runs already left out, and
-//! hands the rows here, so the rule for finding the composer, and the sequence
-//! that types into it, exist once whichever terminal drew it.
+//! hands the rows here, so the rule for finding the composer, the sequence
+//! that types into it, and the wait for the agent to leave after `/exit` before
+//! its session is closed, exist once whichever terminal drew it.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// The text in the last composer among `lines`, trimmed, or `None` when none is
 /// on screen. `lines` are a pane's rows top to bottom, with faint runs removed.
@@ -39,6 +40,64 @@ pub const KEY_PAUSE: Duration = Duration::from_millis(600);
 /// looks.
 pub const EXIT_WAIT: Duration = Duration::from_secs(30);
 pub const EXIT_POLL: Duration = Duration::from_millis(500);
+
+/// What one look at a session after `/exit` found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExitSeen {
+    /// The session is gone, closed by its user or by its agent exiting.
+    SessionGone,
+    /// The agent has left and the session is still open, for the caller to
+    /// close.
+    AgentGone,
+    /// The agent still runs.
+    Running,
+}
+
+/// Why [`wait_for_exit`] gave up at [`EXIT_WAIT`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ExitTimeout {
+    /// The last look found the agent still running.
+    Running,
+    /// The last look could not read the terminal, for this reason.
+    Unreadable(String),
+}
+
+/// Look at a session through `probe` every [`EXIT_POLL`] after `/exit` was
+/// typed, until it answers [`ExitSeen::SessionGone`] or [`ExitSeen::AgentGone`]
+/// or [`EXIT_WAIT`] has passed. A look that cannot read the terminal is retried
+/// until then, since `/exit` has already been typed. A terminal whose session
+/// outlives its agent goes through [`close_after_exit`] instead.
+pub fn wait_for_exit(mut probe: impl FnMut() -> Result<ExitSeen, String>) -> Result<ExitSeen, ExitTimeout> {
+    let until = Instant::now() + EXIT_WAIT;
+    loop {
+        std::thread::sleep(EXIT_POLL);
+        let seen = probe();
+        if let Ok(gone @ (ExitSeen::SessionGone | ExitSeen::AgentGone)) = seen {
+            return Ok(gone);
+        }
+        if Instant::now() >= until {
+            return Err(match seen {
+                Err(e) => ExitTimeout::Unreadable(e),
+                Ok(_) => ExitTimeout::Running,
+            });
+        }
+    }
+}
+
+/// After `/exit` was typed: wait through `probe` for the agent to leave, then
+/// `close` the session it leaves behind, for a terminal whose session outlives
+/// its agent. A session gone already is done. One the agent has not left by
+/// [`EXIT_WAIT`] is left open, since closing it would end an agent still
+/// running, and reported as an error naming `terminal` and, in `running`, what
+/// that terminal's last look still saw.
+pub fn close_after_exit(terminal: &str, running: &str, probe: impl FnMut() -> Result<ExitSeen, String>, close: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
+    match wait_for_exit(probe) {
+        Ok(ExitSeen::AgentGone) => close(),
+        Ok(ExitSeen::SessionGone | ExitSeen::Running) => Ok(()),
+        Err(ExitTimeout::Unreadable(e)) => Err(format!("typed /exit, but {terminal} could not be read to see whether the agent exited: {e}")),
+        Err(ExitTimeout::Running) => Err(format!("typed /exit, but {running} after {}s; its tab is left open", EXIT_WAIT.as_secs())),
+    }
+}
 
 /// The built-in commands this dashboard will type into a session. An
 /// allowlist, because typing into a person's terminal is safe only for text
@@ -79,6 +138,18 @@ pub enum Keys {
     Command(Command),
     /// The Enter key.
     Enter,
+}
+
+impl Keys {
+    /// What a terminal that takes typed text is sent for these keys: the
+    /// command's text, or a carriage return for Enter, which is what submits
+    /// Claude Code's composer.
+    pub fn text(self) -> &'static str {
+        match self {
+            Keys::Command(c) => c.text(),
+            Keys::Enter => "\r",
+        }
+    }
 }
 
 /// Type `command` into an empty composer and press Enter once the composer
@@ -175,6 +246,29 @@ mod tests {
             assert!(result.unwrap_err().contains("Enter was not pressed"), "{after:?}");
             assert_eq!(sent, [Keys::Command(Command::Exit)], "{after:?}");
         }
+    }
+
+    #[test]
+    fn the_exit_wait_ends_at_the_first_look_that_finds_the_agent_gone() {
+        let mut looks = [Err("busy".to_string()), Ok(ExitSeen::Running), Ok(ExitSeen::AgentGone)].into_iter();
+        assert_eq!(wait_for_exit(|| looks.next().unwrap()), Ok(ExitSeen::AgentGone));
+        assert_eq!(wait_for_exit(|| Ok(ExitSeen::SessionGone)), Ok(ExitSeen::SessionGone));
+    }
+
+    #[test]
+    fn only_an_agent_gone_from_a_session_still_open_is_closed() {
+        let mut closed = false;
+        assert_eq!(close_after_exit("t", "r", || Ok(ExitSeen::AgentGone), || { closed = true; Ok(()) }), Ok(()));
+        assert!(closed);
+        let mut closed = false;
+        assert_eq!(close_after_exit("t", "r", || Ok(ExitSeen::SessionGone), || { closed = true; Ok(()) }), Ok(()));
+        assert!(!closed);
+    }
+
+    #[test]
+    fn enter_is_typed_as_a_carriage_return() {
+        assert_eq!(Keys::Enter.text(), "\r");
+        assert_eq!(Keys::Command(Command::Exit).text(), "/exit");
     }
 
     #[test]

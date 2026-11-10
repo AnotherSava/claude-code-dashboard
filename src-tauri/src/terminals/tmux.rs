@@ -44,9 +44,9 @@
 //! machine without the holder one that may start the distro each time.
 
 use std::process::Command;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use super::composer::{self, Keys, EXIT_POLL, EXIT_WAIT, KEY_PAUSE};
+use super::composer::{self, ExitSeen, Keys, EXIT_WAIT, KEY_PAUSE};
 use super::tmux_wire::{self as wire, TmuxSession};
 use super::{CloseTarget, Observation, TerminalAdapter, TerminalSession};
 use crate::subprocess::RunFailure;
@@ -164,18 +164,13 @@ impl TerminalAdapter for TmuxAdapter {
     fn close_session(&self, key: &str) -> Result<(), String> {
         type_into(key, composer::Command::Exit, wire::close_refusal)?;
         let target = format!("={key}");
-        let until = Instant::now() + EXIT_WAIT;
-        loop {
-            std::thread::sleep(EXIT_POLL);
-            if let Ok(out) = wsl(&["tmux", "has-session", "-t", &target]) {
-                if !out.status.success() && wire::says_gone(&String::from_utf8_lossy(&out.stderr)) {
-                    return Ok(());
-                }
-            }
-            if Instant::now() >= until {
-                return Err(format!("typed /exit, but the tmux session was still there after {}s", EXIT_WAIT.as_secs()));
-            }
-        }
+        let probe = || {
+            let out = wsl(&["tmux", "has-session", "-t", &target])?;
+            Ok(if !out.status.success() && wire::says_gone(&String::from_utf8_lossy(&out.stderr)) { ExitSeen::SessionGone } else { ExitSeen::Running })
+        };
+        // tmux destroys the session when its agent exits cleanly, so only the
+        // session's absence ends the wait, and every timeout reads the same.
+        composer::wait_for_exit(probe).map(|_| ()).map_err(|_| format!("typed /exit, but the tmux session was still there after {}s", EXIT_WAIT.as_secs()))
     }
 
     fn can_close(&self) -> bool {

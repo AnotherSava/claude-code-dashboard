@@ -231,15 +231,8 @@ impl TerminalAdapter for AgtermAdapter {
     /// the agent refuses the close ([`wire::close_refusal`]), read fresh because
     /// it is a fact of the moment.
     fn close_session(&self, key: &str) -> Result<(), String> {
-        let (window, session) = wire::split_key(key).ok_or_else(|| format!("not a key this adapter minted: {key}"))?;
-        let tree = crate::agterm::agtermctl_checked(&["tree", "--json", "--window", window])?;
-        let node = crate::agterm::session_node(&tree, session).ok_or_else(|| format!("session {session} is no longer in window {window}"))?;
-        if let Some(reason) = wire::close_refusal(node) {
-            return Err(reason);
-        }
-        let argv = wire::close_argv(window, session);
-        let args: Vec<&str> = argv.iter().map(String::as_str).collect();
-        crate::agterm::agtermctl_checked(&args).map(|_| ())
+        let (window, session) = unrefused_session(key, |_, node| wire::close_refusal(node))?;
+        close(window, session)
     }
 
     fn can_type_command(&self) -> bool {
@@ -256,23 +249,13 @@ impl TerminalAdapter for AgtermAdapter {
     /// [`AGTERM_COMMAND`] leaves a shell behind that nobody asking for `/exit`
     /// wants.
     fn type_command(&self, key: &str, command: super::composer::Command) -> Result<(), String> {
-        let (window, session) = wire::split_key(key).ok_or_else(|| format!("not a key this adapter minted: {key}"))?;
-        let windows = facts::windows(crate::agterm::agtermctl(&["window", "list", "--json"]).as_ref());
-        let front = facts::front(facts::agterm_frontmost(), &windows, window);
-        let tree = crate::agterm::agtermctl_checked(&["tree", "--json", "--window", window])?;
-        let node = crate::agterm::session_node(&tree, session).ok_or_else(|| format!("session {session} is no longer in window {window}"))?;
-        if let Some(reason) = wire::typing_refusal(node, front) {
-            return Err(reason);
-        }
+        let (window, session) = unrefused_session(key, |window, node| {
+            let windows = facts::windows(crate::agterm::agtermctl(&["window", "list", "--json"]).as_ref());
+            wire::typing_refusal(node, facts::front(facts::agterm_frontmost(), &windows, window))
+        })?;
         let run = |argv: Vec<String>| crate::agterm::agtermctl_checked(&argv.iter().map(String::as_str).collect::<Vec<_>>());
         let composer = || run(wire::text_argv(window, session)).map(|t| wire::composer_text(&t));
-        let send = |keys| {
-            let text = match keys {
-                super::composer::Keys::Command(c) => c.text(),
-                super::composer::Keys::Enter => "\r",
-            };
-            run(wire::type_argv(window, session, text)).map(|_| ())
-        };
+        let send = |keys: super::composer::Keys| run(wire::type_argv(window, session, keys.text())).map(|_| ());
         super::composer::type_command(command, composer, send, super::composer::KEY_PAUSE)?;
         match command {
             super::composer::Command::Exit => close_after_exit(window, session),
@@ -779,37 +762,51 @@ pub struct Reading {
     pub cover: super::Cover,
 }
 
+/// The window and session behind `key`, once a fresh `tree` still lists the
+/// session and `refusal`, asked with the window and the session's node, finds
+/// nothing against acting on it. A close and a typed command each pass their
+/// own refusal.
+#[cfg(target_os = "macos")]
+fn unrefused_session(key: &str, refusal: impl FnOnce(&str, &Value) -> Option<String>) -> Result<(&str, &str), String> {
+    let (window, session) = wire::split_key(key).ok_or_else(|| format!("not a key this adapter minted: {key}"))?;
+    let tree = crate::agterm::agtermctl_checked(&["tree", "--json", "--window", window])?;
+    let node = crate::agterm::session_node(&tree, session).ok_or_else(|| format!("session {session} is no longer in window {window}"))?;
+    match refusal(window, node) {
+        Some(reason) => Err(reason),
+        None => Ok((window, session)),
+    }
+}
+
+/// Close `session`, ending every process in it.
+#[cfg(target_os = "macos")]
+fn close(window: &str, session: &str) -> Result<(), String> {
+    let argv = wire::close_argv(window, session);
+    crate::agterm::agtermctl_checked(&argv.iter().map(String::as_str).collect::<Vec<_>>()).map(|_| ())
+}
+
+/// Wait for the agent to leave `session` after `/exit` was typed, then close
+/// the session, ending the shell [`AGTERM_COMMAND`] leaves behind and whatever
+/// else the session holds, as an idle close does; the waiting and what a
+/// timeout reports are [`super::composer::close_after_exit`]'s.
+#[cfg(target_os = "macos")]
+fn close_after_exit(window: &str, session: &str) -> Result<(), String> {
+    use super::composer::ExitSeen;
+    let probe = || {
+        let tree = crate::agterm::agtermctl_checked(&["tree", "--json", "--window", window])?;
+        Ok(match crate::agterm::session_node(&tree, session) {
+            None => ExitSeen::SessionGone,
+            Some(node) if wire::agent_gone(node) => ExitSeen::AgentGone,
+            Some(_) => ExitSeen::Running,
+        })
+    };
+    super::composer::close_after_exit("agterm", "the session's primary pane had not fallen back to a shell", probe, || close(window, session))
+}
+
 /// Read one window's `tree --json` answer.
 ///
 /// Pure and fixture-pinned: the shape this depends on is agterm's private state,
 /// so a schema change should break a test here rather than silently make every
 /// session look unattended.
-/// Wait for the agent to leave `session` after `/exit` was typed, then close
-/// the session, ending the shell [`AGTERM_COMMAND`] leaves behind and whatever
-/// else the session holds, as an idle close does. A session gone already is
-/// done; one whose primary pane does not fall back to a bare shell within
-/// [`super::composer::EXIT_WAIT`] is left open and reported.
-#[cfg(target_os = "macos")]
-fn close_after_exit(window: &str, session: &str) -> Result<(), String> {
-    let until = std::time::Instant::now() + super::composer::EXIT_WAIT;
-    loop {
-        std::thread::sleep(super::composer::EXIT_POLL);
-        let tree = match crate::agterm::agtermctl_checked(&["tree", "--json", "--window", window]) {
-            Ok(tree) => tree,
-            Err(e) if std::time::Instant::now() >= until => return Err(format!("typed /exit, but agterm could not be read to see whether the agent exited: {e}")),
-            Err(_) => continue,
-        };
-        match crate::agterm::session_node(&tree, session) {
-            None => return Ok(()),
-            Some(node) if wire::agent_gone(node) => break,
-            Some(_) if std::time::Instant::now() >= until => return Err(format!("typed /exit, but the session's primary pane had not fallen back to a shell after {}s; it is left open", super::composer::EXIT_WAIT.as_secs())),
-            Some(_) => {}
-        }
-    }
-    let argv = wire::close_argv(window, session);
-    crate::agterm::agtermctl_checked(&argv.iter().map(String::as_str).collect::<Vec<_>>()).map(|_| ())
-}
-
 pub fn parse_reading(tree: &Value) -> Option<Reading> {
     let active = crate::agterm::session_nodes(tree).find(|s| s.get("active").and_then(Value::as_bool) == Some(true))?;
     Some(Reading { session_id: active.get("id").and_then(Value::as_str)?.to_string(), selected: session_from_node(active), occupant: facts::occupant(Some(active)), cover: facts::cover(Some(active)) })

@@ -133,7 +133,7 @@ use std::time::{Duration, Instant};
 
 use super::agwinterm_state::{self as state, Frontmost, Watch, TERMINAL as NAME};
 use super::agwinterm_wire as wire;
-use super::composer::{Command, Keys, EXIT_POLL, EXIT_WAIT, KEY_PAUSE};
+use super::composer::{Command, ExitSeen, Keys, KEY_PAUSE};
 use super::{Front, LabelTarget, LabelWrite, LastInput, Observation, Selection, TerminalAdapter, TerminalSession};
 
 /// How long `ping`, `window.list` and `tree` get to answer. `tree` is served on
@@ -218,13 +218,7 @@ impl AgwintermAdapter {
         let node = wire::session_node(&tree, session).ok_or_else(|| format!("session {session} is no longer in window {window}"))?;
         let pane = pick(node, in_front)?;
         let composer = || self.call(&wire::styled_text_req(window, &pane.id), READ_DEADLINE).map(|t| wire::composer_text(&t));
-        let send = |keys| {
-            let text = match keys {
-                Keys::Command(c) => c.text(),
-                Keys::Enter => "\r",
-            };
-            self.call(&wire::type_req(window, &pane.id, text), WRITE_DEADLINE).map(|_| ())
-        };
+        let send = |keys: Keys| self.call(&wire::type_req(window, &pane.id, keys.text()), WRITE_DEADLINE).map(|_| ());
         super::composer::type_command(command, composer, send, KEY_PAUSE)?;
         Ok((window, session, pane))
     }
@@ -232,23 +226,17 @@ impl AgwintermAdapter {
     /// Wait for the agent in `pane` to exit after `/exit` was typed, then close
     /// the session's tab, which otherwise stays `[exited]` or on a bare shell.
     fn close_after_exit(&self, window: &str, session: &str, pane: &wire::Pane) -> Result<(), String> {
-        let until = Instant::now() + EXIT_WAIT;
-        loop {
-            std::thread::sleep(EXIT_POLL);
-            let tree = match self.call(&wire::tree_req(window), READ_DEADLINE) {
-                Ok(tree) => tree,
-                Err(e) if Instant::now() >= until => return Err(format!("typed /exit, but agwinterm could not be read to see whether the agent exited: {e}")),
-                Err(_) => continue,
-            };
-            match wire::session_node(&tree, session) {
+        let probe = || {
+            let tree = self.call(&wire::tree_req(window), READ_DEADLINE)?;
+            Ok(match wire::session_node(&tree, session) {
                 // Closed already, by its user or by its root exiting.
-                None => return Ok(()),
-                Some(node) if wire::agent_gone(node, pane.index) => break,
-                Some(_) if Instant::now() >= until => return Err(format!("typed /exit, but the pane had neither fallen back to a shell nor exited after {}s; its tab is left open", EXIT_WAIT.as_secs())),
-                Some(_) => {}
-            }
-        }
-        self.call(&wire::close_req(window, session), WRITE_DEADLINE).map(|_| ())
+                None => ExitSeen::SessionGone,
+                Some(node) if wire::agent_gone(node, pane.index) => ExitSeen::AgentGone,
+                Some(_) => ExitSeen::Running,
+            })
+        };
+        let close = || self.call(&wire::close_req(window, session), WRITE_DEADLINE).map(|_| ());
+        super::composer::close_after_exit("agwinterm", "the pane had neither fallen back to a shell nor exited", probe, close)
     }
 
     /// One request on the shared pipe, its failure as the sentence a caller
@@ -637,7 +625,7 @@ impl TerminalAdapter for AgwintermAdapter {
     /// fork's `exitedPanes`, from 0.20.13.2). Why typing rather than closing,
     /// and what refuses it, is [`wire::close_pane`]'s doc, and the typing is
     /// [`Self::type_into`]'s. A pane where the agent still runs after
-    /// [`EXIT_WAIT`] leaves its tab open and the close reported as failed,
+    /// [`super::composer::EXIT_WAIT`] leaves its tab open and the close reported as failed,
     /// since closing the tab then would detach a client from an agent that is
     /// still running. A tree read that fails while waiting is retried until
     /// then, since `/exit` has already been typed.

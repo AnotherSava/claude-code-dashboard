@@ -114,7 +114,7 @@ pub mod agwinterm_wire;
 /// Where Claude Code's composer sits on a screen of text, and the allowlisted
 /// commands typed into it, shared by every adapter that types into the agent.
 /// Compiled everywhere, since [`TerminalAdapter::type_command`] names its
-/// [`composer::Command`]; only Windows has an adapter that types.
+/// [`composer::Command`]; Linux has no adapter that types.
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub mod composer;
 /// The WSL tmux server that holds the claude repo's remote sessions, reached
@@ -991,7 +991,10 @@ pub trait TerminalAdapter: Send {
     }
 
     /// Type one allowlisted built-in command into the agent in the session
-    /// behind `key` and press Enter, or say why not; nothing else follows it.
+    /// behind `key` and press Enter, or say why not. After `/exit`, a terminal
+    /// whose tab outlives the agent waits up to [`composer::EXIT_WAIT`] for the
+    /// agent to leave and then closes the tab, as a close does, and answers an
+    /// agent still running then as a refusal although `/exit` was typed.
     /// `key` is a [`CloseTarget::key`] this adapter minted, since a session is
     /// found for typing by the same title join it is closed by.
     ///
@@ -1003,7 +1006,8 @@ pub trait TerminalAdapter: Send {
     /// pane the close would end) is the close's alone.
     ///
     /// **May block** for several seconds, the pause between the command and
-    /// Enter included. The default refuses.
+    /// Enter included, and after `/exit` for up to [`composer::EXIT_WAIT`]
+    /// beyond. The default refuses.
     fn type_command(&self, key: &str, command: composer::Command) -> Result<(), String> {
         let _ = (key, command);
         Err("this terminal cannot type into a session".to_string())
