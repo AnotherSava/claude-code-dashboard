@@ -216,7 +216,7 @@ fn tailscale_bin() -> Option<std::path::PathBuf> {
 
 /// The port of a tailnet front URL a deploy published (`https://<node>:<port>/`),
 /// or `None` for anything else.
-pub(crate) fn front_port(url: &str) -> Option<u16> {
+fn front_port(url: &str) -> Option<u16> {
     let rest = url.strip_prefix("https://")?;
     let authority = rest.split('/').next()?;
     authority.rsplit_once(':')?.1.parse().ok()
@@ -224,7 +224,7 @@ pub(crate) fn front_port(url: &str) -> Option<u16> {
 
 /// Whether `tailscale serve status --json` shows `front` proxying `/` to the
 /// loopback server on `origin`, the mapping a deploy made for that server.
-pub(crate) fn fronts(status: &serde_json::Value, front: u16, origin: u16) -> bool {
+fn fronts(status: &serde_json::Value, front: u16, origin: u16) -> bool {
     let target = format!("http://127.0.0.1:{origin}");
     let suffix = format!(":{front}");
     status.get("Web").and_then(serde_json::Value::as_object).is_some_and(|web| {
