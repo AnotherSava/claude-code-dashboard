@@ -96,7 +96,7 @@ command "Local session"  cmd+shift+o  /usr/bin/env python3 /path/to/claude-code-
 
 ## See and open a running dev server
 
-A script that starts a dev server can tell the dashboard about it, and the agterm session it was started from then shows a green **▶ dev server** line with its port for as long as the server keeps answering. The script makes one request once the server is up, posting `{"port": 5173, "dir": "<project folder>", "session": "$AGTERM_SESSION_ID"}` to `http://127.0.0.1:9077/api/dev-server`. Servers no script announces are not shown.
+A script that starts a dev server can tell the dashboard about it, and the agterm session it was started from then shows a green **▶ dev server** line with its port for as long as the server keeps answering. The script makes one request once the server is up, posting `{"port": 5173, "dir": "<project folder>", "session": "$AGTERM_SESSION_ID"}` to `http://127.0.0.1:9077/api/dev-server`. Servers no script announces are not shown. When the agent's session ends, the servers announced for it are stopped with it, unless you turn that off.
 
 With sync on, a dev server an agent starts on your other machine shows the same way on the Mac, on the `⇄` tab you reach that agent through. For that the script also sends the agent's Claude Code session and the tailnet address it published the server at (see the [HTTP API](development/http-api#post-apidev-server)).
 

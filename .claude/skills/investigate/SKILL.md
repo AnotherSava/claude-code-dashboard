@@ -200,6 +200,17 @@ or `id`), and a `reason`:
   `via=reaped`.
   This is a terminal decision: if it's the newest line, the row is gone on
   purpose, not stuck.
+- `session_leftovers` — the row's last session left, and the dashboard stopped
+  what it had left running: whatever listened on the dev-server ports recorded
+  for the row, and the agent's descendants as the reaper last saw them, then
+  removed each server's tailnet front (`unpublished` lists the front ports).
+  `outcome` is `stopped`, `stop_failed` (with `failed`), `none_left` (nothing
+  was still running) or `unreadable` (the process table could not be read). It
+  comes from the same departure as a `session_clear` or `reap_exited`, written
+  from a thread of its own, so it can land on either side of that line; with
+  `reap_exited_sessions` off the row stays and it follows the `member_leave`.
+  No line at all where nothing was recorded for the row or
+  `stop_session_processes` is off. Moves no status.
 
 Historical, only in logs written by older builds: `enter_waiting` (WAIT now
 comes from `classify` of a `Stop`), and `correct_to_blocked` /

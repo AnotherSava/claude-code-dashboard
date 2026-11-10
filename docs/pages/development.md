@@ -115,7 +115,7 @@ Under the repo root `claude-code-dashboard/`:
     - `log_watcher.rs` — per-session transcript tailing + infer_state + assistant text upsert
     - `membership.rs` — which live sessions belong to a row and which one (its main) drives it
     - `liveness.rs` — process-liveness primitives, and the process table with each process's parent
-    - `liveness_reaper.rs` — drops row members whose Claude process exited without a `SessionEnd`, and removes a row once its last member is gone
+    - `liveness_reaper.rs` — drops row members whose Claude process exited without a `SessionEnd`, and removes a row once its last member is gone; its process table also records each agent's descendants for `session_leftovers.rs`
     - `session_leftovers.rs` — stops what a session left running once its row's last member is gone: the dev servers announced for the row, and each agent's descendants as the reaper's last process table showed them
     - `waiting_settle.rs` — settles a `waiting` row to `done` once its killed background task can no longer report
     - `idle_close.rs` — closes a session, and the terminal tab it runs in where one on this machine shows it, once it has sat clean past `idle_close_ms`
