@@ -242,6 +242,37 @@ impl TerminalAdapter for AgtermAdapter {
         crate::agterm::agtermctl_checked(&args).map(|_| ())
     }
 
+    fn can_type_command(&self) -> bool {
+        true
+    }
+
+    /// The command, typed into the session's primary pane through
+    /// [`super::composer::type_command`], after [`wire::typing_refusal`]'s
+    /// refusals read off a fresh `tree`: the session selected in the window in
+    /// front, an overlay over it, a primary pane no longer running the agent.
+    /// agterm's text is plain, so the composer is read without the faint runs
+    /// the other terminals drop; see [`wire::composer_text`].
+    fn type_command(&self, key: &str, command: super::composer::Command) -> Result<(), String> {
+        let (window, session) = wire::split_key(key).ok_or_else(|| format!("not a key this adapter minted: {key}"))?;
+        let windows = facts::windows(crate::agterm::agtermctl(&["window", "list", "--json"]).as_ref());
+        let front = facts::front(facts::agterm_frontmost(), &windows, window);
+        let tree = crate::agterm::agtermctl_checked(&["tree", "--json", "--window", window])?;
+        let node = crate::agterm::session_node(&tree, session).ok_or_else(|| format!("session {session} is no longer in window {window}"))?;
+        if let Some(reason) = wire::typing_refusal(node, front) {
+            return Err(reason);
+        }
+        let run = |argv: Vec<String>| crate::agterm::agtermctl_checked(&argv.iter().map(String::as_str).collect::<Vec<_>>());
+        let composer = || run(wire::text_argv(window, session)).map(|t| wire::composer_text(&t));
+        let send = |keys| {
+            let text = match keys {
+                super::composer::Keys::Command(c) => c.text(),
+                super::composer::Keys::Enter => "\r",
+            };
+            run(wire::type_argv(window, session, text)).map(|_| ())
+        };
+        super::composer::type_command(command, composer, send, super::composer::KEY_PAUSE)
+    }
+
     fn can_launch(&self) -> bool {
         true
     }

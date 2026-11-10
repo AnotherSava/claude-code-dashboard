@@ -14,8 +14,11 @@ use std::time::Duration;
 /// The composer is the last row that starts with the prompt glyph directly
 /// under a `─` rule, through the rows down to the next rule. The last, because
 /// a reply can quote a box shaped like the composer earlier in the output.
+///
+/// A rule is a row that begins and ends with `─`, since a session started with
+/// a name has Claude Code draw it inside the top rule (`──── agterm ──`).
 pub fn composer_in(lines: &[String]) -> Option<String> {
-    let is_rule = |l: &str| !l.trim().is_empty() && l.trim().chars().all(|c| c == '─');
+    let is_rule = |l: &str| l.trim().starts_with('─') && l.trim().ends_with('─');
     let prompt = |l: &str| l.trim_start().strip_prefix(['>', '❯']).map(str::to_string);
     let top = (1..lines.len()).rev().find(|&i| is_rule(&lines[i - 1]) && prompt(&lines[i]).is_some())?;
     let bottom = (top + 1..lines.len()).find(|&i| is_rule(&lines[i]))?;
@@ -145,6 +148,14 @@ mod tests {
             assert_eq!(Command::parse(other), None, "{other:?}");
         }
         assert_eq!(Command::Clear.text(), "/clear");
+    }
+
+    #[test]
+    fn a_session_name_drawn_in_the_top_rule_still_bounds_the_composer() {
+        let lines: Vec<String> = ["✻ Brewed for 14s", "──── tripit ──", "❯ ", "──────────", "  ⏵⏵ auto mode on"].iter().map(|l| l.to_string()).collect();
+        assert_eq!(composer_in(&lines), Some(String::new()));
+        let drafted: Vec<String> = ["──── tripit ──", "❯ fix it", "──────────"].iter().map(|l| l.to_string()).collect();
+        assert_eq!(composer_in(&drafted), Some("fix it".to_string()));
     }
 
     #[test]

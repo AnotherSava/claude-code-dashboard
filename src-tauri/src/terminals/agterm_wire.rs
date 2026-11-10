@@ -128,6 +128,64 @@ pub(crate) fn close_argv(window: &str, session: &str) -> Vec<String> {
     vec!["session".into(), "close".into(), "--target".into(), session.into(), "--window".into(), window.into(), "--json".into()]
 }
 
+/// The argv that prints the visible screen of `session`'s primary pane in
+/// `window` as plain text, for reading the composer back. The primary pane,
+/// because it is the one [`close_refusal`] and [`typing_refusal`] judge.
+pub(crate) fn text_argv(window: &str, session: &str) -> Vec<String> {
+    vec!["session".into(), "text".into(), "--pane".into(), "primary".into(), "--target".into(), session.into(), "--window".into(), window.into(), "--json".into()]
+}
+
+/// The argv that types `text` into `session`'s primary pane in `window`. `--`
+/// goes last, immediately before the text, as in [`context_argv`]; measured on
+/// 0.40.0 to serve this verb the same way. Enter is the text `"\r"`.
+pub(crate) fn type_argv(window: &str, session: &str, text: &str) -> Vec<String> {
+    vec![
+        "session".into(),
+        "type".into(),
+        "--pane".into(),
+        "primary".into(),
+        "--target".into(),
+        session.into(),
+        "--window".into(),
+        window.into(),
+        "--json".into(),
+        "--".into(),
+        text.into(),
+    ]
+}
+
+/// What the composer holds in a [`text_argv`] answer, `None` when no composer
+/// is on screen or the answer carries no text.
+///
+/// agterm's text is plain, so a faint placeholder in an empty composer would
+/// read as a draft and refuse the typing; measured on 0.40.0, a finished
+/// session's composer shows none, and refusing is the safe direction.
+pub(crate) fn composer_text(answer: &serde_json::Value) -> Option<String> {
+    let text = answer.get("result")?.get("text")?.as_str()?;
+    let lines: Vec<String> = text.lines().map(str::to_string).collect();
+    super::composer::composer_in(&lines)
+}
+
+/// Why keys must not be typed into this session, or `None` when they may.
+/// `node` is the session's `tree --json` node and `front` whether its window
+/// is agterm's active one with agterm in front.
+///
+/// The session selected in the window in front may have someone reading or
+/// typing in it, and an unknown front counts as in front, since a refusal
+/// costs a retry while keys in a person's face cost their typing. An overlay
+/// over the session would take the keys, and the primary pane must still run
+/// the agent, for the reason [`close_refusal`] gives.
+pub(crate) fn typing_refusal(node: &serde_json::Value, front: super::Front) -> Option<String> {
+    let selected = node.get("active").and_then(serde_json::Value::as_bool) == Some(true);
+    if selected && front != super::Front::No {
+        return Some("the session is the one selected in agterm's window in front, so someone may be using it".to_string());
+    }
+    if super::agterm_facts::cover(Some(node)) != super::Cover::Clear {
+        return Some("an overlay covers the session, so it would take the keys".to_string());
+    }
+    close_refusal(node)
+}
+
 /// What [`servers_line`] starts with, so the line begins under the session's
 /// name rather than under the status glyph before it. agterm offers no indent,
 /// so the offset is made of characters: three figure spaces (U+2007) measured
@@ -383,6 +441,9 @@ mod tests {
     #[test]
     fn a_close_names_its_session_in_its_window() {
         assert_eq!(close_argv("W1", "S1"), ["session", "close", "--target", "S1", "--window", "W1", "--json"]);
+        assert_eq!(text_argv("W1", "S1"), ["session", "text", "--pane", "primary", "--target", "S1", "--window", "W1", "--json"]);
+        assert_eq!(type_argv("W1", "S1", "/clear"), ["session", "type", "--pane", "primary", "--target", "S1", "--window", "W1", "--json", "--", "/clear"]);
+        assert_eq!(type_argv("W1", "S1", "-x").last().map(String::as_str), Some("-x"), "text that looks like a flag stays the text, after `--`");
     }
 
     #[test]
@@ -458,4 +519,28 @@ mod tests {
         assert_eq!(close_refusal(&focus_on_split), None);
     }
 
+    #[test]
+    fn the_composer_is_read_off_the_text_answer() {
+        let answer = |text: &str| serde_json::json!({"ok": true, "result": {"pane": "left", "text": text}});
+        assert_eq!(composer_text(&answer("✻ Brewed for 14s\n──── tripit ──\n❯ \n──────\n\n  ⏵⏵ auto mode on")).as_deref(), Some(""));
+        assert_eq!(composer_text(&answer("──────\n❯ /clear\n──────")).as_deref(), Some("/clear"));
+        assert_eq!(composer_text(&answer("Do you want to proceed?\n❯ 1. Yes")), None, "a dialog in place of the composer is no composer");
+        assert_eq!(composer_text(&serde_json::json!({"ok": true, "result": {}})), None);
+    }
+
+    #[test]
+    fn typing_refuses_the_session_in_front_and_whatever_the_close_refuses() {
+        let background = node(serde_json::json!({}));
+        assert_eq!(typing_refusal(&background, crate::terminals::Front::No), None);
+        assert_eq!(typing_refusal(&background, crate::terminals::Front::Yes), None, "a session not selected is typed into whatever window is in front");
+        let selected = node(serde_json::json!({ "active": true }));
+        assert_eq!(typing_refusal(&selected, crate::terminals::Front::No), None, "selected in a window behind another is out of sight");
+        for front in [crate::terminals::Front::Yes, crate::terminals::Front::Unknown("frontmost_unreadable")] {
+            assert!(typing_refusal(&selected, front).unwrap().contains("selected in agterm's window in front"), "{front:?}");
+        }
+        let covered = node(serde_json::json!({ "overlay": true }));
+        assert!(typing_refusal(&covered, crate::terminals::Front::No).unwrap().contains("overlay"));
+        let shell = node(serde_json::json!({ "hasSplit": false, "foreground": null, "foregroundShell": "zsh" }));
+        assert_eq!(typing_refusal(&shell, crate::terminals::Front::No), close_refusal(&shell));
+    }
 }
