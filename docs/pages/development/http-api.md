@@ -405,7 +405,7 @@ Types a built-in Claude Code command into a session on this machine and presses 
 
 Name the session by exactly one of `project`, a row id as [`GET /api/agents`](#get-apiagents) lists it, or `session_id`, which resolves to the row that session is anchored to. Only `/clear` and `/exit` can be typed (the slash is optional), because typing anything else into a person's terminal would send a prompt on their behalf. The session is the one whose tab title names the row, found the same way the idle close finds the tab it closes.
 
-Before any key is sent, the dashboard reads the session's composer and refuses where it holds a draft, where no composer is on screen (a question dialog replaces it), where the session is the one selected in the frontmost agwinterm window or sits under an overlay, where the pane it would type into is a bare shell, or where a tmux session holds more than one pane. Enter is pressed only once the composer reads back exactly the command. A refusal types nothing, while `typed` means Enter was pressed, not that the command has finished. Only Windows can type, through agwinterm or the WSL tmux server; on macOS every request is refused as `unsupported`. Carries the loopback `Host` gate on top of the `Origin` check.
+Before any key is sent, the dashboard reads the session's composer and refuses where it holds a draft, where no composer is on screen (a question dialog replaces it), where the session is the one selected in the frontmost agwinterm window or sits under an overlay, where the pane it would type into is a bare shell or has exited, or where a tmux session holds more than one pane. Enter is pressed only once the composer reads back exactly the command. A refusal types nothing, while `typed` means Enter was pressed, not that the command has finished. Only Windows can type, through agwinterm or the WSL tmux server; on macOS every request is refused as `unsupported`. Carries the loopback `Host` gate on top of the `Origin` check.
 
 | Status | `outcome` | `reason` | Meaning |
 |---     |---        |---       |---      |
@@ -418,7 +418,7 @@ Before any key is sent, the dashboard reads the session's composer and refuses w
 | `409`  | `refused` | `unsupported` | no terminal on this machine can type into a session |
 | `409`  | `refused` | `terminal_unreadable` | the terminal could not be asked for its sessions |
 | `409`  | `refused` | `no_session`, `same_label`, `shared_title` | no tab title names the row, or more than one does |
-| `409`  | `refused` | `typing_refused` | the terminal refused: a draft, no composer, the session in front, an overlay, a bare shell in the pane, a tmux session with several panes, or a read-back that did not match; `detail` says which |
+| `409`  | `refused` | `typing_refused` | the terminal refused: a draft, no composer, the session in front, an overlay, a bare shell or an exited pane, a tmux session with several panes, or a read-back that did not match; `detail` says which |
 
 Every answer is `{"outcome", "row", "reason", "detail"}`, with `row` empty where the request named no row, or was refused before its target was read (`unknown_command`, `no_target`). Logged as `decision = "session_command"` with the row, the `outcome`, the `command` and, on a refusal, the `reason`.
 

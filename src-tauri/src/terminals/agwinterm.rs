@@ -611,13 +611,14 @@ impl TerminalAdapter for AgwintermAdapter {
     }
 
     /// End the agent with `/exit`, then close its tab once the pane is back at
-    /// a shell. Why typing rather than closing, and what refuses it, is
-    /// [`wire::close_pane`]'s doc, and the typing is [`Self::type_into`]'s. A
-    /// pane that has not fallen back to a shell within [`EXIT_WAIT`] leaves its
-    /// tab open and the close reported as failed, since closing the tab then
-    /// would detach a client from an agent that is still running. A tree read
-    /// that fails while waiting is retried until then, since `/exit` has
-    /// already been typed.
+    /// a shell or has exited ([`wire::agent_gone`]; the exited case needs the
+    /// fork's `exitedPanes`, from 0.20.13.2). Why typing rather than closing,
+    /// and what refuses it, is [`wire::close_pane`]'s doc, and the typing is
+    /// [`Self::type_into`]'s. A pane where the agent still runs after
+    /// [`EXIT_WAIT`] leaves its tab open and the close reported as failed,
+    /// since closing the tab then would detach a client from an agent that is
+    /// still running. A tree read that fails while waiting is retried until
+    /// then, since `/exit` has already been typed.
     fn close_session(&self, key: &str) -> Result<(), String> {
         let (window, session, pane) = self.type_into(key, Command::Exit, wire::close_pane)?;
         let until = Instant::now() + EXIT_WAIT;
@@ -632,7 +633,7 @@ impl TerminalAdapter for AgwintermAdapter {
                 // Closed already, by its user or by its root exiting.
                 None => return Ok(()),
                 Some(node) if wire::agent_gone(node, pane.index) => break,
-                Some(_) if Instant::now() >= until => return Err(format!("typed /exit, but the pane was still not back at a shell after {}s; its tab is left open", EXIT_WAIT.as_secs())),
+                Some(_) if Instant::now() >= until => return Err(format!("typed /exit, but the pane had neither fallen back to a shell nor exited after {}s; its tab is left open", EXIT_WAIT.as_secs())),
                 Some(_) => {}
             }
         }

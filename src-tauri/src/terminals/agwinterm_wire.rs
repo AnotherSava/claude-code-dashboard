@@ -210,13 +210,13 @@ pub fn session_node<'a>(result: &'a Value, id: &str) -> Option<&'a Value> {
     sessions.find(|s| s.get("id").and_then(Value::as_str) == Some(id))
 }
 
-/// The pane a close types `/exit` into: the session's focused pane, the one its
-/// `title` is read from.
+/// The pane a typed command goes into, `/exit` for a close included: the
+/// session's focused pane, the one its `title` is read from.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Pane {
-    /// The pane's id. agwinterm resolves a session id to the pane that carries
-    /// it, which in a split need not be the focused one, so a split names the
-    /// focused pane by its own id.
+    /// The pane's own id, never the session's: agwinterm resolves a session id
+    /// to the pane that carries it, which in a split need not be the focused
+    /// one. See [`pane_id`].
     pub id: String,
     /// The pane's place in `foregroundShells`, which is in pane order.
     pub index: usize,
@@ -226,11 +226,12 @@ pub struct Pane {
 /// `node`.
 ///
 /// Typing must reach the agent's composer: an overlay over the session takes
-/// its input, and a focused pane that is a bare shell is a prompt that would
-/// run the text as a command. It must not reach a person mid-sentence, so the
-/// selected session of agwinterm's frontmost window is left alone. A draft in
-/// the composer is checked separately, from the pane's text
-/// ([`composer_text`]), since the tree does not carry it.
+/// its input, a focused pane that is a bare shell is a prompt that would run
+/// the text as a command, and one that has exited has no agent to type into.
+/// It must not reach a person mid-sentence, so the selected session of
+/// agwinterm's frontmost window is left alone. A draft in the composer is
+/// checked separately, from the pane's text ([`composer_text`]), since the
+/// tree does not carry it.
 pub fn typing_pane(node: &Value, in_front: bool) -> Result<Pane, String> {
     if in_front && node.get("active").and_then(Value::as_bool) == Some(true) {
         return Err("the session is on screen in agwinterm's frontmost window".to_string());
@@ -240,12 +241,9 @@ pub fn typing_pane(node: &Value, in_front: bool) -> Result<Pane, String> {
     }
     let index = node.get("focusedPane").and_then(Value::as_u64).unwrap_or(0) as usize;
     if agent_gone(node, index) {
-        return Err("the focused pane is a bare shell, so the agent is no longer running there".to_string());
+        return Err("the focused pane is a bare shell or has exited, so the agent is no longer running there".to_string());
     }
-    let id = match node.get("paneIds").and_then(Value::as_array) {
-        Some(ids) => ids.get(index).and_then(Value::as_str).ok_or("the tree names no focused pane")?.to_string(),
-        None => node.get("id").and_then(Value::as_str).ok_or("the session has no id")?.to_string(),
-    };
+    let id = pane_id(node, index).ok_or("the tree names no focused pane")?.to_string();
     Ok(Pane { id, index })
 }
 
@@ -258,9 +256,9 @@ pub fn typing_pane(node: &Value, in_front: bool) -> Result<Pane, String> {
 /// clean `/exit` ends the agent and lets tmux tear its session down. The title
 /// it was chosen by must still say CLEAN, since the agent may have moved on
 /// since the label read. And the close then ends the whole session, so a split
-/// is closed only where its other pane is a bare shell: agwinterm closes a
-/// session without confirming, and whatever ran beside the agent would go with
-/// it.
+/// is closed only where its other pane is a bare shell or has exited:
+/// agwinterm closes a session without confirming, and whatever ran beside the
+/// agent would go with it.
 pub fn close_pane(node: &Value, in_front: bool) -> Result<Pane, String> {
     let pane = typing_pane(node, in_front)?;
     if !node.get("title").and_then(Value::as_str).is_some_and(crate::terminal_title::shows_clean_here) {
@@ -273,11 +271,45 @@ pub fn close_pane(node: &Value, in_front: bool) -> Result<Pane, String> {
     Ok(pane)
 }
 
-/// Whether pane `index` of session `node` has fallen back to a shell with no
-/// child process, which is what the pane shows once the agent has exited,
-/// tmux's client with it where there was one.
+/// Whether the agent is no longer running in pane `index` of session `node`:
+/// the pane has fallen back to a shell with no child process, or its process
+/// has exited. The second is what a tab that ran `wsl … tmux attach` as its
+/// command shows once the agent exits and tmux ends the session under it:
+/// agwinterm keeps an exited single-pane session on screen, and its
+/// `foregroundShells` entry then reads `null`, exactly as a live agent's does.
+///
+/// `exitedPanes` lists pane ids. A split names its panes in `paneIds`; an
+/// unsplit session names none, and its one pane's id is the session's own only
+/// while the pane it was created with survives a split closing, so there any
+/// entry is that pane.
+///
+/// `exitedPanes` is a field of the agwinterm fork from 0.20.13.2. An older or
+/// stock build reports none, so there an exited pane reads as a live agent and
+/// a close waits out its deadline and fails.
 pub fn agent_gone(node: &Value, index: usize) -> bool {
-    node.get("foregroundShells").and_then(Value::as_array).and_then(|panes| panes.get(index)).is_some_and(Value::is_string)
+    let shell = node.get("foregroundShells").and_then(Value::as_array).and_then(|panes| panes.get(index)).is_some_and(Value::is_string);
+    let mut exited = node.get("exitedPanes").and_then(Value::as_array).into_iter().flatten();
+    let gone = match node.get("paneIds").and_then(Value::as_array) {
+        Some(ids) => ids.get(index).and_then(Value::as_str).is_some_and(|id| exited.any(|e| e.as_str() == Some(id))),
+        None => index == 0 && exited.next().is_some(),
+    };
+    shell || gone
+}
+
+/// The id of pane `index` of session `node`: its `paneIds` entry while the
+/// session is split, else the one key of `paneCwds`, else the session's own id.
+/// An unsplit session's pane carries the session id only while the pane it was
+/// created with survives a split closing, which `paneCwds`, keyed by pane id,
+/// does not depend on.
+fn pane_id(node: &Value, index: usize) -> Option<&str> {
+    match node.get("paneIds").and_then(Value::as_array) {
+        Some(ids) => ids.get(index).and_then(Value::as_str),
+        None if index == 0 => match node.get("paneCwds").and_then(Value::as_object) {
+            Some(cwds) if cwds.len() == 1 => cwds.keys().next().map(String::as_str),
+            _ => node.get("id").and_then(Value::as_str),
+        },
+        None => None,
+    }
 }
 
 /// A row with the edge and fill tmux draws beyond a window smaller than the
@@ -486,6 +518,9 @@ mod tests {
     #[test]
     fn a_clean_agent_in_a_single_pane_is_typed_into_by_its_session_id() {
         assert_eq!(close_pane(&clean_agent(), true), Ok(Pane { id: "S".into(), index: 0 }));
+        let mut n = clean_agent();
+        n["paneCwds"] = json!({ "P-survivor": "C:/src" });
+        assert_eq!(close_pane(&n, true), Ok(Pane { id: "P-survivor".into(), index: 0 }), "a pane left by a split closing keeps its own id");
     }
 
     #[test]
@@ -607,5 +642,23 @@ mod tests {
         n["foregroundShells"] = json!(["pwsh"]);
         assert!(agent_gone(&n, 0));
         assert!(!agent_gone(&n, 1), "a pane the tree does not list is not known to be a shell");
+    }
+
+    #[test]
+    fn the_agent_is_gone_once_its_pane_has_exited() {
+        let mut n = clean_agent();
+        n["foregroundShells"] = json!([null]);
+        let id = n["id"].as_str().unwrap().to_string();
+        assert!(!agent_gone(&n, 0), "a null shell alone is a live agent under WSL");
+        n["exitedPanes"] = json!([id]);
+        assert!(agent_gone(&n, 0));
+        n["exitedPanes"] = json!(["P-survivor"]);
+        assert!(agent_gone(&n, 0), "an unsplit session's one pane need not carry the session id");
+        assert!(!agent_gone(&n, 1));
+        n["paneIds"] = json!(["S", "P2"]);
+        n["foregroundShells"] = json!([null, null]);
+        n["exitedPanes"] = json!(["P2"]);
+        assert!(!agent_gone(&n, 0));
+        assert!(agent_gone(&n, 1), "a split names each pane by its paneIds entry");
     }
 }
