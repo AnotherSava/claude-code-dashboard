@@ -205,6 +205,48 @@ fn tailscale_bin() -> Option<std::path::PathBuf> {
     })
 }
 
+/// The port of a tailnet front URL a deploy published (`https://<node>:<port>/`),
+/// or `None` for anything else.
+pub(crate) fn front_port(url: &str) -> Option<u16> {
+    let rest = url.strip_prefix("https://")?;
+    let authority = rest.split('/').next()?;
+    authority.rsplit_once(':')?.1.parse().ok()
+}
+
+/// Whether `tailscale serve status --json` shows `front` proxying `/` to the
+/// loopback server on `origin`, the mapping a deploy made for that server.
+pub(crate) fn fronts(status: &serde_json::Value, front: u16, origin: u16) -> bool {
+    let target = format!("http://127.0.0.1:{origin}");
+    let suffix = format!(":{front}");
+    status.get("Web").and_then(serde_json::Value::as_object).is_some_and(|web| {
+        web.iter().any(|(host, site)| {
+            host.ends_with(&suffix) && site.pointer("/Handlers/~1/Proxy").and_then(serde_json::Value::as_str).is_some_and(|p| p.trim_end_matches('/') == target)
+        })
+    })
+}
+
+/// Remove the tailnet front `front` where it still proxies to the server on
+/// `origin`: `Ok(true)` removed, `Ok(false)` left alone because it fronts
+/// something else or nothing, since a later deploy may have handed the port on.
+pub fn unserve_front(front: u16, origin: u16) -> Result<bool, String> {
+    let bin = tailscale_bin().ok_or("no tailscale binary")?;
+    let run = |args: &[&str]| {
+        let mut cmd = Command::new(&bin);
+        cmd.args(args);
+        match crate::subprocess::run(cmd, WHOIS_TIMEOUT) {
+            Ok(out) if out.status.success() => Ok(out.stdout),
+            Ok(out) => Err(String::from_utf8_lossy(&out.stderr).trim().to_string()),
+            Err(RunFailure::TimedOut) => Err("tailscale timed out".to_string()),
+            Err(RunFailure::NotRun(e)) => Err(e),
+        }
+    };
+    let status: serde_json::Value = serde_json::from_slice(&run(&["serve", "status", "--json"])?).map_err(|e| e.to_string())?;
+    if !fronts(&status, front, origin) {
+        return Ok(false);
+    }
+    run(&["serve", &format!("--https={front}"), "off"]).map(|_| true)
+}
+
 fn whois_uncached(ip: IpAddr) -> Option<TailnetPeer> {
     let bin = tailscale_bin()?;
     // The port is required by the argument shape and irrelevant to the answer.
@@ -344,5 +386,23 @@ mod tests {
         assert_eq!(parse_whois("{}"), None);
         assert_eq!(parse_whois(r#"{"Node":{"ComputedName":""}}"#), None);
         assert_eq!(parse_whois(r#"{"Node":{"ComputedName":"chrome"}}"#), Some(TailnetPeer { node: "chrome".into(), user: None }));
+    }
+
+    #[test]
+    fn a_front_port_is_read_off_the_published_url() {
+        assert_eq!(front_port("https://node.example.ts.net:3902/"), Some(3902));
+        assert_eq!(front_port("https://node.example.ts.net:3902"), Some(3902));
+        assert_eq!(front_port("http://localhost:5173/"), None, "a localhost address is no front");
+        assert_eq!(front_port("https://node.example.ts.net/"), None);
+    }
+
+    #[test]
+    fn only_a_front_still_proxying_to_its_server_is_ours() {
+        let status = serde_json::json!({"TCP": {"3900": {"HTTPS": true}}, "Web": {"node.example.ts.net:3900": {"Handlers": {"/": {"Proxy": "http://127.0.0.1:3939"}}}, "node.example.ts.net:3901": {"Handlers": {"/f/": {"Proxy": "http://127.0.0.1:3939"}}}}});
+        assert!(fronts(&status, 3900, 3939));
+        assert!(!fronts(&status, 3900, 5173), "handed on to another server");
+        assert!(!fronts(&status, 3901, 3939), "a path mapping is not a server's front");
+        assert!(!fronts(&status, 3902, 3939), "no mapping at all");
+        assert!(!fronts(&serde_json::json!({}), 3900, 3939));
     }
 }

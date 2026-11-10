@@ -66,8 +66,10 @@ pub fn on_session_end(app: &AppHandle, row: &str) {
         return;
     }
     let procs = app.try_state::<Tracked>().map(|t| t.take(row)).unwrap_or_default();
-    let ports = app.try_state::<crate::dev_servers::DevServers>().map(|d| d.ports_of_row(row)).unwrap_or_default();
-    let leftovers = Leftovers { row: row.to_string(), procs, ports };
+    let servers = app.try_state::<crate::dev_servers::DevServers>().map(|d| d.servers_of_row(row)).unwrap_or_default();
+    let ports = servers.iter().map(|(port, _)| *port).collect();
+    let fronts = servers.iter().filter_map(|(port, url)| Some((crate::tailnet::front_port(url.as_deref()?)?, *port))).collect();
+    let leftovers = Leftovers { row: row.to_string(), procs, ports, fronts };
     std::thread::spawn(move || leftovers.stop());
 }
 
@@ -78,15 +80,28 @@ struct Leftovers {
     procs: Vec<Proc>,
     /// The ports of the dev servers this machine recorded for the row.
     ports: Vec<u16>,
+    /// Each of those servers' tailnet front port with the port it proxies to,
+    /// where its deploy published one.
+    fronts: Vec<(u16, u16)>,
 }
 
 impl Leftovers {
     /// Stop what is still running: each process recorded that still runs
-    /// under the same image, and whatever listens on each dev
-    /// server's port, with its descendants.
+    /// under the same image, and whatever listens on each dev server's port,
+    /// with its descendants. Then remove each server's tailnet front, which
+    /// would otherwise go on proxying to a port nothing listens on.
     fn stop(self) {
         if self.procs.is_empty() && self.ports.is_empty() {
             return;
+        }
+        let mut failed: Vec<String> = Vec::new();
+        let mut unpublished: Vec<u16> = Vec::new();
+        for &(front, origin) in &self.fronts {
+            match crate::tailnet::unserve_front(front, origin) {
+                Ok(true) => unpublished.push(front),
+                Ok(false) => {}
+                Err(e) => failed.push(format!("front {front}: {e}")),
+            }
         }
         let Some(table) = crate::liveness::process_table() else {
             tracing::warn!(chat_id = %self.row, decision = "session_leftovers", outcome = "unreadable", "the process table could not be read, so nothing the session left was stopped");
@@ -99,7 +114,7 @@ impl Leftovers {
         let mut singles: HashSet<u32> = survivors(&self.procs, &table);
         singles.extend(descendants(&table, &listeners).iter().map(|p| p.pid));
         singles.retain(|pid| !spared.contains(pid) && !listeners.contains(pid));
-        if singles.is_empty() && listeners.is_empty() {
+        if singles.is_empty() && listeners.is_empty() && unpublished.is_empty() && failed.is_empty() {
             tracing::info!(chat_id = %self.row, decision = "session_leftovers", outcome = "none_left", ports = ?self.ports, "nothing the session started was still running");
             return;
         }
@@ -108,14 +123,14 @@ impl Leftovers {
         // A listener's tree may hold workers started after it; a recorded
         // process is killed alone, since its tree was listed and a tree kill
         // could reach this dashboard if a deploy under the agent started it.
-        let mut failed: Vec<String> = listeners.iter().filter_map(|&pid| kill(pid, true).err().map(|e| format!("{pid}: {e}"))).collect();
+        failed.extend(listeners.iter().filter_map(|&pid| kill(pid, true).err().map(|e| format!("{pid}: {e}"))));
         failed.extend(pids.iter().filter_map(|&pid| kill(pid, false).err().map(|e| format!("{pid}: {e}"))));
-        tracing::info!(chat_id = %self.row, decision = "session_leftovers", outcome = if failed.is_empty() { "stopped" } else { "stop_failed" }, ports = ?self.ports, ?listeners, ?pids, ?failed, "stopped what the ended session left running");
+        tracing::info!(chat_id = %self.row, decision = "session_leftovers", outcome = if failed.is_empty() { "stopped" } else { "stop_failed" }, ports = ?self.ports, ?listeners, ?pids, ?unpublished, ?failed, "stopped what the ended session left running");
     }
 }
 
 /// Every process below `roots` in `table`, the roots themselves excluded.
-pub(crate) fn descendants(table: &[Proc], roots: &[u32]) -> Vec<Proc> {
+fn descendants(table: &[Proc], roots: &[u32]) -> Vec<Proc> {
     let mut children: HashMap<u32, Vec<&Proc>> = HashMap::new();
     for p in table {
         // A process listed as its own parent (pid 0 on Windows) would loop.
@@ -139,7 +154,7 @@ pub(crate) fn descendants(table: &[Proc], roots: &[u32]) -> Vec<Proc> {
 
 /// This process, its ancestors and its descendants, which nothing here may
 /// kill: on Windows a deploy run by an agent starts the dashboard below it.
-pub(crate) fn own_lineage(table: &[Proc], me: u32) -> HashSet<u32> {
+fn own_lineage(table: &[Proc], me: u32) -> HashSet<u32> {
     let parents: HashMap<u32, u32> = table.iter().map(|p| (p.pid, p.ppid)).collect();
     let mut out: HashSet<u32> = descendants(table, &[me]).iter().map(|p| p.pid).collect();
     let mut at = me;
@@ -154,7 +169,7 @@ pub(crate) fn own_lineage(table: &[Proc], me: u32) -> HashSet<u32> {
 
 /// The pids among `before` still running under the same image in `now`, so a
 /// pid the system has since handed to another program is left alone.
-pub(crate) fn survivors(before: &[Proc], now: &[Proc]) -> HashSet<u32> {
+fn survivors(before: &[Proc], now: &[Proc]) -> HashSet<u32> {
     let images: HashMap<u32, &str> = now.iter().map(|p| (p.pid, p.image.as_str())).collect();
     before.iter().filter(|p| images.get(&p.pid) == Some(&p.image.as_str())).map(|p| p.pid).collect()
 }
@@ -183,7 +198,7 @@ fn listening_pids(port: u16) -> Vec<u32> {
 
 /// The pids `netstat -ano` lists as listening on TCP `port`, on any address.
 #[cfg_attr(not(windows), allow(dead_code))]
-pub(crate) fn netstat_listeners(text: &str, port: u16) -> Vec<u32> {
+fn netstat_listeners(text: &str, port: u16) -> Vec<u32> {
     let suffix = format!(":{port}");
     let mut pids: Vec<u32> = text
         .lines()
