@@ -48,13 +48,32 @@ pub fn is_live_claude(images: &HashMap<u32, String>, pid: u32) -> bool {
     images.get(&pid).is_some_and(|img| is_claude_image(img))
 }
 
+/// One running process: its id, its parent's id and its image.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Proc {
+    pub pid: u32,
+    pub ppid: u32,
+    pub image: String,
+}
+
 /// A snapshot of running process ids → image name, or `None` if the OS
 /// enumeration failed (the caller then concludes nothing this tick — never a
 /// false "dead"). On Windows the image is the bare exe name (e.g. `claude.exe`);
 /// on macOS it is the executable path from `ps`. Either way run it through
 /// [`is_claude_image`].
-#[cfg(windows)]
 pub fn process_images() -> Option<HashMap<u32, String>> {
+    Some(images_of(&process_table()?))
+}
+
+/// The pid → image map of `table`, for a caller that also needs the table.
+pub fn images_of(table: &[Proc]) -> HashMap<u32, String> {
+    table.iter().map(|p| (p.pid, p.image.clone())).collect()
+}
+
+/// Every running process with its parent, from one enumeration, or `None` if
+/// the enumeration failed.
+#[cfg(windows)]
+pub fn process_table() -> Option<Vec<Proc>> {
     // Hand-declared, same style as `terminal_title::push_title` — avoids a
     // `windows`/`windows-sys` dependency for a couple of ancient calls.
     #[link(name = "kernel32")]
@@ -87,36 +106,42 @@ pub fn process_images() -> Option<HashMap<u32, String>> {
         if snap == INVALID_HANDLE || snap == 0 {
             return None;
         }
-        let mut map = HashMap::new();
+        let mut out = Vec::new();
         let mut entry: Pe32W = std::mem::zeroed();
         entry.dw_size = std::mem::size_of::<Pe32W>() as u32;
         let mut ok = Process32FirstW(snap, &mut entry);
         while ok != 0 {
             let len = entry.sz_exe_file.iter().position(|&c| c == 0).unwrap_or(entry.sz_exe_file.len());
-            map.insert(entry.th32_process_id, String::from_utf16_lossy(&entry.sz_exe_file[..len]));
+            out.push(Proc { pid: entry.th32_process_id, ppid: entry.th32_parent_process_id, image: String::from_utf16_lossy(&entry.sz_exe_file[..len]) });
             ok = Process32NextW(snap, &mut entry);
         }
         CloseHandle(snap);
-        Some(map)
+        Some(out)
     }
 }
 
 #[cfg(not(windows))]
-pub fn process_images() -> Option<HashMap<u32, String>> {
-    let out = std::process::Command::new("ps").args(["-axo", "pid=,comm="]).output().ok()?;
+pub fn process_table() -> Option<Vec<Proc>> {
+    let out = std::process::Command::new("ps").args(["-axo", "pid=,ppid=,comm="]).output().ok()?;
     if !out.status.success() {
         return None;
     }
-    let text = String::from_utf8_lossy(&out.stdout);
-    let mut map = HashMap::new();
-    for line in text.lines() {
-        let line = line.trim_start();
-        let Some((pid_str, comm)) = line.split_once(char::is_whitespace) else { continue };
-        if let Ok(pid) = pid_str.trim().parse::<u32>() {
-            map.insert(pid, comm.trim().to_string());
-        }
-    }
-    Some(map)
+    Some(parse_ps(&String::from_utf8_lossy(&out.stdout)))
+}
+
+/// The rows of `ps -axo pid=,ppid=,comm=`, the image being the rest of the
+/// line, since a path may hold spaces.
+#[cfg_attr(windows, allow(dead_code))]
+fn parse_ps(text: &str) -> Vec<Proc> {
+    text.lines()
+        .filter_map(|line| {
+            let mut parts = line.trim_start().splitn(2, char::is_whitespace);
+            let pid = parts.next()?.parse().ok()?;
+            let mut rest = parts.next()?.trim_start().splitn(2, char::is_whitespace);
+            let ppid = rest.next()?.parse().ok()?;
+            Some(Proc { pid, ppid, image: rest.next().unwrap_or_default().trim().to_string() })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -134,6 +159,12 @@ mod tests {
         assert!(!is_claude_image("node"));
         assert!(!is_claude_image("claude-code.exe"), "a different binary name");
         assert!(!is_claude_image(""));
+    }
+
+    #[test]
+    fn ps_rows_keep_a_spaced_path_whole() {
+        let rows = parse_ps("    1     0 /sbin/launchd\n 4242     1 /Applications/My App.app/Contents/MacOS/My App\nbad line\n");
+        assert_eq!(rows, vec![Proc { pid: 1, ppid: 0, image: "/sbin/launchd".into() }, Proc { pid: 4242, ppid: 1, image: "/Applications/My App.app/Contents/MacOS/My App".into() }]);
     }
 
     #[test]

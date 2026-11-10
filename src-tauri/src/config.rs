@@ -154,6 +154,11 @@ pub struct Config {
     /// when no member is left. Off keeps that row until the next `/clear` or app
     /// restart.
     pub reap_exited_sessions: bool,
+    /// Stop what a session leaves running once its row's last session ends,
+    /// however it ended: the dev servers announced for the row, and whatever
+    /// else the agent started that outlives it. Read by `session_leftovers`
+    /// at each end. Off leaves them running.
+    pub stop_session_processes: bool,
     /// Track which finished sessions the user has actually looked at, so a row
     /// that finished and hasn't been read stands apart from one already read.
     /// Read by `commands::resolved_snapshot` (which stamps the verdict), by
@@ -775,6 +780,7 @@ impl Default for Config {
             intensity_min_week_tokens: Some(crate::token_history::MIN_WEEK_TOKENS),
             detect_cancelled_turns: true,
             reap_exited_sessions: true,
+            stop_session_processes: true,
             attention_tracking: true,
             clean_hide_after_ms: default_clean_hide_after_ms(),
             restore_sessions: true,

@@ -32,6 +32,7 @@ mod remote_tokens;
 mod remote_usage;
 mod session_command;
 mod session_launcher;
+mod session_leftovers;
 mod session_registry;
 mod session_restore;
 mod setup;
@@ -157,6 +158,7 @@ pub fn run() {
         .manage(terminal_title::TerminalTitles::new())
         .manage(session_registry::SessionRegistry::new())
         .manage(membership::Members::default())
+        .manage(session_leftovers::Tracked::default())
         .manage(commands::RowLocks::default())
         .manage(nonce_store::NonceStore::new())
         .manage(lid_awake::LidAwakeState::default())

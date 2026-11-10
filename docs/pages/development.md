@@ -114,8 +114,9 @@ Under the repo root `claude-code-dashboard/`:
     - `project_rename.rs` — carrying a project's history, anchors and name over to the id its renamed folder derives, and announcing the rename to peers
     - `log_watcher.rs` — per-session transcript tailing + infer_state + assistant text upsert
     - `membership.rs` — which live sessions belong to a row and which one (its main) drives it
-    - `liveness.rs` — process-liveness primitives
+    - `liveness.rs` — process-liveness primitives, and the process table with each process's parent
     - `liveness_reaper.rs` — drops row members whose Claude process exited without a `SessionEnd`, and removes a row once its last member is gone
+    - `session_leftovers.rs` — stops what a session left running once its row's last member is gone: the dev servers announced for the row, and each agent's descendants as the reaper's last process table showed them
     - `waiting_settle.rs` — settles a `waiting` row to `done` once its killed background task can no longer report
     - `idle_close.rs` — closes a session, and the terminal tab it runs in where one on this machine shows it, once it has sat clean past `idle_close_ms`
     - `subagent_gate.rs` — the subagent permission-prompt overlay, and finding the gated call's result that releases it
@@ -146,11 +147,11 @@ Under the repo root `claude-code-dashboard/`:
     - `agterm.rs` — transport for agterm's `agtermctl` control socket (macOS)
     - `terminals/` — one adapter per terminal behind the `TerminalAdapter` seam, so nothing downstream names a terminal
       - `mod.rs` — the trait, the shared vocabulary, and the pure verdicts over it (`person_verdict`, `departure_stamp`, `read_front`)
-      - `agterm.rs` / `agterm_facts.rs` — agterm's adapter, which also starts sessions, and the facts it reads from agterm and the system (macOS)
-      - `agterm_wire.rs` — agterm's `session context` protocol (the argv a write takes, the targets its tree reports, and the release that first served the verb), the `session info` line naming a session's dev servers, its `session close` argv with `close_refusal`, the rule that refuses a close, and `placement`, which picks the workspace a started session opens in (macOS)
+      - `agterm.rs` / `agterm_facts.rs` — agterm's adapter, which also starts sessions and types `/clear` and `/exit` into them, and the facts it reads from agterm and the system (macOS)
+      - `agterm_wire.rs` — agterm's `session context` protocol (the argv a write takes, the targets its tree reports, and the release that first served the verb), the `session info` line naming a session's dev servers, its `session close` argv with `close_refusal`, the rule that refuses a close, the `session text` and `session type` argv a typed command takes with `composer_text`, `typing_refusal` and `agent_gone`, and `placement`, which picks the workspace a started session opens in (macOS)
       - `agwinterm.rs` / `agwinterm_state.rs` / `agwinterm_wire.rs` — agwinterm's control pipe, its per-window state files, and its protocol, including `typing_pane`, the rules that refuse any typed command, `close_pane`, which adds the ones that refuse a close, and `composer_text` (Windows)
       - `tmux.rs` / `tmux_wire.rs` — the WSL tmux server holding remote sessions, an adapter that closes and starts them: it offers `idle_close` the sessions no terminal on this machine is showing and types `/exit` into one, or a command `POST /api/session/command` asks for, and starts a detached session through the claude repo's `cc-session.sh` where `remote_session_script` is set (Windows)
-      - `composer.rs` — where Claude Code's composer sits on a screen of text, and the allowlisted `Command` (`/clear`, `/exit`) typed into it by `type_command`, shared by every close and by `POST /api/session/command`
+      - `composer.rs` — where Claude Code's composer sits on a screen of text, and the allowlisted `Command` (`/clear`, `/exit`) typed into it by `type_command`, shared by every close and by `POST /api/session/command`, and the wait for the agent to leave after `/exit` that comes before a tab is closed
       - `windows.rs` / `wt_tabs.rs` — Windows Terminal and the Windows console, and the UI Automation read of what a tab really holds
       - `composite.rs` — presents several terminals on one platform as one adapter
       - `labels.rs` — writes each row's task into a terminal's own per-session context line

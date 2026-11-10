@@ -1186,7 +1186,10 @@ pub fn persist_row(app: &AppHandle, state: &AppState, id: &str) {
 /// How a member left its row, for [`apply_departure`].
 pub enum LeaveVia<'a> {
     /// Its `SessionEnd`, tagging the separator a last-member removal appends.
-    SessionEnd { kind: BoundaryKind },
+    /// `member` is false for an end on a row with no known members, which is
+    /// taken at its word as the last one leaving and logged as such, there
+    /// being no member to record leaving.
+    SessionEnd { kind: BoundaryKind, member: bool },
     /// The reaper read these pids dead on consecutive ticks. `remove_row` is
     /// `reap_exited_sessions`, which gates only removing a row whose last member
     /// died: the dead members are dropped either way, so the next event founds a
@@ -1215,10 +1218,15 @@ pub fn apply_departure(app: &AppHandle, id: &str, left: &Left, via: LeaveVia, no
     let log_leave = |prior_status: Option<crate::state::Status>| tracing::debug!(chat_id = %id, decision = "member_leave", via = via_slug, pids = ?pids, was_main = left.was_main, drove_last = left.drove_last, remaining = left.remaining, prior_status = prior_status.map(|s| format!("{s:?}")).as_deref(), "a session left its row");
     let Some(state) = app.try_state::<AppState>() else { return };
     if left.remaining == 0 {
-        log_leave(None);
+        let member = !matches!(via, LeaveVia::SessionEnd { member: false, .. });
+        if member {
+            log_leave(None);
+        }
+        crate::session_leftovers::on_session_end(app, id);
         match via {
-            LeaveVia::SessionEnd { kind } => {
-                tracing::debug!(chat_id = %id, decision = "session_clear", reason = "session ended; row removed", "event -> clear");
+            LeaveVia::SessionEnd { kind, .. } => {
+                let reason = if member { "session ended; row removed" } else { "session ended; the row has no known members, so the end signal is taken at its word" };
+                tracing::debug!(chat_id = %id, decision = "session_clear", reason, "event -> clear");
                 remove_session(app, id, kind, now, Membership::Forget);
             }
             LeaveVia::Reaped { pids, remove_row: true } => {

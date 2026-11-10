@@ -165,6 +165,13 @@ impl DevServers {
         held.servers.iter().filter_map(|s| Some(SharedServer { row: s.row.clone()?, port: s.port, url: s.url.clone(), announced_at: s.announced_at })).collect()
     }
 
+    /// The ports of the servers this machine recorded for `row`, for
+    /// [`crate::session_leftovers`] to stop when that row's session is closed.
+    pub fn ports_of_row(&self, row: &str) -> Vec<u16> {
+        let held = self.held.lock().unwrap();
+        held.servers.iter().filter(|s| s.row.as_deref() == Some(row)).map(|s| s.port).collect()
+    }
+
     /// The servers started from `session`, newest first, then the peer
     /// servers the last pass showed on it, newest first.
     pub fn for_session(&self, session: &str) -> Vec<Offered> {

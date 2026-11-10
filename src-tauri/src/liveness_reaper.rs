@@ -32,7 +32,7 @@ use tauri::{AppHandle, Manager};
 
 use crate::commands::{now_ms, LeaveVia};
 use crate::config::ConfigState;
-use crate::liveness::{is_live_claude, process_images};
+use crate::liveness::{images_of, is_live_claude, process_table};
 use crate::membership::Members;
 
 /// Poll cadence. Reaping a vanished session is a backstop, not latency-critical,
@@ -84,10 +84,16 @@ pub fn spawn(app: AppHandle) {
 
             // One enumeration per tick. If it fails we can't prove anything is
             // dead — skip the whole tick (streaks untouched, never a false reap).
-            let Some(images) = process_images() else { continue };
+            let Some(table) = process_table() else { continue };
+            let images: HashMap<u32, String> = images_of(&table);
 
             let pairs: HashSet<(String, u32)> = members.pid_members().into_iter().collect();
             tracker.retain(&pairs);
+            // The same table records each agent's descendants, for what a
+            // session leaves running once it ends (`session_leftovers`).
+            if let Some(tracked) = app.try_state::<crate::session_leftovers::Tracked>() {
+                tracked.record(&table, &pairs);
+            }
 
             let mut judged: BTreeMap<String, Vec<u32>> = BTreeMap::new();
             for (row, pid) in &pairs {

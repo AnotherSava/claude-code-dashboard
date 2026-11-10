@@ -42,6 +42,8 @@ A clean row stays on screen for a while (half an hour by default) in case you pi
 
 When you build the app from source, a session that stays clean for an hour also closes on its own: the agent exits and its terminal tab closes with it. Nothing is lost — the conversation stays on disk, and `claude --continue` in that folder picks it back up. Closing works in agterm on the Mac and in agwinterm on Windows, including a Windows session no terminal on Windows is showing, one you only have open on the Mac or one you detached by closing its tab, and is off in the downloadable app until you set a delay — see [Settings](settings#behavior).
 
+When a session ends, however it ends, the dev servers it started and anything else it left running are stopped, unless you turn that off — see [Settings](settings#behavior).
+
 ## Compact view
 
 Turn on the tray's **Compact view** toggle for a denser widget: each row drops its current prompt and time-in-state, and the 5-hour / 7-day usage bars shrink to just their percentage and reset time — the segmented track giving way to a slim border that fills left-to-right and shifts green → amber → red as each limit climbs. What's left is the state badge, token count, and usage figures — nothing that needs reading, just glanceable numbers. Off by default.

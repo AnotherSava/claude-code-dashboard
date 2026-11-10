@@ -239,10 +239,14 @@ async fn post_session_open(State(app): State<AppHandle>, headers: HeaderMap, Jso
 /// a draft, a missing composer and a failed read-back.
 ///
 /// Answers `outcome` of `typed` or `refused` with a `reason` slug and a human
-/// `detail`, and the `row` it resolved where it got that far. A refusal types
-/// nothing. `typed` means Enter was pressed on a composer that read back the
-/// command, not that the command has finished running. Loopback `Host`
-/// required: it types into a person's terminal.
+/// `detail`, and the `row` it resolved where it got that far. A refusal can
+/// follow typing: a composer that did not read the command back has its text
+/// and no Enter, and after `/exit` an agent still running at the end of the
+/// wait leaves the tab open, so a refusal is not safe to retry blindly.
+/// `typed` means Enter was pressed on a composer that read back the command;
+/// for `/exit` on a terminal whose tab outlives the agent, it also means the
+/// agent left and the tab was closed. Loopback `Host` required: it types into
+/// a person's terminal.
 async fn post_session_command(State(app): State<AppHandle>, headers: HeaderMap, Json(req): Json<session_command::CommandRequest>) -> Response {
     if let Some(detail) = csrf_refusal(&headers, true) {
         return csrf_refused(detail).into_response();
@@ -1709,9 +1713,14 @@ enum ClearAction {
     MemberOnly,
     /// A member left: [`crate::commands::apply_departure`].
     Leave(Left),
-    /// Nobody is known in the row, so there is nobody the end could be wrong
-    /// about and it is taken at its word. Only a `/clear` forgets the nonce.
-    RemoveUnknown { forget_nonce: bool },
+    /// A `/clear` end on a row with nobody known in it, so there is nobody it
+    /// could be wrong about and it is taken at its word: remove the row and
+    /// forget the nonce.
+    ClearUnknown,
+    /// Any other end on a row with nobody known in it, likewise taken at its
+    /// word: [`crate::commands::apply_departure`] as the last member leaving,
+    /// so it stops what the session left running like every end.
+    EndUnknown,
     /// The ending session is not a member of a row that has members.
     Refuse,
 }
@@ -1722,7 +1731,8 @@ fn clear_action(departure: Departure, wiped: bool) -> ClearAction {
         Departure::Clearing { drives_row: true } => ClearAction::Teardown,
         Departure::Clearing { drives_row: false } => ClearAction::MemberOnly,
         Departure::Left(left) => ClearAction::Leave(left),
-        Departure::Unmatched { row_known: false } => ClearAction::RemoveUnknown { forget_nonce: wiped },
+        Departure::Unmatched { row_known: false } if wiped => ClearAction::ClearUnknown,
+        Departure::Unmatched { row_known: false } => ClearAction::EndUnknown,
         Departure::Unmatched { row_known: true } => ClearAction::Refuse,
     }
 }
@@ -2115,13 +2125,15 @@ fn apply_event_in(app: &AppHandle, req: &EventRequest, placed: Option<String>) -
                     forget_nonce();
                 }
                 ClearAction::MemberOnly => log_clear("member_event", "a /clear in a session that does not drive this row; the row is not its to clear"),
-                ClearAction::Leave(left) => crate::commands::apply_departure(app, &id, &left, LeaveVia::SessionEnd { kind }, now_ms()),
-                ClearAction::RemoveUnknown { forget_nonce: forget } => {
-                    log_clear("session_clear", "session ended; the row has no known members, so the end signal is taken at its word");
+                ClearAction::Leave(left) => crate::commands::apply_departure(app, &id, &left, LeaveVia::SessionEnd { kind, member: true }, now_ms()),
+                ClearAction::EndUnknown => {
+                    let last = Left { was_main: false, drove_last: false, remaining: 0, main_change: None };
+                    crate::commands::apply_departure(app, &id, &last, LeaveVia::SessionEnd { kind, member: false }, now_ms());
+                }
+                ClearAction::ClearUnknown => {
+                    log_clear("session_clear", "/clear ended a session; the row has no known members, so the end signal is taken at its word");
                     remove_session(app, &id, kind, now_ms(), Membership::Forget);
-                    if forget {
-                        forget_nonce();
-                    }
+                    forget_nonce();
                 }
                 ClearAction::Refuse => log_clear("end_unmatched", "end signal from a session that is not a member of this row; refused"),
             }
@@ -3045,8 +3057,8 @@ mod tests {
         assert_eq!(clear_action(Departure::Clearing { drives_row: true }, true), ClearAction::Teardown);
         assert_eq!(clear_action(Departure::Clearing { drives_row: false }, true), ClearAction::MemberOnly);
         assert_eq!(clear_action(Departure::Left(left.clone()), false), ClearAction::Leave(left));
-        assert_eq!(clear_action(Departure::Unmatched { row_known: false }, true), ClearAction::RemoveUnknown { forget_nonce: true });
-        assert_eq!(clear_action(Departure::Unmatched { row_known: false }, false), ClearAction::RemoveUnknown { forget_nonce: false }, "only a /clear wipes the marker");
+        assert_eq!(clear_action(Departure::Unmatched { row_known: false }, true), ClearAction::ClearUnknown);
+        assert_eq!(clear_action(Departure::Unmatched { row_known: false }, false), ClearAction::EndUnknown, "any other end on a row with nobody known is taken at its word");
         assert_eq!(clear_action(Departure::Unmatched { row_known: true }, true), ClearAction::Refuse);
     }
 
