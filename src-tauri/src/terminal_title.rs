@@ -926,7 +926,8 @@ fn desired_labels(enabled: bool, sessions: &[AgentSession]) -> Vec<DesiredLabel>
 /// through (hook events, transcript watcher, renames, row removal) — so the
 /// tab tracks everything the row shows, with no second state machine.
 /// Sessions that vanished (SessionEnd, row removed) get a blank title — the
-/// terminal falls back to its default — and are forgotten.
+/// terminal falls back to its default — and are forgotten. A row gone only for a
+/// `/clear`, whose members are still recorded, is not blanked.
 ///
 /// `seq` is the ticket `sessions` was snapshotted under. Two emits can be in
 /// flight at once and each snapshots before racing for the locks here, so the one
@@ -1038,15 +1039,22 @@ pub fn sync(app: &AppHandle, sessions: &[AgentSession], seq: u64) {
     }
 
     let live: HashSet<&str> = sessions.iter().map(|s| s.id.as_str()).collect();
-    for chat_id in written.iter().filter(|id| !live.contains(id.as_str())) {
+    // A row inside a `/clear` gap keeps its title. Its `SessionStart` puts the
+    // row back, usually under the title it had, and a blank followed by that
+    // same title is dropped by ConPTY: the second write never reaches the tab,
+    // which then shows no title and so names no row for `labels` or `idle_close`.
+    let members = app.try_state::<crate::membership::Members>();
+    let in_gap = |id: &str| members.as_ref().is_some_and(|m| m.has_members(id));
+    let kept: HashSet<&str> = written.iter().map(String::as_str).filter(|id| in_gap(id)).chain(live.iter().copied()).collect();
+    for chat_id in written.iter().filter(|id| !kept.contains(id.as_str())) {
         let settled = blank(chat_id, &mut last, &mut landings);
         outcomes.push((chat_id.clone(), settled));
     }
-    pids.retain(|chat_id, _| live.contains(chat_id.as_str()));
+    pids.retain(|chat_id, _| kept.contains(chat_id.as_str()));
     // The same pruning the two maps above get. Without it every chat_id this
     // process ever titled keeps an entry, and a dead row keeps a window handle
     // that has since been reused.
-    titles.hosts.lock().unwrap().retain(|chat_id, _| live.contains(chat_id.as_str()));
+    titles.hosts.lock().unwrap().retain(|chat_id, _| kept.contains(chat_id.as_str()));
 
     for s in sessions {
         let candidates = resolve(&s.id, pids.get(&s.id).map_or(&[][..], Vec::as_slice));

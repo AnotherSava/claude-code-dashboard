@@ -636,6 +636,13 @@ impl Members {
         self.pid_members().into_iter().filter(|(id, _)| id == row).map(|(_, pid)| pid).collect()
     }
 
+    /// Whether any session is still recorded as a member of `row`. A row that
+    /// is absent while this holds is inside a `/clear` gap, since every other
+    /// removal leaves it with no members or forgets them.
+    pub fn has_members(&self, row: &str) -> bool {
+        self.rows.lock().unwrap().get(row).is_some_and(|r| !r.members.is_empty())
+    }
+
     pub fn forget_row(&self, row: &str) {
         self.rows.lock().unwrap().remove(row);
     }
@@ -725,6 +732,23 @@ mod tests {
         assert_eq!(adm.rotation, Some(Rotation { from: Some("s1".into()), teardown: true }));
         assert_eq!(r.depart("s1", None, true), Departure::Superseded);
         assert!(r.admit(&ev("Stop", Some(A), "s1")).rotation.is_none(), "a late event from the old id does not rotate back");
+    }
+
+    #[test]
+    fn a_row_has_members_inside_a_clear_gap_and_none_once_its_last_session_ends() {
+        // `terminal_title::sync` keeps a removed row's title while this holds.
+        let m = Members::default();
+        m.admit("r", &ev("UserPromptSubmit", Some(A), "s1"), 0).unwrap();
+        m.depart("r", "s1", None, true, 0);
+        assert!(m.has_members("r"), "end-first /clear");
+        m.admit("r", &start("clear", Some(A), "s2"), 0).unwrap();
+        assert!(m.has_members("r"), "start-first /clear");
+        m.depart("r", "s2", None, false, 0);
+        assert!(!m.has_members("r"), "an ordinary last end");
+        m.admit("r", &ev("Stop", Some(A), "s3"), 0).unwrap();
+        m.drop_dead("r", &[A], 0);
+        assert!(!m.has_members("r"), "a reaped last member");
+        assert!(!m.has_members("never-seen"));
     }
 
     #[test]
