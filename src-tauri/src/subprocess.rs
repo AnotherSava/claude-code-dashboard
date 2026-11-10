@@ -19,6 +19,34 @@ pub enum RunFailure {
     TimedOut,
 }
 
+impl RunFailure {
+    /// The failure as one sentence naming `program`, which ran under `timeout`.
+    pub fn describe(self, program: &str, timeout: Duration) -> String {
+        match self {
+            RunFailure::NotRun(reason) => reason,
+            RunFailure::TimedOut => format!("{program} did not answer within {}s", timeout.as_secs()),
+        }
+    }
+}
+
+/// What a run that exited non-zero said: its stderr, else its stdout, since
+/// some helpers (wsl.exe among them) write their own errors there.
+pub fn failure_text(out: &Output) -> String {
+    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    if stderr.is_empty() { String::from_utf8_lossy(&out.stdout).trim().to_string() } else { stderr }
+}
+
+/// [`run`] for a caller that needs the run to succeed: its output where it
+/// exited zero, else the reason it did not, as one string.
+pub fn run_checked(cmd: Command, timeout: Duration) -> Result<Output, String> {
+    let program = cmd.get_program().to_string_lossy().into_owned();
+    match run(cmd, timeout) {
+        Ok(out) if out.status.success() => Ok(out),
+        Ok(out) => Err(failure_text(&out)),
+        Err(f) => Err(f.describe(&program, timeout)),
+    }
+}
+
 /// Run `cmd` with no stdin and both outputs captured, killing it at `timeout`.
 pub fn run(mut cmd: Command, timeout: Duration) -> Result<Output, RunFailure> {
     cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());

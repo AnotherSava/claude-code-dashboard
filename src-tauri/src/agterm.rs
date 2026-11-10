@@ -87,11 +87,7 @@ pub(crate) fn agtermctl(args: &[&str]) -> Option<serde_json::Value> {
 /// agterm's rules.
 #[cfg(target_os = "macos")]
 pub(crate) fn agtermctl_checked(args: &[&str]) -> Result<serde_json::Value, String> {
-    let out = match run(args, AGTERMCTL_TIMEOUT) {
-        Ok(out) => out,
-        Err(RunFailure::TimedOut) => return Err("agtermctl timed out".to_string()),
-        Err(RunFailure::NotRun(reason)) => return Err(reason),
-    };
+    let out = run(args, AGTERMCTL_TIMEOUT).map_err(|f| f.describe("agtermctl", AGTERMCTL_TIMEOUT))?;
     let parsed: Option<serde_json::Value> = serde_json::from_slice(&out.stdout).ok();
     // agterm answers a refusal as `{"ok":false,"error":"…"}` on stdout with exit
     // 0, so the envelope is read before the exit status is judged.

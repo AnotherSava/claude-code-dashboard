@@ -49,7 +49,7 @@ use std::time::Duration;
 use super::composer::{self, ExitSeen, Keys, EXIT_WAIT, KEY_PAUSE};
 use super::tmux_wire::{self as wire, TmuxSession};
 use super::{CloseTarget, Observation, TerminalAdapter, TerminalSession};
-use crate::subprocess::RunFailure;
+use crate::subprocess::failure_text;
 
 pub const NAME: &str = "tmux";
 
@@ -76,17 +76,7 @@ fn wsl(args: &[&str]) -> Result<std::process::Output, String> {
     // stdout and as UTF-16LE unless told otherwise, so without this a failure
     // of WSL itself reaches the log as an empty or garbled reason.
     cmd.env("WSL_UTF8", "1").arg("-e").args(args);
-    crate::subprocess::run(cmd, CALL_TIMEOUT).map_err(|f| match f {
-        RunFailure::TimedOut => format!("wsl.exe did not answer within {}s", CALL_TIMEOUT.as_secs()),
-        RunFailure::NotRun(reason) => reason,
-    })
-}
-
-/// What a failed call said: tmux's stderr, else wsl.exe's own message, which it
-/// writes to stdout.
-fn failure_text(out: &std::process::Output) -> String {
-    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-    if stderr.is_empty() { String::from_utf8_lossy(&out.stdout).trim().to_string() } else { stderr }
+    crate::subprocess::run(cmd, CALL_TIMEOUT).map_err(|f| f.describe("wsl.exe", CALL_TIMEOUT))
 }
 
 /// Every tmux session, or why the server could not be asked.

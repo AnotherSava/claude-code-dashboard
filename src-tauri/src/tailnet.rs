@@ -1,5 +1,5 @@
 //! Asking Tailscale which machine a connection came from, instead of asking the
-//! sender.
+//! sender, and removing the tailnet front of a dev server that has stopped.
 //!
 //! # Why this exists
 //!
@@ -44,6 +44,15 @@
 //! Loopback answering `peer not found` is correct and expected: the localhost
 //! observer-peer test harness is not a tailnet peer. That path degrades to
 //! [`Attestation::Claimed`], never to a failure.
+//!
+//! # The one write
+//!
+//! Beside those reads, [`unserve_front`] changes the user's `tailscale serve`
+//! config: it removes the front a deploy published for a dev server
+//! (`tailscale serve --https=<front> off`) once that server has stopped, called
+//! by the `dev_servers` worker, and only where
+//! `tailscale serve status --json` still shows the front proxying to that
+//! server's port ([`fronts`]).
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::IpAddr;
@@ -225,26 +234,23 @@ pub(crate) fn fronts(status: &serde_json::Value, front: u16, origin: u16) -> boo
     })
 }
 
-/// Remove the tailnet front `front` where it still proxies to the server on
-/// `origin`: `Ok(true)` removed, `Ok(false)` left alone because it fronts
-/// something else or nothing, since a later deploy may have handed the port on.
-pub fn unserve_front(front: u16, origin: u16) -> Result<bool, String> {
+/// Remove the tailnet front a deploy published at `url` for the server on
+/// `origin`, where it still proxies there: `Ok(Some(front))` removed,
+/// `Ok(None)` when `url` names no front or the front now proxies to something
+/// else or nothing, since a later deploy may have handed the port on.
+pub fn unserve_front(url: &str, origin: u16) -> Result<Option<u16>, String> {
+    let Some(front) = front_port(url) else { return Ok(None) };
     let bin = tailscale_bin().ok_or("no tailscale binary")?;
     let run = |args: &[&str]| {
         let mut cmd = Command::new(&bin);
         cmd.args(args);
-        match crate::subprocess::run(cmd, WHOIS_TIMEOUT) {
-            Ok(out) if out.status.success() => Ok(out.stdout),
-            Ok(out) => Err(String::from_utf8_lossy(&out.stderr).trim().to_string()),
-            Err(RunFailure::TimedOut) => Err("tailscale timed out".to_string()),
-            Err(RunFailure::NotRun(e)) => Err(e),
-        }
+        crate::subprocess::run_checked(cmd, WHOIS_TIMEOUT).map(|out| out.stdout)
     };
     let status: serde_json::Value = serde_json::from_slice(&run(&["serve", "status", "--json"])?).map_err(|e| e.to_string())?;
     if !fronts(&status, front, origin) {
-        return Ok(false);
+        return Ok(None);
     }
-    run(&["serve", &format!("--https={front}"), "off"]).map(|_| true)
+    run(&["serve", &format!("--https={front}"), "off"]).map(|_| Some(front))
 }
 
 fn whois_uncached(ip: IpAddr) -> Option<TailnetPeer> {
