@@ -8,3 +8,10 @@ gem "github-pages", group: :jekyll_plugins
 
 # Windows and JRuby do not include zoneinfo files.
 gem "tzinfo-data", platforms: [:mingw, :x64_mingw, :mswin, :jruby]
+
+# jekyll-remote-theme needs openssl >= 3.1.2, and left free bundler locks the
+# newest, which has no prebuilt Windows gem and must compile against MSYS2's
+# OpenSSL. A Ruby whose default openssl gem is 3.2.4 (3.3.12 on the Windows
+# box) installs nothing for this pin; any other Ruby, 3.4 included, downloads
+# and compiles openssl 3.2.x instead.
+gem "openssl", "~> 3.2.4"
