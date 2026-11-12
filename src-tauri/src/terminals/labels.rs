@@ -25,11 +25,19 @@
 //! **A session is joined to a row by its title.** The title is the string this
 //! dashboard wrote, so it names the row rather than guessing at it, and it is
 //! read by the rule `crate::attention` names a session by
-//! ([`crate::terminal_title::title_names`]): the longest label wins, and a draw
+//! ([`crate::terminal_title::title_names_in_scope`]): the longest label wins, and a draw
 //! between identically labelled rows is refused. A row whose title two sessions
 //! carry is refused too. On agwinterm a session whose focused pane is not the
 //! agent, a shell beside it in a split for one, carries that pane's title and is
 //! not joined; agterm reports the primary pane's title whatever has focus.
+//!
+//! **A `⇄` tab is labelled from the synced row it renders.** The claude repo's
+//! attach tab shows another machine's session here, its title the far
+//! dashboard's own, forwarded by tmux behind `terminal_title::REMOTE_BADGE`.
+//! That dashboard cannot reach this terminal, so its context line is written
+//! from this side, joined by the names `attention::remote_names` gives the
+//! synced row, and only ever to a badged title, so a `⇄` tab and a local tab
+//! carrying the same name never stand in for each other.
 //!
 //! **The context of a session this dashboard labels is its own.** It is
 //! overwritten or cleared whatever it held, and the log keeps the value replaced.
@@ -49,9 +57,10 @@
 //! [`super::TerminalAdapter::write_label`]. This module owns when to ask and the
 //! pure [`plan`] that turns the rows and the live reading into writes.
 //!
-//! **`sync` hands over and never waits.** It runs on the emitting thread, which
-//! can be the hook handler or the Tauri main thread, and a write is a
-//! cross-process call that can take seconds. So [`request`] only replaces a
+//! **The hand-off never waits.** `terminal_title::request_labels` runs on the
+//! emitting thread of both emits, local and remote, which can be the hook
+//! handler or the Tauri main thread, and a write is a cross-process call that
+//! can take seconds. So [`request`] only replaces a
 //! latest-wins slot, and a worker thread does the reading and writing.
 //!
 //! **Every write is decided against the terminal's live reading.** That is what
@@ -65,7 +74,7 @@ use tauri::AppHandle;
 
 use super::{CloseTarget, LabelBudget, LabelTarget, LabelWrite, TerminalAdapter};
 use crate::state::AgentSession;
-use crate::terminal_title::{title_names, Named};
+use crate::terminal_title::{title_names_in_scope, Named};
 
 /// How long requests have to stop arriving before the worker acts, so a `/clear`
 /// that removes a row and recreates it in the next emit is never seen in between.
@@ -160,7 +169,7 @@ pub fn fit(line: &str, budget: LabelBudget) -> String {
     }
 }
 
-/// One row, as `terminal_title::sync` wants its sessions labelled.
+/// One row, as `terminal_title::request_labels` wants its sessions labelled.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DesiredLabel {
     pub row: String,
@@ -170,6 +179,10 @@ pub struct DesiredLabel {
     /// The [`one_line`] of the row's task, or `None` when the row has none, which
     /// clears the context. Fitted to each target's budget by [`plan`].
     pub context: Option<String>,
+    /// A row synced from another machine, matched only against a title carrying
+    /// `terminal_title::REMOTE_BADGE` — the `⇄` tab rendering that machine's
+    /// session here — and a local row only against an unbadged one.
+    pub remote: bool,
 }
 
 impl DesiredLabel {
@@ -177,7 +190,15 @@ impl DesiredLabel {
     /// Every caller of [`join`] builds its rows here, so the label a title is
     /// matched against cannot drift from the one written.
     pub fn for_row(s: &AgentSession, context: Option<String>) -> Self {
-        DesiredLabel { row: s.id.clone(), label: s.display_label().to_string(), context }
+        DesiredLabel { row: s.id.clone(), label: s.display_label().to_string(), context, remote: false }
+    }
+
+    /// A synced row as the join ranks it: one entry per name it answers to
+    /// (`attention::remote_names`), since the title on its `⇄` tab is the name
+    /// the origin wrote, which a rename on either machine can make differ from
+    /// this one's.
+    pub fn for_synced_row(s: &AgentSession, context: Option<String>) -> Vec<Self> {
+        crate::attention::remote_names(s).into_iter().map(|name| DesiredLabel { row: s.id.clone(), label: name.to_string(), context: context.clone(), remote: true }).collect()
     }
 }
 
@@ -225,9 +246,10 @@ fn slot() -> &'static (Mutex<Slot>, Condvar) {
     SLOT.get_or_init(Default::default)
 }
 
-/// Whether a set from snapshot `seq` replaces the one held. `sync` already drops
-/// a stale snapshot before it gets here, so this only keeps the slot from going
-/// backwards if two hand-offs ever crossed.
+/// Whether a set from snapshot `seq` replaces the one held. Both emits hand a set
+/// over through `terminal_title::request_labels` with no seq gate of their own,
+/// and a local emit and a remote one routinely cross, so this is the only thing
+/// that stops an older snapshot's labels replacing a newer one's.
 fn newer(held: Option<u64>, seq: u64) -> bool {
     held.is_none_or(|h| seq > h)
 }
@@ -292,8 +314,9 @@ fn should_read(changed: bool, last: Option<LastPass>, now: Instant) -> bool {
 /// retried, so a terminal with no context line would otherwise be asked every few
 /// seconds for the life of the process.
 ///
-/// Not gated on `terminal_titles`, which hot-reloads: with titles off, `sync`
-/// hands over an empty set, and that withdraws every context of ours.
+/// Not gated on `terminal_titles`, which hot-reloads: with titles off,
+/// `terminal_title::request_labels` hands over an empty set, and that withdraws
+/// every context of ours.
 pub fn spawn(app: AppHandle) {
     let Some(adapter) = super::for_platform(&app) else { return };
     if WORKER.set(()).is_err() {
@@ -562,12 +585,9 @@ pub fn plan(rows: &[DesiredLabel], targets: &[LabelTarget], written: &HashMap<St
 pub(crate) fn join<'a>(rows: &'a [DesiredLabel], titles: &[Option<&str>], declined: &mut Vec<Declined>) -> Vec<Claim<'a>> {
     let mut claims: Vec<Claim> = Vec::with_capacity(titles.len());
     for title in titles {
-        // Local rows only: a context line is written *into* a session, so it is
-        // only ever about one this dashboard owns. A tab rendering another
-        // machine's session reads as foreign here and is left alone, which is
-        // also the only safe answer — the far machine owns that session's
-        // context line as surely as it owns its title.
-        let named = title.and_then(|title| title_names(title, false, rows.iter().map(|r| (r, r.label.as_str()))));
+        // The far machine cannot reach this terminal, so a `⇄` tab's context is
+        // this side's to write, from the synced row.
+        let named = title.and_then(|title| title_names_in_scope(title, rows.iter().filter(|r| !r.remote).map(|r| (r, r.label.as_str())), rows.iter().filter(|r| r.remote).map(|r| (r, r.label.as_str())))).map(|(named, _)| named);
         claims.push(match named {
             None => Claim::Foreign,
             Some(Named::One(r)) => Claim::Row(r),
@@ -623,7 +643,7 @@ mod tests {
 
     /// The row `id`, labelled `id` on its tab, wanting `context`.
     fn row(id: &str, context: Option<&str>) -> DesiredLabel {
-        DesiredLabel { row: id.into(), label: id.into(), context: context.map(Into::into) }
+        DesiredLabel { row: id.into(), label: id.into(), context: context.map(Into::into), remote: false }
     }
 
     /// The row `dash` wanting the context `Fix the build`.
@@ -729,6 +749,44 @@ mod tests {
         let p = fresh(&[dash()], &[target("k", Some("✋ dash [47%] ⚠"), Some("an agent's note"))]);
         assert_eq!(p.writes, vec![write("dash", "k", "Fix the build", Some("an agent's note"))], "the suffix does not stop the join, and the replaced text is kept for the log");
         assert!(p.declined.is_empty());
+    }
+
+    /// The synced row `id` from CHROME, answering to `name` on its `⇄` tab.
+    fn synced(name: &str, context: Option<&str>) -> DesiredLabel {
+        DesiredLabel { row: format!("CHROME/{name}"), remote: true, ..row(name, context) }
+    }
+
+    #[test]
+    fn a_badged_tab_takes_its_synced_rows_task() {
+        let p = fresh(&[synced("ai-dashboard", Some("Ship the relay"))], &[target("k", Some("⇄ ⚪ ai-dashboard"), None)]);
+        assert_eq!(p.writes, vec![write("CHROME/ai-dashboard", "k", "Ship the relay", None)]);
+    }
+
+    #[test]
+    fn a_badged_tab_and_a_local_tab_of_one_name_never_stand_in_for_each_other() {
+        let rows = [row("ai-dashboard", Some("Local task")), synced("ai-dashboard", Some("Remote task"))];
+        let p = fresh(&rows, &[target("local", Some("🔵 ai-dashboard"), None), target("remote", Some("⇄ ⚪ ai-dashboard"), None)]);
+        assert_eq!(p.writes, vec![write("ai-dashboard", "local", "Local task", None), write("CHROME/ai-dashboard", "remote", "Remote task", None)]);
+        assert!(p.declined.is_empty(), "the two rows share a name and still do not draw, being matched against different titles");
+
+        let p = fresh(&[row("ai-dashboard", Some("Local task"))], &[target("remote", Some("⇄ ⚪ ai-dashboard"), None)]);
+        assert!(p.writes.is_empty(), "a local row never takes a badged tab");
+        let p = fresh(&[synced("ai-dashboard", Some("Remote task"))], &[target("local", Some("🔵 ai-dashboard"), None)]);
+        assert!(p.writes.is_empty(), "a synced row never takes an unbadged tab");
+    }
+
+    #[test]
+    fn every_name_of_one_synced_row_claims_its_tab_once() {
+        let rows = [synced("tauri-dashboard", Some("Ship it")), DesiredLabel { label: "ai-dashboard".into(), ..synced("tauri-dashboard", Some("Ship it")) }];
+        let p = fresh(&rows, &[target("k", Some("⇄ 🟢 ai-dashboard"), None)]);
+        assert_eq!(p.writes, vec![write("CHROME/tauri-dashboard", "k", "Ship it", None)]);
+        assert!(p.declined.is_empty());
+    }
+
+    #[test]
+    fn a_badged_tab_whose_synced_row_left_has_its_context_withdrawn() {
+        let p = fresh(&[], &[target("k", Some("⇄ ⚪ ai-dashboard"), Some("Ship the relay"))]);
+        assert_eq!(p.writes, vec![withdraw("k", "Ship the relay")]);
     }
 
     #[test]

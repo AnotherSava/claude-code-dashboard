@@ -60,7 +60,7 @@ Once a session's context usage climbs past a threshold (50% by default), the tab
 
 {% include os_chip.html os="macos" %}
 
-agterm shows each session's current prompt as well, on the context line in the title bar of the window's active session. While the widget tracks a session it owns that line, so a note an agent left there is replaced, and the line is cleared when the session's row leaves the widget. It needs agterm 0.26.0 or newer, which is the release that gave a session a context line at all; on anything earlier the status glyph still shows and nothing is written beside it.
+agterm shows each session's current prompt as well, on the context line in the title bar of the window's active session. While the widget tracks a session it owns that line, so a note an agent left there is replaced, and the line is cleared when the session's row leaves the widget. A tab attached to a session on your other machine gets that session's prompt too, from the row the other machine synced here. It needs agterm 0.26.0 or newer, which is the release that gave a session a context line at all; on anything earlier the status glyph still shows and nothing is written beside it.
 
 {% include os_chip.html os="windows" %}
 

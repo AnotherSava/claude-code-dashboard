@@ -217,31 +217,25 @@ pub enum Resolved {
 /// ordering above exists to close.
 pub fn resolve_row(session: &TerminalSession, sessions: &[AgentSession], projects_root: Option<&str>) -> Resolved {
     // A tab wearing the remote badge renders a session on another machine, so
-    // the only rows it can name are the synced ones — and it is answered here,
-    // before the local pass and with no fall-through, because the hazard it
-    // closes is precisely that the two halves share names. Both machines hold a
+    // the only rows it can name are the synced ones, and a badged title naming
+    // none of them does not fall through to the directory join, because the
+    // hazard the badge closes is precisely that the two halves share names. Both machines hold a
     // `claude` row; the badge is what says which of them the user was looking
     // at, and spending the observation on the local one would mark unread work
     // read. For the same reason there is no working-directory fallback on this
     // path: a transport opened by the attach picker reports `/`, and one started
     // by hand inside a project reports *this* machine's copy of that project —
     // the wrong row, confidently derived.
-    if let Some(title) = session.title.as_deref() {
-        match crate::terminal_title::title_names(title, true, remote_labels(sessions)) {
-            Some(Named::One(id)) => return Resolved::Row(id.to_string(), NamedBy::RemoteTitle),
-            Some(Named::Drawn(drawn)) => return Resolved::Ambiguous(drawn.len()),
-            // A badged title naming no synced row: the session it belongs to has
-            // ended over there, or that device has gone quiet and been reaped.
-            // Nothing to credit, and the local pass must not see it.
-            Some(Named::Nothing) => return Resolved::Unknown,
-            None => {}
-        }
-    }
-    let local = sessions.iter().filter(|s| s.origin.is_none()).map(|s| (s, s.display_label()));
-    match session.title.as_deref().and_then(|t| crate::terminal_title::title_names(t, false, local)) {
-        Some(Named::One(s)) => return Resolved::Row(s.id.clone(), NamedBy::Title),
-        Some(Named::Drawn(drawn)) => return Resolved::Ambiguous(drawn.len()),
-        Some(Named::Nothing) | None => {}
+    let local = sessions.iter().filter(|s| s.origin.is_none()).map(|s| (s.id.as_str(), s.display_label()));
+    match session.title.as_deref().and_then(|t| crate::terminal_title::title_names_in_scope(t, local, remote_labels(sessions))) {
+        Some((Named::One(id), true)) => return Resolved::Row(id.to_string(), NamedBy::RemoteTitle),
+        Some((Named::One(id), false)) => return Resolved::Row(id.to_string(), NamedBy::Title),
+        Some((Named::Drawn(drawn), _)) => return Resolved::Ambiguous(drawn.len()),
+        // A badged title naming no synced row: the session it belongs to has
+        // ended over there, or that device has gone quiet and been reaped.
+        // Nothing to credit, and the directory join must not see it.
+        Some((Named::Nothing, true)) => return Resolved::Unknown,
+        Some((Named::Nothing, false)) | None => {}
     }
     let Some(cwd) = session.cwd.as_deref() else { return Resolved::Unknown };
     let derived = crate::adapters::claude::derive_chat_id(Some(cwd), projects_root);
@@ -282,19 +276,24 @@ pub fn resolve_row(session: &TerminalSession, sessions: &[AgentSession], project
 /// Pinned by `terminal_title`'s `a_draw_can_only_be_byte_identical_labels`,
 /// since both halves of that argument are its rules rather than this module's.
 fn remote_labels(sessions: &[AgentSession]) -> Vec<(&str, &str)> {
-    let mut out = Vec::new();
-    for s in sessions.iter().filter(|s| s.origin.is_some()) {
-        let mut names: Vec<&str> = vec![s.display_label()];
-        if let Some(raw) = s.origin.as_deref().and_then(|o| crate::sync::raw_id(&s.id, o)) {
-            names.push(raw);
-        }
-        if let Some(origin) = s.origin_label.as_deref() {
-            names.push(origin);
-        }
-        for (i, name) in names.iter().enumerate() {
-            if !name.is_empty() && !names[..i].contains(name) {
-                out.push((s.id.as_str(), *name));
-            }
+    sessions.iter().filter(|s| s.origin.is_some()).flat_map(|s| remote_names(s).into_iter().map(move |name| (s.id.as_str(), name))).collect()
+}
+
+/// The names one synced row answers to, each once and none empty, by the rule
+/// [`remote_labels`] documents. Shared with `terminals::labels`, which writes a
+/// synced row's task onto the `⇄` tab this join finds for it.
+pub(crate) fn remote_names(s: &AgentSession) -> Vec<&str> {
+    let mut names: Vec<&str> = vec![s.display_label()];
+    if let Some(raw) = s.origin.as_deref().and_then(|o| crate::sync::raw_id(&s.id, o)) {
+        names.push(raw);
+    }
+    if let Some(origin) = s.origin_label.as_deref() {
+        names.push(origin);
+    }
+    let mut out: Vec<&str> = Vec::with_capacity(names.len());
+    for name in names {
+        if !name.is_empty() && !out.contains(&name) {
+            out.push(name);
         }
     }
     out

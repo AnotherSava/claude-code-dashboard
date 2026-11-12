@@ -180,7 +180,7 @@ mod tests {
     const WINDOW: u64 = 3_600_000;
 
     fn row(id: &str) -> DesiredLabel {
-        DesiredLabel { row: id.into(), label: id.into(), context: None }
+        DesiredLabel { row: id.into(), label: id.into(), context: None, remote: false }
     }
 
     fn tab(key: &str, title: &str) -> CloseTarget {

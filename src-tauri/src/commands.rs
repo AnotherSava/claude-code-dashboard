@@ -1312,6 +1312,7 @@ pub fn emit_sessions_updated(app: &AppHandle) {
     // pid bookkeeping.
     let local = local_rows(&sessions);
     crate::terminal_title::sync(app, &local, seq);
+    crate::terminal_title::request_labels(app, &sessions, seq);
     // Same chokepoint drives the lid-closed sleep veto: it must be armed while
     // an agent is busy *before* the lid shuts, since a lid close sleeps the Mac
     // instantly and leaves no window to react in. Local rows only — a remote
@@ -1340,9 +1341,11 @@ pub fn emit_sessions_updated(app: &AppHandle) {
 /// only `AppState::remote`, which the pusher never ships, and poking it back
 /// would ping-pong pushes between two devices (see `emit_sessions_updated`).
 /// Also skips terminal-title reconciliation: remote rows never own a local
-/// terminal, and the local subset is untouched by definition.
+/// console, and the local subset is untouched by definition. The context lines
+/// are refreshed, since a `⇄` tab shows a synced row's task.
 pub fn emit_sessions_updated_remote(app: &AppHandle) {
     let (seq, sessions) = display_snapshot_versioned(app);
+    crate::terminal_title::request_labels(app, &sessions, seq);
     publish_sessions(app, seq, sessions);
 }
 

@@ -667,13 +667,15 @@ pub struct TitleReading<'a> {
     /// machine's dashboard rather than by this one.
     ///
     /// Every reader has to decide about it rather than inherit a default, which
-    /// is why it is a field here instead of a second parser. The three that
-    /// exist today all refuse it, each for its own reason: `session_restore`
-    /// because a tab belonging to another machine's session is not a local row
-    /// to bring back, [`shared_label`] because the stale-tab check compares a
-    /// caption against what *this* dashboard wrote onto a local console, and
-    /// `terminals::labels` because a context line is written into a session this
-    /// dashboard owns. Only `attention::resolve_row` acts on it.
+    /// is why it is a field here instead of a second parser. Two refuse it:
+    /// `session_restore`, because a tab belonging to another machine's session
+    /// is not a local row to bring back, and [`shared_label`], because the
+    /// stale-tab check compares a caption against what *this* dashboard wrote
+    /// onto a local console. Two act on it by matching a badged title against
+    /// synced rows alone: `attention::resolve_row` (and `dev_servers` through
+    /// it, with `NamedBy::RemoteTitle`), and `terminals::labels` through
+    /// [`title_names_in_scope`], which writes a synced row's task onto the `⇄`
+    /// tab rendering it, since the far machine cannot reach this terminal.
     pub remote: bool,
     /// Everything after the glyph, suffixes included — deliberately not the bare
     /// name. `build_title` appends " [N%]" and " ⚠" today and will grow more, so
@@ -804,15 +806,30 @@ pub fn unique_best<T, K: Ord>(ranked: impl IntoIterator<Item = (T, K)>) -> Named
 /// to a row by.
 /// `remote` is the scope the caller is asking about, and it is a parameter
 /// rather than a default so each call site states which half of the rows it
-/// means. A title names rows on one machine or the other, never both:
-/// `terminals::labels` writes into sessions this dashboard owns and so asks for
-/// local rows, while `attention::resolve_row` asks twice, once per scope. A
-/// title whose badge disagrees with the scope answers `None` — not one of ours
-/// *for this question* — which is the same answer an unrecognized title gives
-/// and wants the same handling.
+/// means. A title names rows on one machine or the other, never both; a caller
+/// holding both halves asks [`title_names_in_scope`] instead. A title whose
+/// badge disagrees with the scope answers `None` — not one of ours *for this
+/// question* — which is the same answer an unrecognized title gives and wants
+/// the same handling.
 pub fn title_names<'r, T>(title: &str, remote: bool, rows: impl IntoIterator<Item = (T, &'r str)>) -> Option<Named<T>> {
     let reading = parse_title(title).filter(|r| r.remote == remote)?;
     Some(unique_best(rows.into_iter().filter(|(_, label)| reading.names(label)).map(|(row, label)| (row, label.len()))))
+}
+
+/// Which row a title names when the caller holds both halves of the rows, with
+/// whether it was answered from the synced half: a badged title is matched
+/// against `remote` alone and an unbadged one against `local` alone, so a `⇄`
+/// tab is never taken for a local row of the same name, nor a local tab for a
+/// synced one. `None` for a title this dashboard did not write.
+///
+/// The one scope rule `attention::resolve_row` (which finds the `⇄` tab
+/// `dev_servers` puts a synced row's ports on) and `terminals::labels::join`
+/// (which writes that row's task onto it) both follow, so the two cannot pick
+/// different tabs for one row.
+pub fn title_names_in_scope<'r, T>(title: &str, local: impl IntoIterator<Item = (T, &'r str)>, remote: impl IntoIterator<Item = (T, &'r str)>) -> Option<(Named<T>, bool)> {
+    let badged = parse_title(title)?.remote;
+    let named = if badged { title_names(title, true, remote) } else { title_names(title, false, local) };
+    named.map(|n| (n, badged))
 }
 
 /// Read back a title this dashboard wrote, or `None` for anything else — a
@@ -910,7 +927,8 @@ fn build_title(session: &AgentSession, context_threshold: f32, window_tokens: &H
 
 /// The labels these rows want: each row's task (`AgentSession::shown_task`) on
 /// one line as the context, under the label its tab title carries. Never the
-/// status label: the title's glyph already says the row is asking.
+/// status label: the title's glyph already says the row is asking. A synced row
+/// is labelled too, for the `⇄` tab rendering it (see `terminals::labels`).
 ///
 /// With titles off the set is empty, which withdraws every context of ours,
 /// matching the blank sweep the console gets.
@@ -918,7 +936,17 @@ fn desired_labels(enabled: bool, sessions: &[AgentSession]) -> Vec<DesiredLabel>
     if !enabled {
         return Vec::new();
     }
-    sessions.iter().map(|s| DesiredLabel::for_row(s, s.shown_task().and_then(|t| one_line(&t)))).collect()
+    let context = |s: &AgentSession| s.shown_task().and_then(|t| one_line(&t));
+    sessions.iter().flat_map(|s| if s.origin.is_some() { DesiredLabel::for_synced_row(s, context(s)) } else { vec![DesiredLabel::for_row(s, context(s))] }).collect()
+}
+
+/// Hand a terminal's own session labels the snapshot `seq`, local and synced
+/// rows both. Called from both emits, since a synced row's task changes on a
+/// push that reaches no title write; `terminals::labels::request` keeps only the
+/// newest `seq`, which orders the two against each other.
+pub fn request_labels(app: &AppHandle, sessions: &[AgentSession], seq: u64) {
+    let enabled = app.try_state::<ConfigState>().map(|s| s.snapshot().terminal_titles).unwrap_or(true);
+    crate::terminals::labels::request(seq, desired_labels(enabled, sessions));
 }
 
 /// Reconcile terminal tab titles with the current sessions. Called from
@@ -1031,7 +1059,6 @@ pub fn sync(app: &AppHandle, sessions: &[AgentSession], seq: u64) {
         // silently come to name a live, unrelated window.
         titles.pinned.lock().unwrap().clear();
         titles.hosts.lock().unwrap().clear();
-        crate::terminals::labels::request(seq, desired_labels(false, sessions));
         if let Some(state) = app.try_state::<AppState>() {
             state.clear_all_terminal_stale(now);
         }
@@ -1132,11 +1159,6 @@ pub fn sync(app: &AppHandle, sessions: &[AgentSession], seq: u64) {
     let mut failures = titles.failures.lock().unwrap();
     schedule_retry(app, next_retry(&mut failures, &outcomes, |id| live.contains(id) || landings.contains_key(id)));
     drop(failures);
-
-    // A terminal's own session labels, after the seq gate so the worker only ever
-    // holds the newest snapshot's labels, and reached for every row, including
-    // one no console pid resolves for, which the loop skips.
-    crate::terminals::labels::request(seq, desired_labels(true, sessions));
 }
 
 /// How many failed writes in a row a row is retried for before only the next
