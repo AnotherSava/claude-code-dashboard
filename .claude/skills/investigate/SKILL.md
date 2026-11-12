@@ -41,7 +41,8 @@ meanings worth having in hand before reading a trail:
   pull, where the pull reported leaving nothing and the row was clean before the
   request — see `pull_claim` / `pull_clean` below. The fourth is `restore_row`
   after a restart, reading back a `⚫` tab whose session the registry reports
-  idle. The fifth is also `restore_row`: a session that started while the
+  idle, or busy with no prompt in its transcript since it went busy (a `!` shell
+  command such as `!deploy`, which restarts the dashboard while it runs). The fifth is also `restore_row`: a session that started while the
   dashboard was down has its `SessionStart` replayed, which reads no title and
   sets IDLE where the registry reports the session idle and it is fresh (no
   dialog kept for its row) or its dialog ends at a `/clear`. No degrade path
@@ -174,8 +175,9 @@ or `id`), and a `reason`:
   or WAIT glyph is only as fresh as the downtime, so it is kept only where the
   session registry independently reports a turn running and degrades to DONE
   otherwise. A CLEAN tab comes back IDLE, so `idle_close` can still close it,
-  but only where the registry reports the session idle; otherwise it too
-  degrades to DONE.
+  but only where the registry reports the session idle, or busy with no prompt
+  since it went busy (a running `!` command, whose restored clock dates from the
+  command's start); otherwise it too degrades to DONE.
 - `idle_close` — a local row sat CLEAN past `idle_close_ms`. `outcome=closed`
   means the dashboard itself closed the session (`key`, `idle_ms`,
   `window_ms`): its terminal tab here with it, except for a `tmux|` key, a

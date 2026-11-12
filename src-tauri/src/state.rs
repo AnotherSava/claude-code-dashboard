@@ -18,7 +18,8 @@ pub enum Status {
     /// leaving nothing behind, on a row that was already clean when the request
     /// arrived (`http_server::pull_declared_clean`), plus `session_restore`
     /// reading back the `⚫` this dashboard wrote before a restart, which it
-    /// keeps only where Claude Code's registry reports the session idle
+    /// keeps only where Claude Code's registry reports the session idle, or
+    /// busy with no prompt since it went busy, which a `!` shell command is
     /// (`session_restore::restored_status`). Nothing else may write it —
     /// above all not a
     /// degrade path, which is what five of them used to do back when this variant
