@@ -164,7 +164,11 @@ pub struct Restorable {
     pub read: bool,
     /// When that status began, from the registry's own `statusUpdatedAt`, or for
     /// an `Idle` row the later of that and `updatedAt`, since a `/clear` moves
-    /// only `updatedAt`.
+    /// only `updatedAt`. An `Idle` row kept CLEAN through a running `!` command
+    /// is dated from its last transcript entry before the command instead (see
+    /// [`restored_status`]); for a session resumed CLEAN, whose resume usually
+    /// writes no entry, that is the cleared conversation's last line, which can
+    /// be days old and make `idle_close` close the session on its first tick.
     pub state_entered_at: i64,
     /// Every record the registry collapsed into this row, which become its
     /// members.
@@ -222,24 +226,31 @@ pub fn gap_exists(live: &[LiveSession], rows: &[String], anchored: &dyn Fn(&str)
 /// `idle_close` needs to see to close the session on schedule and what the
 /// widget's clean-hide delay counts from. It is kept where the registry
 /// independently reports the session idle, or reports it busy and
-/// `busy_unprompted` confirms the busy began with no prompt: Claude Code marks
+/// `clean_since` finds no prompt since the busy began: Claude Code marks
 /// a session busy while a `!` shell command runs, and a `!deploy` that restarts
 /// this dashboard is restored while that command is still running. It fires no
 /// hook, so the hook path leaves such a row CLEAN, and the restore keeps it the
-/// same, its clock dating from the session's last transcript entry before the
-/// command, since a `!` command is not agent work and would otherwise restart
-/// `idle_close`'s hour (see `plan`).
+/// same, its clock dating from the instant `clean_since` answers, the
+/// session's last transcript entry before the command, since a `!` command is
+/// not agent work and would otherwise restart `idle_close`'s hour. That instant
+/// is returned beside the status, `None` wherever the row is dated by the
+/// registry's stamps instead, so the clock is decided with the status that
+/// needs it.
 /// Anything else — a turn running, or a `waiting` the registry writes for a
 /// session parked on a question — means a prompt arrived that this dashboard
 /// never saw, and the row degrades to `Done` rather than claim CLEAN, which
 /// `idle_close` would act on. That row comes back read (`plan` sets `read`),
 /// since a CLEAN tab held nothing unread when the glyph was written.
-pub fn restored_status(from_title: Status, activity: Activity, busy_unprompted: &dyn Fn() -> bool) -> Option<Status> {
+pub fn restored_status(from_title: Status, activity: Activity, clean_since: &dyn Fn() -> Option<i64>) -> Option<(Status, Option<i64>)> {
+    if from_title == Status::Idle && activity == Activity::Busy {
+        if let Some(since) = clean_since() {
+            return Some((Status::Idle, Some(since)));
+        }
+    }
     match from_title {
-        Status::Idle if activity == Activity::Busy && busy_unprompted() => Some(Status::Idle),
-        Status::Idle if activity != Activity::Idle => Some(Status::Done),
-        Status::Working | Status::Waiting if activity != Activity::Busy => Some(Status::Done),
-        s => Some(s),
+        Status::Idle if activity != Activity::Idle => Some((Status::Done, None)),
+        Status::Working | Status::Waiting if activity != Activity::Busy => Some((Status::Done, None)),
+        s => Some((s, None)),
     }
 }
 
@@ -419,10 +430,7 @@ pub fn plan(
             continue;
         }
         let Some((from_title, read)) = title_status(&s.chat_id, tabs, derive) else { continue };
-        let clean_since = std::cell::OnceCell::new();
-        let clean_since = || *clean_since.get_or_init(|| busy_clean_since(s));
-        let Some(status) = restored_status(from_title, s.activity, &|| clean_since().is_some()) else { continue };
-        let kept_through_busy = status == Status::Idle && s.activity == Activity::Busy;
+        let Some((status, clean_since)) = restored_status(from_title, s.activity, &|| busy_clean_since(s)) else { continue };
         out.push(Restorable {
             id,
             status,
@@ -430,7 +438,7 @@ pub fn plan(
             // was written; claiming unread would raise attention after every
             // restart for a session the user had cleared.
             read: read || from_title == Status::Idle,
-            state_entered_at: clean_since().filter(|_| kept_through_busy).unwrap_or_else(|| entered_at(s, status, now_ms)),
+            state_entered_at: clean_since.unwrap_or_else(|| entered_at(s, status, now_ms)),
             members: s.records.clone(),
             evidence: Evidence::TabTitle,
         });
@@ -718,8 +726,8 @@ mod tests {
         None
     }
 
-    fn never() -> bool {
-        false
+    fn never() -> Option<i64> {
+        None
     }
 
     /// A session whose process started after [`STAMP`], while the dashboard was down.
@@ -773,11 +781,11 @@ mod tests {
         // The glyph is as stale as the downtime, which is unbounded. A phantom
         // `Working` row holds off system sleep via `lid_awake` and reads blue
         // forever here and on every synced peer.
-        assert_eq!(restored_status(Status::Working, Activity::Busy, &never), Some(Status::Working));
-        assert_eq!(restored_status(Status::Working, Activity::Idle, &never), Some(Status::Done), "a stale WORK degrades to the neutral sink, never to a clean claim");
-        assert_eq!(restored_status(Status::Working, Activity::Unknown, &never), Some(Status::Done));
-        assert_eq!(restored_status(Status::Waiting, Activity::Busy, &never), Some(Status::Waiting));
-        assert_eq!(restored_status(Status::Waiting, Activity::Idle, &never), Some(Status::Done));
+        assert_eq!(restored_status(Status::Working, Activity::Busy, &never), Some((Status::Working, None)));
+        assert_eq!(restored_status(Status::Working, Activity::Idle, &never), Some((Status::Done, None)), "a stale WORK degrades to the neutral sink, never to a clean claim");
+        assert_eq!(restored_status(Status::Working, Activity::Unknown, &never), Some((Status::Done, None)));
+        assert_eq!(restored_status(Status::Waiting, Activity::Busy, &never), Some((Status::Waiting, None)));
+        assert_eq!(restored_status(Status::Waiting, Activity::Idle, &never), Some((Status::Done, None)));
     }
 
     #[test]
@@ -786,7 +794,7 @@ mod tests {
         // `Status`: it cannot express any of these, so it gets no vote on them.
         for status in [Status::Blocked, Status::Done, Status::Error] {
             for activity in [Activity::Idle, Activity::Busy, Activity::Unknown] {
-                assert_eq!(restored_status(status, activity, &never), Some(status), "{status:?} / {activity:?}");
+                assert_eq!(restored_status(status, activity, &never), Some((status, None)), "{status:?} / {activity:?}");
             }
         }
     }
@@ -811,12 +819,12 @@ mod tests {
     fn a_clean_tab_comes_back_clean_only_where_the_registry_says_idle() {
         // The row is what `idle_close` acts on, so a session left CLEAN across a
         // restart must come back as one, or it would never be closed.
-        assert_eq!(restored_status(Status::Idle, Activity::Idle, &never), Some(Status::Idle));
+        assert_eq!(restored_status(Status::Idle, Activity::Idle, &never), Some((Status::Idle, None)));
         // A prompt submitted while the dashboard was down — running, or parked on
         // a question (`waiting`, which parses as Unknown): claiming CLEAN would let
         // `idle_close` end it.
         for activity in [Activity::Busy, Activity::Unknown] {
-            assert_eq!(restored_status(Status::Idle, activity, &never), Some(Status::Done), "{activity:?}");
+            assert_eq!(restored_status(Status::Idle, activity, &never), Some((Status::Done, None)), "{activity:?}");
         }
         let out = planned(&[live("scratch", Activity::Busy, Some(10))], &[tab("/p/scratch", Some("⚫ scratch"))], &[]);
         assert!(out[0].status == Status::Done && out[0].read, "a cleared session comes back read, not asking for attention");
@@ -827,11 +835,11 @@ mod tests {
     fn a_clean_tab_stays_clean_through_a_shell_command_that_took_no_prompt() {
         // `!deploy` restarts the dashboard while the command still holds the
         // session busy; no prompt arrived, so the CLEAN claim still holds.
-        assert_eq!(restored_status(Status::Idle, Activity::Busy, &|| true), Some(Status::Idle));
+        assert_eq!(restored_status(Status::Idle, Activity::Busy, &|| Some(4_000)), Some((Status::Idle, Some(4_000))));
         // Only a busy session is asked: a `waiting` one may be parked on a question.
-        assert_eq!(restored_status(Status::Idle, Activity::Unknown, &|| true), Some(Status::Done));
+        assert_eq!(restored_status(Status::Idle, Activity::Unknown, &|| Some(4_000)), Some((Status::Done, None)));
         // And no other glyph is changed by it.
-        assert_eq!(restored_status(Status::Done, Activity::Busy, &|| true), Some(Status::Done));
+        assert_eq!(restored_status(Status::Done, Activity::Busy, &|| Some(4_000)), Some((Status::Done, None)));
         let out = plan(&[live("scratch", Activity::Busy, Some(10))], &[tab("/p/scratch", Some("⚫ scratch"))], &[], 10_000, &derive, &seen, Some(STAMP), &never_clean, &|_| Some(4_000));
         assert_eq!(out[0].status, Status::Idle);
         assert_eq!(out[0].state_entered_at, 4_000, "dated from when it was last clean, not from the command's start");

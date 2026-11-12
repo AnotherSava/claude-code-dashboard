@@ -177,7 +177,8 @@ or `id`), and a `reason`:
   otherwise. A CLEAN tab comes back IDLE, so `idle_close` can still close it,
   but only where the registry reports the session idle, or busy with no prompt
   since it went busy (a running `!` command, whose restored clock dates from the
-  command's start); otherwise it too degrades to DONE.
+  session's last transcript entry before the command, which for a session
+  resumed CLEAN can be days old); otherwise it too degrades to DONE.
 - `idle_close` — a local row sat CLEAN past `idle_close_ms`. `outcome=closed`
   means the dashboard itself closed the session (`key`, `idle_ms`,
   `window_ms`): its terminal tab here with it, except for a `tmux|` key, a
