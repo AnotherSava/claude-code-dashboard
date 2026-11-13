@@ -22,11 +22,11 @@ __pycache__/
 !/docs/plans/completed/
 !/docs/plans/draft/
 
-# Deploy-time config. `local.template.json` is the per-machine, secret-free
-# source (secrets are {{tojson .NAME}} placeholders pulled from Doppler project
-# `claude-code-dashboard`). `scripts/deploy.sh` renders it to `local.json`,
-# copies that to the install dir as config.json, then wipes it — so the rendered
-# secret-bearing file only ever exists transiently during a deploy.
+# Deploy-time config, per machine. `local.template.json` is the secret-free
+# source: its {{tojson .NAME}} placeholders are filled from the Doppler project
+# and config named in `config/deploy.env`, and the global deploy script renders
+# it straight into the installed config.json. A machine with no template keeps a
+# plaintext `local.json`, which the deploy copies verbatim.
 config/local.json
 config/local.template.json
 

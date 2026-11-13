@@ -48,7 +48,7 @@
 - [Context-alert tracking not persisted](context_alert_outstanding_not_persisted.md) — context_outstanding is in-memory; app restart orphans Telegram alerts (known, deliberately unfixed); grep decision=context_alert/context_dismiss
 - [Hook research findings](hooks_research_findings.md) — adopted Stop.last_assistant_message + background_tasks + SessionStart.source/SessionEnd.reason; UserPromptSubmit.source declared but never emitted (#94675); token data DOES arrive now; CLAUDE_CODE_SESSION_ID is in the Bash env
 - [A Status variant is a wire break](status_variant_is_a_wire_break.md) — a new variant 422s the whole sync push on an older peer and wipes prompt_history.json on a downgrade; redefine or add a field instead
-- [Doppler secret storage](doppler_secret_storage.md) — Windows deploy-tauri.sh renders local.template.json from Doppler claude-code-dashboard/dev; the Mac copies plaintext local.json
+- [Doppler secret storage](doppler_secret_storage.md) — Windows deploy-tauri.sh renders local.template.json from Doppler local/dev_claude-code-dashboard; the Mac copies plaintext local.json
 - [Usage endpoint weekly resets](usage_endpoint_weekly_resets.md) — usage API has at times reported resets_at null for 7d (often 5h too) after a 7d reset, none since 2026-09-07 (null resets_at is the transient); separately, a 7d drop to ~0 mid-window is a real reset and mostly follows no 5h cap
 - [Usage endpoint drops the 5h bucket](usage_endpoint_no_five_hour_bucket.md) — no 5h limit = five_hour absent; a 0/null bucket is a reset transient; detection and reset tracker rely on it
 - [Context-% features need watcher-resolved tokens](context_percent_tokens_watcher_only.md) — input_tokens is watcher-only (None post-restart, can't be faked via hooks); config reload doesn't re-sync terminal titles
@@ -67,7 +67,7 @@
 - [Check npm -v, not the packageManager field](node_toolchain_pin_ahead_of_node.md) — the pin needs Node >=24.15.0, and a Node upgrade silently resets corepack so the field stays right while the shim is gone
 - [A migration filed two open memos as done](done_memo_that_is_not_done.md) — v1 asserts presence, not location; both reopened 2026-09-18, and a misfiled memo is invisible rather than wrong-looking
 - [Memo backlog audited 2026-09-20](memo_backlog_audit_2026_09_20.md) — a memo can be done and left open (its body says so); the rest verified genuinely open, don't re-sweep
-- [Telegram bot identity](telegram_bot_identity.md) — pings go through the dedicated notifications bot (token in Doppler claude-code-dashboard/dev); both machines configured, the Mac from plaintext config/local.json; never print config.json notifications
+- [Telegram bot identity](telegram_bot_identity.md) — pings go through the dedicated notifications bot (token in Doppler local/dev_claude-code-dashboard); both machines configured, the Mac from plaintext config/local.json; never print config.json notifications
 - [Typed prompts are invisible to the watcher](transcript_string_content_invisible.md) — string `content` fails log_watcher's Vec wire type, so infer_state skips typed prompts; pre-existing, not fixed
 - [agwinterm label route](agwinterm_label_route.md) — status via OSC title, prompt via session context; rename, caption, capabilities routes built then deleted 2026-10-02
 - [Vite dev port launch chain](vite-dev-port-launch-chain.md) — `"dev": "vite"` stays bare; the wrapper goes on `"tauri"`, since the CLI runs `beforeDevCommand` itself and reads `devUrl` first; our dev.mjs then forwards a stray `vite` to the CLI
