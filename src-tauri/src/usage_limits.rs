@@ -41,8 +41,8 @@ pub struct UsageLimits {
     /// poll until it is due, so the poller has to know which kind it is holding
     /// (`UsageLimits::peer_due_at`). On a machine with no credentials it also
     /// decides what is shown: `poll_once` keeps a peer's reading on screen past
-    /// due, while a reading without a source is blanked to `Unavailable`, which
-    /// is why such a machine shows no bars after a restart until a peer pushes.
+    /// due, also one replayed from the cache after a restart, while a reading
+    /// without a source is blanked to `Unavailable`.
     #[serde(skip)]
     pub source: Option<String>,
 }
@@ -1001,12 +1001,16 @@ async fn poll_once(app: &AppHandle, client: &reqwest::Client) -> Option<u64> {
             // Retry-After). Keep its last reading on screen rather than blanking
             // the bars the moment it falls due, and call it stale only once it is
             // older than a regular poll would ever leave it: a reading falls due
-            // early ahead of a window reset, and is not stale for that.
-            if previous.source.is_some() && previous.has_reading() {
+            // early ahead of a window reset, and is not stale for that. After a
+            // restart nothing is held yet, and the stored peer reading stands in.
+            let restored = !previous.has_reading();
+            let held = if restored { cache.as_ref().and_then(|c| c.replay(UsageStatus::Ok)) } else { Some(previous) };
+            if let Some(held) = held.filter(|h| h.source.is_some()) {
                 let interval = poll_interval_seconds(app);
-                let age_ms = now - previous.updated;
-                if peer_reading_is_stale(age_ms, interval) && previous.status != UsageStatus::NetworkError {
-                    state.replace(UsageLimits { status: UsageStatus::NetworkError, ..previous });
+                let age_ms = now - held.updated;
+                let status = if peer_reading_is_stale(age_ms, interval) { UsageStatus::NetworkError } else { held.status };
+                if restored || status != held.status {
+                    state.replace(UsageLimits { status, ..held });
                     emit_usage_limits_updated(app);
                 }
                 return Some(held_peer_reading_sleep_secs(age_ms, interval));

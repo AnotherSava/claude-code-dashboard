@@ -40,6 +40,11 @@ struct CacheFile {
     seven_day: Option<LimitBucket>,
     #[serde(default)]
     updated: i64,
+    /// The device whose poll took the reading, `None` for this machine's own.
+    /// A machine with no credentials of its own has nothing else to show after
+    /// a restart, so dropping it would blank its bars until a peer pushes again.
+    #[serde(default)]
+    source: Option<String>,
     /// Epoch ms before which no request may be made, from the endpoint's own
     /// `Retry-After`. Absent means nothing is owed.
     #[serde(default)]
@@ -77,9 +82,8 @@ impl UsageCacheStore {
     /// `updated` is always the moment the reading was TAKEN, never now, so the
     /// age the UI shows stays honest however it is replayed.
     ///
-    /// `source` is always `None`, including for a sample `store_peer_sample`
-    /// wrote, so a replayed peer reading is scheduled as this machine's own and
-    /// loses the peer margin once; that cost is accepted.
+    /// `source` comes back as stored, so a replayed peer reading keeps the peer
+    /// margin and stays on screen on a machine that cannot poll for itself.
     pub fn replay(&self, status: UsageStatus) -> Option<UsageLimits> {
         let d = self.data.lock().unwrap();
         let limits = UsageLimits {
@@ -87,7 +91,7 @@ impl UsageCacheStore {
             seven_day: d.seven_day.clone(),
             status,
             updated: d.updated,
-            source: None,
+            source: d.source.clone(),
         };
         (d.updated != 0 && limits.has_reading()).then_some(limits)
     }
@@ -114,6 +118,7 @@ impl UsageCacheStore {
             d.five_hour = usage.five_hour.clone();
             d.seven_day = usage.seven_day.clone();
             d.updated = usage.updated;
+            d.source = usage.source.clone();
             if clears_block {
                 d.blocked_until = None;
             }
@@ -253,6 +258,19 @@ mod tests {
         let fresh = s.replay(UsageStatus::Ok).expect("a stored sample replays");
         assert_eq!(fresh.status, UsageStatus::Ok);
         assert_eq!(fresh.updated, NOW, "still the moment it was taken, never now");
+    }
+
+    #[test]
+    fn a_peer_sample_replays_with_its_source() {
+        let cache = store();
+        cache.store_peer_sample(&UsageLimits {
+            five_hour: None,
+            seven_day: Some(LimitBucket { utilization: 0.4, resets_at: None }),
+            status: UsageStatus::Ok,
+            updated: 1_000,
+            source: Some("AIR".to_string()),
+        });
+        assert_eq!(cache.replay(UsageStatus::Ok).and_then(|r| r.source).as_deref(), Some("AIR"));
     }
 
     #[test]
