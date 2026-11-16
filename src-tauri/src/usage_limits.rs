@@ -39,7 +39,10 @@ pub struct UsageLimits {
     /// which keeps no source even for a sample a peer took, so such a reading is
     /// scheduled without the peer margin. A peer's reading stands in for a local
     /// poll until it is due, so the poller has to know which kind it is holding
-    /// (`UsageLimits::peer_due_at`).
+    /// (`UsageLimits::peer_due_at`). On a machine with no credentials it also
+    /// decides what is shown: `poll_once` keeps a peer's reading on screen past
+    /// due, while a reading without a source is blanked to `Unavailable`, which
+    /// is why such a machine shows no bars after a restart until a peer pushes.
     #[serde(skip)]
     pub source: Option<String>,
 }
@@ -578,7 +581,7 @@ impl UsageLimitsPoller {
                 .unwrap_or_else(|_| reqwest::Client::new());
             tracing::info!("usage limits poller started");
             loop {
-                poll_once(&app, &client).await;
+                let held = poll_once(&app, &client).await;
                 let configured = poll_interval_seconds(&app);
                 let delay = reset_delay_seconds(&app);
                 let (five_reset, seven_reset) = app
@@ -605,7 +608,7 @@ impl UsageLimitsPoller {
                     .and_then(|s| s.snapshot().peer_due_at(configured, delay));
                 let scheduled = sleep_secs_honouring_block(scheduled, peer_due, now_ms());
                 let blocked_until = app.try_state::<UsageCacheStore>().and_then(|c| c.blocked_until(now_ms()));
-                let secs = sleep_secs_honouring_block(scheduled, blocked_until, now_ms());
+                let secs = held.unwrap_or_else(|| sleep_secs_honouring_block(scheduled, blocked_until, now_ms()));
                 let wake = app
                     .try_state::<UsageLimitsState>()
                     .map(|s| s.wake.clone());
@@ -743,6 +746,32 @@ fn peer_reading_due_at(configured_secs: u64, reset_delay_secs: u64, reading: &Us
     reading.updated + secs as i64 * 1000 + PEER_READING_MARGIN_MS
 }
 
+/// Whether a peer's reading, held by a machine that cannot poll for itself, is
+/// older than the regular poll interval plus [`PEER_READING_MARGIN_MS`], which
+/// no healthy peer lets it reach.
+fn peer_reading_is_stale(age_ms: i64, interval_secs: u64) -> bool {
+    age_ms > peer_reading_stale_after_ms(interval_secs)
+}
+
+fn peer_reading_stale_after_ms(interval_secs: u64) -> i64 {
+    interval_secs as i64 * 1000 + PEER_READING_MARGIN_MS
+}
+
+/// How long a machine with no credentials sleeps while it holds a peer's reading
+/// past due: until the reading turns stale, then a full interval. Nothing moves
+/// the reading's `updated` meanwhile, so the age-based schedule would sit at
+/// [`MIN_POLL_SECS`] and read the credentials (on macOS a `security` subprocess
+/// and a warning) every minute for as long as the peer stays quiet. A fresh
+/// peer reading replaces the snapshot without waiting for this wake.
+fn held_peer_reading_sleep_secs(age_ms: i64, interval_secs: u64) -> u64 {
+    let until_stale_ms = peer_reading_stale_after_ms(interval_secs) - age_ms;
+    if until_stale_ms >= 0 {
+        ((until_stale_ms as u64) / 1000 + 1).max(MIN_POLL_SECS)
+    } else {
+        interval_secs.max(MIN_POLL_SECS)
+    }
+}
+
 /// Show a peer's usage reading in place of polling for one.
 ///
 /// The 5h and 7d counters are account-wide, so another machine's poll on the
@@ -873,8 +902,11 @@ fn sleep_secs_honouring_block(scheduled_secs: u64, blocked_until: Option<i64>, n
     }
 }
 
-async fn poll_once(app: &AppHandle, client: &reqwest::Client) {
-    let Some(state) = app.try_state::<UsageLimitsState>() else { return };
+/// Returns the seconds the loop must sleep in place of its own schedule, or
+/// `None` to schedule as usual. Only a held peer reading answers one (see
+/// [`held_peer_reading_sleep_secs`]).
+async fn poll_once(app: &AppHandle, client: &reqwest::Client) -> Option<u64> {
+    let Some(state) = app.try_state::<UsageLimitsState>() else { return None };
     let cache = app.try_state::<UsageCacheStore>();
     let now = now_ms();
 
@@ -911,7 +943,7 @@ async fn poll_once(app: &AppHandle, client: &reqwest::Client) {
             // unstamped, the user cannot force a refresh even after the deadline
             // lapses, and the log line explaining the refusal is itself wrong.
             state.mark_poll_attempt();
-            return;
+            return None;
         }
     }
 
@@ -939,7 +971,7 @@ async fn poll_once(app: &AppHandle, client: &reqwest::Client) {
                     state.replace(recent);
                     state.mark_poll_attempt();
                     emit_usage_limits_updated(app);
-                    return;
+                    return None;
                 }
             }
         }
@@ -953,7 +985,7 @@ async fn poll_once(app: &AppHandle, client: &reqwest::Client) {
     if let Some(due) = previous.peer_due_at(poll_interval_seconds(app), reset_delay_seconds(app)) {
         if now < due {
             tracing::debug!(device = previous.source.as_deref(), in_ms = due - now, "usage poll skipped; a peer's reading is not due yet");
-            return;
+            return None;
         }
     }
 
@@ -964,6 +996,21 @@ async fn poll_once(app: &AppHandle, client: &reqwest::Client) {
         }
         Err(CredsError::Missing | CredsError::Unreadable) => {
             state.saw_expired_last_poll.store(false, Ordering::SeqCst);
+            // A machine with no credentials of its own has only a peer's
+            // readings to show, and the peer can go quiet for an hour (a 429's
+            // Retry-After). Keep its last reading on screen rather than blanking
+            // the bars the moment it falls due, and call it stale only once it is
+            // older than a regular poll would ever leave it: a reading falls due
+            // early ahead of a window reset, and is not stale for that.
+            if previous.source.is_some() && previous.has_reading() {
+                let interval = poll_interval_seconds(app);
+                let age_ms = now - previous.updated;
+                if peer_reading_is_stale(age_ms, interval) && previous.status != UsageStatus::NetworkError {
+                    state.replace(UsageLimits { status: UsageStatus::NetworkError, ..previous });
+                    emit_usage_limits_updated(app);
+                }
+                return Some(held_peer_reading_sleep_secs(age_ms, interval));
+            }
             state.replace(UsageLimits {
                 five_hour: None,
                 seven_day: None,
@@ -972,7 +1019,7 @@ async fn poll_once(app: &AppHandle, client: &reqwest::Client) {
                 source: None,
             });
             emit_usage_limits_updated(app);
-            return;
+            return None;
         }
         Err(CredsError::Expired) => {
             // Defer the first expired sighting to give Claude Code a poll
@@ -992,7 +1039,7 @@ async fn poll_once(app: &AppHandle, client: &reqwest::Client) {
                 tracing::debug!(
                     "token expired; deferring refresh, keeping previous snapshot"
                 );
-                return;
+                return None;
             }
             // Either cold start, or this is the second consecutive expired
             // poll. Hit the OAuth endpoint with the stored refresh_token.
@@ -1011,7 +1058,7 @@ async fn poll_once(app: &AppHandle, client: &reqwest::Client) {
                         source: None,
                     });
                     emit_usage_limits_updated(app);
-                    return;
+                    return None;
                 }
             }
         }
@@ -1084,6 +1131,7 @@ async fn poll_once(app: &AppHandle, client: &reqwest::Client) {
             emit_usage_limits_updated(app);
         }
     }
+    None
 }
 
 #[cfg(test)]
@@ -1379,6 +1427,24 @@ mod tests {
         let reset = NOW + 5 * 60_000;
         let due = peer_reading_due_at(600, 30, &reading(NOW, Some(reset), Some("AIR")));
         assert_eq!(due, reset + 30_000 + PEER_READING_MARGIN_MS);
+    }
+
+    #[test]
+    fn a_peer_reading_turns_stale_only_past_the_interval_and_margin() {
+        let limit = 600_000 + PEER_READING_MARGIN_MS;
+        assert!(!peer_reading_is_stale(6 * 60_000, 600), "due early before a reset is not stale");
+        assert!(!peer_reading_is_stale(limit, 600));
+        assert!(peer_reading_is_stale(limit + 1, 600));
+    }
+
+    #[test]
+    fn a_held_peer_reading_wakes_once_stale_then_each_interval() {
+        let limit = 600_000 + PEER_READING_MARGIN_MS;
+        assert_eq!(held_peer_reading_sleep_secs(limit - 300_000, 600), 301, "wakes just past the stale threshold");
+        assert_eq!(held_peer_reading_sleep_secs(limit - 1_000, 600), MIN_POLL_SECS);
+        assert!(peer_reading_is_stale(limit - 300_000 + 301_000, 600));
+        assert_eq!(held_peer_reading_sleep_secs(limit + 1, 600), 600, "a stale reading sleeps a full interval");
+        assert_eq!(held_peer_reading_sleep_secs(10 * HOUR, 600), 600);
     }
 
     #[test]
