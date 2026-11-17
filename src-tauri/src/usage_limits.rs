@@ -35,9 +35,8 @@ pub struct UsageLimits {
     pub status: UsageStatus,
     pub updated: i64,
     /// The peer device whose poll this reading is, or `None` for this machine's
-    /// own or for any reading replayed from the cache (`UsageCacheStore::replay`),
-    /// which keeps no source even for a sample a peer took, so such a reading is
-    /// scheduled without the peer margin. A peer's reading stands in for a local
+    /// own. A reading replayed from the cache (`UsageCacheStore::replay`) keeps
+    /// the source it was stored with. A peer's reading stands in for a local
     /// poll until it is due, so the poller has to know which kind it is holding
     /// (`UsageLimits::peer_due_at`). On a machine with no credentials it also
     /// decides what is shown: `poll_once` keeps a peer's reading on screen past
@@ -902,6 +901,36 @@ fn sleep_secs_honouring_block(scheduled_secs: u64, blocked_until: Option<i64>, n
     }
 }
 
+/// What `poll_once` has to show when it cannot take a reading of its own: the
+/// reading held in memory where there is one, else the stored sample, which
+/// a restart leaves as the only copy.
+enum Shown {
+    Held(UsageLimits),
+    Replayed(UsageLimits),
+    Nothing,
+}
+
+impl Shown {
+    fn reading(self) -> Option<UsageLimits> {
+        match self {
+            Shown::Held(r) | Shown::Replayed(r) => Some(r),
+            Shown::Nothing => None,
+        }
+    }
+}
+
+/// The one rule for when the stored sample stands in for the held snapshot,
+/// replayed under `status`, which is the only thing its callers disagree on.
+fn held_or_replayed(held: UsageLimits, cache: Option<&UsageCacheStore>, status: UsageStatus) -> Shown {
+    if held.has_reading() {
+        return Shown::Held(held);
+    }
+    match cache.and_then(|c| c.replay(status)) {
+        Some(r) => Shown::Replayed(r),
+        None => Shown::Nothing,
+    }
+}
+
 /// Returns the seconds the loop must sleep in place of its own schedule, or
 /// `None` to schedule as usual. Only a held peer reading answers one (see
 /// [`held_peer_reading_sleep_secs`]).
@@ -929,12 +958,10 @@ async fn poll_once(app: &AppHandle, client: &reqwest::Client) -> Option<u64> {
             // succeeded this run holds a fresher reading than the file does,
             // and `replay` reports `NetworkError`, so overwriting would
             // downgrade a good snapshot on a later skip.
-            if !state.snapshot().has_reading() {
-                if let Some(stale) = cache.replay(UsageStatus::NetworkError) {
-                    tracing::debug!(age_ms = now - stale.updated, "replaying the stored usage sample while blocked");
-                    state.replace(stale);
-                    emit_usage_limits_updated(app);
-                }
+            if let Shown::Replayed(stale) = held_or_replayed(state.snapshot(), Some(cache.inner()), UsageStatus::NetworkError) {
+                tracing::debug!(age_ms = now - stale.updated, "replaying the stored usage sample while blocked");
+                state.replace(stale);
+                emit_usage_limits_updated(app);
             }
             // Stamp the attempt even though nothing was sent. `request_refresh`
             // reads a missing stamp as "the opening poll is about to cover this"
@@ -1003,9 +1030,9 @@ async fn poll_once(app: &AppHandle, client: &reqwest::Client) -> Option<u64> {
             // older than a regular poll would ever leave it: a reading falls due
             // early ahead of a window reset, and is not stale for that. After a
             // restart nothing is held yet, and the stored peer reading stands in.
-            let restored = !previous.has_reading();
-            let held = if restored { cache.as_ref().and_then(|c| c.replay(UsageStatus::Ok)) } else { Some(previous) };
-            if let Some(held) = held.filter(|h| h.source.is_some()) {
+            let shown = held_or_replayed(previous, cache.as_deref(), UsageStatus::Ok);
+            let restored = matches!(shown, Shown::Replayed(_));
+            if let Some(held) = shown.reading().filter(|h| h.source.is_some()) {
                 let interval = poll_interval_seconds(app);
                 let age_ms = now - held.updated;
                 let status = if peer_reading_is_stale(age_ms, interval) { UsageStatus::NetworkError } else { held.status };
@@ -1121,8 +1148,7 @@ async fn poll_once(app: &AppHandle, client: &reqwest::Client) -> Option<u64> {
             // limit look like a broken feature. Replay the last real reading
             // with its own age instead; `updated` is what the UI renders as
             // "as of N ago".
-            let fallback = cache.as_ref().and_then(|c| c.replay(UsageStatus::NetworkError));
-            let prev = if previous.has_reading() { Some(previous.clone()) } else { fallback };
+            let prev = held_or_replayed(previous, cache.as_deref(), UsageStatus::NetworkError).reading();
             let keep_prev = matches!(status, UsageStatus::NetworkError) && prev.is_some();
             let prev = prev.unwrap_or_else(UsageLimits::empty);
             state.replace(UsageLimits {
