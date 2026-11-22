@@ -18,6 +18,11 @@ x86_64-pc-windows-msvc` dies in `aws-lc-sys` (pulled in by reqwest's rustls
 backend), whose C needs `windows.h`. Re-confirmed 2026-10-04 on
 `aws-lc-sys-0.43.0`, compiling `jitterentropy-timer.c`, after installing the
 target; the target install is not the missing piece and adding it buys nothing.
+Building on the Windows machine over SSH does not work either: its rustup
+toolchain refuses to execute in an sshd session (os error 448, measured
+2026-11-22 — `windows-openssh-over-tailscale` in the global learnings). So the
+scratch-copy recipe below is the route; that day it was reached only after both
+remote attempts had cost a round trip each, because this file went unread.
 
 **A stale stub is not the only class this hides — an UNUSED IMPORT is the other,
 and it is easier to produce.** Windows compiles `composite.rs` and
