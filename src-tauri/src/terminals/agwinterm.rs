@@ -658,10 +658,10 @@ impl TerminalAdapter for AgwintermAdapter {
     /// to the holder's session the way every tab opened on a remote session
     /// here does. The session already exists when this is asked, so the
     /// script's `start` creates nothing.
-    fn attach_hosted(&self, name: &str) -> Result<(), String> {
+    fn attach_hosted(&self, name: &str) -> Result<super::Attached, String> {
         let script = self.attach_script.as_deref().ok_or("config.remote_session_script is not set")?;
         let req = wire::new_session_req(&wire::attach_command(script, name));
-        self.call(&req, WRITE_DEADLINE).map(|_| ())
+        self.call(&req, WRITE_DEADLINE).map(|_| super::Attached::Opened)
     }
 }
 

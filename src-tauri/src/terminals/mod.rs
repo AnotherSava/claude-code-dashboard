@@ -1064,16 +1064,38 @@ pub trait TerminalAdapter: Send {
     }
 
     /// Open a tab on this machine attached to the remote-session holder's
-    /// session `name`, a [`Launched::hosted_name`], without putting it in front.
-    /// It is how a session started for an agent here, on whichever machine the
-    /// holder runs, gets a tab where that agent's user is: on the Mac a `⇄` tab
-    /// reaching the Windows holder over ssh, on Windows a tab attaching to the
-    /// local one.
+    /// session `name`, a [`Launched::hosted_name`] or a [`HostedSession::name`],
+    /// without putting it in front. It is how a session an agent here started
+    /// or messaged, on whichever machine the holder runs, gets a tab where that
+    /// agent's user is: on the Mac a `⇄` tab reaching the Windows holder over
+    /// ssh, on Windows a tab attaching to the local one. A terminal that can
+    /// see a tab already attached to `name` answers [`Attached::AlreadyOpen`]
+    /// and opens nothing, since a second client on one session draws the same
+    /// screen at whichever size was used last.
     ///
     /// **May block.** The default refuses.
-    fn attach_hosted(&self, name: &str) -> Result<(), String> {
+    fn attach_hosted(&self, name: &str) -> Result<Attached, String> {
         let _ = name;
         Err("this terminal cannot attach a hosted session".to_string())
+    }
+
+    /// Whether [`hosted_session_of`](Self::hosted_session_of) can ever answer
+    /// `Some` here: whether this terminal is the remote-session holder. A fact
+    /// about the adapter, answered without asking the terminal, so a message
+    /// arriving on a machine that hosts nothing spawns no lookup.
+    fn can_report_hosted(&self) -> bool {
+        false
+    }
+
+    /// The holder's session running in `dir`, a working directory as Claude
+    /// Code's session registry or a hook reports it, with the name another
+    /// machine attaches to it by and whether a terminal on another machine is
+    /// attached to it now. `None` where no holder session runs there.
+    ///
+    /// **May block.** The default answers `None`.
+    fn hosted_session_of(&self, dir: &str) -> Result<Option<HostedSession>, String> {
+        let _ = dir;
+        Ok(None)
     }
 
     /// Whether [`show_servers`](Self::show_servers) can ever succeed here. A
@@ -1135,6 +1157,31 @@ pub struct ServerTarget {
 pub enum ServersShown {
     Shown,
     NoSuchSession,
+}
+
+/// What [`TerminalAdapter::attach_hosted`] did.
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Attached {
+    Opened,
+    /// A tab here was already attached to the session, so none was opened.
+    // Constructed only by the agterm adapter.
+    #[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+    AlreadyOpen,
+}
+
+/// A remote-session holder's session, as [`TerminalAdapter::hosted_session_of`]
+/// reports it.
+#[cfg_attr(not(any(target_os = "windows", test)), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostedSession {
+    /// The name the claude repo's attach scripts take, as
+    /// [`Launched::hosted_name`] carries it.
+    pub name: String,
+    /// Whether a terminal on another machine is attached to the session now: a
+    /// client that recorded a machine other than the holder's own. A client that
+    /// recorded none is not counted, since it may as well be the holder's.
+    pub watched_elsewhere: bool,
 }
 
 /// What [`TerminalAdapter::launch`] created.

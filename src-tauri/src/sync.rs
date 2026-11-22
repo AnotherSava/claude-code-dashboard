@@ -746,6 +746,140 @@ async fn post_attention(State(app): State<AppHandle>, Json(report): Json<Attenti
     (StatusCode::OK, Json(AttentionReceipt { recorded: true, reason: (!changed).then(|| "no_change".to_string()) }))
 }
 
+/// The remote-session holder asking a peer to open a tab on one of its
+/// sessions, because a message reached that session for an agent whose user is
+/// at the peer ([`offer_tab`]).
+#[derive(Serialize, Deserialize, Debug, Default)]
+pub struct AttachRequest {
+    /// The asking machine, which the receiver requires to be bound in its own
+    /// `sync.peer_identity`, and which namespaces `chat_id` for the log.
+    #[serde(default)]
+    pub origin_device: String,
+    /// The session's row on the asking machine, un-namespaced.
+    #[serde(default)]
+    pub chat_id: String,
+    /// The name the claude repo's attach scripts take
+    /// ([`crate::terminals::HostedSession::name`]).
+    #[serde(default)]
+    pub name: String,
+}
+
+/// Whether `name` can be handed to an attach script as one argument: what
+/// `cc-session.sh … name` prints, a path below `WSL_PROJECT_ROOT`. The
+/// character set is the one the claude repo's `remote-session/mac/attach.sh`
+/// accepts, and changes with it. Checked by `http_server::attach_started` for
+/// every route that opens a tab, and here before attestation so a malformed
+/// request is answered `400`.
+pub(crate) fn attach_name_ok(name: &str) -> bool {
+    !name.is_empty() && name.len() <= 200 && !name.starts_with('-') && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '-' | '_' | '.'))
+}
+
+/// `POST /api/sync/attach`: open a background tab here on the holder's session
+/// [`AttachRequest::name`], unless a tab here already attaches to it
+/// (`http_server::attach_started`).
+///
+/// The sender must be attested, not merely claimed, since this runs a command
+/// in a terminal on this machine: the attach script reaches the holder over ssh
+/// and may bring back a session that did not end cleanly, the same reach a
+/// relayed start is held to.
+async fn post_attach(State(app): State<AppHandle>, ConnectInfo(peer): ConnectInfo<SocketAddr>, Json(req): Json<AttachRequest>) -> StatusCode {
+    let refuse = |code: StatusCode, why: &str| {
+        tracing::warn!(decision = "peer_attach", peer_ip = %peer.ip(), origin_device = %req.origin_device, session = %req.name, outcome = "refused", reason = why, "a peer's request for a tab was refused");
+        code
+    };
+    if req.origin_device.is_empty() || req.chat_id.is_empty() || !attach_name_ok(&req.name) {
+        return refuse(StatusCode::BAD_REQUEST, "malformed_request");
+    }
+    let Some(cfg) = app.try_state::<ConfigState>().map(|c| c.snapshot()) else {
+        return refuse(StatusCode::INTERNAL_SERVER_ERROR, "state_unavailable");
+    };
+    let bound = app.try_state::<crate::tailnet::TailnetResolver>().is_some_and(|r| r.peer_is_bound(peer.ip(), &req.origin_device, &cfg.sync.peer_identity));
+    if !bound {
+        return refuse(StatusCode::FORBIDDEN, "unattested");
+    }
+    crate::http_server::attach_started(&app, &namespaced_id(&req.origin_device, &req.chat_id), req.name).await;
+    StatusCode::OK
+}
+
+/// Who [`offer_tab`] asks to open the tab.
+pub enum TabRecipients {
+    /// The device a relayed message came from, whose agent sent it.
+    Device(String),
+    /// Every peer this machine has heard from, for a sender on this machine
+    /// that a terminal on another machine is watching: the holder records the
+    /// machine a client sits at (`mac`), which names no sync device.
+    EveryPeer,
+}
+
+/// Ask a peer to open a tab on the session in `cwd`, row `chat_id`, where it is
+/// a session the remote-session holder here runs and no terminal on another
+/// machine is attached to it, so the user of the agent that messaged it can read
+/// and answer it there. With `sender_cwd`, the session a local `SendMessage`
+/// came from must itself be a holder session another machine watches, which is
+/// what says its user is over there. The peer opens nothing where a tab of its
+/// own already attaches.
+///
+/// Off the caller's path, since every lookup spawns `wsl.exe`, and
+/// fire-and-forget like [`report_attention`]: a lost request leaves the session
+/// reachable through the attach picker. Logged `tab_offer`, keyed by the row.
+pub fn offer_tab(app: &AppHandle, chat_id: String, cwd: String, sender_cwd: Option<String>, to: TabRecipients) {
+    let Some(adapter) = crate::terminals::for_platform(app).filter(|a| a.can_report_hosted()) else { return };
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let lookup = tokio::task::spawn_blocking(move || -> Result<Result<crate::terminals::HostedSession, &'static str>, String> {
+            if let Some(sender) = sender_cwd {
+                if !adapter.hosted_session_of(&sender)?.is_some_and(|h| h.watched_elsewhere) {
+                    return Ok(Err("sender_not_watched_elsewhere"));
+                }
+            }
+            Ok(match adapter.hosted_session_of(&cwd)? {
+                None => Err("not_hosted"),
+                Some(h) if h.watched_elsewhere => Err("watched_elsewhere"),
+                Some(h) => Ok(h),
+            })
+        })
+        .await
+        .unwrap_or_else(|e| Err(format!("the lookup task did not finish: {e}")));
+        let hosted = match lookup {
+            Ok(Ok(h)) => h,
+            Ok(Err(why)) => {
+                tracing::debug!(chat_id = %chat_id, decision = "tab_offer", outcome = why, "no tab offered");
+                return;
+            }
+            Err(reason) => {
+                tracing::warn!(chat_id = %chat_id, decision = "tab_offer", outcome = "lookup_failed", reason = %reason, "could not ask the holder whether a messaged session needs a tab");
+                return;
+            }
+        };
+        let Some(cfg) = app.try_state::<ConfigState>().map(|c| c.snapshot()) else { return };
+        let (Some(token), device_name) = (cfg.sync.token.filter(|t| !t.is_empty()), cfg.sync.device_name) else { return };
+        let peers: Vec<(String, String)> = app.try_state::<AppState>().map_or_else(Vec::new, |state| {
+            let remote = state.remote.lock().unwrap();
+            remote
+                .iter()
+                .filter(|(device, d)| !d.origin_addr.is_empty() && match &to { TabRecipients::Device(want) => *device == want, TabRecipients::EveryPeer => true })
+                .map(|(device, d)| (device.clone(), d.origin_addr.clone()))
+                .collect()
+        });
+        if peers.is_empty() {
+            tracing::info!(chat_id = %chat_id, decision = "tab_offer", session = %hosted.name, outcome = "no_peer", "a messaged session needs a tab, and no peer to open one has an address");
+            return;
+        }
+        let client = reqwest::Client::builder().timeout(Duration::from_secs(MESSAGE_HOP_TIMEOUT_SECS)).build().unwrap_or_default();
+        let body = AttachRequest { origin_device: device_name, chat_id: chat_id.clone(), name: hosted.name.clone() };
+        for (device, addr) in peers {
+            let url = format!("{}/api/sync/attach", addr.trim_end_matches('/'));
+            match client.post(&url).bearer_auth(&token).json(&body).send().await {
+                Ok(resp) if resp.status().is_success() => tracing::info!(chat_id = %chat_id, decision = "tab_offer", session = %hosted.name, device = %device, outcome = "sent", "asked a peer to open a tab on a messaged session"),
+                // A peer predating the route answers 404, the same as any other
+                // refusal for this purpose: no tab, and the picker still works.
+                Ok(resp) => tracing::warn!(chat_id = %chat_id, decision = "tab_offer", session = %hosted.name, device = %device, outcome = "refused", status = %resp.status(), "a peer refused to open a tab on a messaged session"),
+                Err(e) => tracing::warn!(chat_id = %chat_id, decision = "tab_offer", session = %hosted.name, device = %device, outcome = "failed", error = %e, "could not ask a peer to open a tab"),
+            }
+        }
+    });
+}
+
 /// Tell the machine that owns `id` that its session was read here.
 ///
 /// Fire-and-forget, by design. There is no acknowledgement to wait on and no
@@ -1025,8 +1159,8 @@ async fn post_message(
         }
     }
 
-    let (pid, socket_path) = match inbox {
-        InboxLookup::Found { pid, socket_path } => (pid, socket_path),
+    let (pid, socket_path, cwd) = match inbox {
+        InboxLookup::Found { pid, socket_path, cwd } => (pid, socket_path, cwd),
         InboxLookup::Ambiguous { sessions } => {
             return refuse("ambiguous_target", StatusCode::CONFLICT, Some(format!("{sessions} live interactive sessions share that directory; picking one would decide which agent reads this")));
         }
@@ -1143,6 +1277,13 @@ async fn post_message(
                 outcome = "written",
                 "frame written to the session's inbox"
             );
+            // A session this message started reaches the sender's tab through
+            // the receipt; one already running may still have no tab where the
+            // sender is, which only the holder here can find out, and which the
+            // receipt cannot wait on.
+            if hosted_session.is_none() {
+                offer_tab(&app, env.target_project.clone(), cwd, None, TabRecipients::Device(env.origin_device.clone()));
+            }
             let mut r = receipt(Outcome::Written);
             r.hosted_session = hosted_session;
             (StatusCode::OK, Json(r))
@@ -1591,6 +1732,7 @@ pub async fn run_listener(app: AppHandle, port: u16, scope: SyncBindScope) {
         .route("/api/sync/tokens", get(get_tokens))
         .route("/api/sync/message", post(post_message))
         .route("/api/sync/attention", post(post_attention))
+        .route("/api/sync/attach", post(post_attach))
         .layer(middleware::from_fn_with_state(GuardState { app: app.clone(), scope }, guard))
         .with_state(app.clone());
 
@@ -2263,7 +2405,11 @@ mod tests {
         // sessions, which the notifier revokes Telegram messages on. That is
         // what makes its clamp (`post_attention`) part of the gate rather than a
         // nicety.
-        assert_eq!(expr.matches(".route(").count(), 6, "route count changed — confirm the new route is above the layer, then update this number");
+        //
+        // 6 -> 7 with `POST /api/sync/attach`, the holder asking this machine to
+        // open a tab on one of its sessions. It runs a command in a terminal
+        // here, which is why it also takes an attested sender (`post_attach`).
+        assert_eq!(expr.matches(".route(").count(), 7, "route count changed — confirm the new route is above the layer, then update this number");
     }
 
     #[test]
@@ -2992,7 +3138,7 @@ mod tests {
         assert!(!starts(&InboxLookup::Ambiguous { sessions: 2 }));
         assert!(!starts(&InboxLookup::NoInbox));
         assert!(!starts(&InboxLookup::Unreadable));
-        assert!(!starts(&InboxLookup::Found { pid: 1, socket_path: "/tmp/s".into() }));
+        assert!(!starts(&InboxLookup::Found { pid: 1, socket_path: "/tmp/s".into(), cwd: "/p".into() }));
     }
 
     /// The sending half of the property above. `receipt_status` deliberately

@@ -31,6 +31,12 @@
 //! sequence the close uses, refused by [`super::tmux_wire::command_refusal`]
 //! rather than by the close's CLEAN checks.
 //!
+//! And it says which of its sessions runs in a directory, for `sync::offer_tab`
+//! (`hosted_session_of`): `cc-session.sh … name` gives the project and tmux
+//! session names, since only the script knows the root a session is named
+//! below, and the tmux list says whether that session runs and whether a
+//! client on another machine is attached to it.
+//!
 //! The rest of the seam answers nothing: restore reads each session's console
 //! title through the console adapter already, tmux has no context line, and
 //! which tab a person reads is a question for the terminals that draw them.
@@ -194,5 +200,29 @@ impl TerminalAdapter for TmuxAdapter {
             return Err(format!("cc-session.sh exited {}: {}", out.status.code().map_or("by signal".to_string(), |c| c.to_string()), failure_text(&out)));
         }
         Ok(super::Launched { key: None, hosted_name: wire::hosted_name(&String::from_utf8_lossy(&out.stdout)) })
+    }
+
+    fn can_report_hosted(&self) -> bool {
+        self.script.is_some()
+    }
+
+    /// `cc-session.sh <dir> windows start name` for the project and session
+    /// names, since only the script knows the root a session is named below,
+    /// then the tmux list for whether that session runs and who watches it.
+    /// A directory outside the root, or one the root does not hold, is a session
+    /// this holder cannot be running ([`wire::not_a_project`]); any other
+    /// failure is a failure to ask.
+    fn hosted_session_of(&self, dir: &str) -> Result<Option<super::HostedSession>, String> {
+        let script = self.script.as_deref().ok_or("config.remote_session_script is not set")?;
+        let out = wsl(&[script, dir, "windows", "start", "name"])?;
+        if !out.status.success() {
+            let why = failure_text(&out);
+            if wire::not_a_project(&why) {
+                return Ok(None);
+            }
+            return Err(format!("cc-session.sh exited {}: {why}", out.status.code().map_or("by signal".to_string(), |c| c.to_string())));
+        }
+        let (project, session) = wire::parse_name(&String::from_utf8_lossy(&out.stdout)).ok_or("cc-session.sh printed no project and session name")?;
+        Ok(wire::hosted(&list()?, &project, &session))
     }
 }

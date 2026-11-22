@@ -305,8 +305,11 @@ fn is_interactive(r: &Record) -> bool {
 #[derive(Debug, PartialEq, Eq)]
 pub enum InboxLookup {
     /// Exactly one live interactive session derives this id and publishes an
-    /// inbox. `socket_path` is the record's own string, uncomposed.
-    Found { pid: u32, socket_path: String },
+    /// inbox. `socket_path` is the record's own string, uncomposed, and `cwd`
+    /// the record's working directory, which `sync::post_message` and a local
+    /// `SendMessage`'s arrival in `http_server` ask the remote-session holder
+    /// about.
+    Found { pid: u32, socket_path: String, cwd: String },
     /// Several live interactive sessions derive this id (a `--fork-session
     /// --resume` migration leaves two). Refused, never guessed.
     Ambiguous { sessions: usize },
@@ -325,7 +328,7 @@ fn inbox_in(records: &[Record], chat_id: &str, projects_root: Option<&str>) -> I
     match matches.as_slice() {
         [] => InboxLookup::NotFound,
         [only] => match only.messaging_socket_path.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
-            Some(path) => InboxLookup::Found { pid: only.pid, socket_path: path.to_string() },
+            Some(path) => InboxLookup::Found { pid: only.pid, socket_path: path.to_string(), cwd: only.cwd.clone() },
             None => InboxLookup::NoInbox,
         },
         many => InboxLookup::Ambiguous { sessions: many.len() },
@@ -417,6 +420,14 @@ impl SessionRegistry {
             Some(recs) => sender_in(recs, inbox, name, anchored, projects_root),
             None => SenderLookup::Unreadable,
         }
+    }
+
+    /// The working directory of the live session that sent a `SendMessage`,
+    /// matched as [`sender_of`](Self::sender_of) matches it, or `None` where that
+    /// finds no single session.
+    pub fn sender_cwd(&self, inbox: Option<&str>, name: Option<&str>, now: i64) -> Option<String> {
+        let mut cached = self.cached.lock().unwrap();
+        sender_record(Self::refresh(&mut cached, now)?, inbox, name).ok().map(|r| r.cwd.clone())
     }
 
     /// Drop the cache, so the next read re-scans.
@@ -586,15 +597,26 @@ pub enum SenderLookup {
 /// project — and every project sharing the basename — takes again, so a name
 /// match there would report a namesake's task as the sender's.
 fn sender_in(records: &[Record], inbox: Option<&str>, name: Option<&str>, anchored: &dyn Fn(&str) -> Option<String>, projects_root: Option<&str>) -> SenderLookup {
+    match sender_record(records, inbox, name) {
+        Ok(only) => SenderLookup::Found(record_row(only, anchored, projects_root)),
+        Err(miss) => miss,
+    }
+}
+
+/// The one record an envelope's `from` inbox, else its `from-name`, names, or
+/// the [`SenderLookup`] miss saying why there is none. Shared by [`sender_in`]
+/// and [`SessionRegistry::sender_cwd`], so the row a sender's task is read from
+/// and the directory its holder session is looked up by come from one match.
+fn sender_record<'a>(records: &'a [Record], inbox: Option<&str>, name: Option<&str>) -> Result<&'a Record, SenderLookup> {
     let matches: Vec<&Record> = match (inbox, name) {
         (Some(i), _) => records.iter().filter(|r| r.messaging_socket_path.as_deref() == Some(i)).collect(),
         (None, Some(n)) => records.iter().filter(|r| r.name.as_deref() == Some(n)).collect(),
         (None, None) => Vec::new(),
     };
     match matches.as_slice() {
-        [] => SenderLookup::NotFound,
-        [only] => SenderLookup::Found(record_row(only, anchored, projects_root)),
-        _ => SenderLookup::Ambiguous,
+        [] => Err(SenderLookup::NotFound),
+        [only] => Ok(only),
+        _ => Err(SenderLookup::Ambiguous),
     }
 }
 
@@ -835,7 +857,7 @@ mod tests {
         let recs = vec![with_inbox(93331, "/Users/x/Projects/printlab", Some("/private/tmp/cc-socks-501/93331-a1b2c3d4.sock"))];
         assert_eq!(
             inbox(recs, "printlab", all_claude(&[93331])),
-            InboxLookup::Found { pid: 93331, socket_path: "/private/tmp/cc-socks-501/93331-a1b2c3d4.sock".into() }
+            InboxLookup::Found { pid: 93331, socket_path: "/private/tmp/cc-socks-501/93331-a1b2c3d4.sock".into(), cwd: "/Users/x/Projects/printlab".into() }
         );
     }
 

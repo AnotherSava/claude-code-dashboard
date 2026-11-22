@@ -21,7 +21,7 @@
 
 use std::sync::mpsc::Sender;
 
-use super::{CloseTarget, FrontReading, LabelTarget, LabelWrite, Launched, Observation, TerminalAdapter, TerminalSession, FALLBACK_STALE_REMEDY};
+use super::{Attached, CloseTarget, FrontReading, HostedSession, LabelTarget, LabelWrite, Launched, Observation, TerminalAdapter, TerminalSession, FALLBACK_STALE_REMEDY};
 
 pub struct Composite {
     name: &'static str,
@@ -212,9 +212,21 @@ impl TerminalAdapter for Composite {
 
     /// The first child that can attach, in the order the set was built, as
     /// `launch` is routed.
-    fn attach_hosted(&self, name: &str) -> Result<(), String> {
+    fn attach_hosted(&self, name: &str) -> Result<Attached, String> {
         let child = self.children.iter().find(|c| c.can_attach_hosted()).ok_or_else(|| "no terminal in this set can attach a hosted session".to_string())?;
         child.attach_hosted(name)
+    }
+
+    fn can_report_hosted(&self) -> bool {
+        self.children.iter().any(|c| c.can_report_hosted())
+    }
+
+    /// The first child that hosts sessions, as `launch` is routed.
+    fn hosted_session_of(&self, dir: &str) -> Result<Option<HostedSession>, String> {
+        match self.children.iter().find(|c| c.can_report_hosted()) {
+            Some(child) => child.hosted_session_of(dir),
+            None => Ok(None),
+        }
     }
 
     fn can_show_servers(&self) -> bool {
@@ -311,9 +323,15 @@ mod tests {
         fn can_attach_hosted(&self) -> bool {
             self.launches
         }
-        fn attach_hosted(&self, name: &str) -> Result<(), String> {
+        fn attach_hosted(&self, name: &str) -> Result<Attached, String> {
             self.writes.lock().unwrap().push((format!("attach {name}"), LabelWrite::ClearContext));
-            Ok(())
+            Ok(Attached::Opened)
+        }
+        fn can_report_hosted(&self) -> bool {
+            self.launches
+        }
+        fn hosted_session_of(&self, dir: &str) -> Result<Option<HostedSession>, String> {
+            Ok(Some(HostedSession { name: format!("{}-{dir}", self.name), watched_elsewhere: false }))
         }
         fn launch_unrealized(&self, key: &str) -> bool {
             key == format!("{}-session", self.name)
@@ -427,12 +445,16 @@ mod tests {
         assert!(c.can_attach_hosted());
         c.attach_hosted("web").unwrap();
         assert_eq!(writes.lock().unwrap()[1].0, "attach web", "an attach goes to the first child that can, like a launch");
+        assert!(c.can_report_hosted());
+        assert_eq!(c.hosted_session_of("/p").unwrap().map(|h| h.name).as_deref(), Some("tmux-/p"), "a hosted lookup goes to the first child that hosts");
         assert!(!c.launch_unrealized("kitty|x"), "a key naming no child is not known to be dead");
         let none = composite(vec![Fake { name: "windows", ..Fake::default() }]);
         assert!(!none.can_launch());
         assert!(none.launch(std::path::Path::new("/p"), false).is_err());
         assert!(!none.can_attach_hosted());
         assert!(none.attach_hosted("web").is_err());
+        assert!(!none.can_report_hosted());
+        assert_eq!(none.hosted_session_of("/p"), Ok(None), "a set that hosts nothing finds no hosted session");
     }
 
     #[test]

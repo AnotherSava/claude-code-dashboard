@@ -338,11 +338,20 @@ impl TerminalAdapter for AgtermAdapter {
     /// cmd+shift+r picker opens one ([`ATTACH_WORKSPACE`], cwd `/`, no
     /// `--name`), except that it stays in the background. With no start token
     /// the script attaches to the session as it stands, which is the case here:
-    /// the session was started before this was asked.
-    fn attach_hosted(&self, name: &str) -> Result<(), String> {
+    /// the session was running before this was asked.
+    ///
+    /// Every open window is searched first for a tab already attached to
+    /// `name` ([`wire::attached_names`]), which the picker does too. A search
+    /// agterm could not answer opens the tab anyway: a second client is the
+    /// recoverable mistake, a session left with no tab is the one this exists
+    /// to prevent.
+    fn attach_hosted(&self, name: &str) -> Result<super::Attached, String> {
         let script = self.attach_script.as_deref().ok_or("config.remote_attach_script is not set")?;
+        if walk_windows(self.memory.as_deref(), "searched for an attached tab", |_, tree| wire::attached_names(tree)).is_some_and(|names| names.iter().any(|n| n == name)) {
+            return Ok(super::Attached::AlreadyOpen);
+        }
         let command = attach_command(script, name);
-        crate::agterm::agtermctl_checked(&["session", "new", "--workspace-name", ATTACH_WORKSPACE, "--create-workspace", "--cwd", "/", "--no-select", "--json", "--command", &command]).map(|_| ())
+        crate::agterm::agtermctl_checked(&["session", "new", "--workspace-name", ATTACH_WORKSPACE, "--create-workspace", "--cwd", "/", "--no-select", "--json", "--command", &command]).map(|_| super::Attached::Opened)
     }
 
     /// Input to the session on screen in agterm's active window.

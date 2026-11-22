@@ -7,7 +7,7 @@
 //! dashboard's console title reaches tmux as the pane's title, which is what
 //! names the session's row.
 
-use super::CloseTarget;
+use super::{CloseTarget, HostedSession};
 
 /// The shell script that lists every pane, then every client with the machine
 /// it is sitting at. One `P` line per pane (session, its pane title) and one
@@ -25,6 +25,10 @@ tmux list-clients -F '#{client_pid} #{session_name}' | while read -r pid s; do o
 
 /// The origin the claude repo's scripts record for a client on this machine.
 const ORIGIN_HERE: &str = "windows";
+
+/// The origin [`LIST_SCRIPT`] reports for a client that recorded none, as the
+/// claude repo's `start-here.sh` also reads it.
+const ORIGIN_UNRECORDED: &str = "unknown";
 
 /// One tmux session as [`LIST_SCRIPT`] reports it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -66,7 +70,7 @@ fn entry<'a>(sessions: &'a mut Vec<TmuxSession>, name: &str) -> &'a mut TmuxSess
 /// Whether a terminal on this machine may be showing the session: a client
 /// that says so, or one that recorded nothing, which could be.
 fn shown_here(session: &TmuxSession) -> bool {
-    session.origins.iter().any(|o| o == ORIGIN_HERE || o == "unknown")
+    session.origins.iter().any(|o| o == ORIGIN_HERE || o == ORIGIN_UNRECORDED)
 }
 
 /// The sessions only another machine's tabs, or none, are showing, keyed by
@@ -111,6 +115,30 @@ pub fn command_refusal(session: &TmuxSession) -> Option<String> {
 /// which is the name an attach to the session takes.
 pub fn hosted_name(stdout: &str) -> Option<String> {
     stdout.lines().map(str::trim).filter(|l| !l.is_empty()).next_back().map(str::to_string)
+}
+
+/// What `cc-session.sh … name` printed: the project an attach takes, then the
+/// tmux session it runs under, its last two nonblank lines.
+pub fn parse_name(stdout: &str) -> Option<(String, String)> {
+    let lines: Vec<&str> = stdout.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    match lines.as_slice() {
+        [.., project, session] => Some((project.to_string(), session.to_string())),
+        _ => None,
+    }
+}
+
+/// Whether `cc-session.sh`'s stderr refused the directory itself: one outside
+/// `WSL_PROJECT_ROOT`, or one it does not hold. Either names no session the
+/// holder could be running, where every other failure is a failure to ask.
+pub fn not_a_project(stderr: &str) -> bool {
+    stderr.contains("is not under") || stderr.contains("no such project directory")
+}
+
+/// The holder's session `session` among `sessions`, reported under `project`,
+/// the name an attach takes, or `None` where no such session runs.
+pub fn hosted(sessions: &[TmuxSession], project: &str, session: &str) -> Option<HostedSession> {
+    let s = sessions.iter().find(|s| s.name == session)?;
+    Some(HostedSession { name: project.to_string(), watched_elsewhere: s.origins.iter().any(|o| o != ORIGIN_HERE && o != ORIGIN_UNRECORDED) })
 }
 
 /// Whether `tmux has-session`'s stderr says the session is gone, which with
@@ -250,6 +278,29 @@ mod tests {
     fn a_command_needs_one_pane_and_nothing_else() {
         assert_eq!(command_refusal(&session("cc-x", &["🟢 x"], &["windows"])), None, "neither the status nor a client here refuses typing");
         assert!(command_refusal(&session("cc-x", &["🟢 x", "bash"], &[])).unwrap().contains("2 panes"));
+    }
+
+    #[test]
+    fn the_name_mode_prints_the_project_then_the_session() {
+        assert_eq!(parse_name("games/overlay\ncc-games-overlay\n"), Some(("games/overlay".into(), "cc-games-overlay".into())));
+        assert_eq!(parse_name("profile noise\nweb\ncc-web\n\n"), Some(("web".into(), "cc-web".into())), "anything printed before them is not the name");
+        assert_eq!(parse_name("web\n"), None, "one line is not the two the mode prints");
+    }
+
+    #[test]
+    fn a_directory_outside_the_root_is_not_a_failure_to_ask() {
+        assert!(not_a_project("cc-session: D:\\tmp\\x is not under /mnt/d/Projects\n"));
+        assert!(not_a_project("cc-session: no such project directory: /mnt/d/Projects/x\n"));
+        assert!(!not_a_project("usage: cc-session.sh <project> <origin> [<start|resume> [check|detach|shell|restart]]\n"), "a script predating the name mode is a failure");
+    }
+
+    #[test]
+    fn a_hosted_session_says_whether_another_machine_watches_it() {
+        let sessions = parse_list(LIST);
+        assert_eq!(hosted(&sessions, "claude", "cc-claude"), Some(HostedSession { name: "claude".into(), watched_elsewhere: true }));
+        assert_eq!(hosted(&sessions, "landlord", "cc-landlord"), Some(HostedSession { name: "landlord".into(), watched_elsewhere: false }), "a client here is not another machine");
+        assert!(!hosted(&[session("cc-x", &["⚫ x"], &["unknown"])], "x", "cc-x").unwrap().watched_elsewhere, "a client that recorded nothing may be here");
+        assert_eq!(hosted(&sessions, "web", "cc-web"), None, "no session runs under that name");
     }
 
     #[test]

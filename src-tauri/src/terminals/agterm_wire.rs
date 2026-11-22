@@ -299,6 +299,33 @@ pub(crate) fn agent_tabs(window: &str, tree: &serde_json::Value) -> Vec<AgentTab
     out
 }
 
+/// What names the remote session inside a `⇄` tab's foreground argv: the word
+/// after whichever of these the argv carries. agterm names a pane by its
+/// process group leader, which for a tab the attach picker or
+/// [`super::agterm`]'s `attach_hosted` opened is the claude repo's `attach.sh`,
+/// while an ssh run by hand carries the session inside its remote command,
+/// after `cc-session.sh`. The same rule as `FOREGROUND_MARKERS` in that repo's
+/// `remote-session/mac/pick-session.py`, which must change with it.
+const ATTACH_MARKERS: [&str; 2] = ["/attach.sh", "/cc-session.sh"];
+
+/// The remote sessions a tab in one window's `tree --json` answer is attached
+/// to, by the name [`ATTACH_MARKERS`] finds. The argv is flattened to words
+/// first, so a marker and its name read alike whether they are two arguments or
+/// two words of one; `attach.sh` refuses a name carrying a space, so the
+/// flattening cannot split one.
+pub(crate) fn attached_names(tree: &serde_json::Value) -> Vec<String> {
+    let mut out = Vec::new();
+    for ws in crate::agterm::workspace_nodes(tree) {
+        for node in ws.get("sessions").and_then(serde_json::Value::as_array).into_iter().flatten() {
+            let argv = node.get("foreground").and_then(serde_json::Value::as_array).into_iter().flatten().filter_map(serde_json::Value::as_str);
+            let words: Vec<&str> = argv.flat_map(str::split_whitespace).collect();
+            let name = words.windows(2).find(|w| ATTACH_MARKERS.iter().any(|m| w[0].ends_with(m))).map(|w| w[1]);
+            out.extend(name.map(str::to_string));
+        }
+    }
+    out
+}
+
 /// Every workspace id in one window's `tree --json` answer.
 pub(crate) fn workspace_ids(tree: &serde_json::Value) -> Vec<String> {
     crate::agterm::workspace_nodes(tree).filter_map(|w| w.get("id").and_then(serde_json::Value::as_str)).map(str::to_string).collect()
@@ -412,6 +439,19 @@ mod tests {
     #[test]
     fn a_blank_name_that_cannot_be_found_falls_back_to_the_current_workspace() {
         assert_eq!(placement(Some(&last("  ")), true, Some(&[])), Placement::Current);
+    }
+
+    #[test]
+    fn a_tab_is_attached_to_the_session_its_attach_argv_names() {
+        let tree = serde_json::json!({"ok": true, "result": {"tree": {"workspaces": [
+            {"id": "S1", "name": "remote", "sessions": [
+                {"id": "a", "cwd": "/", "foreground": ["/bin/sh", "/Users/u/claude/remote-session/mac/attach.sh", "games/overlay", "/tmp/token"]},
+                {"id": "b", "cwd": "/", "foreground": ["ssh", "-t", "u@host", "wsl -d U -- /home/u/remote-session/wsl/cc-session.sh trips mac resume"]},
+                {"id": "c", "cwd": "/p", "foreground": ["claude"]},
+                {"id": "d", "cwd": "/", "foreground": ["/bin/sh", "/x/attach.sh"]},
+            ]},
+        ]}}});
+        assert_eq!(attached_names(&tree), ["games/overlay", "trips"], "a marker with nothing after it names nothing");
     }
 
     #[test]

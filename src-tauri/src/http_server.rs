@@ -1579,23 +1579,30 @@ async fn post_message(State(app): State<AppHandle>, headers: HeaderMap, Json(req
     (crate::sync::receipt_status(&receipt), Json(receipt))
 }
 
-/// Open a background tab on this machine for a session started from here — on
-/// the other machine through the relay, or on this one by a relayed message or
-/// `POST /api/session/open` — where the session runs with no tab of its own, so
-/// its user can read and answer it. A refusal is logged and changes nothing
-/// about the caller's answer, which is already decided; on the Mac,
-/// cmd+shift+r still reaches the session.
-/// Logged `peer_attach`, keyed by the started session's row.
-async fn attach_started(app: &AppHandle, chat_id: &str, name: String) {
+/// Open a background tab on this machine for a session an agent here caused to
+/// exist or messaged, where the session runs on the remote-session holder with
+/// no tab here, so its user can read and answer it: one the relay or
+/// `POST /api/session/open` started, or one the holder reported a message
+/// reaching (`sync::post_attach`). A session a tab here already attaches to
+/// gets no second one. A refusal is logged and changes nothing about the
+/// caller's answer, which is already decided; on the Mac, cmd+shift+r still
+/// reaches the session.
+/// Logged `peer_attach`, keyed by the session's row.
+pub(crate) async fn attach_started(app: &AppHandle, chat_id: &str, name: String) {
+    if !crate::sync::attach_name_ok(&name) {
+        tracing::warn!(chat_id, decision = "peer_attach", session = %name, outcome = "malformed_name", "a hosted session's name cannot be handed to the attach script");
+        return;
+    }
     let Some(adapter) = crate::terminals::for_platform(app).filter(|a| a.can_attach_hosted()) else {
-        tracing::info!(chat_id, decision = "peer_attach", session = %name, outcome = "no_attacher", "a started session has no tab here: no terminal on this machine attaches hosted sessions");
+        tracing::info!(chat_id, decision = "peer_attach", session = %name, outcome = "no_attacher", "a hosted session has no tab here: no terminal on this machine attaches hosted sessions");
         return;
     };
     let session = name.clone();
     let result = tokio::task::spawn_blocking(move || adapter.attach_hosted(&session)).await.unwrap_or_else(|e| Err(format!("the attach task did not finish: {e}")));
     match result {
-        Ok(()) => tracing::info!(chat_id, decision = "peer_attach", session = %name, outcome = "attached", "opened a background tab on a started session"),
-        Err(reason) => tracing::warn!(chat_id, decision = "peer_attach", session = %name, outcome = "attach_failed", reason = %reason, "could not open a tab on a started session"),
+        Ok(crate::terminals::Attached::Opened) => tracing::info!(chat_id, decision = "peer_attach", session = %name, outcome = "attached", "opened a background tab on a hosted session"),
+        Ok(crate::terminals::Attached::AlreadyOpen) => tracing::info!(chat_id, decision = "peer_attach", session = %name, outcome = "already_attached", "a tab here already attaches to the hosted session"),
+        Err(reason) => tracing::warn!(chat_id, decision = "peer_attach", session = %name, outcome = "attach_failed", reason = %reason, "could not open a tab on a hosted session"),
     }
 }
 
@@ -1931,6 +1938,23 @@ fn apply_event_in(app: &AppHandle, req: &EventRequest, placed: Option<String>) -
                 };
                 (msg, crate::prompt_origin::for_arrival(msg, &live))
             });
+            // A local `SendMessage` from a holder session another machine watches
+            // may reach a holder session nothing there shows; that machine is
+            // asked to open a tab on it (`sync::offer_tab`). The receiving
+            // session's directory is its registry record's, found by the row as
+            // `sync::post_message` finds a relayed message's target, never the
+            // hook's `cwd`, which follows a mid-session `cd` while the holder
+            // names a session by the directory it started in. A receiving
+            // session whose record no longer derives this row, having `cd`-ed if
+            // Claude Code moves the record's `cwd` too, is offered no tab.
+            if let Some((crate::peer_message::AgentMessage::Local { inbox, name, .. }, _)) = &origin {
+                if let Some(registry) = app.try_state::<SessionRegistry>() {
+                    let now = now_ms();
+                    if let (Some(sender_cwd), crate::session_registry::InboxLookup::Found { cwd, .. }) = (registry.sender_cwd(inbox.as_deref(), name.as_deref(), now), registry.inbox_for(&chat_id, cfg.projects_root.as_deref(), now)) {
+                        crate::sync::offer_tab(&app, chat_id.clone(), cwd, Some(sender_cwd), crate::sync::TabRecipients::EveryPeer);
+                    }
+                }
+            }
             if let Some((msg, res)) = &origin {
                 input.delegated_task = res.delegated_task();
                 input.message_line = res.message_line();

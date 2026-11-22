@@ -392,7 +392,7 @@ On Windows the session starts detached in the remote-session holder's tmux serve
 | `200`  | `running` | a session is already running in that folder, so nothing was started |
 | `409`  | `refused` | `reason` is the start refusal's slug, such as `start_no_directory` or `start_already_running`, or `registry_unreadable` when Claude Code's session list could not be read, so a running session there cannot be ruled out |
 
-Every answer also carries the `project` id the folder derives. Logged as `decision = "session_open"` with that id and the `outcome`; a Windows start that opened a tab is followed by a `decision = "peer_attach"` line under the same id, with an `outcome` of `attached`, `attach_failed` or `no_attacher`.
+Every answer also carries the `project` id the folder derives. Logged as `decision = "session_open"` with that id and the `outcome`; a Windows start that opened a tab is followed by a `decision = "peer_attach"` line under the same id, with an `outcome` of `attached`, `attach_failed`, `no_attacher`, or `malformed_name` for a session name an attach script could not take as one argument.
 
 ## `POST /api/session/command`
 
@@ -561,3 +561,15 @@ Both machines can observe a read and neither can observe the other's: the origin
 `attended_at` is **our own content watermark echoed back** — the newest thing the reporter had of this row, which is a number this machine minted. It needs no clock agreement, and it cannot be read as a time anybody was at a keyboard. It is clamped on arrival to the row's current watermark, because the stamp only ever moves forward: unclamped, a value from the far future would mark the row read for every turn it ever has. A value *below* ours is kept as sent — the reporter's dialog copy lags while a pull is outstanding, and the row then stays unread here, which leaves the work showing.
 
 Answers `{"recorded": true}`, with `reason: "no_change"` when the row was already read or this machine has `attention_tracking` off; `400` without a `chat_id`, `404` when no local row derives it. The sender does not retry: a lost report leaves that row showing on the machine that owns it, and a retry would need a per-row record of what the far side had taken — the kind of guess about another device's contents this protocol removed everywhere else.
+
+### `POST /api/sync/attach`
+
+Asks this machine to open a background tab on a session the remote-session holder on the sender runs. The holder sends it when a message reaches one of its sessions that no terminal on another machine is attached to, and the agent that sent the message has its user here: a relayed message from this machine's agent, or a local `SendMessage` from a holder session a tab here is watching.
+
+```json
+{ "origin_device": "CHROME", "chat_id": "trips", "name": "trips" }
+```
+
+`name` is what the claude repo's attach scripts take, printed by `cc-session.sh … name` on the holder. The tab is the one a started session gets (on the Mac a `⇄` tab running `attach.sh`, which needs `remote_attach_script`), and none opens where a tab here already runs `attach.sh` or `cc-session.sh` on that name. Logged `peer_attach`, with `already_attached` for the second case, and on the holder `tab_offer`.
+
+The sender must be bound in this machine's `sync.peer_identity`, the same bar a relayed start meets, since the request runs a command in a terminal here. Answers `200` once the attach was tried, `403` for an unbound sender, `400` for a missing field or a `name` an attach script could not take as one argument. The holder does not retry: without the tab, cmd+shift+r still reaches the session.
