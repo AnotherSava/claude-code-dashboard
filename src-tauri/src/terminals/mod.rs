@@ -1165,8 +1165,9 @@ pub enum ServersShown {
 pub enum Attached {
     Opened,
     /// A tab here was already attached to the session, so none was opened.
-    // Constructed only by the agterm adapter.
-    #[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+    // Constructed only by the agterm adapter's `attach_hosted`, which is
+    // macOS-only even where a test build compiles the rest of `agterm`.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     AlreadyOpen,
 }
 
