@@ -660,7 +660,7 @@ impl TerminalAdapter for AgwintermAdapter {
     /// script's `start` creates nothing.
     fn attach_hosted(&self, name: &str) -> Result<super::Attached, String> {
         let script = self.attach_script.as_deref().ok_or("config.remote_session_script is not set")?;
-        let req = wire::new_session_req(&wire::attach_command(script, name));
+        let req = wire::new_session_req(&wire::attach_command(script, name)?);
         self.call(&req, WRITE_DEADLINE).map(|_| super::Attached::Opened)
     }
 }

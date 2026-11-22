@@ -85,11 +85,45 @@ pub fn new_session_req(command: &str) -> String {
 
 /// The command a tab attaching to the holder session `name` runs:
 /// `cc-session.sh <name> windows start` under WSL, the call every tab opened
-/// on a remote session here makes. Each argument is quoted, since agwinterm
-/// splits a direct command by Windows argv rules and a project path can hold
-/// a space.
-pub fn attach_command(script: &str, name: &str) -> String {
-    format!("wsl.exe -e \"{script}\" \"{name}\" windows start")
+/// on a remote session here makes. agwinterm splits a direct command by
+/// Windows argv rules and `wsl.exe -e` runs no shell, so each argument is
+/// quoted by those rules ([`argv_quote`]) and arrives as exactly one argument
+/// whatever it holds, a space included. The name is normally the one this
+/// machine's own `cc-session.sh … detach` printed (`tmux_wire::hosted_name`),
+/// but a hop receipt or `POST /api/sync/attach` can hand one over from a peer,
+/// so a name `cc-session.sh` would read as an option (a leading `-`), or one
+/// carrying a control character, is refused.
+pub fn attach_command(script: &str, name: &str) -> Result<String, String> {
+    if name.is_empty() || name.starts_with('-') || name.chars().any(char::is_control) {
+        return Err(format!("refusing hosted session name {name:?}"));
+    }
+    Ok(format!("wsl.exe -e {} {} windows start", argv_quote(script), argv_quote(name)))
+}
+
+/// `arg` in double quotes as the Windows argv rules (`CommandLineToArgvW`)
+/// read it back: a quote is escaped with a backslash, and the backslashes
+/// before a quote, or before the closing one, are doubled.
+fn argv_quote(arg: &str) -> String {
+    let mut out = String::from("\"");
+    let mut backslashes = 0;
+    for c in arg.chars() {
+        match c {
+            '\\' => backslashes += 1,
+            '"' => {
+                out.extend(std::iter::repeat_n('\\', backslashes * 2 + 1));
+                out.push('"');
+                backslashes = 0;
+            }
+            _ => {
+                out.extend(std::iter::repeat_n('\\', backslashes));
+                out.push(c);
+                backslashes = 0;
+            }
+        }
+    }
+    out.extend(std::iter::repeat_n('\\', backslashes * 2));
+    out.push('"');
+    out
 }
 
 /// A reply's `result`, or its `error` text.
@@ -376,9 +410,20 @@ mod tests {
         );
         assert_eq!(
             attach_command("/mnt/d/p/claude/claude/remote-session/wsl/cc-session.sh", "AutoHotkey scripts"),
-            r#"wsl.exe -e "/mnt/d/p/claude/claude/remote-session/wsl/cc-session.sh" "AutoHotkey scripts" windows start"#,
+            Ok(r#"wsl.exe -e "/mnt/d/p/claude/claude/remote-session/wsl/cc-session.sh" "AutoHotkey scripts" windows start"#.to_string()),
             "a name with a space stays one argument"
         );
+    }
+
+    #[test]
+    fn a_hosted_name_cannot_add_arguments() {
+        assert_eq!(argv_quote(r#"a"b"#), r#""a\"b""#, "a quote is escaped");
+        assert_eq!(argv_quote(r"a\"), r#""a\\""#, "a trailing backslash is doubled so it cannot escape the closing quote");
+        assert_eq!(argv_quote(r#"a\"b"#), r#""a\\\"b""#, "backslashes before a quote are doubled, then the quote escaped");
+        assert_eq!(argv_quote(r"a\b"), r#""a\b""#, "a backslash before anything else is literal");
+        assert!(attach_command("/s.sh", "-x").is_err(), "a leading dash would read as an option");
+        assert!(attach_command("/s.sh", "a\nb").is_err(), "a control character is refused");
+        assert!(attach_command("/s.sh", "").is_err());
     }
 
     /// `tree` captured read-only from agwinterm 0.20.13.1 on 2026-10-02. The live
