@@ -392,7 +392,7 @@ On Windows the session starts detached in the remote-session holder's tmux serve
 | `200`  | `running` | a session is already running in that folder, so nothing was started |
 | `409`  | `refused` | `reason` is the start refusal's slug, such as `start_no_directory` or `start_already_running`, or `registry_unreadable` when Claude Code's session list could not be read, so a running session there cannot be ruled out |
 
-Every answer also carries the `project` id the folder derives. Logged as `decision = "session_open"` with that id and the `outcome`; a Windows start that opened a tab is followed by a `decision = "peer_attach"` line under the same id, with an `outcome` of `attached`, `attach_failed`, `no_attacher`, or `malformed_name` for a session name an attach script could not take as one argument.
+Every answer also carries the `project` id the folder derives. Logged as `decision = "session_open"` with that id and the `outcome`; a Windows start that opened a tab is followed by a `decision = "peer_attach"` line under the same id, with an `outcome` of `attached`, `attach_failed` or `no_attacher`.
 
 ## `POST /api/session/command`
 

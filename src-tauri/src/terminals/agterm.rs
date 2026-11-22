@@ -347,6 +347,9 @@ impl TerminalAdapter for AgtermAdapter {
     /// to prevent.
     fn attach_hosted(&self, name: &str) -> Result<super::Attached, String> {
         let script = self.attach_script.as_deref().ok_or("config.remote_attach_script is not set")?;
+        if !crate::sync::attach_name_ok(name) {
+            return Err(format!("{name:?} is not a name attach.sh takes as one argument"));
+        }
         if walk_windows(self.memory.as_deref(), "searched for an attached tab", |_, tree| wire::attached_names(tree)).is_some_and(|names| names.iter().any(|n| n == name)) {
             return Ok(super::Attached::AlreadyOpen);
         }

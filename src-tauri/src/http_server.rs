@@ -1589,10 +1589,6 @@ async fn post_message(State(app): State<AppHandle>, headers: HeaderMap, Json(req
 /// reaches the session.
 /// Logged `peer_attach`, keyed by the session's row.
 pub(crate) async fn attach_started(app: &AppHandle, chat_id: &str, name: String) {
-    if !crate::sync::attach_name_ok(&name) {
-        tracing::warn!(chat_id, decision = "peer_attach", session = %name, outcome = "malformed_name", "a hosted session's name cannot be handed to the attach script");
-        return;
-    }
     let Some(adapter) = crate::terminals::for_platform(app).filter(|a| a.can_attach_hosted()) else {
         tracing::info!(chat_id, decision = "peer_attach", session = %name, outcome = "no_attacher", "a hosted session has no tab here: no terminal on this machine attaches hosted sessions");
         return;

@@ -767,9 +767,10 @@ pub struct AttachRequest {
 /// Whether `name` can be handed to an attach script as one argument: what
 /// `cc-session.sh … name` prints, a path below `WSL_PROJECT_ROOT`. The
 /// character set is the one the claude repo's `remote-session/mac/attach.sh`
-/// accepts, and changes with it. Checked by `http_server::attach_started` for
-/// every route that opens a tab, and here before attestation so a malformed
-/// request is answered `400`.
+/// accepts, and changes with it. Checked by agterm's `attach_hosted` for every
+/// route that opens a `⇄` tab, and here before attestation so a malformed
+/// request is answered `400`. Windows' agwinterm attach quotes each argument
+/// and runs `cc-session.sh` rather than `attach.sh`, so it is not held to it.
 pub(crate) fn attach_name_ok(name: &str) -> bool {
     !name.is_empty() && name.len() <= 200 && !name.starts_with('-') && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '-' | '_' | '.'))
 }
