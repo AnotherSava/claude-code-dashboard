@@ -76,3 +76,4 @@
 - [A session name is a row](feedback_session_name_is_a_row.md) — "why is <name> session …" means that dashboard row; /investigate <name> first, "claude" is the dotfiles row
 - [Close CLEAN sessions, never hide](project_clean_close_not_hide.md) — both machines: idle_close_ms 30 min, clean_hide_after_ms null since 2026-11-09; don't propose a synced-row hide
 - [Dependabot residuals](dependabot_unfixable_residuals.md) — glib stays open (gtk-rs 0.18 via tao); docs bundle: lock --conservative + jekyll build, bundle install fails here
+- [Tab tints are the dashboard's](tab_tint_ownership.md) — agterm row tint on agent and ⇄ tabs, model over remote, per-machine tab_tints; attach.sh tint retired
