@@ -61,7 +61,7 @@ use super::window_files::WindowFiles;
 #[cfg(target_os = "macos")]
 use super::{SelectionClock, TerminalAdapter};
 #[cfg(target_os = "macos")]
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 const NAME: &str = "agterm";
 
@@ -85,12 +85,26 @@ pub struct AgtermAdapter {
     memory: Option<Arc<crate::workspace_memory::WorkspaceMemory>>,
     /// `config.remote_attach_script`, read when the adapter was built.
     attach_script: Option<String>,
+    /// agterm's version, kept once it has answered: `can_label` and `can_tint`
+    /// both gate on it, and one `version` call serves the two.
+    version: OnceLock<String>,
 }
 
 #[cfg(target_os = "macos")]
 impl AgtermAdapter {
     pub fn new(memory: Option<Arc<crate::workspace_memory::WorkspaceMemory>>, attach_script: Option<String>) -> Self {
-        Self { selections: Arc::default(), files: Arc::new(Mutex::new(WindowFiles::new(NAME))), memory, attach_script }
+        Self { selections: Arc::default(), files: Arc::new(Mutex::new(WindowFiles::new(NAME))), memory, attach_script, version: OnceLock::new() }
+    }
+
+    /// agterm's version, asked through `version --json` until it answers and
+    /// kept after; `None` while agterm cannot be asked.
+    fn app_version(&self) -> Option<&str> {
+        if let Some(version) = self.version.get() {
+            return Some(version.as_str());
+        }
+        let value = crate::agterm::agtermctl(&["version", "--json"])?;
+        let version = wire::app_version(&value)?.to_string();
+        Some(self.version.get_or_init(|| version).as_str())
     }
 }
 
@@ -156,8 +170,7 @@ impl TerminalAdapter for AgtermAdapter {
     /// login is the ordinary case — and the caller retries. `Some(false)` is a
     /// settled no, and stands the labeller down for the life of the process.
     fn can_label(&self) -> Option<bool> {
-        let value = crate::agterm::agtermctl(&["version", "--json"])?;
-        let version = wire::app_version(&value)?;
+        let version = self.app_version()?;
         let serves = wire::supports_context(version);
         if !serves {
             tracing::info!(terminal = NAME, version, "this agterm has no session context verb; not labelling");
@@ -192,6 +205,24 @@ impl TerminalAdapter for AgtermAdapter {
             LabelWrite::Context(text) => wire::context_argv(window, session, text),
             LabelWrite::ClearContext => wire::clear_argv(window, session),
         };
+        let args: Vec<&str> = argv.iter().map(String::as_str).collect();
+        crate::agterm::agtermctl_checked(&args).map(|_| ())
+    }
+
+    /// From the same `version` answer as [`can_label`](Self::can_label), and
+    /// gated the same way: 0.38 and older answer `session tint` with a refusal.
+    fn can_tint(&self) -> Option<bool> {
+        let version = self.app_version()?;
+        let serves = wire::supports_tint(version);
+        if !serves {
+            tracing::info!(terminal = NAME, version, "this agterm has no session tint verb; not tinting");
+        }
+        Some(serves)
+    }
+
+    fn write_tint(&self, key: &str, tint: Option<&super::Tint>) -> Result<(), String> {
+        let (window, session) = wire::split_key(key).ok_or_else(|| format!("not a key this adapter minted: {key}"))?;
+        let argv = wire::tint_argv(window, session, tint);
         let args: Vec<&str> = argv.iter().map(String::as_str).collect();
         crate::agterm::agtermctl_checked(&args).map(|_| ())
     }

@@ -70,6 +70,7 @@ For reference, the copied snippet has this shape (your copy substitutes the real
     "PreCompact":          [{"hooks": [{"type": "command", "command": "python3 \"<app-data>/claude_hook.py\""}]}],
     "SubagentStop":        [{"hooks": [{"type": "command", "command": "python3 \"<app-data>/claude_hook.py\""}]}],
     "SessionEnd":          [{"hooks": [{"type": "command", "command": "python3 \"<app-data>/claude_hook.py\""}]}],
+    "PostModelSwitch":     [{"hooks": [{"type": "command", "command": "python3 \"<app-data>/claude_hook.py\""}]}],
     "PreToolUse": [{
       "matcher": "^(AskUserQuestion|ExitPlanMode)$",
       "hooks": [{"type": "command", "command": "python3 \"<app-data>/claude_hook.py\""}]

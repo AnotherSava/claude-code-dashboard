@@ -1055,7 +1055,7 @@ mod tests {
         let tree = r#"{"ok":true,"result":{"workspaces":[{"sessions":[{"id":"s1","name":"session 1","title":"🔵 dash","context":"Fix the build"}]}]}}"#;
         let s = serve(&path, vec![PING.to_string(), r#"{"ok":true,"result":{"windows":[{"id":"w1","open":true,"active":true},{"id":"w2","open":false}]}}"#.to_string(), tree.to_string()]);
         let targets = pipe(&path).targets().unwrap();
-        assert_eq!(targets, vec![LabelTarget { key: "w1/s1".into(), title: Some("🔵 dash".into()), context: Some("Fix the build".into()), budget: LabelBudget::Utf16(wire::CONTEXT_MAX_UTF16) }]);
+        assert_eq!(targets, vec![LabelTarget { key: "w1/s1".into(), title: Some("🔵 dash".into()), context: Some("Fix the build".into()), budget: LabelBudget::Utf16(wire::CONTEXT_MAX_UTF16), tint: None, attached_remote: false }]);
         assert_eq!(s.join().unwrap().len(), 3, "a ping, the window list and one tree: a closed window is not asked");
     }
 

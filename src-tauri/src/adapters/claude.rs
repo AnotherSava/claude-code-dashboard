@@ -171,6 +171,15 @@ pub fn dispatch(event: &str, payload: &Value, cfg: &Config) -> AdapterOutput {
         return AdapterOutput::Boundary { id: chat_id };
     }
 
+    // `/model`, or Claude Code restoring a session's model on resume. Status is
+    // untouched; only the row's model moves, ahead of the next reply.
+    if event == "PostModelSwitch" {
+        return match payload.get("to_model").and_then(|v| v.as_str()).map(str::trim).filter(|m| !m.is_empty()) {
+            Some(model) => AdapterOutput::ModelSwitched { id: chat_id, model: model.to_string() },
+            None => AdapterOutput::Ignore,
+        };
+    }
+
     // A subagent ended, normally or interrupted: none of its permission
     // dialogs can still be on screen. Without an `agent_id` there is nothing
     // to settle by.
@@ -240,7 +249,7 @@ pub fn dispatch(event: &str, payload: &Value, cfg: &Config) -> AdapterOutput {
             status,
             label,
             source: Some("claude".into()),
-            model: None,
+            model: session_start_model(event, payload),
             input_tokens: None,
             dialog_entry,
             waiting_backstop_armed,
@@ -254,6 +263,16 @@ pub fn dispatch(event: &str, payload: &Value, cfg: &Config) -> AdapterOutput {
         subagent,
         agent_message,
     }
+}
+
+/// The model a `SessionStart` names, which Claude Code includes only
+/// sometimes; `None` for every other event and where it is absent, which leaves
+/// the row's model to the transcript watcher.
+fn session_start_model(event: &str, payload: &Value) -> Option<String> {
+    if event != "SessionStart" {
+        return None;
+    }
+    payload.get("model").and_then(|v| v.as_str()).map(str::trim).filter(|m| !m.is_empty()).map(str::to_string)
 }
 
 /// Derive a friendly `chat_id` from `cwd` relative to `projects_root`.
@@ -2385,6 +2404,29 @@ mod tests {
             AdapterOutput::Boundary { id } => assert_eq!(id, "demo"),
             _ => panic!("expected Boundary"),
         }
+    }
+
+    #[test]
+    fn dispatch_post_model_switch_records_the_new_model_only() {
+        let cfg = cfg_with(Some("d:/projects"), &[]);
+        let p = json!({ "cwd": "d:/projects/demo", "from_model": "claude-opus-5-5", "to_model": "claude-fable-5-2", "source": "picker" });
+        match dispatch("PostModelSwitch", &p, &cfg) {
+            AdapterOutput::ModelSwitched { id, model } => assert_eq!((id.as_str(), model.as_str()), ("demo", "claude-fable-5-2")),
+            _ => panic!("expected ModelSwitched"),
+        }
+        let p = json!({ "cwd": "d:/projects/demo" });
+        assert!(matches!(dispatch("PostModelSwitch", &p, &cfg), AdapterOutput::Ignore), "a switch naming no model records nothing");
+    }
+
+    #[test]
+    fn dispatch_session_start_carries_its_model_where_given() {
+        let cfg = cfg_with(Some("d:/projects"), &[]);
+        let model_of = |p: Value| match dispatch("SessionStart", &p, &cfg) {
+            AdapterOutput::Set { input, .. } => input.model,
+            _ => panic!("expected Set"),
+        };
+        assert_eq!(model_of(json!({ "cwd": "d:/projects/demo", "source": "startup", "model": "claude-fable-5-2" })).as_deref(), Some("claude-fable-5-2"));
+        assert_eq!(model_of(json!({ "cwd": "d:/projects/demo", "source": "startup" })), None);
     }
 
     #[test]

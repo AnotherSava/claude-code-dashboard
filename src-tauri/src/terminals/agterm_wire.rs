@@ -26,7 +26,7 @@
 
 #![cfg(any(target_os = "macos", test))]
 
-use super::{LabelBudget, LabelTarget};
+use super::{LabelBudget, LabelTarget, Tint, TintColour, TintOn};
 use crate::workspace_memory::LastWorkspace;
 
 /// The longest context agterm accepts, in UTF-8 bytes (`Session.contextByteLimit`).
@@ -44,6 +44,9 @@ pub(crate) const CONTEXT_MAX_UTF8: usize = 256;
 /// rather than probing the verb, so the refusal never reaches a log line.
 pub(crate) const CONTEXT_SINCE: (u32, u32, u32) = (0, 26, 0);
 
+/// The first agterm release with `session tint`, 0.39.0.
+pub(crate) const TINT_SINCE: (u32, u32, u32) = (0, 39, 0);
+
 /// The `version --json` answer's app version, or `None` when the shape is not
 /// what this knows.
 pub(crate) fn app_version(value: &serde_json::Value) -> Option<&str> {
@@ -57,11 +60,20 @@ pub(crate) fn app_version(value: &serde_json::Value) -> Option<&str> {
 /// unreadable version is treated as too old, so the feature stays off rather
 /// than writing into a terminal that may not understand it.
 pub(crate) fn supports_context(version: &str) -> bool {
+    at_least(version, CONTEXT_SINCE)
+}
+
+/// Whether `version` is at least [`TINT_SINCE`], by [`supports_context`]'s rule.
+pub(crate) fn supports_tint(version: &str) -> bool {
+    at_least(version, TINT_SINCE)
+}
+
+fn at_least(version: &str, since: (u32, u32, u32)) -> bool {
     let mut parts = version.split(['.', '-', '+']).map(str::parse::<u32>);
     let (Some(Ok(major)), Some(Ok(minor)), Some(Ok(patch))) = (parts.next(), parts.next(), parts.next()) else {
         return false;
     };
-    (major, minor, patch) >= CONTEXT_SINCE
+    (major, minor, patch) >= since
 }
 
 /// Every labellable session in one window's `tree --json`, as [`LabelTarget`]s.
@@ -74,10 +86,10 @@ pub(crate) fn supports_context(version: &str) -> bool {
 ///
 /// `context` is the tree's **shown** value. On a session attached from another
 /// Mac that is the local override else the origin's mirrored context, so it can
-/// be a value this dashboard never wrote — which cannot mislead the planner,
-/// because an attached session's title carries the `⇄` badge and
-/// `terminal_title::title_names` refuses a badged title, so no row ever claims
-/// one.
+/// be a value this dashboard never wrote.
+///
+/// `tint` is read from the tree's `tint` and `tintOn`, and `attached_remote`
+/// from what runs in the session ([`attached_name`]).
 pub(crate) fn targets_from(window: &str, sessions: &[serde_json::Value]) -> Vec<LabelTarget> {
     sessions
         .iter()
@@ -88,6 +100,8 @@ pub(crate) fn targets_from(window: &str, sessions: &[serde_json::Value]) -> Vec<
                 title: s.get("title").and_then(serde_json::Value::as_str).map(str::to_string),
                 context: s.get("context").and_then(serde_json::Value::as_str).map(str::to_string),
                 budget: LabelBudget::Utf8Bytes(CONTEXT_MAX_UTF8),
+                tint: tint_of(s),
+                attached_remote: attached_name(s).is_some(),
             })
         })
         .collect()
@@ -314,16 +328,52 @@ const ATTACH_MARKERS: [&str; 2] = ["/attach.sh", "/cc-session.sh"];
 /// two words of one; `attach.sh` refuses a name carrying a space, so the
 /// flattening cannot split one.
 pub(crate) fn attached_names(tree: &serde_json::Value) -> Vec<String> {
-    let mut out = Vec::new();
-    for ws in crate::agterm::workspace_nodes(tree) {
-        for node in ws.get("sessions").and_then(serde_json::Value::as_array).into_iter().flatten() {
-            let argv = node.get("foreground").and_then(serde_json::Value::as_array).into_iter().flatten().filter_map(serde_json::Value::as_str);
-            let words: Vec<&str> = argv.flat_map(str::split_whitespace).collect();
-            let name = words.windows(2).find(|w| ATTACH_MARKERS.iter().any(|m| w[0].ends_with(m))).map(|w| w[1]);
-            out.extend(name.map(str::to_string));
+    crate::agterm::workspace_nodes(tree).flat_map(|ws| ws.get("sessions").and_then(serde_json::Value::as_array).into_iter().flatten()).filter_map(attached_name).collect()
+}
+
+/// The remote session one session node's tab is attached to, by the name
+/// [`ATTACH_MARKERS`] finds in its foreground argv, or `None` for a tab that
+/// attaches to nothing.
+pub(crate) fn attached_name(node: &serde_json::Value) -> Option<String> {
+    let argv = node.get("foreground").and_then(serde_json::Value::as_array).into_iter().flatten().filter_map(serde_json::Value::as_str);
+    let words: Vec<&str> = argv.flat_map(str::split_whitespace).collect();
+    words.windows(2).find(|w| ATTACH_MARKERS.iter().any(|m| w[0].ends_with(m))).map(|w| w[1].to_string())
+}
+
+/// A session node's row tint, from the tree's `tint` (a colour name) and
+/// `tintOn` (`["icon"]`, `["name"]` or both). `None` with no tint, and for a
+/// colour or placement this build does not know, which `tints::plan` then
+/// rewrites to what it wants.
+pub(crate) fn tint_of(node: &serde_json::Value) -> Option<Tint> {
+    let colour = serde_json::from_value::<TintColour>(node.get("tint")?.clone()).ok()?;
+    let parts: Vec<&str> = node.get("tintOn")?.as_array()?.iter().filter_map(serde_json::Value::as_str).collect();
+    let on = match (parts.contains(&"icon"), parts.contains(&"name")) {
+        (true, true) => TintOn::IconAndName,
+        (true, false) => TintOn::Icon,
+        (false, true) => TintOn::Name,
+        (false, false) => return None,
+    };
+    Some(Tint { colour, on })
+}
+
+/// The argv that sets (`Some`) or clears `session`'s row tint in `window`.
+/// agterm refuses a placement beside `clear`, so a clear carries none.
+pub(crate) fn tint_argv(window: &str, session: &str, tint: Option<&Tint>) -> Vec<String> {
+    let mut argv: Vec<String> = vec!["session".into(), "tint".into()];
+    match tint {
+        Some(t) => {
+            let colour = serde_json::to_value(t.colour).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default();
+            let on = match t.on {
+                TintOn::Icon => "icon",
+                TintOn::Name => "name",
+                TintOn::IconAndName => "icon,name",
+            };
+            argv.extend([colour, "--on".into(), on.into()]);
         }
+        None => argv.push("clear".into()),
     }
-    out
+    argv.extend(["--target".into(), session.into(), "--window".into(), window.into(), "--json".into()]);
+    argv
 }
 
 /// Every workspace id in one window's `tree --json` answer.
@@ -600,5 +650,35 @@ mod tests {
         assert!(agent_gone(&node(serde_json::json!({ "foreground": null }))), "a pane whose command was claude exits with it");
         assert!(agent_gone(&node(serde_json::json!({ "foreground": [] }))));
         assert!(!agent_gone(&node(serde_json::json!({ "foreground": ["npm", "run", "dev"] }))), "another program is not the agent's leftovers");
+    }
+
+    /// The tree's shape as agterm 0.40.0 printed it on the Mac for an attach.sh tab.
+    #[test]
+    fn a_target_reads_its_tint_and_whether_it_is_an_attach_tab() {
+        let attach = serde_json::json!({ "id": "S1", "title": "⇄ 🟢 auth", "tint": "gray", "tintOn": ["icon", "name"], "foreground": ["/bin/sh", "/Users/u/Projects/claude/claude/remote-session/mac/attach.sh", "auth"] });
+        let local = serde_json::json!({ "id": "S2", "title": "🟢 agterm", "tint": null, "tintOn": null, "foreground": ["claude", "--continue"] });
+        let t = targets_from("W", &[attach, local]);
+        assert_eq!((t[0].tint, t[0].attached_remote), (Some(Tint { colour: TintColour::Gray, on: TintOn::IconAndName }), true));
+        assert_eq!((t[1].tint, t[1].attached_remote), (None, false));
+    }
+
+    #[test]
+    fn an_unknown_tint_colour_reads_as_none() {
+        assert_eq!(tint_of(&serde_json::json!({ "tint": "teal", "tintOn": ["name"] })), None);
+        assert_eq!(tint_of(&serde_json::json!({ "tint": "purple", "tintOn": [] })), None);
+    }
+
+    #[test]
+    fn a_tint_argv_carries_its_placement_and_a_clear_none() {
+        let purple = Tint { colour: TintColour::Purple, on: TintOn::Name };
+        assert_eq!(tint_argv("W", "S", Some(&purple)), ["session", "tint", "purple", "--on", "name", "--target", "S", "--window", "W", "--json"]);
+        assert_eq!(tint_argv("W", "S", None), ["session", "tint", "clear", "--target", "S", "--window", "W", "--json"]);
+    }
+
+    #[test]
+    fn tint_is_served_from_0_39_0() {
+        assert!(!supports_tint("0.38.9"));
+        assert!(supports_tint("0.39.0"));
+        assert!(supports_tint("0.40.0"));
     }
 }

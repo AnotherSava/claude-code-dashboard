@@ -52,6 +52,7 @@ Two statuses are easy to confuse. **`done`** means a turn ended here, and it is 
 | `StopFailure`         | `error`                                                                             | The turn ended on an API error, which fires no `Stop`. Label is the failure kind, else `"turn failed"`. |
 | `PreCompact`          | emits `Boundary` (a history separator; the stale context-token count is cleared)    | No status change: the session continues past the compaction.   |
 | `SubagentStop`        | emits `SubagentStopped` for the payload's `agent_id`; ignored without one            | No status of its own. Releases every open prompt from that agent. |
+| `PostModelSwitch`     | emits `ModelSwitched` with the payload's `to_model`; ignored without one             | No status change: only the row's model moves, ahead of the next reply the transcript would show it in, so a terminal row tint follows `/model` at once (logged `model_switch`). |
 | `SessionEnd`          | emits `Clear` (the session leaves its row; see [Data flow](data-flow) for when the row goes) | Bypasses status classification entirely.                       |
 
 The table is what an event does when it comes from the session the row follows, its main. An event from another session in the same folder is recorded and changes nothing (`member_event`), a prompt included — see [Data flow → Path 1](data-flow#path-1--hook-posts-event).

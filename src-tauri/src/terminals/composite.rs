@@ -64,6 +64,18 @@ fn combine_capability<T>(answers: impl IntoIterator<Item = Option<Vec<T>>>) -> O
     })
 }
 
+/// The union of the children's answers to an `Option<bool>` capability: any
+/// `Some(true)` makes it true, and `Some(false)` needs every child to have
+/// answered, since a child that could not be asked leaves the answer open
+/// rather than settling it as a no. `can_label` and `can_tint` both take it.
+fn combine_flag(answers: impl IntoIterator<Item = Option<bool>>) -> Option<bool> {
+    let answers: Vec<Option<bool>> = answers.into_iter().collect();
+    if answers.contains(&Some(true)) {
+        return Some(true);
+    }
+    answers.iter().all(Option::is_some).then_some(false)
+}
+
 /// The child name and the child's own key inside a label or close key this
 /// composite minted, or `None` for a key it did not mint.
 fn route_key(key: &str) -> Option<(&str, &str)> {
@@ -129,14 +141,7 @@ impl TerminalAdapter for Composite {
     /// Whether any child has a context line: one that does is enough for the
     /// worker to have something to ask.
     fn can_label(&self) -> Option<bool> {
-        // Any child that can label makes the composite labellable, and a child
-        // that could not be asked leaves the answer open rather than settling it
-        // as a no — the union rule every other read on this seam follows.
-        let answers: Vec<Option<bool>> = self.children.iter().map(|c| c.can_label()).collect();
-        if answers.iter().any(|a| *a == Some(true)) {
-            return Some(true);
-        }
-        answers.iter().all(|a| a.is_some()).then_some(false)
+        combine_flag(self.children.iter().map(|c| c.can_label()))
     }
 
     fn label_targets(&self) -> Option<Vec<LabelTarget>> {
@@ -149,6 +154,16 @@ impl TerminalAdapter for Composite {
     fn write_label(&self, key: &str, write: &LabelWrite) -> Result<(), String> {
         let (target, inner) = self.child_for(key)?;
         target.write_label(inner, write)
+    }
+
+    /// Whether any child can tint a session's row.
+    fn can_tint(&self) -> Option<bool> {
+        combine_flag(self.children.iter().map(|c| c.can_tint()))
+    }
+
+    fn write_tint(&self, key: &str, tint: Option<&super::Tint>) -> Result<(), String> {
+        let (target, inner) = self.child_for(key)?;
+        target.write_tint(inner, tint)
     }
 
     /// Each child's own `close_targets`, never derived from the composite's
@@ -364,7 +379,7 @@ mod tests {
     }
 
     fn target(key: &str) -> LabelTarget {
-        LabelTarget { key: key.to_string(), title: Some("🔵 x".to_string()), context: None, budget: LabelBudget::Utf16(200) }
+        LabelTarget { key: key.to_string(), title: Some("🔵 x".to_string()), context: None, budget: LabelBudget::Utf16(200), tint: None, attached_remote: false }
     }
 
     fn composite(children: Vec<Fake>) -> Composite {

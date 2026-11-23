@@ -3,6 +3,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+use crate::terminals::{Tint, TintColour, TintOn};
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -248,6 +250,11 @@ pub struct Config {
     /// on this Mac, in the background. `None` opens no tab, and the session
     /// stays reachable through cmd+shift+r.
     pub remote_attach_script: Option<String>,
+    /// The sidebar-row tints this dashboard gives terminal sessions on this
+    /// machine, written by `terminals::tints` (agterm today). Each machine
+    /// tints the tabs it shows from its own copy, a `⇄` tab rendering another
+    /// machine's session included.
+    pub tab_tints: TabTints,
     /// Multi-device session sync (see `sync.rs`). Disabled by default:
     /// `listen=false` and empty `peers` make every sync task a no-op.
     pub sync: SyncConfig,
@@ -354,6 +361,27 @@ pub struct Config {
     /// low-battery emergency sleep, so without this floor a closed laptop could
     /// run itself flat instead of sleeping. `0` disables the floor.
     pub lid_awake_battery_floor_pct: u8,
+}
+
+/// The two session row tints, each `None` to leave that case untinted.
+/// A session off the default model takes `model`; otherwise a `⇄` tab takes
+/// `remote`; any other agent tab is cleared (see `terminals::tints`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TabTints {
+    /// For a session whose model is not the default, `env.ANTHROPIC_MODEL` in
+    /// Claude Code's user settings (`terminals::tints::default_model`).
+    pub model: Option<Tint>,
+    /// For a `⇄` tab: another machine's session attached here.
+    pub remote: Option<Tint>,
+}
+
+impl Default for TabTints {
+    fn default() -> Self {
+        // `remote` is the gray the claude repo's `attach.sh` sets on a `⇄` tab,
+        // so a `⇄` tab keeps that colour with no config line.
+        Self { model: Some(Tint { colour: TintColour::Purple, on: TintOn::Name }), remote: Some(Tint { colour: TintColour::Gray, on: TintOn::IconAndName }) }
+    }
 }
 
 /// The standing policy for when the lid-closed sleep veto arms by itself. See
@@ -789,6 +817,7 @@ impl Default for Config {
             idle_close_ms: (!built_for_release()).then_some(IDLE_CLOSE_MS),
             remote_session_script: None,
             remote_attach_script: None,
+            tab_tints: TabTints::default(),
             sync: SyncConfig::default(),
             tray_badge: TrayBadge::None,
             tray_context_alert_enabled: true,

@@ -56,6 +56,7 @@ pub fn build_settings_snippet(hook_path_for_command: &str) -> String {
     "PreCompact":          [{{"hooks": [{{"type": "command", "command": "{cmd}"}}]}}],
     "SubagentStop":        [{{"hooks": [{{"type": "command", "command": "{cmd}"}}]}}],
     "SessionEnd":          [{{"hooks": [{{"type": "command", "command": "{cmd}"}}]}}],
+    "PostModelSwitch":     [{{"hooks": [{{"type": "command", "command": "{cmd}"}}]}}],
     "PreToolUse": [{{
       "matcher": "^(AskUserQuestion|ExitPlanMode)$",
       "hooks": [{{"type": "command", "command": "{cmd}"}}]
@@ -84,6 +85,7 @@ mod tests {
         let snippet = build_settings_snippet("/x/claude_hook.py");
         let parsed: serde_json::Value = serde_json::from_str(&snippet).expect("the snippet is JSON");
         assert!(parsed["hooks"]["SubagentStop"][0]["hooks"][0]["command"].as_str().is_some_and(|c| c.contains("/x/claude_hook.py")));
+        assert!(parsed["hooks"]["PostModelSwitch"][0]["hooks"][0]["command"].as_str().is_some_and(|c| c.contains("/x/claude_hook.py")));
     }
 
     #[test]

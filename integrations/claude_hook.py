@@ -23,6 +23,7 @@ Install in `~/.claude/settings.json`:
         "PreCompact":          [{"hooks": [{"type": "command", "command": "python <repo>/integrations/claude_hook.py"}]}],
         "SubagentStop":        [{"hooks": [{"type": "command", "command": "python <repo>/integrations/claude_hook.py"}]}],
         "SessionEnd":          [{"hooks": [{"type": "command", "command": "python <repo>/integrations/claude_hook.py"}]}],
+        "PostModelSwitch":     [{"hooks": [{"type": "command", "command": "python <repo>/integrations/claude_hook.py"}]}],
         "PreToolUse":          [{"matcher": "^(AskUserQuestion|ExitPlanMode)$", "hooks": [{"type": "command", "command": "python <repo>/integrations/claude_hook.py"}]}]
       }
     }
@@ -43,6 +44,10 @@ The `PreToolUse` matcher restricts the hook to user-gating tools. The JSONL
 transcript records such a call but nothing marks it as waiting on the user,
 so this hook is the only signal that the dialog is on screen. The matcher
 avoids the per-Bash/Read/Grep fork overhead of an unfiltered hook.
+
+`PostModelSwitch` records the session's new model the moment it switches,
+ahead of the next reply the transcript would show it in, so a session off the
+default model has its terminal row tinted at once.
 
 `UserPromptExpansion` fires the instant a slash command is invoked — seconds
 before `UserPromptSubmit`, which Claude Code only emits after the command's

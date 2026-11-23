@@ -2081,6 +2081,23 @@ impl AppState {
         changed
     }
 
+    /// Record that row `id`'s session now runs `model`, as a `PostModelSwitch`
+    /// reports it the moment the user switches, ahead of the next reply the
+    /// transcript watcher would learn it from. Nothing else changes: `updated`
+    /// is left alone, since a switch is no activity. `false` when there is no
+    /// such row or it already reads `model`.
+    pub fn set_model(&self, id: &str, model: &str) -> bool {
+        let mut sessions = self.sessions.lock().unwrap();
+        let Some(session) = sessions.iter_mut().find(|s| s.id == id) else {
+            return false;
+        };
+        if session.model.as_deref() == Some(model) {
+            return false;
+        }
+        session.model = Some(model.to_string());
+        true
+    }
+
     /// Mark a compaction boundary in the in-memory dialog — a history separator
     /// without ending the session, so the prior task is not resurrected onto the
     /// next turn. `PreCompact` is its only caller; the `/clear` half of the pair

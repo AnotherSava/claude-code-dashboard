@@ -43,6 +43,9 @@ pub enum AdapterOutput {
     /// A subagent ended (`SubagentStop`), so none of its permission prompts can
     /// still be on screen: settle every one it holds on row `id`.
     SubagentStopped { id: String, agent_id: String },
+    /// The session switched model (`PostModelSwitch`): record it on row `id`
+    /// without touching its status.
+    ModelSwitched { id: String, model: String },
     /// Remove a session.
     Clear { id: String },
     /// Mark a context boundary in the session's dialog (a history separator)

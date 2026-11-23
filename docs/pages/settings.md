@@ -67,6 +67,7 @@ Every field is optional — omit one and the built-in default applies. A complet
   "idle_close_ms": null,
   "remote_session_script": null,
   "remote_attach_script": null,
+  "tab_tints": { "model": { "colour": "purple", "on": "name" }, "remote": { "colour": "gray", "on": "icon_and_name" } },
   "instruction_canary_enabled": false,
   "save_window_position": true,
   "window_position": null,
@@ -152,6 +153,7 @@ Set autostart through the tray's **On system start** submenu — it writes both 
 ### Color terminal tabs
 
 - `terminal_titles` — mirror each session's status onto its terminal tab as a symbol next to the session name (🔵 working, ⏳ background work still running, ✋ blocked on you, 🟢 finished and unread, ⚪ finished and you've read it, 🔴 error, ⚫ nothing left in it). On Windows the same title shows in agwinterm's sidebar, which names each session after it, and the session's current prompt goes on the dim line beside its name (with an agwinterm build whose sessions are named after their titles). On macOS agterm takes the prompt the same way, on the context line in the title bar of its window's active session (agterm 0.26.0 or newer, the release that gave a session a context line). Turning this off clears that line on either. See [Features → color terminal tabs](features#color-terminal-tabs).
+- `tab_tints` — Mac only for now: how agterm colours a session's row in its sidebar. `model` is used while a session runs a model other than the one `ANTHROPIC_MODEL` names in your Claude Code settings, and `remote` for a `⇄` tab showing your other machine's session the rest of the time. Each takes a `colour` (`red`, `orange`, `yellow`, `green`, `blue`, `purple` or `gray`) and where it shows, `on` (`icon`, `name` or `icon_and_name`); `null` leaves that case uncoloured. Any other agent tab is left uncoloured. Defaults: `model` purple on the name, `remote` gray on the icon and name. Needs agterm 0.39.0 or newer.
 - `terminal_title_context_percent` — once a session's context usage reaches this percent of its model's window, append it to the terminal tab title as ` [N%]` (e.g. `🔵 printlab [67%]`), so a tab filling toward `/compact` stands out. `null` or `0` turns the number off (the status symbol and name still show); it needs `terminal_titles` on to appear at all.
 
 While a session works, Claude Code writes its own spinner title into the tab, which can replace the status. Set `CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1` in the environment you start Claude Code from to turn that off.

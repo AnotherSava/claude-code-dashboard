@@ -1596,7 +1596,12 @@ pub(crate) async fn attach_started(app: &AppHandle, chat_id: &str, name: String)
     let session = name.clone();
     let result = tokio::task::spawn_blocking(move || adapter.attach_hosted(&session)).await.unwrap_or_else(|e| Err(format!("the attach task did not finish: {e}")));
     match result {
-        Ok(crate::terminals::Attached::Opened) => tracing::info!(chat_id, decision = "peer_attach", session = %name, outcome = "attached", "opened a background tab on a hosted session"),
+        Ok(crate::terminals::Attached::Opened) => {
+            tracing::info!(chat_id, decision = "peer_attach", session = %name, outcome = "attached", "opened a background tab on a hosted session");
+            // The new tab is tinted and labelled on the next reading, which no
+            // row change would otherwise prompt for up to a resync.
+            crate::terminals::labels::poke();
+        }
         Ok(crate::terminals::Attached::AlreadyOpen) => tracing::info!(chat_id, decision = "peer_attach", session = %name, outcome = "already_attached", "a tab here already attaches to the hosted session"),
         Err(reason) => tracing::warn!(chat_id, decision = "peer_attach", session = %name, outcome = "attach_failed", reason = %reason, "could not open a tab on a hosted session"),
     }
@@ -1792,7 +1797,7 @@ fn apply_event_in(app: &AppHandle, req: &EventRequest, placed: Option<String>) -
                 registry.forget(session_id);
             }
         }
-        AdapterOutput::Boundary { id } | AdapterOutput::SubagentStopped { id, .. } => *id = pick_row(pid_row.as_deref(), anchored, id),
+        AdapterOutput::Boundary { id } | AdapterOutput::SubagentStopped { id, .. } | AdapterOutput::ModelSwitched { id, .. } => *id = pick_row(pid_row.as_deref(), anchored, id),
         AdapterOutput::Ignore => {}
     }
     let anchor = |row: &str| {
@@ -1812,7 +1817,7 @@ fn apply_event_in(app: &AppHandle, req: &EventRequest, placed: Option<String>) -
     // per-row store land as a unit — see `RowLocks` for the `/clear` race.
     let row_id = match &output {
         AdapterOutput::Set { input, .. } => Some(input.id.as_str()),
-        AdapterOutput::Clear { id } | AdapterOutput::Boundary { id } | AdapterOutput::SubagentStopped { id, .. } => Some(id.as_str()),
+        AdapterOutput::Clear { id } | AdapterOutput::Boundary { id } | AdapterOutput::SubagentStopped { id, .. } | AdapterOutput::ModelSwitched { id, .. } => Some(id.as_str()),
         AdapterOutput::Ignore => None,
     };
     let row_lock = match (row_id, app.try_state::<crate::commands::RowLocks>()) {
@@ -2182,6 +2187,21 @@ fn apply_event_in(app: &AppHandle, req: &EventRequest, placed: Option<String>) -
             if state.mark_session_boundary(&id, now) {
                 crate::commands::persist_row(&app, &state, &id);
                 emit_sessions_updated(&app);
+            }
+        }
+        AdapterOutput::ModelSwitched { id, model } => {
+            let facts = EventFacts { event: &req.event, source: None, pid: req.agent_pid, session_id, transcript_path: None, still_running: &still_running };
+            let adm = members.admit(&id, &facts, now_ms())?;
+            anchor(&id);
+            membership::log_admission(&id, &req.event, session_id, &adm);
+            if !adm.drives_row {
+                tracing::debug!(client = %req.client, event = %req.event, chat_id = %id, decision = "member_event", model = %model, reason = "a model switch in a session that does not drive this row; not recorded", "event -> member");
+                return Ok((StatusCode::OK, Json(resp)).into_response());
+            }
+            let changed = state.set_model(&id, &model);
+            tracing::info!(chat_id = %id, decision = "model_switch", model = %model, changed, "the session switched model");
+            if changed {
+                emit_sessions_updated(app);
             }
         }
         AdapterOutput::Ignore => {

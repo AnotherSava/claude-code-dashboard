@@ -97,6 +97,7 @@ pub mod stale_check;
 /// [`TerminalAdapter::write_label`]. Names no terminal; it starts only where an
 /// adapter exists and answers [`TerminalAdapter::can_label`].
 pub mod labels;
+pub mod tints;
 /// Several adapters answering as one, for a platform where more than one terminal
 /// can host a session. Only Windows builds one, so it is compiled there and for
 /// tests.
@@ -949,6 +950,24 @@ pub trait TerminalAdapter: Send {
         Err("this terminal cannot be labelled".to_string())
     }
 
+    /// Whether this terminal can tint a session's sidebar row at all, with
+    /// [`can_label`](Self::can_label)'s three answers and for its reason: agterm
+    /// answers from its version, which needs its control socket. `tints` writes
+    /// nothing until this is `Some(true)`, and asks again while it is `None`.
+    /// A terminal that tints reports each session's tint on
+    /// [`LabelTarget::tint`].
+    fn can_tint(&self) -> Option<bool> {
+        Some(false)
+    }
+
+    /// Set or clear (`None`) one session's row tint. `key` is a
+    /// [`LabelTarget::key`] this adapter minted. **May block**, and is called
+    /// only from `labels`' worker thread.
+    fn write_tint(&self, key: &str, tint: Option<&Tint>) -> Result<(), String> {
+        let _ = (key, tint);
+        Err("this terminal cannot tint a session".to_string())
+    }
+
     /// Every session [`close_session`](Self::close_session) could end, with
     /// its title, or `None` when the terminal could not be asked. The line
     /// [`label_targets`](Self::label_targets) draws between the two.
@@ -1227,6 +1246,43 @@ pub struct LabelTarget {
     /// The longest context the terminal accepts, in the unit that terminal
     /// enforces, which `labels` fits a row's text to.
     pub budget: LabelBudget,
+    /// The session's row tint, or `None` where it has none or the terminal
+    /// tints nothing ([`TerminalAdapter::can_tint`]).
+    pub tint: Option<Tint>,
+    /// Whether the session runs the claude repo's attach onto a session another
+    /// machine hosts — a `⇄` tab — read off what runs in it, which is there from
+    /// the tab's first moment, unlike the badged title that names its row.
+    pub attached_remote: bool,
+}
+
+/// A colour a terminal tints a session's row with: agterm's seven.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TintColour {
+    Red,
+    Orange,
+    Yellow,
+    Green,
+    Blue,
+    Purple,
+    Gray,
+}
+
+/// Which part of a session's row a tint colours.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TintOn {
+    Icon,
+    Name,
+    IconAndName,
+}
+
+/// One session row tint, as `config.tab_tints` states it and a terminal
+/// reports it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Tint {
+    pub colour: TintColour,
+    pub on: TintOn,
 }
 
 /// One session [`TerminalAdapter::close_targets`] reports.

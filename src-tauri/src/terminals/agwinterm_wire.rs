@@ -384,7 +384,7 @@ pub fn composer_text(styled: &Value) -> Option<String> {
 /// `"{window}/{session}"`, so a write carries both halves of the address and
 /// never resolves a session by its name.
 pub fn targets_from(window: &str, sessions: &[AgSession]) -> Vec<LabelTarget> {
-    sessions.iter().map(|s| LabelTarget { key: format!("{window}/{}", s.target), title: s.title.clone(), context: s.context.clone(), budget: LabelBudget::Utf16(CONTEXT_MAX_UTF16) }).collect()
+    sessions.iter().map(|s| LabelTarget { key: format!("{window}/{}", s.target), title: s.title.clone(), context: s.context.clone(), budget: LabelBudget::Utf16(CONTEXT_MAX_UTF16), tint: None, attached_remote: false }).collect()
 }
 
 /// The window and session halves of a key [`targets_from`] minted.
@@ -532,7 +532,7 @@ mod tests {
     #[test]
     fn targets_address_by_window_and_session() {
         let t = targets_from("499dc388-2497-4072-b1d9-05a339f9a03b", &parse_tree(&tree()));
-        assert_eq!(t[2], LabelTarget { key: "499dc388-2497-4072-b1d9-05a339f9a03b/c18abb52-0589-46ed-9010-4d2a552c7a86".into(), title: Some("🔵 tauri-dashboard [68%]".into()), context: Some("Wire the context line — tests".into()), budget: LabelBudget::Utf16(CONTEXT_MAX_UTF16) });
+        assert_eq!(t[2], LabelTarget { key: "499dc388-2497-4072-b1d9-05a339f9a03b/c18abb52-0589-46ed-9010-4d2a552c7a86".into(), title: Some("🔵 tauri-dashboard [68%]".into()), context: Some("Wire the context line — tests".into()), budget: LabelBudget::Utf16(CONTEXT_MAX_UTF16), tint: None, attached_remote: false });
         assert_eq!(split_key(&t[3].key), Some(("499dc388-2497-4072-b1d9-05a339f9a03b", "7e0d3c11-2a5b-4c8e-9f10-3b2a1c4d5e6f")));
     }
 

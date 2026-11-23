@@ -65,12 +65,23 @@
 //!
 //! **Every write is decided against the terminal's live reading.** That is what
 //! catches the user changing a context, and the terminal losing one.
+//!
+//! **The same pass tints each session's row** (`super::tints`), on the targets
+//! it has just read, wherever [`super::TerminalAdapter::can_tint`] answers yes,
+//! asked on every pass until the terminal answers. The two halves share the
+//! reading, the join and the timing: a failed tint write marks the pass failed
+//! as a failed label write does, so the next read comes after the retry delay
+//! rather than the resync, while the label writes of that pass stand. [`poke`]
+//! asks for a reading though no row changed, for a session the last reading
+//! could not have seen, the `⇄` tab `attach_hosted` opens. Tinting rides this
+//! worker, so a terminal that could tint and had no context line would not be
+//! tinted; every agterm that tints also labels.
 
 use std::collections::HashMap;
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use tauri::AppHandle;
+use tauri::{AppHandle, Manager};
 
 use super::{CloseTarget, LabelBudget, LabelTarget, LabelWrite, TerminalAdapter};
 use crate::state::AgentSession;
@@ -183,6 +194,9 @@ pub struct DesiredLabel {
     /// `terminal_title::REMOTE_BADGE` — the `⇄` tab rendering that machine's
     /// session here — and a local row only against an unbadged one.
     pub remote: bool,
+    /// The model the row's session runs, `AgentSession::model`, which
+    /// `tints::plan` weighs against the default; `None` where it is not known.
+    pub model: Option<String>,
 }
 
 impl DesiredLabel {
@@ -190,7 +204,7 @@ impl DesiredLabel {
     /// Every caller of [`join`] builds its rows here, so the label a title is
     /// matched against cannot drift from the one written.
     pub fn for_row(s: &AgentSession, context: Option<String>) -> Self {
-        DesiredLabel { row: s.id.clone(), label: s.display_label().to_string(), context, remote: false }
+        DesiredLabel { row: s.id.clone(), label: s.display_label().to_string(), context, remote: false, model: s.model.clone() }
     }
 
     /// A synced row as the join ranks it: one entry per name it answers to
@@ -198,7 +212,7 @@ impl DesiredLabel {
     /// the origin wrote, which a rename on either machine can make differ from
     /// this one's.
     pub fn for_synced_row(s: &AgentSession, context: Option<String>) -> Vec<Self> {
-        crate::attention::remote_names(s).into_iter().map(|name| DesiredLabel { row: s.id.clone(), label: name.to_string(), context: context.clone(), remote: true }).collect()
+        crate::attention::remote_names(s).into_iter().map(|name| DesiredLabel { row: s.id.clone(), label: name.to_string(), context: context.clone(), remote: true, model: s.model.clone() }).collect()
     }
 }
 
@@ -237,6 +251,8 @@ struct Slot {
     fresh: bool,
     /// When the latest request arrived that dropped a row the set before it had.
     removed_at: Option<Instant>,
+    /// A [`poke`] asked for a reading though the set has not changed.
+    poked: bool,
 }
 
 static SLOT: OnceLock<(Mutex<Slot>, Condvar)> = OnceLock::new();
@@ -267,6 +283,17 @@ pub fn request(seq: u64, rows: Vec<DesiredLabel>) {
         held.removed_at = Some(now);
     }
     held.set = Some(LabelSet { seq, rows, at: now });
+    held.fresh = true;
+    cv.notify_one();
+}
+
+/// Ask the worker for a fresh reading now, though no row changed: a terminal
+/// session has just appeared that the last reading could not have seen, the `⇄`
+/// tab `attach_hosted` opened for one. Never does I/O and never waits.
+pub fn poke() {
+    let (lock, cv) = slot();
+    let mut held = lock.lock().unwrap();
+    held.poked = true;
     held.fresh = true;
     cv.notify_one();
 }
@@ -304,8 +331,9 @@ fn should_read(changed: bool, last: Option<LastPass>, now: Instant) -> bool {
     changed || last.is_none_or(|l| now >= due_at(l))
 }
 
-/// Start the worker, if this platform has a terminal with a context line. A
-/// no-op if called twice.
+/// Start the worker, if this platform has a terminal with a context line. The
+/// worker tints rows too (see the module doc), so it is the context line that
+/// decides whether it runs. A no-op if called twice.
 ///
 /// Two ways it declines to run: `for_platform` answering `None` (no terminal
 /// adapter at all), and an adapter whose terminal has no context line. The second
@@ -333,7 +361,7 @@ pub fn spawn(app: AppHandle) {
         let terminal = adapter.name();
         for attempt in 1..=CAN_LABEL_ATTEMPTS {
             match adapter.can_label() {
-                Some(true) => return run(adapter),
+                Some(true) => return run(&app, adapter),
                 Some(false) => {
                     tracing::debug!(terminal, "this terminal has no session context line; the label worker does not start");
                     return;
@@ -351,7 +379,7 @@ pub fn spawn(app: AppHandle) {
     });
 }
 
-fn run(adapter: &dyn TerminalAdapter) {
+fn run(app: &AppHandle, adapter: &dyn TerminalAdapter) {
     let terminal = adapter.name();
     let (lock, cv) = slot();
     let mut last: Option<LastPass> = None;
@@ -359,8 +387,11 @@ fn run(adapter: &dyn TerminalAdapter) {
     let mut seen = Seen::default();
     let mut written: HashMap<String, Placed> = HashMap::new();
     let mut last_outcome: Option<&'static str> = None;
+    let mut tinting: Option<bool> = None;
+    let mut tinted: HashMap<String, (String, super::Tint)> = HashMap::new();
+    let mut last_tint_outcome: Option<&'static str> = None;
     loop {
-        let set = {
+        let (set, poked) = {
             let mut held = lock.lock().unwrap();
             while held.set.is_none() {
                 held = cv.wait(held).unwrap();
@@ -377,14 +408,37 @@ fn run(adapter: &dyn TerminalAdapter) {
                 }
             }
             held.fresh = false;
-            held.set.clone().expect("the wait above returns only once a set is held")
+            let poked = std::mem::take(&mut held.poked);
+            (held.set.clone().expect("the wait above returns only once a set is held"), poked)
         };
         let changed = read_for.as_ref() != Some(&set.rows);
-        if !should_read(changed, last, Instant::now()) {
+        if !should_read(changed || poked, last, Instant::now()) {
             continue;
         }
-        let outcome = pass(adapter, &set.rows, &mut seen, &mut written);
-        last = Some(LastPass { at: Instant::now(), failed: matches!(outcome, Outcome::Unanswered | Outcome::WriteFailed) });
+        let targets = adapter.label_targets();
+        let outcome = match &targets {
+            Some(targets) => pass(adapter, &set.rows, targets, &mut seen, &mut written),
+            None => Outcome::Unanswered,
+        };
+        // Asked again on every pass until the terminal answers, for
+        // `can_label`'s reason; settled once it does.
+        if tinting.is_none() {
+            tinting = adapter.can_tint();
+        }
+        let mut tint_failed = false;
+        if let (Some(true), Some(targets)) = (tinting, &targets) {
+            let tab_tints = app.try_state::<crate::config::ConfigState>().map(|c| c.snapshot().tab_tints).unwrap_or_default();
+            let tint_outcome = super::tints::pass(adapter, &set.rows, targets, &tab_tints, &mut tinted);
+            tint_failed = matches!(tint_outcome, super::tints::Outcome::WriteFailed);
+            let slug = tint_outcome.slug();
+            if last_tint_outcome != Some(slug) {
+                tracing::info!(decision = "tint_pass", terminal, outcome = slug, "terminal tints pass");
+                last_tint_outcome = Some(slug);
+            } else {
+                tracing::debug!(decision = "tint_pass", terminal, outcome = slug, "terminal tints pass");
+            }
+        }
+        last = Some(LastPass { at: Instant::now(), failed: tint_failed || matches!(outcome, Outcome::Unanswered | Outcome::WriteFailed) });
         read_for = Some(set.rows);
         let slug = outcome.slug();
         // Every pass at debug, and at info whenever the outcome moves, so a
@@ -431,9 +485,8 @@ struct Seen {
 
 /// One read and the writes it calls for. `written` is the context this worker
 /// last wrote to each target and has not cleared since, kept up to date here.
-fn pass(adapter: &dyn TerminalAdapter, rows: &[DesiredLabel], seen: &mut Seen, written: &mut HashMap<String, Placed>) -> Outcome {
-    let Some(targets) = adapter.label_targets() else { return Outcome::Unanswered };
-    let plan = plan(rows, &targets, written);
+fn pass(adapter: &dyn TerminalAdapter, rows: &[DesiredLabel], targets: &[LabelTarget], seen: &mut Seen, written: &mut HashMap<String, Placed>) -> Outcome {
+    let plan = plan(rows, targets, written);
     written.extend(plan.in_place.iter().cloned());
     // Edge-only: a row is reported when it starts being declined or its reason
     // changes, not on every pass it stays that way.
@@ -539,6 +592,22 @@ pub(crate) enum Claim<'a> {
     Row(&'a DesiredLabel),
 }
 
+impl Claim<'_> {
+    /// Whether a target no row claims holds a value that is ours to clear: its
+    /// title is one of this dashboard's naming no row it can carry, or it still
+    /// shows exactly what this process placed there (`placed`, with the row it
+    /// was placed for) for a row that has since left. `shown` is what the target
+    /// shows now. [`plan`] asks it of a context and `tints::plan` of a tint, so
+    /// the two withdraw by one rule.
+    pub(crate) fn ours_to_clear<T: PartialEq>(&self, placed: Option<(&str, &T)>, shown: Option<&T>, rows: &[DesiredLabel]) -> bool {
+        match self {
+            Claim::Row(_) => false,
+            Claim::Ours => true,
+            Claim::Foreign => placed.is_some_and(|(row, value)| shown == Some(value) && !rows.iter().any(|r| r.row == row)),
+        }
+    }
+}
+
 /// The writes that bring every session's context in line with the rows. Pure:
 /// the whole judgment, with every terminal fact already turned into a
 /// [`LabelTarget`]. The rules are the module doc's; `written` is the record of
@@ -560,9 +629,7 @@ pub fn plan(rows: &[DesiredLabel], targets: &[LabelTarget], written: &HashMap<St
                 }
                 continue;
             }
-            Claim::Ours => true,
-            // Text this process wrote for a row that has since left.
-            Claim::Foreign => written.get(&t.key).is_some_and(|p| t.context.as_ref() == Some(&p.text) && !rows.iter().any(|r| r.row == p.row)),
+            _ => claim.ours_to_clear(written.get(&t.key).map(|p| (p.row.as_str(), &p.text)), t.context.as_ref(), rows),
         };
         if let Some(c) = t.context.as_ref().filter(|_| ours) {
             out.writes.push(PlannedWrite { key: t.key.clone(), write: LabelWrite::ClearContext, replaced: Some(c.clone()), purpose: Purpose::Withdraw });
@@ -643,7 +710,7 @@ mod tests {
 
     /// The row `id`, labelled `id` on its tab, wanting `context`.
     fn row(id: &str, context: Option<&str>) -> DesiredLabel {
-        DesiredLabel { row: id.into(), label: id.into(), context: context.map(Into::into), remote: false }
+        DesiredLabel { row: id.into(), label: id.into(), context: context.map(Into::into), remote: false, model: None }
     }
 
     /// The row `dash` wanting the context `Fix the build`.
@@ -653,7 +720,7 @@ mod tests {
 
     /// A session titled `title`, showing `context`.
     fn target(key: &str, title: Option<&str>, context: Option<&str>) -> LabelTarget {
-        LabelTarget { key: key.into(), title: title.map(Into::into), context: context.map(Into::into), budget: LabelBudget::Utf16(BUDGET) }
+        LabelTarget { key: key.into(), title: title.map(Into::into), context: context.map(Into::into), budget: LabelBudget::Utf16(BUDGET), tint: None, attached_remote: false }
     }
 
     fn write(row: &str, key: &str, text: &str, replaced: Option<&str>) -> PlannedWrite {
@@ -997,10 +1064,10 @@ mod tests {
     fn a_context_written_for_a_row_is_withdrawn_once_the_row_leaves_and_its_title_is_blanked() {
         let mut written = HashMap::new();
         let shown = Recording::new(vec![target("k", Some("🔵 dash"), None)]);
-        assert_eq!(pass(&shown, &[dash()], &mut Seen::default(), &mut written), Outcome::Applied);
+        assert_eq!(pass(&shown, &[dash()], &shown.targets, &mut Seen::default(), &mut written), Outcome::Applied);
         assert_eq!(written.get("k"), Some(&placed("dash", "Fix the build")));
         let left = Recording::new(vec![target("k", None, Some("Fix the build"))]);
-        assert_eq!(pass(&left, &[], &mut Seen::default(), &mut written), Outcome::Applied);
+        assert_eq!(pass(&left, &[], &left.targets, &mut Seen::default(), &mut written), Outcome::Applied);
         assert_eq!(*left.writes.lock().unwrap(), vec![("k".to_string(), LabelWrite::ClearContext)]);
         assert!(written.is_empty(), "a cleared context is no longer recorded");
     }
@@ -1011,7 +1078,7 @@ mod tests {
         // written for it, and its withdrawal still has the record to go by.
         let mut written = HashMap::new();
         let found = Recording::new(vec![target("k", Some("🟢 dash"), Some("Fix the build"))]);
-        assert_eq!(pass(&found, &[dash()], &mut Seen::default(), &mut written), Outcome::Unchanged);
+        assert_eq!(pass(&found, &[dash()], &found.targets, &mut Seen::default(), &mut written), Outcome::Unchanged);
         assert!(found.writes.lock().unwrap().is_empty());
         assert_eq!(written.get("k"), Some(&placed("dash", "Fix the build")));
     }
@@ -1021,7 +1088,7 @@ mod tests {
         let mut terminal = Recording::new(vec![target("k1", Some("🔵 dash"), None), target("k2", Some("🔵 web"), None)]);
         terminal.failing = Some("k1");
         let mut written = HashMap::new();
-        assert_eq!(pass(&terminal, &[dash(), row("web", Some("Ship it"))], &mut Seen::default(), &mut written), Outcome::WriteFailed);
+        assert_eq!(pass(&terminal, &[dash(), row("web", Some("Ship it"))], &terminal.targets, &mut Seen::default(), &mut written), Outcome::WriteFailed);
         assert_eq!(terminal.writes.lock().unwrap().len(), 1, "the second write is left to the retry");
         assert!(written.is_empty());
     }
