@@ -73,7 +73,8 @@
 //! as a failed label write does, so the next read comes after the retry delay
 //! rather than the resync, while the label writes of that pass stand. [`poke`]
 //! asks for a reading though no row changed, for a session the last reading
-//! could not have seen, the `⇄` tab `attach_hosted` opens. Tinting rides this
+//! could not have seen, the `⇄` tab `attach_hosted` opens or a session
+//! agterm's selection watch sees a window's state file add. Tinting rides this
 //! worker, so a terminal that could tint and had no context line would not be
 //! tinted; every agterm that tints also labels.
 
@@ -288,8 +289,10 @@ pub fn request(seq: u64, rows: Vec<DesiredLabel>) {
 }
 
 /// Ask the worker for a fresh reading now, though no row changed: a terminal
-/// session has just appeared that the last reading could not have seen, the `⇄`
-/// tab `attach_hosted` opened for one. Never does I/O and never waits.
+/// session has just appeared that the last reading could not have seen — the `⇄`
+/// tab `attach_hosted` opened for one, or any session agterm's selection watch
+/// sees a window's state file add (`AgtermAdapter::watch`). Never does I/O and
+/// never waits.
 pub fn poke() {
     let (lock, cv) = slot();
     let mut held = lock.lock().unwrap();

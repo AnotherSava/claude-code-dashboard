@@ -43,7 +43,7 @@
 //! could have been named by a plain shell in the project's directory; the verdict
 //! asks what runs in the session there, and refuses a known shell everywhere.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde_json::Value;
 
@@ -126,6 +126,15 @@ impl TerminalAdapter for AgtermAdapter {
     /// renames, moves, reordering, sidebar width and recency. The record of which
     /// application is in front starts here too, with the check each of agterm's
     /// activations gets ([`confirm_activations`]).
+    ///
+    /// The same save is also how a new tab shows up soonest, a background one
+    /// included (measured on agterm 0.40.0: the write lands within 3s of `session
+    /// new --no-select` and names the new id), so a write that adds a session to
+    /// its window pokes the label worker. For a `⇄` tab opened by hand that writes
+    /// its remote tint at once, which needs only the tab's `attach.sh` argv; its
+    /// context and any model tint join it to a row by the badged title, which
+    /// arrives only after the attach's ssh connects, so they still wait for the
+    /// next resync.
     fn watch(&self, sink: std::sync::mpsc::Sender<Observation>) {
         let Some(dir) = windows_dir() else {
             tracing::warn!(terminal = NAME, "no HOME; the selection watcher cannot start");
@@ -137,7 +146,8 @@ impl TerminalAdapter for AgtermAdapter {
         std::thread::spawn(move || confirm_activations(&files, &rx));
         let selections = self.selections.clone();
         let files = self.files.clone();
-        super::snapshot_watch::spawn(NAME, dir, move |dir, baseline| reread(dir, baseline, &files, &selections), sink);
+        let mut known = HashMap::new();
+        super::snapshot_watch::spawn(NAME, dir, move |dir, baseline| reread(dir, baseline, &files, &selections, &mut known), sink);
     }
 
     /// Every tab agterm currently holds, across every workspace of every open
@@ -465,8 +475,8 @@ const FACTS_ALLOWANCE_MS: i64 = SAVE_DEBOUNCE_MS + 500;
 /// observations carry on.
 const SNAPSHOT_VERSION: u64 = 1;
 
-/// What one window's snapshot says: which session is selected, and every
-/// session's working directory.
+/// What one window's snapshot says: which session is selected, every session
+/// it holds, and every session's working directory.
 ///
 /// The file carries **no title**, which is why a departure still costs one
 /// `tree` call — `resolve_row` prefers the title because a session that has
@@ -476,7 +486,15 @@ const SNAPSHOT_VERSION: u64 = 1;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Snapshot {
     pub selected_session_id: Option<String>,
+    /// Every session's id, a session reporting no directory included.
+    pub sessions: HashSet<String>,
     pub cwds: HashMap<String, String>,
+}
+
+/// Read one window snapshot file's text, or `None` if it is not JSON of a shape
+/// we know.
+fn read_snapshot(text: &str) -> Option<Snapshot> {
+    serde_json::from_str::<Value>(text).ok().as_ref().and_then(parse_snapshot)
 }
 
 /// Read one window snapshot, or `None` if it is not a shape we know.
@@ -487,15 +505,18 @@ pub fn parse_snapshot(value: &Value) -> Option<Snapshot> {
     if value.get("version").and_then(Value::as_u64) != Some(SNAPSHOT_VERSION) {
         return None;
     }
+    let mut sessions = HashSet::new();
     let mut cwds = HashMap::new();
     for ws in value.get("workspaces").and_then(Value::as_array).into_iter().flatten() {
         for s in ws.get("sessions").and_then(Value::as_array).into_iter().flatten() {
-            if let (Some(id), Some(cwd)) = (s.get("id").and_then(Value::as_str), s.get("cwd").and_then(Value::as_str)) {
+            let Some(id) = s.get("id").and_then(Value::as_str) else { continue };
+            sessions.insert(id.to_string());
+            if let Some(cwd) = s.get("cwd").and_then(Value::as_str) {
                 cwds.insert(id.to_string(), cwd.to_string());
             }
         }
     }
-    Some(Snapshot { selected_session_id: value.get("selectedSessionID").and_then(Value::as_str).map(str::to_string), cwds })
+    Some(Snapshot { selected_session_id: value.get("selectedSessionID").and_then(Value::as_str).map(str::to_string), sessions, cwds })
 }
 
 /// Re-read every window snapshot and report whoever was departed since last
@@ -506,17 +527,27 @@ pub fn parse_snapshot(value: &Value) -> Option<Snapshot> {
 /// that are the same for every departure in the pass — the desktop's input
 /// clock, the front application, agterm's windows, the activation record — are
 /// read once, the input clock first so the instant it is read at is the pass's,
-/// and only when there is a departure.
+/// and only when there is a departure. A write that adds a session to a window
+/// read before ([`adds_a_session`]) pokes the label worker, whatever it departs.
 #[cfg(target_os = "macos")]
-fn reread(dir: &std::path::Path, baseline: bool, files: &Files, selections: &Selections) -> Vec<Observation> {
+fn reread(dir: &std::path::Path, baseline: bool, files: &Files, selections: &Selections, known: &mut HashMap<String, HashSet<String>>) -> Vec<Observation> {
     let Some(read) = super::window_files::read_dir(dir) else { return Vec::new() };
+    let mut added = false;
     let departures = files.lock().unwrap().pass(read, baseline, |window, prev, text, written_ms| {
-        let stepped = step(window, prev, text, written_ms);
+        let snapshot = read_snapshot(text);
+        let stepped = step(window, prev, snapshot.as_ref(), written_ms);
+        if let Some(snapshot) = snapshot {
+            added |= adds_a_session(known.get(window), &snapshot.sessions);
+            known.insert(window.to_string(), snapshot.sessions);
+        }
         if let Stepped::Read(Some(seen), _) = &stepped {
             selections.lock().unwrap().note(window.to_string(), &seen.id, |a: &str, b: &str| a == b, written_ms);
         }
         stepped
     });
+    if added {
+        super::labels::poke();
+    }
     let lefts: Vec<Left> = departures.into_iter().flatten().collect();
     if lefts.is_empty() {
         return Vec::new();
@@ -539,6 +570,14 @@ fn reread(dir: &std::path::Path, baseline: bool, files: &Files, selections: &Sel
         out.push(observation);
     }
     out
+}
+
+/// Whether a window's write holds a session its previous write did not.
+///
+/// A window's first write adds nothing: it is the watch starting or the window
+/// opening, and the label worker reads every tab when it starts.
+fn adds_a_session(before: Option<&HashSet<String>>, now: &HashSet<String>) -> bool {
+    before.is_some_and(|b| !now.is_subset(b))
 }
 
 /// For each of agterm's activations, ask agterm, once [`super::ACTIVATION_MS`]
@@ -657,11 +696,11 @@ struct Left {
 /// confirmation, and no later than one debounce before this write. A snapshot
 /// with no selection keeps the tracking as it was, and a layout this adapter
 /// does not know stands the window down.
-fn step(window: &str, prev: Option<&Seen>, text: &str, written_ms: i64) -> Stepped<Seen, Option<Left>> {
-    let Some(snapshot) = serde_json::from_str::<Value>(text).ok().as_ref().and_then(parse_snapshot) else {
+fn step(window: &str, prev: Option<&Seen>, snapshot: Option<&Snapshot>, written_ms: i64) -> Stepped<Seen, Option<Left>> {
+    let Some(snapshot) = snapshot else {
         return Stepped::Unknown("unrecognized_snapshot");
     };
-    let Some(now) = snapshot.selected_session_id else { return Stepped::Read(prev.cloned(), None) };
+    let Some(now) = snapshot.selected_session_id.clone() else { return Stepped::Read(prev.cloned(), None) };
     let switched_ms = written_ms - SAVE_DEBOUNCE_MS;
     let earliest = switched_ms.min(prev.map_or(i64::MAX, |p| p.seen_ms));
     // agterm hands out a stable session id, so identity is plain equality here.
@@ -918,6 +957,25 @@ mod tests {
     }
 
     #[test]
+    fn only_a_write_that_brings_a_new_session_into_a_known_window_adds_one() {
+        let ids = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<HashSet<String>>();
+        assert!(adds_a_session(Some(&ids(&["S1"])), &ids(&["S1", "S2"])));
+        assert!(adds_a_session(Some(&ids(&["S1", "S2"])), &ids(&["S1", "S3"])), "one closed and another opened");
+        assert!(!adds_a_session(Some(&ids(&["S1", "S2"])), &ids(&["S1", "S2"])), "a rename, a reorder or a switch");
+        assert!(!adds_a_session(Some(&ids(&["S1", "S2"])), &ids(&["S1"])), "a close");
+        assert!(!adds_a_session(None, &ids(&["S1"])), "the window's first write");
+    }
+
+    #[test]
+    fn a_session_with_no_directory_is_still_one_of_the_window_sessions() {
+        let mut v = snapshot(1, "S2");
+        v["workspaces"][0]["sessions"].as_array_mut().unwrap().push(serde_json::json!({"id": "S3"}));
+        let s = parse_snapshot(&v).expect("snapshot");
+        assert_eq!(s.sessions.len(), 3);
+        assert!(!s.cwds.contains_key("S3"));
+    }
+
+    #[test]
     fn an_unknown_snapshot_version_is_refused_rather_than_guessed_at() {
         // Private, undocumented state with no compatibility promise. Reading a
         // layout we do not know would produce confident wrong departures, which
@@ -928,7 +986,7 @@ mod tests {
     }
 
     fn left(prev: Option<&Seen>, snap: &Value, written: i64) -> (Option<Seen>, Option<Left>) {
-        match step("W1", prev, &snap.to_string(), written) {
+        match step("W1", prev, parse_snapshot(snap).as_ref(), written) {
             Stepped::Read(next, left) => (next, left),
             Stepped::Unknown(reason) => panic!("refused: {reason}"),
         }
@@ -973,8 +1031,8 @@ mod tests {
 
     #[test]
     fn an_unknown_snapshot_stands_the_window_down() {
-        assert!(matches!(step("W1", Some(&seen("S1", 0)), &snapshot(2, "S2").to_string(), 10_000), Stepped::Unknown(_)));
-        assert!(matches!(step("W1", Some(&seen("S1", 0)), "not json", 10_000), Stepped::Unknown(_)));
+        assert!(matches!(step("W1", Some(&seen("S1", 0)), read_snapshot(&snapshot(2, "S2").to_string()).as_ref(), 10_000), Stepped::Unknown(_)));
+        assert!(matches!(step("W1", Some(&seen("S1", 0)), read_snapshot("not json").as_ref(), 10_000), Stepped::Unknown(_)));
     }
 
     #[test]
@@ -991,7 +1049,7 @@ mod tests {
     fn tracked_s1() -> WindowFiles<Seen> {
         let mut files = WindowFiles::new(NAME);
         let read = vec![FileRead { window: "W1".into(), contents: crate::terminals::window_files::Contents::Read(snapshot(1, "S1").to_string(), 1_000) }];
-        files.pass(read, true, |window, prev, text, written_ms| step(window, prev, text, written_ms));
+        files.pass(read, true, |window, prev, text, written_ms| step(window, prev, read_snapshot(text).as_ref(), written_ms));
         files
     }
 
@@ -1016,13 +1074,13 @@ mod tests {
         // The user then clicked into W2, which raises no activation, and later
         // switched its session; W2's tracking was last written at 1 000.
         let switch_in_w2 = |files: &WindowFiles<Seen>| {
-            let Stepped::Read(_, Some(l)) = step("W2", files.tracked().get("W2"), &snapshot(1, "S2").to_string(), 30_000) else { panic!("a departure") };
+            let Stepped::Read(_, Some(l)) = step("W2", files.tracked().get("W2"), parse_snapshot(&snapshot(1, "S2")).as_ref(), 30_000) else { panic!("a departure") };
             let front = facts::front(facts::AppFront::Agterm, &facts::Windows::Listed { active: Some("W2".into()) }, "W2");
             person_verdict(&departure(&l, Some(&tree("S2", "🔵 two")), front, Since::At(5_000), LastInput::At(29_650), 30_000), NamedBy::Title)
         };
         let mut files = WindowFiles::new(NAME);
         let read = vec![FileRead { window: "W2".into(), contents: crate::terminals::window_files::Contents::Read(snapshot(1, "S1").to_string(), 1_000) }];
-        files.pass(read, true, |window, prev, text, written_ms| step(window, prev, text, written_ms));
+        files.pass(read, true, |window, prev, text, written_ms| step(window, prev, read_snapshot(text).as_ref(), written_ms));
         assert_eq!(switch_in_w2(&files), Err(Refusal::ActivatedBySwitch), "with nothing but the write, the switch can have been the activating click");
         // A poll tick at 20 000 read W2 with S1 still selected.
         let mut selections = crate::terminals::SelectionClock::default();
