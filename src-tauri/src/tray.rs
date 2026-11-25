@@ -6,7 +6,7 @@ use tauri::{
 use tauri_plugin_autostart::ManagerExt;
 
 use crate::commands::emit_config_updated;
-use crate::config::{AutoResize, Config, ConfigState, HistoryFontSize, LidAwakeMode, TrayBadge};
+use crate::config::{AutoResize, Config, ConfigState, HistoryFontSize, LidAwakeMode, SessionSort, TrayBadge};
 
 const MENU_SHOW_HIDE: &str = "show_hide";
 const MENU_ALWAYS_ON_TOP: &str = "always_on_top";
@@ -29,6 +29,9 @@ const MENU_TRAY_BADGE_5H_LIGHT: &str = "tray_badge_5h_light";
 const MENU_TRAY_BADGE_7D_LIGHT: &str = "tray_badge_7d_light";
 const MENU_TRAY_BADGE_5H_NUM: &str = "tray_badge_5h_num";
 const MENU_TRAY_BADGE_7D_NUM: &str = "tray_badge_7d_num";
+const MENU_SORT_RECENT: &str = "sort_recent";
+const MENU_SORT_NAME: &str = "sort_name";
+const MENU_GROUP_BY_HOST: &str = "group_by_host";
 const MENU_IDLE_AWAKE: &str = "idle_awake";
 const MENU_LID_AWAKE_OFF: &str = "lid_awake_off";
 const MENU_LID_AWAKE_START_NOW: &str = "lid_awake_start_now";
@@ -75,6 +78,7 @@ pub fn sync_config_checks(app: &AppHandle, cfg: &Config) {
     sync_auto_resize_checks(app, cfg.auto_resize);
     sync_history_font_checks(app, cfg.history_font_size);
     sync_tray_badge_checks(app, cfg.tray_badge);
+    sync_session_sort_checks(app, cfg.session_sort);
     // Reads `start_minimized` from `ConfigState`, which `config_watcher` has
     // already replaced with `cfg` before calling here.
     sync_autostart_checks(app);
@@ -98,8 +102,9 @@ const COMPACT_MODE: ConfigCheck = ConfigCheck { handle: |h| &h.compact_mode, get
 const IDLE_AWAKE: ConfigCheck = ConfigCheck { handle: |h| &h.idle_awake, get: |c| c.idle_awake, set: |c, v| c.idle_awake = v };
 const CONTEXT_ALERT: ConfigCheck = ConfigCheck { handle: |h| &h.context_alert, get: |c| c.tray_context_alert_enabled, set: |c, v| c.tray_context_alert_enabled = v };
 const HIGH_ALERT: ConfigCheck = ConfigCheck { handle: |h| &h.high_alert, get: |c| c.high_alert, set: |c, v| c.high_alert = v };
+const GROUP_BY_HOST: ConfigCheck = ConfigCheck { handle: |h| &h.group_by_host, get: |c| c.group_by_host, set: |c, v| c.group_by_host = v };
 
-const CONFIG_CHECKS: [ConfigCheck; 7] = [ALWAYS_ON_TOP, SAVE_POSITION, TERMINAL_TITLES, COMPACT_MODE, IDLE_AWAKE, CONTEXT_ALERT, HIGH_ALERT];
+const CONFIG_CHECKS: [ConfigCheck; 8] = [ALWAYS_ON_TOP, SAVE_POSITION, TERMINAL_TITLES, COMPACT_MODE, IDLE_AWAKE, CONTEXT_ALERT, HIGH_ALERT, GROUP_BY_HOST];
 
 /// Write `value` into the check's config field, persist it, tick the tray item
 /// and tell the frontend. The tick is set here rather than left to
@@ -148,6 +153,9 @@ pub struct TrayHandles {
     pub tray_badge_7d_light: CheckMenuItem<Wry>,
     pub tray_badge_5h_num: CheckMenuItem<Wry>,
     pub tray_badge_7d_num: CheckMenuItem<Wry>,
+    pub sort_recent: CheckMenuItem<Wry>,
+    pub sort_name: CheckMenuItem<Wry>,
+    pub group_by_host: CheckMenuItem<Wry>,
     pub context_alert: CheckMenuItem<Wry>,
     pub high_alert: CheckMenuItem<Wry>,
     pub idle_awake: CheckMenuItem<Wry>,
@@ -256,6 +264,15 @@ pub fn setup(app: &AppHandle) -> tauri::Result<()> {
         .items(&[&tray_badge_none, &tray_badge_5h_light, &tray_badge_7d_light, &tray_badge_5h_num, &tray_badge_7d_num])
         .build()?;
 
+    let sort_recent = CheckMenuItem::with_id(app, MENU_SORT_RECENT, "Recent update", true, cfg_initial.session_sort == SessionSort::RecentUpdate, None::<&str>)?;
+    let sort_name = CheckMenuItem::with_id(app, MENU_SORT_NAME, "Name", true, cfg_initial.session_sort == SessionSort::Name, None::<&str>)?;
+    let group_by_host = CheckMenuItem::with_id(app, MENU_GROUP_BY_HOST, "Group by host", true, (GROUP_BY_HOST.get)(&cfg_initial), None::<&str>)?;
+    let sort_submenu = SubmenuBuilder::new(app, "Sort sessions")
+        .items(&[&sort_recent, &sort_name])
+        .separator()
+        .item(&group_by_host)
+        .build()?;
+
     // The lid-closed veto is macOS-only (it drives `pmset disablesleep`), so the
     // items exist everywhere but the submenu is only hung in the menu on macOS —
     // a dead entry on Windows would just be a puzzle.
@@ -326,6 +343,7 @@ pub fn setup(app: &AppHandle) -> tauri::Result<()> {
         &compact_mode,
         &autostart_submenu,
         &auto_resize_submenu,
+        &sort_submenu,
         &hist_font_submenu,
         &tray_badge_submenu,
     ];
@@ -366,6 +384,9 @@ pub fn setup(app: &AppHandle) -> tauri::Result<()> {
         tray_badge_7d_light: tray_badge_7d_light.clone(),
         tray_badge_5h_num: tray_badge_5h_num.clone(),
         tray_badge_7d_num: tray_badge_7d_num.clone(),
+        sort_recent: sort_recent.clone(),
+        sort_name: sort_name.clone(),
+        group_by_host: group_by_host.clone(),
         context_alert: context_alert.clone(),
         high_alert: high_alert.clone(),
         idle_awake: idle_awake.clone(),
@@ -448,6 +469,9 @@ fn handle_menu_event(app: &AppHandle, id: &str) {
         MENU_TRAY_BADGE_7D_LIGHT => select_tray_badge(app, TrayBadge::SevenDayLight),
         MENU_TRAY_BADGE_5H_NUM => select_tray_badge(app, TrayBadge::FiveHourNumber),
         MENU_TRAY_BADGE_7D_NUM => select_tray_badge(app, TrayBadge::SevenDayNumber),
+        MENU_SORT_RECENT => select_session_sort(app, SessionSort::RecentUpdate),
+        MENU_SORT_NAME => select_session_sort(app, SessionSort::Name),
+        MENU_GROUP_BY_HOST => toggle_group_by_host(app),
         MENU_IDLE_AWAKE => toggle_idle_awake(app),
         MENU_LID_AWAKE_OFF => select_lid_awake_mode(app, LidAwakeMode::Off),
         MENU_LID_AWAKE_START_NOW => start_lid_awake_now(app),
@@ -539,6 +563,31 @@ fn select_auto_resize_mode(app: &AppHandle, mode: AutoResize) {
         }
     }
     emit_config_updated(app);
+}
+
+fn select_session_sort(app: &AppHandle, order: SessionSort) {
+    let Some(state) = app.try_state::<ConfigState>() else { return };
+    if state.snapshot().session_sort != order {
+        state.with_mut(|c| c.session_sort = order);
+        let _ = state.save_to_disk();
+        emit_config_updated(app);
+        // The order is applied to the display snapshot, so the rows move only
+        // on an emit.
+        crate::commands::emit_sessions_updated_remote(app);
+    }
+    sync_session_sort_checks(app, order);
+}
+
+fn sync_session_sort_checks(app: &AppHandle, order: SessionSort) {
+    let Some(handles) = app.try_state::<TrayHandles>() else { return };
+    let _ = handles.sort_recent.set_checked(order == SessionSort::RecentUpdate);
+    let _ = handles.sort_name.set_checked(order == SessionSort::Name);
+}
+
+fn toggle_group_by_host(app: &AppHandle) {
+    if toggle_config_check(app, GROUP_BY_HOST) {
+        crate::commands::emit_sessions_updated_remote(app);
+    }
 }
 
 fn sync_auto_resize_checks(app: &AppHandle, mode: AutoResize) {

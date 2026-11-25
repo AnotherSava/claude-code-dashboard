@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::config::{Config, ConfigState};
+use crate::config::{Config, ConfigState, SessionSort};
 use crate::custom_names::CustomNamesStore;
 use crate::log_watcher::WatcherRegistry;
 use crate::membership::{Left, Members, Membership};
@@ -163,8 +163,35 @@ pub(crate) fn display_snapshot_versioned(app: &AppHandle) -> (u64, Vec<AgentSess
         s.row_line = s.row_line();
         s.task_lines = s.task_lines();
         s.dialog_messages = crate::state::dialog_messages(&s.dialog);
+        s.shown_name = s.shown_name().to_owned();
+    }
+    if let Some(cfg) = app.try_state::<ConfigState>().map(|c| c.snapshot()) {
+        sort_rows(&mut sessions, cfg.session_sort, cfg.group_by_host);
     }
     (seq, sessions)
+}
+
+/// Put the rows in the order the widget lists them. With `group_by_host` the
+/// local rows come first and each synced device's rows follow as a block, the
+/// blocks in device-name order; `order` then ranks the rows inside each block.
+/// Rows `order` cannot tell apart go local first, then by device name, then by
+/// the shown name and the id, so two rows never swap places between emits.
+///
+/// A synced row's `state_entered_at` is its origin's clock, so under
+/// `RecentUpdate` with rows mixed, a skewed peer clock shifts that device's
+/// rows by the skew.
+pub(crate) fn sort_rows(rows: &mut [AgentSession], order: SessionSort, group_by_host: bool) {
+    rows.sort_by_cached_key(|s| {
+        // `None` sorts first, which puts this machine's rows ahead of every
+        // device's.
+        let host = s.origin.as_ref().map(|d| d.to_lowercase());
+        let name = s.shown_name().to_lowercase();
+        let primary = match order {
+            SessionSort::RecentUpdate => (std::cmp::Reverse(s.state_entered_at), String::new()),
+            SessionSort::Name => (std::cmp::Reverse(0), name.clone()),
+        };
+        (group_by_host.then(|| host.clone()), primary, host, name, s.id.clone())
+    });
 }
 
 /// Mark the finished local rows the user has already looked at.
@@ -1558,6 +1585,53 @@ mod tests {
     }
 
     use crate::state::test_row as row;
+
+    fn sorted(rows: &[AgentSession], order: SessionSort, group_by_host: bool) -> Vec<String> {
+        let mut rows = rows.to_vec();
+        sort_rows(&mut rows, order, group_by_host);
+        rows.into_iter().map(|s| s.id).collect()
+    }
+
+    fn remote(device: &str, id: &str, state_entered_at: i64) -> AgentSession {
+        let mut s = row(&format!("{device}/{id}"), Status::Done, state_entered_at, None);
+        s.origin = Some(device.into());
+        s
+    }
+
+    #[test]
+    fn recent_update_puts_the_newest_status_change_first_across_machines() {
+        let rows = [row("old", Status::Done, 1_000, None), remote("AIR", "mid", 2_000), row("new", Status::Working, 3_000, None)];
+        assert_eq!(sorted(&rows, SessionSort::RecentUpdate, false), ["new", "AIR/mid", "old"]);
+    }
+
+    #[test]
+    fn name_sorts_by_the_shown_name_ignoring_case_and_the_device_prefix() {
+        let mut renamed = row("zzz", Status::Done, 0, None);
+        renamed.display_name = Some("Alpha".into());
+        let rows = [row("charlie", Status::Done, 0, None), remote("AIR", "bravo", 0), renamed];
+        assert_eq!(sorted(&rows, SessionSort::Name, false), ["zzz", "AIR/bravo", "charlie"]);
+    }
+
+    #[test]
+    fn grouping_by_host_puts_local_rows_first_and_devices_in_name_order() {
+        let rows = [remote("chrome", "a", 9_000), row("local-old", Status::Done, 1_000, None), remote("AIR", "b", 5_000), row("local-new", Status::Done, 2_000, None), remote("AIR", "c", 6_000)];
+        assert_eq!(sorted(&rows, SessionSort::RecentUpdate, true), ["local-new", "local-old", "AIR/c", "AIR/b", "chrome/a"]);
+        assert_eq!(sorted(&rows, SessionSort::Name, true), ["local-new", "local-old", "AIR/b", "AIR/c", "chrome/a"]);
+    }
+
+    #[test]
+    fn rows_the_order_cannot_tell_apart_go_local_first_then_by_device_name() {
+        let rows = [remote("chrome", "web", 1_000), remote("AIR", "web", 1_000), row("web", Status::Done, 1_000, None)];
+        assert_eq!(sorted(&rows, SessionSort::Name, false), ["web", "AIR/web", "chrome/web"]);
+        let rows = [remote("chrome", "a", 1_000), remote("AIR", "b", 1_000), row("c", Status::Done, 1_000, None)];
+        assert_eq!(sorted(&rows, SessionSort::RecentUpdate, false), ["c", "AIR/b", "chrome/a"]);
+    }
+
+    #[test]
+    fn equal_rows_keep_one_order_between_emits() {
+        let rows = [row("b", Status::Done, 1_000, None), row("a", Status::Done, 1_000, None)];
+        assert_eq!(sorted(&rows, SessionSort::RecentUpdate, false), ["a", "b"]);
+    }
 
     #[test]
     fn a_finished_row_reads_unread_until_it_is_read() {

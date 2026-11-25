@@ -639,6 +639,15 @@ pub struct AgentSession {
     /// [`row_line`](Self::row_line), for the same reasons.
     #[serde(default)]
     pub dialog_messages: Vec<DialogMessage>,
+    /// The name the widget row shows, the [`AgentSession::shown_name`]
+    /// verdict. The frontend draws it rather than deriving it, so the row and
+    /// `commands::sort_rows`, which orders by the same function, cannot
+    /// disagree about what the name is.
+    ///
+    /// Empty in `AppState` and stamped by `commands::display_snapshot` beside
+    /// [`row_line`](Self::row_line), for the same reasons.
+    #[serde(default)]
+    pub shown_name: String,
     /// The subagent permission prompts open on this row, and the main agent's
     /// own state underneath them. `None` whenever no subagent is waiting on a
     /// dialog, which is nearly always.
@@ -847,6 +856,14 @@ impl AgentSession {
     /// so this reads the chat_id anywhere that overlay hasn't been applied.
     pub fn display_label(&self) -> &str {
         self.display_name.as_deref().unwrap_or(&self.id)
+    }
+
+    /// The name the widget row shows: the custom name, else the id without
+    /// its device prefix, since a synced row's device chip already names the
+    /// machine. Unlike [`display_label`](Self::display_label), which keeps the
+    /// prefix because a notification carries no chip.
+    pub fn shown_name(&self) -> &str {
+        self.display_name.as_deref().unwrap_or_else(|| self.origin.as_deref().and_then(|d| crate::sync::raw_id(&self.id, d)).unwrap_or(&self.id))
     }
 
     /// What the row is about right now. For a row the user must act on
@@ -1679,6 +1696,7 @@ fn new_session(
         row_line: None,
         task_lines: Vec::new(),
         dialog_messages: Vec::new(),
+        shown_name: String::new(),
         subagent_gate: None,
     };
     (session, has_new_entry || dialog_restored)
@@ -3634,6 +3652,7 @@ why did this become the task?");
             row_line: None,
             task_lines: Vec::new(),
             dialog_messages: Vec::new(),
+            shown_name: String::new(),
             subagent_gate: None,
         });
     }
@@ -3914,6 +3933,7 @@ why did this become the task?");
             row_line: None,
             task_lines: Vec::new(),
             dialog_messages: Vec::new(),
+            shown_name: String::new(),
             subagent_gate: None,
         }
     }

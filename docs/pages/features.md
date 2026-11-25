@@ -50,6 +50,10 @@ Turn on the tray's **Compact view** toggle for a denser widget: each row drops i
 
 {% include figure.html id="compact-mode" alt="The widget in compact view — rows without prompts or timers, and the usage bars reduced to their percentage" %}
 
+## Session order
+
+The tray's **Sort sessions** submenu lists the rows either by their latest status change, newest first, or by name. Turn on **Group by host** there to keep this machine's sessions at the top, with each synced machine's sessions below them.
+
 ## Color terminal tabs
 
 Each session's status is mirrored onto the terminal tab it runs in, next to the session name — 🔵 working, ⏳ background work still running, ✋ blocked on you, 🟢 finished, ⚪ finished and read, ⚫ cleared, 🔴 error. The two finished glyphs are the same DONE state twice over: 🟢 marks the ones still waiting on you and ⚪ the ones you've been through — see [Finished, and not yet read](#finished-and-not-yet-read). Three of them deliberately don't mirror the widget's pill: a raised hand for blocked, because an orange and a red circle read too alike at tab size; an hourglass for background work, there being no light-blue circle; and black for a cleared session, there being no grey one. A glance at your terminal tabs shows which session needs attention, even without the widget on screen. The title updates the moment the status changes and clears when the session ends. On by default; the tray's **Color terminal tabs** toggle turns it off.

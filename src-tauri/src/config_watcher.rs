@@ -115,6 +115,11 @@ pub fn spawn(app: AppHandle, path: PathBuf) {
             if new_cfg.lid_awake_minutes != prior.lid_awake_minutes {
                 crate::tray::sync_lid_awake_title(&app, new_cfg.lid_awake_minutes);
             }
+            // The row order is applied to the display snapshot, so an edit to it
+            // shows only once the rows are emitted again.
+            if new_cfg.session_sort != prior.session_sort || new_cfg.group_by_host != prior.group_by_host {
+                crate::commands::emit_sessions_updated_remote(&app);
+            }
             apply_config_to_window(&app, &new_cfg, Some(&prior));
             crate::tray::sync_config_checks(&app, &new_cfg);
             // Re-render the tray badge in case `tray_badge` changed externally.

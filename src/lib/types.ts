@@ -75,6 +75,10 @@ export interface AgentSession {
   // wrote, read out of their envelopes there so the grammar has one parser.
   // Stamped by the Rust display path beside `row_line`.
   dialog_messages?: DialogMessage[]
+  // The name the row shows, decided by `AgentSession::shown_name` in Rust: the
+  // custom name, else the id without its device prefix. The Name sort orders by
+  // the same function. Stamped by the Rust display path beside `row_line`.
+  shown_name: string
 }
 
 export interface DialogMessage {

@@ -747,6 +747,7 @@ fn seed_dev_sessions(app: &tauri::AppHandle) {
                 row_line: None,
                 task_lines: Vec::new(),
                 dialog_messages: Vec::new(),
+                shown_name: String::new(),
                 subagent_gate: None,
                 terminal_stale_at: None,
             }],

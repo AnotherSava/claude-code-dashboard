@@ -76,11 +76,8 @@
 
   const HISTORY_VISIBLE = 4
 
-  // Remote ids arrive namespaced as "{origin}/{raw_id}"; the badge already
-  // carries the device, so an unnamed remote row shows just the raw id.
-  const displayName = $derived(
-    session.display_name ?? (session.origin ? session.id.slice(session.origin.length + 1) : session.id),
-  )
+  // Decided in Rust (`AgentSession::shown_name`), which the Name sort also orders by.
+  const displayName = $derived(session.shown_name)
 
   let editing = $state(false)
   let draft = $state('')

@@ -306,6 +306,18 @@ pub struct Config {
     /// `LimitBar`); toggled from the tray's **Compact view** checkbox. Off by
     /// default.
     pub compact_mode: bool,
+    /// The order of the widget's rows, applied by `commands::sort_rows` to the
+    /// display snapshot. Chosen from the tray's **Sort sessions** submenu.
+    ///
+    /// The default depends on how the binary was built ([`built_for_release`]):
+    /// `name` in a build you deployed, `recent_update` in the downloadable one.
+    pub session_sort: SessionSort,
+    /// List local rows first and the synced rows after them, grouped by the
+    /// device they came from in device-name order, each group in
+    /// `session_sort`'s order. Off mixes every row into one `session_sort`
+    /// order. The **Group by host** checkbox in the same submenu. Off by
+    /// default.
+    pub group_by_host: bool,
     /// Keep macOS awake while a local agent is working, so a turn running with
     /// the lid open isn't cut short by the idle-sleep timer. Held as an
     /// unprivileged IOKit power assertion — the one `caffeinate -i` takes — so
@@ -541,6 +553,17 @@ pub enum AutoResize {
     None,
     Up,
     Down,
+}
+
+/// The order of the widget's rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionSort {
+    /// Newest first by `state_entered_at`, so a row moves when its status
+    /// changes or a new task starts on it, never while it streams text.
+    RecentUpdate,
+    /// By the name the row shows, case-insensitively.
+    Name,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -825,6 +848,8 @@ impl Default for Config {
             high_alert: false,
             instruction_canary_enabled: false,
             compact_mode: false,
+            session_sort: if built_for_release() { SessionSort::RecentUpdate } else { SessionSort::Name },
+            group_by_host: false,
             idle_awake: true,
             idle_awake_silence_ms: Some(1_800_000),
             lid_awake_mode: LidAwakeMode::Off,
@@ -1148,6 +1173,14 @@ mod tests {
         assert!(!cfg(Some(7_200_000), Some(0)).hide_outlasts_close());
         assert!(!cfg(None, Some(60_000)).hide_outlasts_close(), "hide off");
         assert!(!cfg(Some(0), Some(60_000)).hide_outlasts_close());
+    }
+
+    #[test]
+    fn session_sort_defaults_by_build_and_parses() {
+        let expected = if built_for_release() { SessionSort::RecentUpdate } else { SessionSort::Name };
+        assert_eq!(Config::default().session_sort, expected);
+        let set: Config = serde_json::from_str(r#"{ "session_sort": "recent_update" }"#).unwrap();
+        assert_eq!(set.session_sort, SessionSort::RecentUpdate);
     }
 
     #[test]

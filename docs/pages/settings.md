@@ -27,6 +27,7 @@ Right-click the tray icon for the controls you reach for most.
 - **Compact view** — hide each row's current prompt and time-in-state, and collapse the usage bars down to their bare percentage.
 - **On system start** — launch at login: off, open the window, or start hidden in the tray.
 - **Auto resize** — fit the window height to its content, growing upward or downward. The widget owns its height while this is on, so dragging its top or bottom edge does nothing; the sides still resize the width.
+- **Sort sessions** — list the rows by their latest status change, newest first, or by name. **Group by host** puts this machine's sessions first and each synced machine's after them, machine by machine in name order.
 - **History font size** — pick one of five sizes for the history window.
 - **Tray usage badge** — show the 5-hour or 7-day usage on the tray icon, as the recolored traffic light or a number (or none).
 - **Keep awake while working** (macOS) — stop the Mac's idle timer sleeping it while an agent is still working (on by default). Holds off only the idle timer, so the screen still sleeps and closing the lid still works as usual. See [Features](features#keeping-the-mac-awake-while-an-agent-works).
@@ -52,6 +53,8 @@ Every field is optional — omit one and the built-in default applies. A complet
   "intensity_min_week_tokens": 1000000,
   "auto_resize": "none",
   "compact_mode": false,
+  "session_sort": "recent_update",
+  "group_by_host": false,
   "tray_badge": "none",
   "tray_context_alert_enabled": true,
   "tray_context_alert_percent": 80,
@@ -149,6 +152,11 @@ Set autostart through the tray's **On system start** submenu — it writes both 
 ### Compact view
 
 - `compact_mode` — hide each row's current prompt and time-in-state, and collapse the 5h/7d usage bars down to their bare percentage. Toggled from the tray's **Compact view** checkbox. Off by default. See [Features](features#compact-view).
+
+### Session order
+
+- `session_sort` — the order of the rows: `"recent_update"` puts the latest status change first, and `"name"` sorts by the name each row shows. A row moves when its status changes or a new task starts on it, not while its agent is writing. Set from the tray's **Sort sessions** submenu. Default `"name"` in a build you install from source, `"recent_update"` in the downloadable app.
+- `group_by_host` — list this machine's sessions first, then each synced machine's in machine-name order, each group in `session_sort`'s order. Off mixes every row into one list, where rows with the same name or the same status time go this machine's first, then by machine name. The **Group by host** checkbox in the same submenu. Off by default.
 
 ### Color terminal tabs
 
