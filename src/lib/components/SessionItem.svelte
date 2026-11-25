@@ -74,8 +74,6 @@
 
   let { session, config, now }: Props = $props()
 
-  const HISTORY_VISIBLE = 4
-
   // Decided in Rust (`AgentSession::shown_name`), which the Name sort also orders by.
   const displayName = $derived(session.shown_name)
 
@@ -202,9 +200,10 @@
   // hanging-indented second column. Older prompts on top, current on the
   // bottom, prefixed with an arrow marker. The tasks and their text come from
   // Rust (`AgentSession::task_lines`), not from the dialog, whose entry for a
-  // task another agent began is the whole envelope.
+  // task another agent began is the whole envelope. Rust also decides how many
+  // (`state::TOOLTIP_TASKS`), sending no more than the tooltip lists.
   const titleText = $derived.by(() => {
-    const visible = (session.task_lines ?? []).slice(-(HISTORY_VISIBLE + 1))
+    const visible = session.task_lines ?? []
     const lines: string[] = visible.map((t, i) => {
       // Current task gets the ▸ centered in a marker measured to the exact width
       // of the gap (MARKER.gap) the other rows fill, so its prompt text lines up

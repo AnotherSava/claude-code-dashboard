@@ -220,6 +220,21 @@ pub fn dialog_messages(dialog: &[DialogEntry]) -> Vec<DialogMessage> {
         .collect()
 }
 
+/// A value that changes whenever `dialog` gains, loses or rewrites an entry.
+/// An entry is rewritten in place as a reply streams and as a synced turn's
+/// reply is replaced, and each rewrite moves its timestamp or its text, so
+/// those two and the role are what the fingerprint covers.
+pub fn dialog_rev(dialog: &[DialogEntry]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    dialog.len().hash(&mut h);
+    for e in dialog {
+        (e.timestamp, e.role == DialogRole::User, e.role == DialogRole::Separator, e.text.len()).hash(&mut h);
+        e.text.as_bytes()[e.text.len().saturating_sub(64)..].hash(&mut h);
+    }
+    h.finish()
+}
+
 /// Built by the adapter, converted to a full [`DialogEntry`] by `apply_set`
 /// (which adds `timestamp` and `status`).
 #[derive(Clone, Debug)]
@@ -259,6 +274,10 @@ pub enum RowLine {
     /// The most recent task in the dialog, for a row with no current text.
     Past(String),
 }
+
+/// How many tasks the widget row's hover tooltip lists, the current one and
+/// those before it: [`AgentSession::task_lines`] returns no more.
+pub const TOOLTIP_TASKS: usize = 5;
 
 /// One task in the widget row's hover tooltip: when it began and the text it
 /// shows as.
@@ -626,19 +645,22 @@ pub struct AgentSession {
     /// over the task line that shows the sender's task instead.
     ///
     /// Empty in `AppState` and stamped by `commands::display_snapshot` beside
-    /// [`row_line`](Self::row_line), for the same reasons.
+    /// [`row_line`](Self::row_line), for the same reasons, holding at most
+    /// [`TOOLTIP_TASKS`].
     #[serde(default)]
     pub task_lines: Vec<TaskLine>,
-    /// The dialog's prompts that another agent wrote, read out of their
-    /// envelopes, the [`dialog_messages`] verdict over `dialog`. The history
-    /// window shows each as its sender and body, the routing text hidden, and
-    /// reads it here because the envelope grammar lives in `peer_message` and a
-    /// second parser in TypeScript would drift from it.
+    /// A fingerprint of [`dialog`](Self::dialog), the [`dialog_rev`] of it.
+    /// The frontend's rows leave the dialog out, since every row's whole
+    /// conversation in every `sessions_updated` emit came to about 10MB a
+    /// payload, which WebKit held per webview until delivery and which grew the
+    /// app to 25GB over a day on 2026-11-25. The history window reads this
+    /// instead and fetches the one dialog it shows through
+    /// `commands::get_dialog` when it moves.
     ///
-    /// Empty in `AppState` and stamped by `commands::display_snapshot` beside
-    /// [`row_line`](Self::row_line), for the same reasons.
+    /// Zero in `AppState` and stamped by `commands::for_frontend`, the step
+    /// that also empties `dialog`, so nothing else reads a value here.
     #[serde(default)]
-    pub dialog_messages: Vec<DialogMessage>,
+    pub dialog_rev: u64,
     /// The name the widget row shows, the [`AgentSession::shown_name`]
     /// verdict. The frontend draws it rather than deriving it, so the row and
     /// `commands::sort_rows`, which orders by the same function, cannot
@@ -961,13 +983,19 @@ impl AgentSession {
     /// The current task is the entry whose prompt `original_prompt` holds,
     /// compared as `clean_prompt` stored it; an older message of identical text
     /// would read the same either way.
+    ///
+    /// Only the newest [`TOOLTIP_TASKS`] are returned, since the tooltip draws no
+    /// more and the list rides every `sessions_updated` emit: a row's whole
+    /// prompt history, which no dialog trim bounds, was 700KB on one row.
     pub fn task_lines(&self) -> Vec<TaskLine> {
         let current = |e: &DialogEntry| self.original_prompt.as_deref() == Some(crate::adapters::claude::clean_prompt(&e.text).as_str());
         let text = |e: &DialogEntry| match crate::peer_message::parse_agent_message(&e.text) {
             Some(_) if current(e) => self.shown_task().map(Cow::into_owned),
             _ => crate::prompt_origin::shown(&e.text).map(Cow::into_owned),
         };
-        self.dialog.iter().filter(|e| e.task_start).filter_map(|e| text(e).filter(|t| !t.trim().is_empty()).map(|text| TaskLine { at: e.timestamp, text })).collect()
+        let mut lines: Vec<TaskLine> = self.dialog.iter().rev().filter(|e| e.task_start).filter_map(|e| text(e).filter(|t| !t.trim().is_empty()).map(|text| TaskLine { at: e.timestamp, text })).take(TOOLTIP_TASKS).collect();
+        lines.reverse();
+        lines
     }
 
     /// The moment this row last produced something the user may not have seen:
@@ -1281,6 +1309,15 @@ impl AppState {
     /// merge in `commands::resolved_snapshot`.
     pub fn remote_snapshot(&self) -> Vec<AgentSession> {
         self.remote.lock().unwrap().values().flat_map(|d| d.sessions.iter().cloned()).collect()
+    }
+
+    /// One row's dialog, local or synced, for the history window, which is
+    /// the one reader that needs a whole conversation.
+    pub fn dialog_of(&self, id: &str) -> Option<Vec<DialogEntry>> {
+        if let Some(s) = self.sessions.lock().unwrap().iter().find(|s| s.id == id) {
+            return Some(s.dialog.clone());
+        }
+        self.remote.lock().unwrap().values().flat_map(|d| d.sessions.iter()).find(|s| s.id == id).map(|s| s.dialog.clone())
     }
 
     /// Device name → the receiver-clock ms of that device's last push. Exists
@@ -1695,7 +1732,7 @@ fn new_session(
         name_shared_by: None,
         row_line: None,
         task_lines: Vec::new(),
-        dialog_messages: Vec::new(),
+        dialog_rev: 0,
         shown_name: String::new(),
         subagent_gate: None,
     };
@@ -3651,7 +3688,7 @@ why did this become the task?");
             name_shared_by: None,
             row_line: None,
             task_lines: Vec::new(),
-            dialog_messages: Vec::new(),
+            dialog_rev: 0,
             shown_name: String::new(),
             subagent_gate: None,
         });
@@ -3932,7 +3969,7 @@ why did this become the task?");
             name_shared_by: None,
             row_line: None,
             task_lines: Vec::new(),
-            dialog_messages: Vec::new(),
+            dialog_rev: 0,
             shown_name: String::new(),
             subagent_gate: None,
         }
@@ -4297,6 +4334,21 @@ why did this become the task?");
         s
     }
 
+    #[test]
+    fn dialog_rev_moves_on_every_change_the_history_window_must_show() {
+        let mut d = vec![entry(DialogRole::User, "go", true), entry(DialogRole::Assistant, "partial", false)];
+        let first = dialog_rev(&d);
+        assert_eq!(dialog_rev(&d.clone()), first, "the same dialog reads the same");
+        d[1].text.push_str(" reply");
+        let streamed = dialog_rev(&d);
+        assert_ne!(streamed, first, "a reply rewritten in place, timestamp unchanged");
+        d[1].timestamp += 1;
+        assert_ne!(dialog_rev(&d), streamed, "a rewrite that moves only the timestamp");
+        let before = dialog_rev(&d);
+        d.push(entry(DialogRole::User, "next", true));
+        assert_ne!(dialog_rev(&d), before, "an appended entry");
+    }
+
     fn entry(role: DialogRole, text: &str, task_start: bool) -> DialogEntry {
         DialogEntry { role, text: text.to_string(), timestamp: 0, status: Status::Done, task_start, boundary: None }
     }
@@ -4549,6 +4601,17 @@ an older request
         s.delegated_task = None;
         s.message_line = Some("placeholder message".into());
         assert_eq!(s.task_lines()[2].text, "placeholder message", "an unresolved sender's message shows its line, as the task line does");
+    }
+
+    /// The tooltip's tasks ride every emit, so only the newest the tooltip
+    /// lists are sent, in order, with a blank prompt not taking a place.
+    #[test]
+    fn the_tooltip_tasks_are_the_newest_it_lists() {
+        let mut dialog: Vec<DialogEntry> = (0..8).map(|i| user_entry(&format!("task {i}"), i)).collect();
+        dialog.push(user_entry("   ", 8));
+        let s = row(Status::Done, "", None, dialog);
+        let texts: Vec<String> = s.task_lines().into_iter().map(|t| t.text).collect();
+        assert_eq!(texts, (8 - TOOLTIP_TASKS..8).map(|i| format!("task {i}")).collect::<Vec<_>>());
     }
 
     #[test]

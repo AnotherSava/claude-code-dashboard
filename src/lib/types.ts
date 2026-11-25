@@ -18,7 +18,6 @@ export interface DialogEntry {
 export interface AgentSession {
   id: string
   status: Status
-  dialog: DialogEntry[]
   source: string
   model: string | null
   input_tokens: number | null
@@ -69,12 +68,12 @@ export interface AgentSession {
   // The row's tasks as its hover tooltip lists them, oldest first, decided by
   // `AgentSession::task_lines` in Rust: a task another agent began reads as the
   // task line does, never as the envelope its dialog entry holds. Stamped by the
-  // Rust display path beside `row_line`.
+  // Rust display path beside `row_line`, the newest `state::TOOLTIP_TASKS` only.
   task_lines?: TaskLine[]
-  // `AgentSession::dialog_messages` in Rust: the dialog's prompts another agent
-  // wrote, read out of their envelopes there so the grammar has one parser.
-  // Stamped by the Rust display path beside `row_line`.
-  dialog_messages?: DialogMessage[]
+  // A fingerprint of the row's dialog, which rows arrive without: a whole
+  // conversation per row in every emit is what WebKit held in memory. The
+  // history window fetches the dialog it shows (`getDialog`) when this moves.
+  dialog_rev: number
   // The name the row shows, decided by `AgentSession::shown_name` in Rust: the
   // custom name, else the id without its device prefix. The Name sort orders by
   // the same function. Stamped by the Rust display path beside `row_line`.
@@ -88,7 +87,7 @@ export interface DialogMessage {
   body: string
 }
 
-export interface PersistedDialog {
+export interface HistoryDialog {
   dialog: DialogEntry[]
   messages: DialogMessage[]
 }

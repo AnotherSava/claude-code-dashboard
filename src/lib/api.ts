@@ -1,7 +1,7 @@
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow'
-import type { AgentSession, Config, PersistedDialog, SetupState, TokenWeekChart, UsageLimits } from './types'
+import type { AgentSession, Config, HistoryDialog, SetupState, TokenWeekChart, UsageLimits } from './types'
 
 export function getSessions(): Promise<AgentSession[]> {
   return invoke<AgentSession[]>('get_sessions')
@@ -181,10 +181,11 @@ export function onHistoryLoading(
   return listen<{ id: string; loading: boolean }>('history_loading', (evt) => handler(evt.payload))
 }
 
-// The stored dialog for a session with no live row. A row can be absent for a
-// conversation that is complete on disk — a session the restore could not vouch
-// for, one on a platform with no terminal adapter, or simply one that has ended —
-// and without this the history window would have nothing to show for any of them.
-export function getPersistedDialog(id: string): Promise<PersistedDialog> {
-  return invoke<PersistedDialog>('get_persisted_dialog', { id })
+// The dialog the history window shows for one session: the live row's, local or
+// synced, else the stored copy. A row can be absent for a conversation that is
+// complete on disk — a session the restore could not vouch for, one on a platform
+// with no terminal adapter, or simply one that has ended — and the stored copy is
+// what the window shows for those.
+export function getDialog(id: string): Promise<HistoryDialog> {
+  return invoke<HistoryDialog>('get_dialog', { id })
 }

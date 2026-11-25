@@ -2124,8 +2124,9 @@ fn insert_in_timestamp_order(dialog: &mut Vec<DialogEntry>, entry: DialogEntry) 
 /// the result — but only where the merge changed something.
 ///
 /// Both pull paths end this way, and the guard is why they have to: the device
-/// file is rewritten whole and the emit carries every dialog on it, while a
-/// range already held is the ordinary outcome. The catch-up asks for the entire
+/// file is rewritten whole and the emit moves the row's `dialog_rev`, which an
+/// open history window answers by refetching the dialog, while a range already
+/// held is the ordinary outcome. The catch-up asks for the entire
 /// dialog every time a history window opens a remote row, so without this each
 /// open rewrites megabytes to say nothing changed.
 ///
@@ -2351,7 +2352,7 @@ mod tests {
             name_shared_by: None,
             row_line: None,
             task_lines: Vec::new(),
-            dialog_messages: Vec::new(),
+            dialog_rev: 0,
             shown_name: String::new(),
             subagent_gate: None,
             terminal_stale_at: None,

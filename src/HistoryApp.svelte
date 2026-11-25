@@ -2,8 +2,8 @@
   import { onMount } from 'svelte'
   import { invoke } from '@tauri-apps/api/core'
   import { listen, type UnlistenFn } from '@tauri-apps/api/event'
-  import { closeWindow, getConfig, getPersistedDialog, getSessions, onConfigUpdated, onHistoryLoading, onSessionsUpdated, setHistoryFontSize } from './lib/api'
-  import type { AgentSession, DialogEntry, DialogMessage, HistoryFontSize, PersistedDialog } from './lib/types'
+  import { closeWindow, getConfig, getDialog, getSessions, onConfigUpdated, onHistoryLoading, onSessionsUpdated, setHistoryFontSize } from './lib/api'
+  import type { DialogEntry, DialogMessage, HistoryDialog, HistoryFontSize } from './lib/types'
 
   const SIZE_ORDER: HistoryFontSize[] = ['smallest', 'small', 'regular', 'large', 'largest']
   const SIZE_PX: Record<HistoryFontSize, number> = { smallest: 11, small: 12, regular: 14, large: 16, largest: 18 }
@@ -139,11 +139,12 @@
   }
 
   let sessionId = $state<string | null>(null)
-  let session = $state<AgentSession | null>(null)
-  const NO_PERSISTED: PersistedDialog = { dialog: [], messages: [] }
-  // The stored dialog, used only when no live row exists for this id. Cleared
-  // the moment one does, so a live session is never rendered from a stale copy.
-  let persisted = $state<PersistedDialog>(NO_PERSISTED)
+  // The dialog shown, fetched whole for this one session: rows arrive without
+  // theirs. `null` until the first fetch for the current id lands.
+  let history = $state<HistoryDialog | null>(null)
+  // What the dialog was last fetched against: the row's `dialog_rev`, or null
+  // once the row is gone and the stored copy is what is shown.
+  let fetchedRev: number | null | undefined
   let fontSize = $state<HistoryFontSize>('regular')
   let error = $state<string | null>(null)
   // Session id whose remote-dialog catch-up fetch is in flight (see
@@ -156,23 +157,29 @@
   let unlistenConfig: (() => void) | undefined
   let unlistenTarget: UnlistenFn | undefined
   let unlistenLoading: UnlistenFn | undefined
+  let unlistenHidden: UnlistenFn | undefined
+
+  async function fetchDialog(id: string, rev: number | null) {
+    fetchedRev = rev
+    try {
+      const d = await getDialog(id)
+      if (sessionId !== id) return
+      history = d
+      // No row and nothing stored: the session has gone and left nothing to show.
+      error = rev === null && d.dialog.length === 0 ? `session "${id}" not found` : null
+    } catch (e) {
+      error = String(e)
+    }
+  }
 
   async function loadSession(id: string) {
     sessionId = id
+    history = null
     error = null
     expanded = new Set()
     try {
-      const sessions = await getSessions()
-      session = sessions.find((s) => s.id === id) ?? null
-      if (!session) {
-        // No live row. That is not the same as no history: rows are rebuilt from
-        // the hook stream, so every conversation is unreadable after a restart
-        // until its session next acts — while the dialog sits complete on disk.
-        persisted = await getPersistedDialog(id)
-        error = persisted.dialog.length ? null : `session "${id}" not found`
-      } else {
-        persisted = NO_PERSISTED
-      }
+      const row = (await getSessions()).find((s) => s.id === id)
+      await fetchDialog(id, row ? row.dialog_rev : null)
     } catch (e) {
       error = String(e)
     }
@@ -187,29 +194,25 @@
         loadSession(evt.payload)
       })
 
+      // A hidden window follows no row: without this every reply streaming into
+      // the row last shown would refetch its whole dialog for nobody. The next
+      // open sends `history_target` again.
+      unlistenHidden = await listen('history_hidden', () => {
+        sessionId = null
+        history = null
+        fetchedRev = undefined
+        error = null
+      })
+
       const cfg = await getConfig()
       fontSize = cfg.history_font_size
 
       unlistenSessions = await onSessionsUpdated((s) => {
         if (!sessionId) return
-        const found = s.find((x) => x.id === sessionId) ?? null
-        session = found
         // A row disappearing (the session ended, or the app restarted) must not
-        // take the conversation with it — fall back to what was persisted, and
-        // only call it gone when there is nothing stored either.
-        if (!found) {
-          // Resolve first, decide after. Setting the error up front and clearing
-          // it when the fetch lands would flash "session removed" over a
-          // conversation that was never gone.
-          if (persisted.dialog.length === 0) {
-            getPersistedDialog(sessionId).then((d) => {
-              persisted = d
-              if (d.dialog.length === 0) error = 'session removed'
-            })
-          }
-        } else {
-          persisted = NO_PERSISTED
-        }
+        // take the conversation with it: the fetch falls back to what was stored.
+        const rev = s.find((x) => x.id === sessionId)?.dialog_rev ?? null
+        if (rev !== fetchedRev) fetchDialog(sessionId, rev)
       })
 
       unlistenConfig = await onConfigUpdated((c) => { fontSize = c.history_font_size })
@@ -222,6 +225,7 @@
 
     return () => {
       unlistenTarget?.()
+      unlistenHidden?.()
       unlistenSessions?.()
       unlistenConfig?.()
       unlistenLoading?.()
@@ -249,9 +253,9 @@
   }
 
   function deduplicatedDialog(): ShownEntry[] {
-    if (!session && persisted.dialog.length === 0) return []
-    const d = session ? session.dialog : persisted.dialog
-    const messages = new Map((session ? session.dialog_messages ?? [] : persisted.messages).map((m) => [m.index, m]))
+    if (!history) return []
+    const d = history.dialog
+    const messages = new Map(history.messages.map((m) => [m.index, m]))
     const shown: ShownEntry[] = []
     d.forEach((entry, i) => {
       const next = d[i + 1]
@@ -297,7 +301,7 @@
 
 {#if error}
   <div class="msg">{error}</div>
-{:else if session || persisted.dialog.length > 0}
+{:else if history}
   {#if catchingUp && dialog.length > 0}
     <div class="loading-banner">Loading full history...</div>
   {/if}

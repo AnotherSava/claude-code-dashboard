@@ -200,7 +200,7 @@ pub fn run() {
             commands::open_about,
             commands::set_window_size,
             commands::set_compact_width,
-            commands::get_persisted_dialog,
+            commands::get_dialog,
         ])
         .setup(|app| {
             // Runs at `RunEvent::Ready`, AFTER the webviews exist — so it does
@@ -746,7 +746,7 @@ fn seed_dev_sessions(app: &tauri::AppHandle) {
                 name_shared_by: None,
                 row_line: None,
                 task_lines: Vec::new(),
-                dialog_messages: Vec::new(),
+                dialog_rev: 0,
                 shown_name: String::new(),
                 subagent_gate: None,
                 terminal_stale_at: None,

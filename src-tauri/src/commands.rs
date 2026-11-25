@@ -162,7 +162,6 @@ pub(crate) fn display_snapshot_versioned(app: &AppHandle) -> (u64, Vec<AgentSess
     for s in sessions.iter_mut() {
         s.row_line = s.row_line();
         s.task_lines = s.task_lines();
-        s.dialog_messages = crate::state::dialog_messages(&s.dialog);
         s.shown_name = s.shown_name().to_owned();
     }
     if let Some(cfg) = app.try_state::<ConfigState>().map(|c| c.snapshot()) {
@@ -262,7 +261,21 @@ fn forget_read(sessions: &mut [AgentSession]) {
 
 #[tauri::command]
 pub fn get_sessions(app: AppHandle) -> Vec<AgentSession> {
-    display_snapshot(&app)
+    let mut sessions = display_snapshot(&app);
+    for_frontend(&mut sessions);
+    sessions
+}
+
+/// Reduce rows to what the frontend's row list carries: each dialog swapped for
+/// its [`dialog_rev`](crate::state::dialog_rev), since the widget draws none of
+/// it and the history window fetches the one it shows through [`get_dialog`].
+/// Shared by `get_sessions` and `publish_sessions`, the two ways rows reach a
+/// webview.
+fn for_frontend(sessions: &mut [AgentSession]) {
+    for s in sessions.iter_mut() {
+        s.dialog_rev = crate::state::dialog_rev(&s.dialog);
+        s.dialog = Vec::new();
+    }
 }
 
 #[tauri::command]
@@ -1378,7 +1391,8 @@ pub fn emit_sessions_updated_remote(app: &AppHandle) {
 
 /// Send the frontend a `sessions_updated` payload. The one place that event is
 /// emitted, so every emit carries the ticket `onSessionsUpdated` orders on.
-fn publish_sessions(app: &AppHandle, seq: u64, sessions: Vec<AgentSession>) {
+fn publish_sessions(app: &AppHandle, seq: u64, mut sessions: Vec<AgentSession>) {
+    for_frontend(&mut sessions);
     let _ = app.emit("sessions_updated", SessionsUpdate { seq, sessions });
 }
 
@@ -1458,36 +1472,22 @@ pub fn reveal_main(app: &AppHandle) {
     }
 }
 
-/// The stored dialog for `id`, for a history window with no live row to read.
-///
-/// This is the *conversation*, asked for by id — a different question from what
-/// is running, and one that asserts no liveness at all. Without it the two shared
-/// one answer, and every project's history became unreadable after a restart
-/// until that session happened to act again, the data being complete on disk the
-/// whole time.
-///
-/// It stayed the only thing a restart could recover for as long as the dashboard
-/// could not tell a closed session from an idle one. `session_restore` can now,
-/// so rows do come back — but only for the sessions two independent sources
-/// vouch for, and only carrying a status one of them was holding for us. This
-/// fallback is unchanged by that and still needed: the history window can be
-/// opened on a chat_id with no row at all.
-///
-/// The live snapshot still wins when it has the row (see `HistoryApp`): a live
-/// session's dialog is ahead of what has been persisted, because the watcher
-/// upserts the assistant's reply into the row before it is written out. This is
-/// the fallback, not the source.
+/// One row's dialog for the history window: the live row's, local or synced,
+/// else what `prompt_history.json` holds, so a conversation stays readable after
+/// its row is gone. A live dialog wins because it is ahead of the stored one:
+/// the watcher upserts the reply into the row before it is written out.
 #[tauri::command]
-pub fn get_persisted_dialog(id: String, app: AppHandle) -> PersistedDialog {
-    let dialog = app.try_state::<PromptHistoryStore>().and_then(|store| store.get(&id)).map(|s| s.dialog).unwrap_or_default();
+pub fn get_dialog(id: String, app: AppHandle) -> HistoryDialog {
+    let live = app.try_state::<AppState>().and_then(|state| state.dialog_of(&id));
+    let dialog = live.or_else(|| app.try_state::<PromptHistoryStore>().and_then(|store| store.get(&id)).map(|s| s.dialog)).unwrap_or_default();
     let messages = crate::state::dialog_messages(&dialog);
-    PersistedDialog { dialog, messages }
+    HistoryDialog { dialog, messages }
 }
 
-/// A row's stored dialog for the history window, with its agent messages read
-/// out as a live row's are on `AgentSession::dialog_messages`.
+/// A row's dialog for the history window, with the prompts another agent wrote
+/// read out of their envelopes, so the envelope grammar has no TypeScript copy.
 #[derive(serde::Serialize)]
-pub struct PersistedDialog {
+pub struct HistoryDialog {
     dialog: Vec<crate::state::DialogEntry>,
     messages: Vec<crate::state::DialogMessage>,
 }
