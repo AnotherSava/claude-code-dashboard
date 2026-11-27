@@ -129,6 +129,7 @@ use crate::commands::now_ms;
 use crate::config::ConfigState;
 use crate::session_registry::{Activity, LiveSession, RecordKey, SessionRegistry};
 use crate::state::{AppState, SetInput, Status};
+use crate::terminal_title::Glyph;
 use crate::terminals::TerminalSession;
 
 /// How long to wait between attempts while the terminal or the registry is still
@@ -484,7 +485,15 @@ fn title_status(chat_id: &str, tabs: &[TerminalSession], derive: &dyn Fn(&str) -
         if reading.remote {
             continue;
         }
-        let seen = (reading.status, reading.read);
+        let seen = match reading.glyph {
+            Glyph::Status { status, read } => (status, read),
+            // A controlled session's tab names no status. `Working` is the one
+            // reading `restored_status` never takes at its word: it survives only
+            // where the registry reports a turn running and otherwise settles to
+            // `Done`, the sink that claims nothing, so the registry decides. The
+            // row comes back controlled from the persisted mark either way.
+            Glyph::Controlled => (Status::Working, false),
+        };
         match found {
             Some(prev) if prev != seen => return None,
             _ => found = Some(seen),
@@ -903,6 +912,17 @@ mod tests {
         let out = planned(&[live("dash", Activity::Idle, Some(10))], &[tab("/p/dash", Some(&badged)), tab("/p/dash", Some("⚪ dash"))], &[]);
         assert_eq!(out.len(), 1);
         assert!(out[0].read, "the local tab is the only reading, and it stands");
+    }
+
+    #[test]
+    fn a_controlled_tab_restores_from_what_the_registry_reports() {
+        // The tab names no status, so the registry decides: a turn running stays
+        // `Working`, anything else settles to the claim-free `Done`, unread.
+        let title = format!("{} dash", crate::terminal_title::CONTROLLED_GLYPH);
+        let busy = planned(&[live("dash", Activity::Busy, Some(10))], &[tab("/p/dash", Some(&title))], &[]);
+        assert_eq!((busy[0].status, busy[0].read), (Status::Working, false));
+        let idle = planned(&[live("dash", Activity::Idle, Some(10))], &[tab("/p/dash", Some(&title))], &[]);
+        assert_eq!((idle[0].status, idle[0].read), (Status::Done, false));
     }
 
     #[test]

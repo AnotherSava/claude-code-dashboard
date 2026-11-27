@@ -430,6 +430,15 @@ impl SessionRegistry {
         sender_record(Self::refresh(&mut cached, now)?, inbox, name).ok().map(|r| r.cwd.clone())
     }
 
+    /// The process of the live session whose record carries `session_id`, of
+    /// any kind: `Some(None)` where no live record carries it, `None` where the
+    /// registry could not be read. What `session_control` ties a mark to, since
+    /// the id moves on a `/clear` and the process does not.
+    pub fn pid_of_session(&self, session_id: &str, now: i64) -> Option<Option<u32>> {
+        let mut cached = self.cached.lock().unwrap();
+        Self::refresh(&mut cached, now).map(|recs| recs.iter().find(|r| r.session_id.as_deref() == Some(session_id)).map(|r| r.pid))
+    }
+
     /// Drop the cache, so the next read re-scans.
     ///
     /// Needed by exactly one caller: the poll that waits for a session

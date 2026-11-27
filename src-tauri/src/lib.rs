@@ -31,6 +31,7 @@ mod remote_history;
 mod remote_tokens;
 mod remote_usage;
 mod session_command;
+mod session_control;
 mod session_launcher;
 mod session_leftovers;
 mod session_registry;
@@ -487,6 +488,9 @@ pub fn run() {
     app.manage(dev_servers::DevServers::new(
         app_data.join(dev_servers::FILE_NAME),
     ));
+    app.manage(session_control::ControlMarks::new(
+        app_data.join(session_control::FILE_NAME),
+    ));
     app.manage(std::sync::Arc::new(workspace_memory::WorkspaceMemory::new(
         app_data.join(workspace_memory::FILE_NAME),
     )));
@@ -744,6 +748,7 @@ fn seed_dev_sessions(app: &tauri::AppHandle) {
                 clean_claim_at: None,
                 read: false,
                 name_shared_by: None,
+                controlled: false,
                 row_line: None,
                 task_lines: Vec::new(),
                 dialog_rev: 0,

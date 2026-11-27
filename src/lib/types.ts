@@ -52,6 +52,11 @@ export interface AgentSession {
   // the tab is not. The instant is here rather than a bool because the Telegram
   // alert waits it out; the badge only cares that it is set. Windows only.
   terminal_stale_at?: number | null
+  // Whether another agent (the shepherd) is running this session and reading its
+  // results. The pill reads HERD instead of the status and the notifier stays
+  // quiet; the status underneath keeps moving and is what shows on release.
+  // Stamped in Rust for local rows; a synced row carries its machine's value.
+  controlled?: boolean
   // Whether this finished row has already been looked at. DONE covers both
   // halves now, so the pill reads the same either way and only its shade
   // differs. Decided entirely in Rust, by whichever machine ran the session: a

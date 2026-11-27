@@ -100,13 +100,14 @@ Under the repo root `claude-code-dashboard/`:
     - `config_watcher.rs` — notify watcher for config.json hot-reload
     - `commands.rs` — Tauri commands + event emitters
     - `setup.rs` — embedded Python hook + settings.json snippet builder for onboarding
-    - `http_server.rs` — the loopback axum server: `/api/event`, `/api/agents`, `/api/message`, `/api/window`, `/api/session-clean`, `/api/project/rename`, `/api/session/open`, `/api/session/command`, `/api/session/tabs`, `/api/dev-server`
+    - `http_server.rs` — the loopback axum server: `/api/event`, `/api/agents`, `/api/message`, `/api/window`, `/api/session-clean`, `/api/project/rename`, `/api/session/open`, `/api/session/command`, `/api/session/control`, `/api/session/tabs`, `/api/dev-server`
     - `sync.rs` — multi-device session sync: source- and token-gated listener, metadata push, receiver-driven pulls
     - `tailnet.rs` — asking Tailscale which machine a connection came from, instead of trusting its envelope, and removing the tailnet front of a dev server that has stopped
     - `subprocess.rs` — running a helper program to a deadline, with no console window on Windows
     - `peer_message.rs` — relaying one message to an agent on another machine, and the honesty rules around it
     - `session_launcher.rs` — starting a terminal session for a project that has none, for a relayed message or for the local picker (`integrations/pick-local-session.py`, through `POST /api/session/open`); it names no terminal, asking the platform's `terminals::TerminalAdapter` to launch the session (agterm's adapter on macOS, its workspace placement included), so a launcher for another terminal is that terminal's adapter implementing `launch`
     - `session_command.rs` — which local session `POST /api/session/command` types an allowlisted built-in command (`/clear`, `/exit`) into, found by the same title join the idle close uses, and every refusal before the terminal is touched; the typing is the adapter's `type_command`
+    - `session_control.rs` — the rows `POST /api/session/control` marks as run by another agent, kept in `controlled_sessions.json` and tied to that agent's process: a marked row shows 🐑 on its tab and HERD in the widget, and sends no per-state notifications
     - `dev_servers.rs` — announced dev servers, checked until they stop answering, when their tailnet front is removed, and shown on the agterm session they were started from, or on the other machine's `⇄` tab for their row through the sync push, in `dev_servers.json`
     - `workspace_memory.rs` — the agterm window and workspace each project's agent was last seen in, so a started session opens there, in `agterm_workspaces.json`
     - `session_restore.rs` — giving a live session its row back after a restart

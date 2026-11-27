@@ -45,6 +45,7 @@ pub async fn run(app: AppHandle, port: u16) {
         .route("/api/project/rename", post(post_project_rename))
         .route("/api/session/open", post(post_session_open))
         .route("/api/session/command", post(post_session_command))
+        .route("/api/session/control", post(post_session_control).get(get_session_control))
         .route("/api/session/tabs", get(get_session_tabs))
         .route("/api/dev-server", post(post_dev_server).get(get_dev_server))
         .with_state(app);
@@ -286,6 +287,110 @@ async fn post_session_command(State(app): State<AppHandle>, headers: HeaderMap, 
         Ok(Err(r)) => refuse(&row, text, r),
         Err(e) => refuse(&row, text, session_command::Refusal::Typing(format!("the typing task failed: {e}"))),
     }
+}
+
+/// What `POST /api/session/control` is told: a project folder, the agent taking
+/// or giving up the session working in it, and which.
+#[derive(Deserialize)]
+struct ControlRequest {
+    dir: String,
+    /// The controller's own Claude Code session (`CLAUDE_CODE_SESSION_ID`),
+    /// resolved to its process when a mark is set. Not needed to release.
+    #[serde(default)]
+    controller_session: String,
+    controlled: bool,
+}
+
+/// Mark the row `dir` derives as run by another agent, or release it (see
+/// [`crate::session_control`]). Setting answers `outcome` of `controlled` or
+/// `renewed` (a repeat, which restarts the expiry) with the `row` and
+/// `expires_ms`; it is refused `controller_not_live` where no live Claude Code
+/// session carries `controller_session`, since a mark is tied to that process.
+/// Releasing answers `released` or `not_controlled`, whoever set the mark. A
+/// mark may name a row that does not exist yet, for a session the controller
+/// is starting. Loopback `Host` required, like every route a local script
+/// calls.
+async fn post_session_control(State(app): State<AppHandle>, headers: HeaderMap, Json(req): Json<ControlRequest>) -> Response {
+    use crate::session_control::{log_ended, ControlMarks, Mark};
+    if let Some(detail) = csrf_refusal(&headers, true) {
+        return csrf_refused(detail).into_response();
+    }
+    let refuse = |status: StatusCode, row: &str, reason: &str, detail: &str| {
+        tracing::info!(chat_id = %row, decision = "session_control", outcome = "refused", reason, detail, "session control refused");
+        (status, Json(serde_json::json!({"outcome": "refused", "row": row, "reason": reason, "detail": detail}))).into_response()
+    };
+    let dir = req.dir.trim().to_string();
+    if dir.is_empty() {
+        return refuse(StatusCode::BAD_REQUEST, "", "bad_request", "a project folder is required");
+    }
+    let root = app.try_state::<ConfigState>().and_then(|c| c.snapshot().projects_root);
+    let row = adapters::claude::derive_chat_id(Some(&dir), root.as_deref());
+    if app.try_state::<ControlMarks>().is_none() {
+        return refuse(StatusCode::SERVICE_UNAVAILABLE, &row, "state_unavailable", "the dashboard is still starting");
+    }
+    let controller = req.controller_session.trim().to_string();
+    if req.controlled && controller.is_empty() {
+        return refuse(StatusCode::BAD_REQUEST, &row, "bad_request", "controller_session is required to take a session");
+    }
+    // The registry read and the emit both block, the emit on the main thread.
+    let worker_app = app.clone();
+    let worker_row = row.clone();
+    let done = tokio::task::spawn_blocking(move || -> Result<serde_json::Value, (StatusCode, &'static str, String)> {
+        let app = worker_app;
+        let row = worker_row;
+        let marks = app.state::<ControlMarks>();
+        if !req.controlled {
+            let Some(mark) = marks.end(&row) else {
+                tracing::info!(chat_id = %row, decision = "session_control", outcome = "not_controlled", "session control release found no mark");
+                return Ok(serde_json::json!({"outcome": "not_controlled", "row": row}));
+            };
+            log_ended(&row, &mark, "released");
+            emit_sessions_updated(&app);
+            return Ok(serde_json::json!({"outcome": "released", "row": row}));
+        }
+        let registry = app.try_state::<SessionRegistry>().ok_or((StatusCode::SERVICE_UNAVAILABLE, "state_unavailable", "the dashboard is still starting".to_string()))?;
+        // The 5s cache may predate the controller's own `/clear`, which moves its
+        // session id, so a miss is asked again on a fresh read.
+        let pid = match registry.pid_of_session(&controller, now_ms()) {
+            Some(None) => {
+                registry.invalidate();
+                registry.pid_of_session(&controller, now_ms())
+            }
+            found => found,
+        };
+        let pid = match pid {
+            Some(Some(pid)) => pid,
+            Some(None) => return Err((StatusCode::CONFLICT, "controller_not_live", format!("no live Claude Code session carries the id {controller}"))),
+            None => return Err((StatusCode::SERVICE_UNAVAILABLE, "registry_unreadable", "Claude Code's session list could not be read".to_string())),
+        };
+        let now = now_ms();
+        let mark = Mark { dir, controller_session: controller, controller_pid: pid, since_ms: now, renewed_ms: now };
+        let expires_ms = mark.expires_ms();
+        let outcome = marks.mark(&row, mark.clone());
+        tracing::info!(chat_id = %row, decision = "session_control", outcome = outcome.slug(), controller_session = %mark.controller_session, controller_pid = pid, dir = %mark.dir, "session control set");
+        emit_sessions_updated(&app);
+        Ok(serde_json::json!({"outcome": outcome.slug(), "row": row, "expires_ms": expires_ms}))
+    })
+    .await;
+    match done {
+        Ok(Ok(body)) => Json(body).into_response(),
+        Ok(Err((status, reason, detail))) => refuse(status, &row, reason, &detail),
+        Err(e) => refuse(StatusCode::INTERNAL_SERVER_ERROR, &row, "internal", &format!("the control task failed: {e}")),
+    }
+}
+
+/// Every controlled row with who holds it and until when, so a controller can
+/// find and release marks a run left behind. Loopback `Host` required.
+async fn get_session_control(State(app): State<AppHandle>, headers: HeaderMap) -> Response {
+    if let Some(detail) = csrf_refusal(&headers, true) {
+        return csrf_refused(detail).into_response();
+    }
+    let marks = app.try_state::<crate::session_control::ControlMarks>().map(|m| m.list()).unwrap_or_default();
+    let marks: Vec<_> = marks
+        .iter()
+        .map(|(row, m)| serde_json::json!({"row": row, "dir": m.dir, "controller_session": m.controller_session, "controller_pid": m.controller_pid, "since_ms": m.since_ms, "renewed_ms": m.renewed_ms, "expires_ms": m.expires_ms()}))
+        .collect();
+    Json(serde_json::json!({ "marks": marks })).into_response()
 }
 
 /// Every agterm tab running the agent, for the local picker
@@ -2249,6 +2354,7 @@ mod tests {
             clean_claim_at: None,
             read: false,
             name_shared_by: None,
+            controlled: false,
             row_line: None,
             task_lines: Vec::new(),
             dialog_rev: 0,

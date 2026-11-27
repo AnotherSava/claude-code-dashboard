@@ -30,6 +30,45 @@
 //! `claude` binaries (the current default) are covered.
 
 use std::collections::HashMap;
+use std::hash::Hash;
+
+/// Consecutive dead readings per watched process, keyed however the watcher
+/// tells its processes apart: the reaper by (row, pid), the control marks by
+/// controller pid. A tick whose process table could not be read records
+/// nothing, so a failed read neither advances nor breaks a streak.
+pub struct DeadStreaks<K> {
+    streaks: HashMap<K, u32>,
+}
+
+impl<K> Default for DeadStreaks<K> {
+    fn default() -> Self {
+        Self { streaks: HashMap::new() }
+    }
+}
+
+impl<K: Eq + Hash> DeadStreaks<K> {
+    /// Record a confirmed-dead read; returns the running streak length.
+    pub fn record_dead(&mut self, key: K) -> u32 {
+        let count = self.streaks.entry(key).or_insert(0);
+        *count += 1;
+        *count
+    }
+
+    /// Record a live read, which ends the streak.
+    pub fn reset(&mut self, key: &K) {
+        self.streaks.remove(key);
+    }
+
+    pub fn streak(&self, key: &K) -> u32 {
+        self.streaks.get(key).copied().unwrap_or(0)
+    }
+
+    /// Forget the keys no longer watched, so a pid that is later reused starts
+    /// from nothing.
+    pub fn retain(&mut self, watched: impl Fn(&K) -> bool) {
+        self.streaks.retain(|key, _| watched(key));
+    }
+}
 
 /// True if `image` names the Claude Code executable: basename, case-insensitive,
 /// stem (sans `.exe`) equal to `claude`. Matches `claude.exe` / `claude` and a

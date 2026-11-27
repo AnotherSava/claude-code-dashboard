@@ -24,6 +24,10 @@
 //! `reap_exited_sessions` gates only removing a row whose last member died. The
 //! dead member is dropped either way, so a dead process never stays in charge
 //! of a row.
+//!
+//! The same reading judges the controller of every `session_control` mark
+//! ([`crate::session_control::lapse_marks`]), so one enumeration a tick and one
+//! dead-streak rule ([`DEAD_STREAK_TO_REAP`], [`DeadStreaks`]) serve both.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Duration;
@@ -32,46 +36,21 @@ use tauri::{AppHandle, Manager};
 
 use crate::commands::{now_ms, LeaveVia};
 use crate::config::ConfigState;
-use crate::liveness::{images_of, is_live_claude, process_table};
+use crate::liveness::{images_of, is_live_claude, process_table, DeadStreaks};
 use crate::membership::Members;
 
 /// Poll cadence. Reaping a vanished session is a backstop, not latency-critical,
 /// so a slower 2s tick is fine.
 const POLL: Duration = Duration::from_secs(2);
 
-/// Consecutive confirmed-dead reads required before a member is dropped. Rides
-/// out any one-off enumeration oddity. At [`POLL`] this is a ~6s reap latency,
-/// fine for a backstop.
-const DEAD_STREAK_TO_REAP: u32 = 3;
-
-/// Consecutive dead reads per (row, pid).
-#[derive(Default)]
-struct ReapTracker {
-    streaks: HashMap<(String, u32), u32>,
-}
-
-impl ReapTracker {
-    /// Record a confirmed-dead read; returns the running streak length.
-    fn record_dead(&mut self, row: &str, pid: u32) -> u32 {
-        let count = self.streaks.entry((row.to_string(), pid)).or_insert(0);
-        *count += 1;
-        *count
-    }
-
-    fn reset(&mut self, row: &str, pid: u32) {
-        self.streaks.remove(&(row.to_string(), pid));
-    }
-
-    /// Forget the pairs that are no longer members, so a pid that leaves and is
-    /// later reused starts from nothing.
-    fn retain(&mut self, members: &HashSet<(String, u32)>) {
-        self.streaks.retain(|pair, _| members.contains(pair));
-    }
-}
+/// Consecutive confirmed-dead reads required before a member is dropped, or a
+/// control mark's controller counted gone. Rides out any one-off enumeration
+/// oddity. At [`POLL`] this is a ~6s reap latency, fine for a backstop.
+pub const DEAD_STREAK_TO_REAP: u32 = 3;
 
 pub fn spawn(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
-        let mut tracker = ReapTracker::default();
+        let mut tracker: DeadStreaks<(String, u32)> = DeadStreaks::default();
         let mut ticker = tokio::time::interval(POLL);
         ticker.tick().await; // skip the immediate first tick
 
@@ -82,13 +61,19 @@ pub fn spawn(app: AppHandle) {
 
             let Some(members) = app.try_state::<Members>() else { continue };
 
-            // One enumeration per tick. If it fails we can't prove anything is
-            // dead — skip the whole tick (streaks untouched, never a false reap).
-            let Some(table) = process_table() else { continue };
-            let images: HashMap<u32, String> = images_of(&table);
+            // One enumeration per tick, which the control marks' controllers
+            // are judged off too. If it fails we can't prove anything is dead,
+            // so the member pass is skipped (streaks untouched, never a false
+            // reap). Marks are still lapsed on such a tick: expiry needs no
+            // process table, and `lapse_marks` leaves the controllers' counts
+            // where they were.
+            let table = process_table();
+            let images: Option<HashMap<u32, String>> = table.as_deref().map(images_of);
+            crate::session_control::lapse_marks(&app, images.as_ref());
+            let (Some(table), Some(images)) = (table, images) else { continue };
 
             let pairs: HashSet<(String, u32)> = members.pid_members().into_iter().collect();
-            tracker.retain(&pairs);
+            tracker.retain(|pair| pairs.contains(pair));
             // The same table records each agent's descendants, for what a
             // session leaves running once it ends (`session_leftovers`).
             if let Some(tracked) = app.try_state::<crate::session_leftovers::Tracked>() {
@@ -96,19 +81,19 @@ pub fn spawn(app: AppHandle) {
             }
 
             let mut judged: BTreeMap<String, Vec<u32>> = BTreeMap::new();
-            for (row, pid) in &pairs {
+            for pair in &pairs {
                 // Present: alive iff still claude. Absent from a full snapshot: gone.
-                let alive = is_live_claude(&images, *pid);
+                let alive = is_live_claude(&images, pair.1);
                 if alive {
-                    tracker.reset(row, *pid);
-                } else if tracker.record_dead(row, *pid) >= DEAD_STREAK_TO_REAP {
-                    judged.entry(row.clone()).or_default().push(*pid);
+                    tracker.reset(pair);
+                } else if tracker.record_dead(pair.clone()) >= DEAD_STREAK_TO_REAP {
+                    judged.entry(pair.0.clone()).or_default().push(pair.1);
                 }
             }
 
             for (row, pids) in judged {
                 for pid in &pids {
-                    tracker.reset(&row, *pid);
+                    tracker.reset(&(row.clone(), *pid));
                 }
                 // Off the async workers: the row lock can be held by a hook
                 // event in the middle of a 12MB history write.
@@ -137,41 +122,46 @@ fn reap_row(app: &AppHandle, row: &str, pids: &[u32]) {
 mod tests {
     use super::*;
 
+    fn pair(row: &str, pid: u32) -> (String, u32) {
+        (row.to_string(), pid)
+    }
+
     #[test]
     fn streak_counts_consecutive_dead_reads() {
-        let mut t = ReapTracker::default();
-        assert_eq!(t.record_dead("a", 100), 1);
-        assert_eq!(t.record_dead("a", 100), 2);
-        assert_eq!(t.record_dead("a", 100), 3);
+        let mut t = DeadStreaks::default();
+        assert_eq!(t.record_dead(pair("a", 100)), 1);
+        assert_eq!(t.record_dead(pair("a", 100)), 2);
+        assert_eq!(t.record_dead(pair("a", 100)), 3);
     }
 
     #[test]
     fn each_member_of_a_row_keeps_its_own_streak() {
         // The incident's shape: a probe that died beside a live main must be
         // counted alone, and the main's live reads must not reset the probe.
-        let mut t = ReapTracker::default();
-        t.record_dead("dash", 51_016);
-        t.reset("dash", 34_390);
-        assert_eq!(t.record_dead("dash", 51_016), 2);
-        assert_eq!(t.record_dead("dash", 34_390), 1);
-        assert_eq!(t.record_dead("web", 51_016), 1, "the same pid in another row is another pair");
+        let mut t = DeadStreaks::default();
+        t.record_dead(pair("dash", 51_016));
+        t.reset(&pair("dash", 34_390));
+        assert_eq!(t.record_dead(pair("dash", 51_016)), 2);
+        assert_eq!(t.record_dead(pair("dash", 34_390)), 1);
+        assert_eq!(t.record_dead(pair("web", 51_016)), 1, "the same pid in another row is another pair");
     }
 
     #[test]
     fn reset_clears_the_streak() {
-        let mut t = ReapTracker::default();
-        t.record_dead("a", 100);
-        t.reset("a", 100);
-        assert_eq!(t.record_dead("a", 100), 1);
+        let mut t = DeadStreaks::default();
+        t.record_dead(pair("a", 100));
+        t.reset(&pair("a", 100));
+        assert_eq!(t.record_dead(pair("a", 100)), 1);
     }
 
     #[test]
     fn a_pair_that_is_no_longer_a_member_is_forgotten() {
-        let mut t = ReapTracker::default();
-        t.record_dead("a", 100);
-        t.record_dead("a", 200);
-        t.retain(&HashSet::from([("a".to_string(), 200)]));
-        assert_eq!(t.record_dead("a", 100), 1, "a reused pid starts from nothing");
-        assert_eq!(t.record_dead("a", 200), 2);
+        let mut t = DeadStreaks::default();
+        t.record_dead(pair("a", 100));
+        t.record_dead(pair("a", 200));
+        let members = HashSet::from([pair("a", 200)]);
+        t.retain(|p| members.contains(p));
+        assert_eq!(t.record_dead(pair("a", 100)), 1, "a reused pid starts from nothing");
+        assert_eq!(t.record_dead(pair("a", 200)), 2);
     }
 }

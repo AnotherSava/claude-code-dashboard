@@ -633,6 +633,22 @@ fn status_glyph(status: Status, read: bool) -> &'static str {
     }
 }
 
+/// The glyph a tab carries in place of a status while another agent runs its
+/// session (`session_control`). One glyph for every status: the controller
+/// reads the results, so the tab stops tracking the turns, and a release puts
+/// the status glyph back. A sheep, for the shepherd that herds them.
+pub const CONTROLLED_GLYPH: &str = "🐑";
+
+/// What a title's leading glyph says about its row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Glyph {
+    /// The row's status, and for `Done` whether it was read; see [`status_glyph`].
+    Status { status: Status, read: bool },
+    /// [`CONTROLLED_GLYPH`]: another agent runs the session, and the title
+    /// says nothing about its status.
+    Controlled,
+}
+
 /// The marker another machine's attach puts in front of a title this dashboard
 /// wrote, declaring that the tab carrying it renders a session running
 /// **elsewhere**.
@@ -656,12 +672,9 @@ pub const REMOTE_BADGE: &str = "⇄";
 
 /// One reading of a tab title *this* dashboard wrote.
 pub struct TitleReading<'a> {
-    /// The status its glyph names.
-    pub status: Status,
-    /// Whether that glyph was the read variant. Only ever `true` for
-    /// [`Status::Done`]; `false` for every other status, which have one glyph
-    /// each and say nothing about attention.
-    pub read: bool,
+    /// What its glyph says: a status (with whether a `Done` was read), or that
+    /// the session is controlled and the title names no status.
+    pub glyph: Glyph,
     /// Whether the title arrived behind [`REMOTE_BADGE`] — the tab renders a
     /// session on another machine, and the status it shows was written by that
     /// machine's dashboard rather than by this one.
@@ -687,6 +700,14 @@ pub struct TitleReading<'a> {
 }
 
 impl TitleReading<'_> {
+    /// The status the glyph names, `None` for a controlled session's title.
+    pub fn status(&self) -> Option<Status> {
+        match self.glyph {
+            Glyph::Status { status, .. } => Some(status),
+            Glyph::Controlled => None,
+        }
+    }
+
     /// Whether this title is the one written for a row labelled `label`.
     pub fn names(&self, label: &str) -> bool {
         self.rest == label || self.rest.starts_with(&format!("{label} "))
@@ -859,8 +880,13 @@ pub fn parse_title(title: &str) -> Option<TitleReading<'_>> {
         None => (false, trimmed),
     };
     let (head, rest) = body.split_once(' ')?;
-    let (status, read) = status_from_glyph(head)?;
-    Some(TitleReading { status, read, remote, rest: rest.trim() })
+    let glyph = if head == CONTROLLED_GLYPH {
+        Glyph::Controlled
+    } else {
+        let (status, read) = status_from_glyph(head)?;
+        Glyph::Status { status, read }
+    };
+    Some(TitleReading { glyph, remote, rest: rest.trim() })
 }
 
 /// Whether `title` is one this machine wrote for a CLEAN row, which is what a
@@ -868,7 +894,7 @@ pub fn parse_title(title: &str) -> Option<TitleReading<'_>> {
 /// off `⚫` since the close was decided means a turn has started there.
 #[cfg_attr(not(windows), allow(dead_code))]
 pub fn shows_clean_here(title: &str) -> bool {
-    parse_title(title).is_some_and(|r| r.status == Status::Idle && !r.remote)
+    parse_title(title).is_some_and(|r| r.status() == Some(Status::Idle) && !r.remote)
 }
 
 /// The inverse of [`status_glyph`]. Total over the glyphs that function emits
@@ -918,7 +944,8 @@ fn title_suffix(session: &AgentSession, context_threshold: f32, window_tokens: &
 /// `push_title`.
 fn build_title(session: &AgentSession, context_threshold: f32, window_tokens: &HashMap<String, u64>) -> String {
     let name = session.display_name.as_deref().unwrap_or(&session.id);
-    let head = format!("{} {}", status_glyph(session.status, session.read), name);
+    let glyph = if session.controlled { CONTROLLED_GLYPH } else { status_glyph(session.status, session.read) };
+    let head = format!("{glyph} {name}");
     match title_suffix(session, context_threshold, window_tokens) {
         Some(suffix) => format!("{head} {suffix}"),
         None => head,
@@ -1473,7 +1500,7 @@ mod tests {
             let badged = format!("{REMOTE_BADGE} {plain}");
             let a = parse_title(&plain).expect("plain parses");
             let b = parse_title(&badged).expect("badged parses");
-            assert_eq!((a.status, a.read, a.rest), (b.status, b.read, b.rest), "{plain:?}");
+            assert_eq!((a.glyph, a.rest), (b.glyph, b.rest), "{plain:?}");
             assert!(!a.remote);
             assert!(b.remote);
             assert!(b.names("proj"), "and it still names its row");
@@ -1560,7 +1587,7 @@ mod tests {
         for (status, read) in ALL_READINGS {
             let title = format!("{} dash", status_glyph(status, read));
             let reading = parse_title(&title).expect("parses");
-            assert_eq!((reading.status, reading.read), (status, read), "{status:?} read={read}");
+            assert_eq!(reading.glyph, Glyph::Status { status, read }, "{status:?} read={read}");
             assert!(reading.names("dash"));
         }
     }
@@ -1579,7 +1606,7 @@ mod tests {
         // Matching the whole string would have to learn each suffix separately.
         for title in ["✋ dash", "✋ dash [62%]", "✋ dash ⚠", "✋ dash [62%] ⚠"] {
             let reading = parse_title(title).expect("parses");
-            assert_eq!(reading.status, Status::Blocked);
+            assert_eq!(reading.status(), Some(Status::Blocked));
             assert!(reading.names("dash"), "{title}");
             assert!(!reading.names("das"), "a prefix of the name is not the name: {title}");
             assert!(!reading.names("dashboard"), "{title}");
@@ -1764,8 +1791,31 @@ mod tests {
         s.status = Status::Done;
         let title = build_title(&s, 0.0, &HashMap::new());
         let reading = parse_title(&title).expect("parses");
-        assert_eq!(reading.status, Status::Done);
+        assert_eq!(reading.status(), Some(Status::Done));
         assert!(reading.names("what-is-next"));
+    }
+
+    #[test]
+    fn a_controlled_row_shows_the_controlled_glyph_whatever_its_status() {
+        let mut s = session("what-is-next", None, None);
+        s.controlled = true;
+        for status in [Status::Working, Status::Blocked, Status::Done, Status::Idle] {
+            s.status = status;
+            let title = build_title(&s, 0.0, &HashMap::new());
+            assert_eq!(title, format!("{CONTROLLED_GLYPH} what-is-next"));
+            let reading = parse_title(&title).expect("parses");
+            assert_eq!((reading.glyph, reading.status()), (Glyph::Controlled, None), "names no status");
+            assert!(reading.names("what-is-next"), "and still names its row, so labels and joins keep working");
+            assert!(!shows_clean_here(&title), "never read as CLEAN, so nothing closes a controlled session");
+        }
+    }
+
+    #[test]
+    fn the_controlled_glyph_is_no_status_glyph() {
+        assert!(ALL_READINGS.iter().all(|(s, r)| status_glyph(*s, *r) != CONTROLLED_GLYPH));
+        let title = format!("{REMOTE_BADGE} {CONTROLLED_GLYPH} proj");
+        let badged = parse_title(&title).expect("parses");
+        assert!(badged.remote && badged.glyph == Glyph::Controlled);
     }
 
     fn candidates(t: &TerminalTitles, id: &str) -> Vec<u32> {
@@ -1802,6 +1852,7 @@ mod tests {
             clean_claim_at: None,
             read: false,
             name_shared_by: None,
+            controlled: false,
             row_line: None,
             task_lines: Vec::new(),
             dialog_rev: 0,

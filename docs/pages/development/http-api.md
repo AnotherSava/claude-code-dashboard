@@ -422,6 +422,48 @@ Before any key is sent, the dashboard reads the session's composer and refuses w
 
 Every answer is `{"outcome", "row", "reason", "detail"}`, with `row` empty where the request named no row, or was refused before its target was read (`unknown_command`, `no_target`). Logged as `decision = "session_command"` with the row, the `outcome`, the `command` and, on a refusal, the `reason`.
 
+## `POST /api/session/control`
+
+Marks a project's session as run by another agent, or lets it go. A coordinating agent that briefs sessions and reads their results calls it, so the user is not notified about turns they did not ask for. While a row is marked, its tab title shows 🐑 in place of the status glyph, the widget's pill reads HERD, no per-state notification fires for it and an outstanding one is withdrawn, and the idle close leaves the session alone. The row's status keeps changing underneath, and a release shows it.
+
+```json
+{ "dir": "D:/projects/web", "controller_session": "<CLAUDE_CODE_SESSION_ID>", "controlled": true }
+{ "dir": "D:/projects/web", "controlled": false }
+```
+
+`dir` is the project folder; the row is the id it derives. A mark may name a row that does not exist yet, for a session the controller is starting. `controller_session` is the calling agent's own Claude Code session id. The dashboard looks it up in Claude Code's session list and ties the mark to that session's process, so a `/clear` in the controller keeps its marks.
+
+A mark ends in four ways:
+
+- **Released** — a call with `controlled: false`, whoever set the mark.
+- **Row removed** — a `/clear` in the marked session, or its last session leaving. A controller finishes with a session by clearing it, so it needs no release afterwards.
+- **Controller gone** — the controller's process has read dead on three checks in a row, two seconds apart, the rule that drops an exited session's row.
+- **Expired** — 12 hours have passed since the last call that set the mark. Each call renews it, so a controller holding a session for longer renews it at least that often.
+
+Marks are kept in `controlled_sessions.json`, so they survive a dashboard restart. Carries the loopback `Host` gate on top of the `Origin` check.
+
+| Status | `outcome` | Meaning |
+|---     |---        |---      |
+| `200`  | `controlled` | the row is now marked; `expires_ms` says until when |
+| `200`  | `renewed` | the row was already marked; the expiry restarts and the mark keeps when it began |
+| `200`  | `released` | the mark was removed |
+| `200`  | `not_controlled` | a release for a row that had no mark |
+| `400`  | `refused` | `reason` `bad_request`: no `dir`, or no `controller_session` on a call that sets a mark |
+| `409`  | `refused` | `reason` `controller_not_live`: no live Claude Code session carries `controller_session` |
+| `503`  | `refused` | `reason` `registry_unreadable` or `state_unavailable`: Claude Code's session list could not be read, or the dashboard is still starting |
+
+Every answer carries the `row`. Logged as `decision = "session_control"` with the row and an `outcome` of `controlled`, `renewed`, `released`, `not_controlled` or `refused`, and when a mark ends without a release, `row_removed`, `controller_gone` or `expired`.
+
+## `GET /api/session/control`
+
+Lists every marked row, so a controller can find and release marks an earlier run left behind:
+
+```json
+{ "marks": [ { "row": "web", "dir": "D:/projects/web", "controller_session": "…", "controller_pid": 4242, "since_ms": 0, "renewed_ms": 0, "expires_ms": 0 } ] }
+```
+
+Carries the loopback `Host` gate on top of the `Origin` check. Not logged.
+
 ## `GET /api/session/tabs`
 
 Lists every agterm tab running Claude, across every open window, for the local picker: it marks the projects that are already running and raises a running project's tab instead of starting another. The picker asks here rather than walking agterm itself, so it counts a tab as Claude's by the same rule the dashboard uses to remember each project's workspace.

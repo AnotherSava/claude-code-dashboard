@@ -716,7 +716,7 @@ pub async fn reconcile(
             sessions
                 .iter()
                 .find(|s| &s.id == *id)
-                .map_or(true, |s| s.status != o.for_status || read(s))
+                .map_or(true, |s| s.status != o.for_status || read(s) || s.controlled)
         })
         .map(|(k, _)| k.clone())
         .collect();
@@ -732,6 +732,12 @@ pub async fn reconcile(
             continue;
         }
         if read(s) {
+            continue;
+        }
+        // Another agent runs this session and reads its results, so none of its
+        // turns is the user's to hear about (`session_control`). The stamp is
+        // `ControlMarks::apply` on this copy, made where the names are applied.
+        if s.controlled {
             continue;
         }
         let key = status_key(s.status);
@@ -872,6 +878,9 @@ impl NotificationManager {
                 let mut sessions = app_state.snapshot();
                 if let Some(names) = app.try_state::<CustomNamesStore>() {
                     names.apply(&mut sessions);
+                }
+                if let Some(marks) = app.try_state::<crate::session_control::ControlMarks>() {
+                    marks.apply(&mut sessions);
                 }
                 // The read/unread verdict rides along as a flag rather than by
                 // rewriting each row's `status`; see `reconcile`.
@@ -1260,6 +1269,7 @@ mod tests {
             clean_claim_at: None,
             read: false,
             name_shared_by: None,
+            controlled: false,
             row_line: None,
             task_lines: Vec::new(),
             dialog_rev: 0,
@@ -1304,6 +1314,27 @@ mod tests {
         reconcile(m.as_ref(), &sessions, &mut out, &mut HashMap::new(), 59_999, None, 0, false, 0, true).await;
         assert!(out.is_empty());
         assert!(m.events().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_controlled_row_neither_fires_nor_keeps_a_ping() {
+        let m = Mock::with(&[("blocked", 60_000)]);
+        let mut out = HashMap::new();
+        let mut held = session("s1", Status::Blocked, 0);
+        held.controlled = true;
+        reconcile(m.as_ref(), &[held.clone()], &mut out, &mut HashMap::new(), 600_000, None, 0, true, 0, true).await;
+        assert!(out.is_empty() && m.events().is_empty(), "not even under high alert");
+
+        // A ping sent before the controller took the session over is withdrawn.
+        out.insert("s1".to_string(), Outstanding { handle: "h1".into(), for_status: Status::Blocked });
+        reconcile(m.as_ref(), &[held.clone()], &mut out, &mut HashMap::new(), 600_000, None, 0, false, 0, true).await;
+        assert!(out.is_empty());
+        assert_eq!(m.events(), vec![Event::Dismiss { handle: "h1".into() }]);
+
+        // Released still blocked on a question, the row asks the user again.
+        held.controlled = false;
+        reconcile(m.as_ref(), &[held], &mut out, &mut HashMap::new(), 600_000, None, 0, false, 0, true).await;
+        assert_eq!(out["s1"].for_status, Status::Blocked);
     }
 
     #[tokio::test]

@@ -261,7 +261,11 @@
         <span class="device" title="Session on {session.origin}">{session.origin}</span>
       {/if}
       <span class="pill-col">
-        <span class="pill state-{session.status}" class:read={session.read} class:pulse={shouldPulse}>{stateLabel[session.status]}</span>
+        {#if session.controlled}
+          <span class="pill state-controlled" title="Run by another agent, which reads its results, so its status sends no notifications. Underneath: {stateLabel[session.status]}">HERD</span>
+        {:else}
+          <span class="pill state-{session.status}" class:read={session.read} class:pulse={shouldPulse}>{stateLabel[session.status]}</span>
+        {/if}
       </span>
       {#if !config.compact_mode}
         <span class="time">{time}</span>
@@ -476,6 +480,13 @@
   .state-error {
     background: #b91c1c;
     color: #fecaca;
+  }
+  /* Another agent runs the session and reads it, so the row asks nothing of the
+     user: a quiet fill like CLEAN's, in a hue no status uses, so it reads as
+     "someone else's" rather than as a state of this one. */
+  .state-controlled {
+    background: #3b2f4a;
+    color: #c4b5fd;
   }
   .time {
     font-size: 11px;

@@ -100,7 +100,7 @@ fn pick(rows: &[DesiredLabel], targets: &[CloseTarget], due: &HashSet<&str>) -> 
                 Err(NO_SESSION) => Verdict::NoSession,
                 Err(reason) => Verdict::Declined(reason),
                 Ok(t) => match t.title.as_deref().and_then(parse_title) {
-                    Some(reading) if reading.status == Status::Idle => Verdict::Close(t.key.clone()),
+                    Some(reading) if reading.status() == Some(Status::Idle) => Verdict::Close(t.key.clone()),
                     _ => Verdict::TabNotIdle,
                 },
             };
@@ -127,7 +127,10 @@ fn tick(app: &AppHandle, adapter: &dyn TerminalAdapter, logged: &mut HashMap<Str
     let window = cfg.snapshot().idle_close_ms.unwrap_or(0);
     let now = now_ms();
     let local: Vec<_> = crate::commands::resolved_snapshot(app).into_iter().filter(|s| s.origin.is_none()).collect();
-    let due: HashSet<&str> = local.iter().filter(|s| is_due(s.status, s.state_entered_at, now, window)).map(|s| s.id.as_str()).collect();
+    // A controlled session belongs to the agent running it, which ends it with
+    // a `/clear` when it is done; its tab shows no status glyph anyway, so a
+    // close would only log `tab_not_idle` for it every time it came due.
+    let due: HashSet<&str> = local.iter().filter(|s| !s.controlled && is_due(s.status, s.state_entered_at, now, window)).map(|s| s.id.as_str()).collect();
     logged.retain(|row, _| due.contains(row.as_str()));
     if due.is_empty() {
         return;

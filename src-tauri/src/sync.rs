@@ -1872,6 +1872,9 @@ async fn push_all(app: &AppHandle, client: &reqwest::Client) {
     if let Some(names) = app.try_state::<crate::custom_names::CustomNamesStore>() {
         names.apply(&mut sessions);
     }
+    if let Some(marks) = app.try_state::<crate::session_control::ControlMarks>() {
+        marks.apply(&mut sessions);
+    }
     let usage_tip = app
         .try_state::<UsageHistoryStore>()
         .and_then(|s| s.read_all().last().map(|r| r.ts))
@@ -2350,6 +2353,7 @@ mod tests {
             clean_claim_at: None,
             read: false,
             name_shared_by: None,
+            controlled: false,
             row_line: None,
             task_lines: Vec::new(),
             dialog_rev: 0,

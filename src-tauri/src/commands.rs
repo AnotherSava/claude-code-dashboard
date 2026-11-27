@@ -60,6 +60,9 @@ fn resolved_snapshot_versioned(app: &AppHandle) -> (u64, Vec<AgentSession>) {
             };
         }
     }
+    if let Some(marks) = app.try_state::<crate::session_control::ControlMarks>() {
+        marks.apply(&mut sessions);
+    }
     stamp_name_sharing(app, &mut sessions);
     (seq, sessions)
 }
@@ -1207,6 +1210,12 @@ pub fn remove_session(app: &AppHandle, id: &str, kind: BoundaryKind, now: i64, m
     }
     if let Some(reg) = app.try_state::<WatcherRegistry>() {
         reg.stop(id);
+    }
+    // A `/clear` is how a controller finishes with a session, and a row whose
+    // last session left has nothing left to control. Ended only where a row was
+    // removed: a mark set for a session still starting has no row yet.
+    if let Some(mark) = app.try_state::<crate::session_control::ControlMarks>().and_then(|m| m.end(id)) {
+        crate::session_control::log_ended(id, &mark, "row_removed");
     }
     emit_sessions_updated(app);
     true

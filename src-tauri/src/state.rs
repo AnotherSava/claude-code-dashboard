@@ -627,6 +627,18 @@ pub struct AgentSession {
     /// be about that machine's tabs anyway.
     #[serde(default)]
     pub name_shared_by: Option<usize>,
+    /// Whether another agent is running this session and reading its results
+    /// (`session_control`), so its tab shows the controlled glyph, its pill
+    /// reads HERD and the notifier stays quiet about it. The status underneath
+    /// keeps moving and is what a release shows.
+    ///
+    /// Always `false` on a local row in `AppState`, while a synced row in
+    /// `AppState::remote` holds the value its machine pushed. Stamped by
+    /// `ControlMarks::apply` for local rows wherever a reader needs it:
+    /// `commands::resolved_snapshot`, the notifier's copy and the sync push,
+    /// which carries it to the other machine's widget.
+    #[serde(default)]
+    pub controlled: bool,
     /// The text of the widget row's task line, the [`AgentSession::row_line`]
     /// verdict. The frontend draws it rather than deciding it, so the row and
     /// the terminal headline `terminal_title` writes from the same function
@@ -1730,6 +1742,7 @@ fn new_session(
         clean_claim_at: None,
         read: false,
         name_shared_by: None,
+        controlled: false,
         row_line: None,
         task_lines: Vec::new(),
         dialog_rev: 0,
@@ -3686,6 +3699,7 @@ why did this become the task?");
             clean_claim_at: None,
             read: false,
             name_shared_by: None,
+            controlled: false,
             row_line: None,
             task_lines: Vec::new(),
             dialog_rev: 0,
@@ -3967,6 +3981,7 @@ why did this become the task?");
             clean_claim_at: None,
             read: false,
             name_shared_by: None,
+            controlled: false,
             row_line: None,
             task_lines: Vec::new(),
             dialog_rev: 0,
