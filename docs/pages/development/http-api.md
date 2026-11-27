@@ -427,8 +427,8 @@ Every answer is `{"outcome", "row", "reason", "detail"}`, with `row` empty where
 Marks a project's session as run by another agent, or lets it go. A coordinating agent that briefs sessions and reads their results calls it, so the user is not notified about turns they did not ask for. While a row is marked, its tab title shows 🐑 in place of the status glyph, the widget's pill reads HERD, no per-state notification fires for it and an outstanding one is withdrawn, and the idle close leaves the session alone. The row's status keeps changing underneath, and a release shows it.
 
 ```json
-{ "dir": "D:/projects/web", "controller_session": "<CLAUDE_CODE_SESSION_ID>", "controlled": true }
-{ "dir": "D:/projects/web", "controlled": false }
+{ "dir": "/Users/you/Projects/web", "controller_session": "<CLAUDE_CODE_SESSION_ID>", "controlled": true }
+{ "dir": "/Users/you/Projects/web", "controlled": false }
 ```
 
 `dir` is the project folder; the row is the id it derives. A mark may name a row that does not exist yet, for a session the controller is starting. `controller_session` is the calling agent's own Claude Code session id. The dashboard looks it up in Claude Code's session list and ties the mark to that session's process, so a `/clear` in the controller keeps its marks.
@@ -459,7 +459,7 @@ Every answer carries the `row`. Logged as `decision = "session_control"` with th
 Lists every marked row, so a controller can find and release marks an earlier run left behind:
 
 ```json
-{ "marks": [ { "row": "web", "dir": "D:/projects/web", "controller_session": "…", "controller_pid": 4242, "since_ms": 0, "renewed_ms": 0, "expires_ms": 0 } ] }
+{ "marks": [ { "row": "web", "dir": "/Users/you/Projects/web", "controller_session": "…", "controller_pid": 4242, "since_ms": 0, "renewed_ms": 0, "expires_ms": 0 } ] }
 ```
 
 Carries the loopback `Host` gate on top of the `Origin` check. Not logged.

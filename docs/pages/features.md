@@ -27,7 +27,7 @@ The row's status badge tracks the agent in real time:
 - **IDLE** — the session is clean: one you've just started, one whose conversation you've cleared, or one that has done nothing since but pull changes for an agent on another machine. Nothing in it is waiting for you, which is why the widget lets the row go after a while — see [Cleared sessions drop out of the list](#cleared-sessions-drop-out-of-the-list).
 - **DONE** — a turn ended here and the row is holding the result. Timer shows time since it finished. The badge is green until you've been through the result and grey afterwards — see [Finished, and not yet read](#finished-and-not-yet-read). A task you cancel with Esc settles here too: cancelling sends no event of its own, but the dashboard notices the turn ended and settles the row back on its own — to DONE, or back to a question it was waiting on (on by default, see [Settings](settings#behavior)).
 - **ERROR** — the hook reported an error; the row shows the error text.
-- **HERD** — another agent is running the session and reading its results, so the badge stands in for its status until that agent lets it go — see [Sessions another agent is running](#sessions-another-agent-is-running).
+- **HERD** — another agent is running the session and reading its results, so the badge stands in for its status while that agent holds it — see [Sessions another agent is running](#sessions-another-agent-is-running).
 
 Each badge is color-coded, and BLOCK and ERROR pulse to draw your eye when a session needs attention.
 
@@ -169,7 +169,7 @@ When you want nothing held back — you're watching for anything at all — the 
 
 ## Sessions another agent is running
 
-When a coordinating agent such as a shepherd session briefs other sessions and reads their results itself, their turns are not yours to hear about. While it holds a session, that session's tab shows 🐑 instead of a status, its row reads **HERD**, and its status sends no notifications (finished, blocked or error); context-usage and other alerts about it still come. When the agent lets the session go, the real status comes back, so a session left waiting on a question for you pings as usual. A hold ends on its own when the coordinating agent's process exits, or after 12 hours without being renewed.
+When a coordinating agent such as a shepherd session briefs other sessions and reads their results itself, their turns are not yours to hear about. While it holds a session, that session's tab shows 🐑 instead of a status, its row reads **HERD**, and its status sends no notifications (finished, blocked or error); context-usage and other alerts about it still come. When the agent lets the session go, the real status comes back, so a session left waiting on a question for you pings as usual. A hold also ends when the session is cleared or ends, and on its own when the coordinating agent's process exits, or after 12 hours without being renewed.
 
 ## Keeping the Mac awake while an agent works
 

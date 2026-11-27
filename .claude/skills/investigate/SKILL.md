@@ -196,6 +196,17 @@ or `id`), and a `reason`:
   `tab_not_idle` (the tab shows another status, so it is not following the
   row), `same_label` (another row carries the same label) or `shared_title`
   (more than one tab's title names the row).
+- `session_control` — another agent's hold on the row, through
+  `POST /api/session/control`. While a hold lasts, the widget pill reads HERD
+  and the tab shows 🐑 in place of the status this trail reconstructs, and no
+  per-state notification fires; the status underneath keeps moving.
+  `outcome` `controlled` set a hold and `renewed` refreshed one; `released`,
+  `row_removed` (a `/clear` in this session, or its last session leaving),
+  `controller_gone` and `expired` each ended one; `not_controlled` and
+  `refused` changed nothing. The trail cannot say whether a hold is in force
+  now: the line that set it may be older than the trail, and a hold kept
+  across a dashboard restart writes no line. `GET /api/session/control` lists
+  the holds in force. Moves no status.
 - `reap_exited` — the liveness reaper removed the row because its last Claude
   process exited without a `SessionEnd` (e.g. you typed `exit` / closed the
   terminal, or an `idle_close` just closed it). Carries the dead `pids` and the `prior_status` the row last held.

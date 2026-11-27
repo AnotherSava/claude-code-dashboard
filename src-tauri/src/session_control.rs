@@ -19,9 +19,9 @@
 //! consecutive readings of its process table ([`lapse_marks`]), and one not
 //! renewed for [`EXPIRY_MS`], which covers a controller that is alive and
 //! stopped without releasing. Each control call renews. A mark also ends when its row is
-//! removed (`commands::remove_session`), since a `/clear` is how the controller
-//! finishes with a session and a row's last session leaving means nothing is
-//! left to control.
+//! removed (`commands::remove_session`), since a `/clear` in the marked session
+//! is how the controller finishes with it and a row's last session leaving
+//! means nothing is left to control.
 //!
 //! The marks are persisted, because the dashboard is redeployed while runs are
 //! in progress and the controller does not re-mark on a restart. Keyed by row
