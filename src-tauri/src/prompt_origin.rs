@@ -146,6 +146,12 @@ impl Resolution {
     }
 }
 
+/// The row of the local session an envelope's inbox, else its name, identifies.
+pub type SenderRow<'a> = dyn Fn(Option<&str>, Option<&str>) -> Result<String, Miss> + 'a;
+
+/// The task a row hands onward, by row id.
+pub type RowTask<'a> = dyn Fn(&str) -> Result<String, Miss> + 'a;
+
 /// Settle an arriving message's text: its sender's own task, else the
 /// message's first line.
 ///
@@ -157,7 +163,7 @@ impl Resolution {
 /// A relay's task is the header's `header_safe` copy, judged by
 /// [`header_task_names_a_message`], which reads an envelope there with its
 /// quotes stripped and its end cut off.
-pub fn resolve(msg: &AgentMessage, sender_row: &dyn Fn(Option<&str>, Option<&str>) -> Result<String, Miss>, row_task: &dyn Fn(&str) -> Result<String, Miss>) -> Resolution {
+pub fn resolve(msg: &AgentMessage, sender_row: &SenderRow, row_task: &RowTask) -> Resolution {
     let fallback = |miss: Miss, sender: Option<String>| Resolution { text: first_line(msg.body()), outcome: Outcome::BodyFallback(miss), sender };
     let nonblank = |t: &String| !t.trim().is_empty();
     let (task, outcome, sender) = match msg {
@@ -330,10 +336,10 @@ mod tests {
     }
 
     /// Rows by inbox: each entry is (inbox, row id, that row's task text).
-    fn world<'a>(rows: &'a [(&'a str, &'a str, &'a str)]) -> (impl Fn(Option<&str>, Option<&str>) -> Result<String, Miss> + 'a, impl Fn(&str) -> Result<String, Miss> + 'a) {
+    fn world<'a>(rows: &'a [(&'a str, &'a str, &'a str)]) -> (Box<SenderRow<'a>>, Box<RowTask<'a>>) {
         let sender_row = move |inbox: Option<&str>, _name: Option<&str>| rows.iter().find(|(i, _, _)| Some(*i) == inbox).map(|(_, r, _)| r.to_string()).ok_or(Miss::SenderNotLive);
         let row_task = move |row: &str| rows.iter().find(|(_, r, _)| *r == row).map(|(_, _, t)| t.to_string()).ok_or(Miss::SenderHasNoRow);
-        (sender_row, row_task)
+        (Box::new(sender_row), Box::new(row_task))
     }
 
     #[test]

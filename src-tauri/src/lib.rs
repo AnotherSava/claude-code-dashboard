@@ -351,7 +351,7 @@ pub fn run() {
             }
 
             #[cfg(debug_assertions)]
-            seed_dev_sessions(&app.handle());
+            seed_dev_sessions(app.handle());
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -618,13 +618,16 @@ fn save_window_position_if_enabled(window: &tauri::Window) {
     // reconstructed: compact never touches height, so the live height already is
     // the non-compact height (and this matches the toggle-out restore path).
     let (save_x, save_w) = match window.try_state::<commands::CompactWidth>() {
-        Some(cw) => match {
-            let g = cw.0.lock().unwrap();
-            (g.shrunk, g.non_compact_width)
-        } {
-            (true, Some(ncw)) => (pos.x + live_w - ncw, ncw),
-            _ => (pos.x, live_w),
-        },
+        Some(cw) => {
+            let shrunk = {
+                let g = cw.0.lock().unwrap();
+                (g.shrunk, g.non_compact_width)
+            };
+            match shrunk {
+                (true, Some(ncw)) => (pos.x + live_w - ncw, ncw),
+                _ => (pos.x, live_w),
+            }
+        }
         None => (pos.x, live_w),
     };
     let save_h = live_h;

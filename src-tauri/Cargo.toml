@@ -73,3 +73,15 @@ debug = "line-tables-only"
 # non-workspace crate, so it does not touch this crate's own units above.
 [profile.dev.package."*"]
 debug = 0
+
+# `cargo clippy --all-targets -- -D warnings` runs in the commit gate and in
+# build.yml. Each lint turned off here is one the codebase disagrees with by
+# design, not a backlog: anything else clippy reports is fixed in the code.
+[lints.clippy]
+# The functions over the limit (`agent_roster`, `notifications::reconcile`,
+# `session_restore::plan`, `sync::ingest`, `build_token_week_chart`, …) are pure
+# or nearly pure functions over the facts they combine, tested by handing each
+# fact in, and each argument is one such fact. Bundling them into a struct only
+# to get under seven adds a type that names nothing and hides which facts a call
+# site supplies.
+too_many_arguments = "allow"

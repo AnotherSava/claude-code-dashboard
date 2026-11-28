@@ -21,6 +21,8 @@ jobs:
           cache: npm
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
 
       # No NASM step on purpose — see the note in release.yml: aws-lc-sys ships
       # pre-assembled Windows objects, and installing an assembler is what
@@ -44,6 +46,12 @@ jobs:
       - run: cargo check --manifest-path src-tauri/Cargo.toml --all-targets
         env:
           RUSTFLAGS: -D warnings
+
+      # Windows only until the macOS baseline is triaged: the Windows one was
+      # cleared, and macOS compiles code Windows never sees. Mirrored in
+      # `.claude/commit-checks.sh`, which carries the reasoning.
+      - run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+        if: runner.os == 'Windows'
 
       - run: cargo test --manifest-path src-tauri/Cargo.toml --lib
 

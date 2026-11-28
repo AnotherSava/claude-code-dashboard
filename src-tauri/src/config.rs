@@ -1067,7 +1067,7 @@ mod tests {
         let blocked = tg.states.get("blocked").unwrap();
         assert_eq!((blocked.afk_window_ms, blocked.reaction_window_ms), (None, Some(90_000)));
         // Supplying `states` at all replaces the default map wholesale.
-        assert!(tg.states.get("error").is_none());
+        assert!(!tg.states.contains_key("error"));
     }
 
     #[test]

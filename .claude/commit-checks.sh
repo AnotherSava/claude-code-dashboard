@@ -71,6 +71,21 @@ echo "==> cargo check --all-targets (a warning fails the build)"
 # run.
 RUSTFLAGS="-D warnings" cargo check --manifest-path src-tauri/Cargo.toml --all-targets
 
+# Clippy over the same targets, with its findings failing the gate. The lints
+# this crate turns off are listed with their reasons under `[lints.clippy]` in
+# `src-tauri/Cargo.toml`; everything else it reports is fixed in the code. It
+# runs on Windows only for now, here and in build.yml: the Windows baseline was
+# triaged to zero, and the macOS-only code (the agterm adapter, `lid_awake`, the
+# objc FFI) has never been put through clippy, so on macOS it would fail on
+# findings nobody has looked at. Drop the condition in both places once a macOS
+# run comes back clean.
+case "$OSTYPE" in
+  msys*|cygwin*)
+    echo "==> cargo clippy --all-targets -- -D warnings"
+    cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings ;;
+  *) echo "==> cargo clippy: NOT COVERED on $OSTYPE — the macOS baseline has not been triaged yet" ;;
+esac
+
 echo "==> cargo test --lib"
 # Teed to a log because the failing test's NAME is the thing that keeps getting
 # lost. Three times now (2026-09-11, 09-13, 09-29) a single test failed inside

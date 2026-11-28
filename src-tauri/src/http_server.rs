@@ -1945,18 +1945,16 @@ fn apply_event_in(app: &AppHandle, req: &EventRequest, placed: Option<String>) -
             // own `classify` line, so the log reads in the order end-first does.
             // The member is kept: it is the same process, now under the new id,
             // which is how the late end is recognised as superseded.
-            if fx.teardown {
-                if remove_session(app, &chat_id, BoundaryKind::Clear, now_ms(), Membership::Keep) {
-                    tracing::debug!(
-                        client = %req.client,
-                        event = %req.event,
-                        chat_id = %chat_id,
-                        decision = "session_clear",
-                        reason = "SessionStart:clear arrived before its SessionEnd; row removed on the end's behalf",
-                        ending = ?adm.rotation.as_ref().map(|r| &r.from),
-                        "event -> clear"
-                    );
-                }
+            if fx.teardown && remove_session(app, &chat_id, BoundaryKind::Clear, now_ms(), Membership::Keep) {
+                tracing::debug!(
+                    client = %req.client,
+                    event = %req.event,
+                    chat_id = %chat_id,
+                    decision = "session_clear",
+                    reason = "SessionStart:clear arrived before its SessionEnd; row removed on the end's behalf",
+                    ending = ?adm.rotation.as_ref().map(|r| &r.from),
+                    "event -> clear"
+                );
             }
             // --- Instruction-adherence canary (see Config::instruction_canary_enabled) ---
             // On SessionStart, mint (startup/clear) or reuse (resume/compact) the
@@ -2057,7 +2055,7 @@ fn apply_event_in(app: &AppHandle, req: &EventRequest, placed: Option<String>) -
                 if let Some(registry) = app.try_state::<SessionRegistry>() {
                     let now = now_ms();
                     if let (Some(sender_cwd), crate::session_registry::InboxLookup::Found { cwd, .. }) = (registry.sender_cwd(inbox.as_deref(), name.as_deref(), now), registry.inbox_for(&chat_id, cfg.projects_root.as_deref(), now)) {
-                        crate::sync::offer_tab(&app, chat_id.clone(), cwd, Some(sender_cwd), crate::sync::TabRecipients::EveryPeer);
+                        crate::sync::offer_tab(app, chat_id.clone(), cwd, Some(sender_cwd), crate::sync::TabRecipients::EveryPeer);
                     }
                 }
             }
@@ -2205,7 +2203,7 @@ fn apply_event_in(app: &AppHandle, req: &EventRequest, placed: Option<String>) -
                     reg.start(app.clone(), chat_id, tp, Graft::IfFresh);
                 }
             }
-            emit_sessions_updated(&app);
+            emit_sessions_updated(app);
         }
         AdapterOutput::SubagentStopped { id, agent_id } => {
             anchor(&id);
@@ -2216,7 +2214,7 @@ fn apply_event_in(app: &AppHandle, req: &EventRequest, placed: Option<String>) -
             let now = now_ms();
             if let Some(o) = state.settle_subagent_prompts(&id, SettleScope::Agent(&agent_id), now) {
                 crate::subagent_gate::log_prompt_settled(&id, &o, crate::subagent_gate::SettledVia::SubagentStop, None, now);
-                emit_sessions_updated(&app);
+                emit_sessions_updated(app);
             }
         }
         AdapterOutput::Clear { id } => {
@@ -2290,8 +2288,8 @@ fn apply_event_in(app: &AppHandle, req: &EventRequest, placed: Option<String>) -
             // transcript-rotation marking the same boundary is harmless.
             let now = now_ms();
             if state.mark_session_boundary(&id, now) {
-                crate::commands::persist_row(&app, &state, &id);
-                emit_sessions_updated(&app);
+                crate::commands::persist_row(app, &state, &id);
+                emit_sessions_updated(app);
             }
         }
         AdapterOutput::ModelSwitched { id, model } => {
@@ -2442,7 +2440,7 @@ mod tests {
         assert_eq!(roster.agents[0].label, "add a caption");
 
         let row = AgentSession { label: envelope.into(), original_prompt: Some(envelope.into()), delegated_task: Some("add a title-bar caption to agwinterm".into()), ..session("agwinterm", Status::Working, None, 900) };
-        let roster = agent_roster(&[row.clone()], Some(&[]), &BTreeMap::new(), &BTreeMap::new(), &|_| None, &devices(&[]), Some("chrome"), false, 1_000);
+        let roster = agent_roster(std::slice::from_ref(&row), Some(&[]), &BTreeMap::new(), &BTreeMap::new(), &|_| None, &devices(&[]), Some("chrome"), false, 1_000);
         assert_eq!(roster.agents[0].label, "add a title-bar caption to agwinterm", "the sender's task, as the widget shows it");
         assert_eq!(roster.agents[0].label, row.primary_text());
     }

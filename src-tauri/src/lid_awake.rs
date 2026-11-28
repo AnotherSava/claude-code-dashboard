@@ -167,7 +167,7 @@ impl Sample {
     /// Whether the battery is above the floor. An unknown level does not block
     /// (a desktop Mac reports none), and a zero floor disables the check.
     fn battery_ok(&self) -> bool {
-        self.floor_pct == 0 || self.battery_pct.map_or(true, |p| p >= self.floor_pct)
+        self.floor_pct == 0 || self.battery_pct.is_none_or(|p| p >= self.floor_pct)
     }
 
     /// Whether the veto *should* be held right now.
@@ -393,7 +393,7 @@ fn decide(app: &AppHandle, any_busy: bool) {
     // short-circuit here.
     if cfg.lid_awake_mode == LidAwakeMode::Off
         && !inner.armed
-        && !inner.manual_until.is_some_and(|t| now < t)
+        && inner.manual_until.is_none_or(|t| now >= t)
     {
         inner.manual_until = None;
         return;

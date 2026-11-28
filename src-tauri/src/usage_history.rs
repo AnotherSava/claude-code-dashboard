@@ -132,11 +132,11 @@ pub fn build_weekly_quota(records: &[UsageHistoryRecord], week_start_ms: i64) ->
         let rate = delta / dt as f32;
         let first_day = ((start - week_start_ms) / DAY_MS) as usize;
         let last_day = ((end - 1 - week_start_ms) / DAY_MS) as usize;
-        for d in first_day..=last_day {
+        for (d, day) in weekly.iter_mut().enumerate().take(last_day + 1).skip(first_day) {
             let d_start = week_start_ms + d as i64 * DAY_MS;
             let overlap = end.min(d_start + DAY_MS) - start.max(d_start);
             if overlap > 0 {
-                weekly[d] += rate * overlap as f32;
+                *day += rate * overlap as f32;
             }
         }
     }

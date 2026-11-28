@@ -409,7 +409,7 @@ pub fn plan(
     let mut out = Vec::new();
     for s in live {
         let id = s.row_id(anchored);
-        if rows.iter().any(|r| *r == id) {
+        if rows.contains(&id) {
             continue;
         }
         if missed_start(s, down_since) {
@@ -1077,7 +1077,7 @@ mod tests {
         // Without the previous run's stamp, or without the record's start, the
         // downtime cannot be placed, and the title rule alone applies.
         let s = started_while_down("dash", Activity::Idle);
-        assert!(plan(&[s.clone()], &[], &[], 10_000, &derive, &seen, None, &never_clean, &|_| None).is_empty());
+        assert!(plan(std::slice::from_ref(&s), &[], &[], 10_000, &derive, &seen, None, &never_clean, &|_| None).is_empty());
         let unstamped = LiveSession { newest_start_ms: None, ..s };
         assert!(planned(&[unstamped], &[], &[]).is_empty());
     }

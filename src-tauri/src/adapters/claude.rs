@@ -746,10 +746,9 @@ impl<'a> QuestionRules<'a> {
 /// terminator. Used to test whether the closing question *opens* with a benign
 /// offer word (e.g. "Anything …") rather than reading the whole message.
 fn final_sentence(text: &str) -> &str {
-    text.split(|c| matches!(c, '.' | '!' | '?' | '\n'))
+    text.split(['.', '!', '?', '\n'])
         .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .last()
+        .rfind(|s| !s.is_empty())
         .unwrap_or("")
 }
 
@@ -803,7 +802,7 @@ fn strip_trailing_notes<'a>(text: &'a str, rules: QuestionRules) -> &'a str {
     while let Some((before, last)) = cut.rsplit_once("\n\n") {
         let para = last.trim();
         let is_note = para
-            .trim_start_matches(|c: char| matches!(c, '*' | '_' | '#' | ' '))
+            .trim_start_matches(['*', '_', '#', ' '])
             .to_lowercase()
             .starts_with("note:");
         if is_note && question_reason_core(para, rules).is_none() {
@@ -855,8 +854,8 @@ fn question_reason_core(text: &str, rules: QuestionRules) -> Option<&'static str
 /// benign closing sentence while still scanning the rest for a genuine hand-back.
 /// Returns empty when the text is a single sentence (nothing precedes it).
 fn strip_final_sentence(text: &str) -> String {
-    let trimmed = text.trim_end_matches(|c: char| matches!(c, '.' | '!' | '?' | '\n' | '\r' | ' ' | '\t'));
-    match trimmed.rfind(|c: char| matches!(c, '.' | '!' | '?' | '\n')) {
+    let trimmed = text.trim_end_matches(['.', '!', '?', '\n', '\r', ' ', '\t']);
+    match trimmed.rfind(['.', '!', '?', '\n']) {
         Some(idx) => trimmed[..=idx].to_string(),
         None => String::new(),
     }
@@ -972,7 +971,7 @@ const HANDBACK_OPENERS: &[&str] = &["paste ", "please provide ", "confirm ", "re
 fn has_handback_request(text: &str) -> bool {
     last_paragraph(text)
         .to_lowercase()
-        .split(|c| matches!(c, '.' | '!' | '?' | '\n'))
+        .split(['.', '!', '?', '\n'])
         .any(|sentence| {
             let s = sentence.trim_start();
             HANDBACK_OPENERS.iter().any(|opener| s.starts_with(opener))
@@ -1064,10 +1063,11 @@ mod tests {
     use std::path::Path;
 
     fn cfg_with(projects_root: Option<&str>, benign_closers: &[&str]) -> Config {
-        let mut cfg = Config::default();
-        cfg.projects_root = projects_root.map(str::to_string);
-        cfg.benign_closers = benign_closers.iter().map(|s| s.to_string()).collect();
-        cfg
+        Config {
+            projects_root: projects_root.map(str::to_string),
+            benign_closers: benign_closers.iter().map(|s| s.to_string()).collect(),
+            ..Config::default()
+        }
     }
 
     /// No config-driven openers/closers — the bare heuristics only.

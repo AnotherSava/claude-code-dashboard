@@ -704,7 +704,7 @@ mod tests {
         .to_string()
     }
 
-    fn refs<'a>(v: &'a [String]) -> Vec<&'a str> {
+    fn refs(v: &[String]) -> Vec<&str> {
         v.iter().map(|s| s.as_str()).collect()
     }
 

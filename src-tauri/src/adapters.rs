@@ -15,6 +15,11 @@ use crate::state::{SetInput, SubagentPromptRequest};
 
 pub mod claude;
 
+// `Set` carries the whole `SetInput` and the others an id or two. One value is
+// built per hook event and consumed by the handler that matched it, never
+// stored or collected, so the size gap costs a stack copy and boxing `input`
+// would cost an allocation per event for nothing.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum AdapterOutput {
     /// Apply a state update. `transcript_path`, when present, is handed to

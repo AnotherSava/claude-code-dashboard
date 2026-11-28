@@ -189,11 +189,11 @@ impl DevServers {
     pub fn for_session(&self, session: &str) -> Vec<Offered> {
         let held = self.held.lock().unwrap();
         let mut local: Vec<&DevServer> = held.servers.iter().filter(|s| s.session.as_deref() == Some(session)).collect();
-        local.sort_by(|a, b| b.announced_at.cmp(&a.announced_at));
+        local.sort_by_key(|s| std::cmp::Reverse(s.announced_at));
         let mut out: Vec<Offered> = local.iter().map(|s| Offered { port: s.port, device: None, open: Some(format!("http://localhost:{}", s.port)) }).collect();
         if let Some((device, remote)) = held.tabs.get(session) {
             let mut remote: Vec<&SharedServer> = remote.iter().collect();
-            remote.sort_by(|a, b| b.announced_at.cmp(&a.announced_at));
+            remote.sort_by_key(|s| std::cmp::Reverse(s.announced_at));
             out.extend(remote.iter().map(|s| Offered { port: s.port, device: Some(device.clone()), open: s.url.clone() }));
         }
         out

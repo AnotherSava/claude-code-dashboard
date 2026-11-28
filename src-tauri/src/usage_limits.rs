@@ -221,7 +221,7 @@ impl UsageLimitsState {
     /// `true` if the caller should proceed, `false` if we should wait.
     fn claim_refresh_slot(&self) -> bool {
         let mut guard = self.last_refresh_attempt.lock().unwrap();
-        let allowed = guard.map_or(true, |t| {
+        let allowed = guard.is_none_or(|t| {
             t.elapsed() >= Duration::from_secs(REFRESH_COOLDOWN_SECS)
         });
         if allowed {
@@ -935,7 +935,7 @@ fn held_or_replayed(held: UsageLimits, cache: Option<&UsageCacheStore>, status: 
 /// `None` to schedule as usual. Only a held peer reading answers one (see
 /// [`held_peer_reading_sleep_secs`]).
 async fn poll_once(app: &AppHandle, client: &reqwest::Client) -> Option<u64> {
-    let Some(state) = app.try_state::<UsageLimitsState>() else { return None };
+    let state = app.try_state::<UsageLimitsState>()?;
     let cache = app.try_state::<UsageCacheStore>();
     let now = now_ms();
 

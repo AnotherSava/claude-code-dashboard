@@ -434,8 +434,7 @@ pub(crate) fn header_safe(raw: &str, cap: usize) -> String {
     // the transport has already talked one receiver out of replying (2026-08-30),
     // and identity was never the part the receiver had to act on. Routing is.
     for reserved in RESERVED_PHRASES {
-        loop {
-            let Some(at) = collapsed.to_ascii_uppercase().find(&reserved.to_ascii_uppercase()) else { break };
+        while let Some(at) = collapsed.to_ascii_uppercase().find(&reserved.to_ascii_uppercase()) {
             collapsed.replace_range(at..at + reserved.len(), "[redacted]");
         }
     }

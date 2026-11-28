@@ -716,7 +716,7 @@ pub async fn reconcile(
             sessions
                 .iter()
                 .find(|s| &s.id == *id)
-                .map_or(true, |s| s.status != o.for_status || read(s) || s.controlled)
+                .is_none_or(|s| s.status != o.for_status || read(s) || s.controlled)
         })
         .map(|(k, _)| k.clone())
         .collect();
@@ -2324,7 +2324,7 @@ mod tests {
         w.observe(90.0, Some(1_000_000), 1_000_000, MARGIN);
         w.observe(96.0, Some(1_000_050), 1_000_050, MARGIN); // peak climbs to 96
         // resets_at jumps a full 5h forward → reset, peak of the ended window.
-        let jumped = 1_000_000 + 5 * 3600_000;
+        let jumped = 1_000_000 + 5 * 3_600_000;
         assert_eq!(w.observe(3.0, Some(jumped), jumped, MARGIN), Some(96.0));
         // New window's peak starts fresh at the recovery reading, not carrying 96.
         assert_eq!(w.peak_pct, 3.0);
@@ -2356,12 +2356,12 @@ mod tests {
         // with a peak above any threshold: an absent bucket is no reset transient.
         let sched = 1783158000408;
         let mut t = ResetTracker::default();
-        assert!(t.observe(Some((100.0, Some(sched))), Some((50.0, Some(sched + 86400_000))), sched - 600_000, MARGIN).is_empty());
-        assert!(t.observe(None, Some((50.0, Some(sched + 86400_000))), sched + 3600_000, MARGIN).is_empty());
-        assert!(t.observe(None, Some((51.0, Some(sched + 86400_000))), sched + 7200_000, MARGIN).is_empty());
+        assert!(t.observe(Some((100.0, Some(sched))), Some((50.0, Some(sched + 86_400_000))), sched - 600_000, MARGIN).is_empty());
+        assert!(t.observe(None, Some((50.0, Some(sched + 86_400_000))), sched + 3_600_000, MARGIN).is_empty());
+        assert!(t.observe(None, Some((51.0, Some(sched + 86_400_000))), sched + 7_200_000, MARGIN).is_empty());
         // Days later the limit comes back: a first sighting, not a forward jump.
-        let back = sched + 3 * 86400_000;
-        assert!(t.observe(Some((4.0, Some(back + 5 * 3600_000))), Some((60.0, Some(sched + 86400_000))), back, MARGIN).is_empty());
+        let back = sched + 3 * 86_400_000;
+        assert!(t.observe(Some((4.0, Some(back + 5 * 3_600_000))), Some((60.0, Some(sched + 86_400_000))), back, MARGIN).is_empty());
     }
 
     #[test]
@@ -2422,7 +2422,7 @@ mod tests {
         // new window and must not inflate the just-ended window's peak.
         let mut w = WindowReset::default();
         w.observe(30.0, Some(1_000_000), 1_000_000, MARGIN);
-        let jumped = 1_000_000 + 5 * 3600_000;
+        let jumped = 1_000_000 + 5 * 3_600_000;
         assert_eq!(
             w.observe(95.0, Some(jumped), jumped, MARGIN),
             Some(30.0),
@@ -2438,7 +2438,7 @@ mod tests {
         // path and the reset is credited later off the +3.5h resets_at jump.
         let sched = 1781047200343;
         let mut w = WindowReset::default();
-        w.observe(93.0, Some(sched), sched - 3600_000, MARGIN);
+        w.observe(93.0, Some(sched), sched - 3_600_000, MARGIN);
         assert_eq!(
             w.observe(0.0, None, sched - 5_400_000, MARGIN),
             None,
@@ -2451,11 +2451,11 @@ mod tests {
     fn reset_tracker_reports_both_windows_when_both_reset() {
         let mut t = ResetTracker::default();
         t.observe(Some((95.0, Some(1_000_000))), Some((92.0, Some(9_000_000))), 1_000_000, MARGIN);
-        let five_jump = 1_000_000 + 5 * 3600_000;
+        let five_jump = 1_000_000 + 5 * 3_600_000;
         let resets = t.observe(
             Some((1.0, Some(five_jump))),
-            Some((2.0, Some(9_000_000 + 7 * 86400_000))),
-            9_000_000 + 7 * 86400_000,
+            Some((2.0, Some(9_000_000 + 7 * 86_400_000))),
+            9_000_000 + 7 * 86_400_000,
             MARGIN,
         );
         assert_eq!(resets, vec![

@@ -140,6 +140,10 @@ impl SettledVia {
 }
 
 /// Why a prompt's call could not be found, logged once per request.
+// Each variant names a thing that was not there, and `as_str` logs it as the
+// `no_*` slug the decision log already carries; dropping the shared `No` would
+// leave `TranscriptPath` reading as the thing found rather than the thing missing.
+#[allow(clippy::enum_variant_names)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Unmatched {
     /// The hook carried no `transcript_path`, so there is no file to read.

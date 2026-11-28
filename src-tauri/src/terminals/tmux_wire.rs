@@ -114,7 +114,7 @@ pub fn command_refusal(session: &TmuxSession) -> Option<String> {
 /// The project name `cc-session.sh … detach` printed, its last nonblank line,
 /// which is the name an attach to the session takes.
 pub fn hosted_name(stdout: &str) -> Option<String> {
-    stdout.lines().map(str::trim).filter(|l| !l.is_empty()).next_back().map(str::to_string)
+    stdout.lines().map(str::trim).rfind(|l| !l.is_empty()).map(str::to_string)
 }
 
 /// What `cc-session.sh … name` printed: the project an attach takes, then the
