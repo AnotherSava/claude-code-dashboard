@@ -201,7 +201,7 @@ fn compose_badge(cov: &[u8], color: [u8; 3], size: usize) -> Image<'static> {
     // Transparent background — no plate. The colored mark is drawn straight onto
     // empty pixels, so only the digits carry alpha.
     let mut buf = vec![0u8; w * h * 4];
-    for (px, &c) in buf.chunks_exact_mut(4).zip(cov) {
+    for (px, &c) in buf.as_chunks_mut::<4>().0.iter_mut().zip(cov) {
         over(px, color, c);
     }
 
@@ -433,7 +433,7 @@ fn render_badge_alert(text: &str, size: usize) -> Image<'static> {
     let mut buf = vec![0u8; size * size * 4];
     fill_alert_background(&mut buf, size);
     let cov = text_coverage(text, size);
-    for (px, &c) in buf.chunks_exact_mut(4).zip(&cov) {
+    for (px, &c) in buf.as_chunks_mut::<4>().0.iter_mut().zip(&cov) {
         over(px, ALERT_TEXT_COLOR, c);
     }
     Image::new_owned(buf, size as u32, size as u32)
@@ -657,10 +657,10 @@ mod tests {
         assert_eq!((out.width(), out.height()), (24, 24));
         let rgba = out.rgba();
         let has_red = rgba
-            .chunks_exact(4)
+            .as_chunks::<4>().0.iter()
             .any(|p| p[0] == 255 && p[1] == 90 && p[2] == 90);
         assert!(has_red, "the number color should appear in the output");
-        let has_transparent = rgba.chunks_exact(4).any(|p| p[3] == 0);
+        let has_transparent = rgba.as_chunks::<4>().0.iter().any(|p| p[3] == 0);
         assert!(has_transparent, "the background should be transparent");
     }
 
@@ -693,12 +693,12 @@ mod tests {
 
         // State 0 (pct 0): all green.
         let g = render_light_badge(&base, 0, 3, false);
-        for row in g.rgba().chunks_exact(4).take(3) {
+        for row in g.rgba().as_chunks::<4>().0.iter().take(3) {
             assert_eq!(&row[0..3], &LEVEL_COLORS[0]);
         }
         // State 6 (pct 100): all red.
         let r = render_light_badge(&base, 100, 3, false);
-        for row in r.rgba().chunks_exact(4).take(3) {
+        for row in r.rgba().as_chunks::<4>().0.iter().take(3) {
             assert_eq!(&row[0..3], &LEVEL_COLORS[2]);
         }
         // State 1 (pct 20): top amber, middle + bottom green. Output is 3x3, so
@@ -745,10 +745,10 @@ mod tests {
         let rgba = img.rgba();
         // The plate fills the rounded rect in opaque alert red (the margins
         // around the digits are plate-only).
-        let has_red_plate = rgba.chunks_exact(4).any(|p| p[..3] == ALERT_BORDER_COLOR && p[3] == 255);
+        let has_red_plate = rgba.as_chunks::<4>().0.iter().any(|p| p[..3] == ALERT_BORDER_COLOR && p[3] == 255);
         assert!(has_red_plate, "background is an opaque alert-red plate");
         // The digits are drawn in white over the plate.
-        let has_white = rgba.chunks_exact(4).any(|p| p[0] == 255 && p[1] == 255 && p[2] == 255 && p[3] == 255);
+        let has_white = rgba.as_chunks::<4>().0.iter().any(|p| p[0] == 255 && p[1] == 255 && p[2] == 255 && p[3] == 255);
         assert!(has_white, "digits are drawn in white over the red plate");
         // The image corner sits outside the rounded rect and stays transparent.
         assert_eq!(rgba[3], 0, "image corner outside the plate stays transparent");

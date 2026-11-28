@@ -1353,6 +1353,9 @@ fn question_still_pending(event: &str, settling: Status, held: Option<String>) -
 /// tags marks a state change and the `investigate` skill replays them to
 /// reconstruct a row, so a polling reader would bury the real decisions under
 /// entries that explain no state.
+// The error is axum's own `Response`, which every refusal here already is;
+// boxing it would only be unboxed again by `IntoResponse`.
+#[allow(clippy::result_large_err)]
 async fn get_agents(
     State(app): State<AppHandle>,
     headers: HeaderMap,
