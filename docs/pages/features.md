@@ -197,6 +197,8 @@ You can also surface a limit right on the tray icon, via the tray's **Tray usage
 
 When the badge is on, the tray icon also flags the moment any session's context usage crosses a threshold you set — an at-a-glance warning that an agent is filling its context, right in the tray. The light styles gain a red border; the number style draws the digits over a red background. It's on by default — the tray's **Show high context usage** checkbox turns it off. See [Settings](settings) for the threshold.
 
+{% include figure.html id="tray-badges" alt="The tray icon in each badge style: the traffic light at three fill levels, the percentage in green and then red, the all-red light at 100%, and the context warning on each style, a red border round the light and a red plate behind the digits" %}
+
 ## Work intensity
 
 A separate window — opened from the tray's **Work intensity** item — charts how hard your agents have been working over time. Each bar covers a short slice of time and grows taller the busier that slice was, while its colour shows how much of the weekly limit was left at the time — green with plenty to spare, turning yellow and then red as it runs out. A thin blue line marks each moment the weekly limit reset. A **Days** view lays out one week as seven rows, one per day; a **Weeks** view gives one row per week and scrolls back through your history. With [multi-device sync](#multi-device-sync) configured, the chart covers your other devices too, so it shows the work done on the account as a whole rather than just here.

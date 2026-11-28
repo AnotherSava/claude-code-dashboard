@@ -276,6 +276,38 @@
         ]
       },
       "verifiedAt": "73dd02e"
+    },
+    {
+      "id": "tray-badges-windows",
+      "files": [
+        "tray-badges-windows.png"
+      ],
+      "shows": "Windows. The tray icon in each usage-badge style at the platform's tray size, left to right: the lights style at 30%, 60% and 90%; the number style at 42% and 87%, then the all-red light it switches to at 100%; then the context-usage alert on each style, the lights at 60% and the number at 42%. On a flat grey standing in for the dark taskbar",
+      "capture": {
+        "command": "python docs/screenshots/capture/tray-badges.py",
+        "steps": [
+          "Either platform, and no app: one script draws both this and tray-badges-macos, through the product's own `tray_badge::render`, called by the ignored test `render_the_docs_figure` against the working tree.",
+          "Subject anchor: the eight states and their order are written in that test, at the default usage colours; the base icon and tray size per platform are in the script's docstring, with where Tauri takes each from.",
+          "The strip is opaque, so `hairline.py --require` draws its edge outside it; the unframed strip is kept in raw/."
+        ]
+      },
+      "verifiedAt": "at-capture"
+    },
+    {
+      "id": "tray-badges-macos",
+      "files": [
+        "tray-badges-macos.png"
+      ],
+      "shows": "macOS. The tray icon in each usage-badge style at the platform's tray size, left to right: the lights style at 30%, 60% and 90%; the number style at 42% and 87%, then the all-red light it switches to at 100%; then the context-usage alert on each style, the lights at 60% and the number at 42%. On a flat grey standing in for the light menu bar",
+      "capture": {
+        "command": "python docs/screenshots/capture/tray-badges.py",
+        "steps": [
+          "Either platform, and no app: one script draws both this and tray-badges-windows, through the product's own `tray_badge::render`, called by the ignored test `render_the_docs_figure` against the working tree.",
+          "Subject anchor: the eight states and their order are written in that test, at the default usage colours; the base icon and tray size per platform are in the script's docstring, with where Tauri takes each from.",
+          "The strip is opaque, so `hairline.py --require` draws its edge outside it; the unframed strip is kept in raw/."
+        ]
+      },
+      "verifiedAt": "at-capture"
     }
   ],
   "declinedGaps": [

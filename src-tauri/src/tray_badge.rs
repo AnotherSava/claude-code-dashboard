@@ -110,10 +110,13 @@ fn target_icon_px(app: &AppHandle) -> usize {
         .get_webview_window("main")
         .and_then(|w| w.scale_factor().ok())
         .unwrap_or(1.0);
-    #[cfg(target_os = "macos")]
-    let base = 18.0_f64;
-    #[cfg(not(target_os = "macos"))]
-    let base = 16.0_f64;
+    tray_icon_px(cfg!(target_os = "macos"), scale)
+}
+
+/// [`target_icon_px`] for a platform and a display scale, which the docs
+/// figure also renders at so its icons are the size the tray shows.
+fn tray_icon_px(macos: bool, scale: f64) -> usize {
+    let base = if macos { 18.0_f64 } else { 16.0_f64 };
     ((base * scale).round() as usize).clamp(16, 64)
 }
 
@@ -198,9 +201,8 @@ fn compose_badge(cov: &[u8], color: [u8; 3], size: usize) -> Image<'static> {
     // Transparent background — no plate. The colored mark is drawn straight onto
     // empty pixels, so only the digits carry alpha.
     let mut buf = vec![0u8; w * h * 4];
-    for i in 0..w * h {
-        let p = i * 4;
-        over(&mut buf[p..p + 4], color, cov[i]);
+    for (px, &c) in buf.chunks_exact_mut(4).zip(cov) {
+        over(px, color, c);
     }
 
     Image::new_owned(buf, w as u32, h as u32)
@@ -431,9 +433,8 @@ fn render_badge_alert(text: &str, size: usize) -> Image<'static> {
     let mut buf = vec![0u8; size * size * 4];
     fill_alert_background(&mut buf, size);
     let cov = text_coverage(text, size);
-    for i in 0..size * size {
-        let p = i * 4;
-        over(&mut buf[p..p + 4], ALERT_TEXT_COLOR, cov[i]);
+    for (px, &c) in buf.chunks_exact_mut(4).zip(&cov) {
+        over(px, ALERT_TEXT_COLOR, c);
     }
     Image::new_owned(buf, size as u32, size as u32)
 }
@@ -533,16 +534,22 @@ pub fn refresh(app: &AppHandle) {
     // recolor the icon's own white border red; the number style draws the
     // digits over a red background plate.
     let alert = context_alert_active(app, badge, config.tray_context_alert_enabled, config.tray_context_alert_percent, &config.context_window_tokens);
-    let img = match badge_percent(badge, &usage) {
+    let img = render(&base, badge.is_light(), badge_percent(badge, &usage), alert, &config.usage_colors, size);
+    let _ = tray.set_icon(Some(img));
+}
+
+/// The tray bitmap for a badge style (`light`, else number), the bucket's
+/// percentage when there is a reading, and whether the context alert is up.
+fn render(base: &Image, light: bool, pct: Option<u32>, alert: bool, colors: &crate::config::UsageColors, size: usize) -> Image<'static> {
+    match pct {
         // Light modes recolor the traffic light. Number modes draw the
         // percentage, but a maxed (>=100%) bucket shows the all-red light
         // instead of a number.
-        Some(pct) if badge.is_light() || pct >= 100 => render_light_badge(&base, pct, size, alert),
+        Some(pct) if light || pct >= 100 => render_light_badge(base, pct, size, alert),
         Some(pct) if alert => render_badge_alert(&badge_text(pct), size),
-        Some(pct) => render_badge(&badge_text(pct), urgency_color(pct, &config.usage_colors), size),
-        None => render_plain_icon(&base, size, alert),
-    };
-    let _ = tray.set_icon(Some(img));
+        Some(pct) => render_badge(&badge_text(pct), urgency_color(pct, colors), size),
+        None => render_plain_icon(base, size, alert),
+    }
 }
 
 #[cfg(test)]
@@ -745,6 +752,41 @@ mod tests {
         assert!(has_white, "digits are drawn in white over the red plate");
         // The image corner sits outside the rounded rect and stays transparent.
         assert_eq!(rgba[3], 0, "image corner outside the plate stays transparent");
+    }
+
+    /// The tray icon in each badge style, for the features page's Usage limits
+    /// figure: run by `docs/screenshots/capture/tray-badges.py`, which hands it
+    /// the platform's base icon as raw RGBA, the platform and its display
+    /// scale, and composes the strip. Ignored because it writes files and needs
+    /// those inputs; it renders through [`render`], the dispatch `refresh`
+    /// uses, at the default usage colours and at [`tray_icon_px`]'s size.
+    #[test]
+    #[ignore]
+    fn render_the_docs_figure() {
+        let var = |k: &str| std::env::var(k).unwrap_or_else(|_| panic!("{k} is unset; run docs/screenshots/capture/tray-badges.py"));
+        let num = |k: &str| var(k).parse::<usize>().unwrap_or_else(|_| panic!("{k} is not a number"));
+        let (w, h) = (num("TRAY_FIGURE_BASE_W"), num("TRAY_FIGURE_BASE_H"));
+        let scale = var("TRAY_FIGURE_SCALE").parse::<f64>().expect("TRAY_FIGURE_SCALE is not a number");
+        let size = tray_icon_px(var("TRAY_FIGURE_PLATFORM") == "macos", scale);
+        let base = Image::new_owned(std::fs::read(var("TRAY_FIGURE_BASE")).expect("base icon"), w as u32, h as u32);
+        let out = std::path::PathBuf::from(var("TRAY_FIGURE_OUT"));
+        let colors = crate::config::UsageColors::default();
+        // (strip group, name, light style, percentage, context alert), in the
+        // strip's order; the script spaces the strip by the group in each name.
+        let variants = [
+            ("lights", "light-30", true, 30, false),
+            ("lights", "light-60", true, 60, false),
+            ("lights", "light-90", true, 90, false),
+            ("number", "number-42", false, 42, false),
+            ("number", "number-87", false, 87, false),
+            ("number", "number-100", false, 100, false),
+            ("alert", "light-60-alert", true, 60, true),
+            ("alert", "number-42-alert", false, 42, true),
+        ];
+        for (i, (group, name, light, pct, alert)) in variants.into_iter().enumerate() {
+            let img = render(&base, light, Some(pct), alert, &colors, size);
+            std::fs::write(out.join(format!("{i:02}-{group}-{name}.rgba")), img.rgba()).expect("write variant");
+        }
     }
 
     #[test]
