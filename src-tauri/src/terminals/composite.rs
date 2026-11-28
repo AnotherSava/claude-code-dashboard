@@ -21,7 +21,7 @@
 
 use std::sync::mpsc::Sender;
 
-use super::{Attached, CloseTarget, FrontReading, HostedSession, LabelTarget, LabelWrite, Launched, Observation, TerminalAdapter, TerminalSession, FALLBACK_STALE_REMEDY};
+use super::{Attached, CloseTarget, FrontReading, HostedSession, LabelTarget, LabelWrite, Launched, Observation, TerminalAdapter, TerminalSession, TitleLanding, TitleWrite, FALLBACK_STALE_REMEDY};
 
 pub struct Composite {
     name: &'static str,
@@ -203,6 +203,17 @@ impl TerminalAdapter for Composite {
         self.children.iter().any(|c| c.can_launch())
     }
 
+    fn can_write_title(&self) -> bool {
+        self.children.iter().any(|c| c.can_write_title())
+    }
+
+    /// The first child that can write a title, in the order the set was built,
+    /// as for `launch`: a title is written once, and the landing it returns goes
+    /// back unprefixed, since only that child is ever handed one.
+    fn write_title(&self, landing: Option<&TitleLanding>, candidates: &[u32], title: &str) -> Option<TitleWrite> {
+        self.children.iter().find(|c| c.can_write_title())?.write_title(landing, candidates, title)
+    }
+
     /// The first child that can launch, in the order the set was built: a
     /// session is started once, so the order is the preference.
     fn launch(&self, dir: &std::path::Path, select: bool) -> Result<Launched, String> {
@@ -332,6 +343,13 @@ mod tests {
         fn can_launch(&self) -> bool {
             self.launches
         }
+        fn can_write_title(&self) -> bool {
+            self.launches
+        }
+        fn write_title(&self, landing: Option<&TitleLanding>, _candidates: &[u32], title: &str) -> Option<TitleWrite> {
+            self.writes.lock().unwrap().push((format!("title {title} {landing:?}"), LabelWrite::ClearContext));
+            Some(TitleWrite { ok: true, via: None, host: None, landing: TitleLanding::Tty(self.name.to_string()) })
+        }
         fn launch(&self, _dir: &std::path::Path, _select: bool) -> Result<Launched, String> {
             Ok(Launched { key: Some(format!("{}-session", self.name)), hosted_name: Some(format!("{}-hosted", self.name)) })
         }
@@ -439,6 +457,26 @@ mod tests {
         assert_eq!(writes.lock().unwrap()[0].0, "/clear cc-x");
         assert!(c.type_command("kitty|cc-x", crate::terminals::composer::Command::Clear).is_err());
         assert!(!composite(vec![Fake { name: "windows", ..Fake::default() }]).can_type_command());
+    }
+
+    #[test]
+    fn a_title_is_written_once_by_the_first_child_that_can_and_its_landing_goes_back_unprefixed() {
+        let first = Arc::new(Mutex::new(Vec::new()));
+        let second = Arc::new(Mutex::new(Vec::new()));
+        let c = composite(vec![
+            Fake { name: "agwinterm", ..Fake::default() },
+            Fake { name: "windows", launches: true, writes: first.clone(), ..Fake::default() },
+            Fake { name: "tmux", launches: true, writes: second.clone(), ..Fake::default() },
+        ]);
+        assert!(c.can_write_title());
+        let landing = TitleLanding::Tty("prior".to_string());
+        let written = c.write_title(Some(&landing), &[1], "t").expect("a child wrote it");
+        assert_eq!(written.landing, TitleLanding::Tty("windows".to_string()));
+        assert_eq!(first.lock().unwrap()[0].0, format!("title t {:?}", Some(&landing)), "the landing reaches the child as it was handed back");
+        assert!(second.lock().unwrap().is_empty(), "a title is written once");
+        let none = composite(vec![Fake { name: "agwinterm", ..Fake::default() }]);
+        assert!(!none.can_write_title());
+        assert!(none.write_title(None, &[1], "t").is_none());
     }
 
     #[test]

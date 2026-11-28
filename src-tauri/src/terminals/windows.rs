@@ -14,8 +14,8 @@
 //!   a tab is switched, so there is no snapshot to watch the way the macOS
 //!   adapter watches agterm's.
 //! - **What a session is showing** is its *console object*, read per pid by
-//!   `terminal_title::read_title`. On Windows `push_title` writes
-//!   `SetConsoleTitleW`; the terminal only renders that. So reading the console
+//!   `console::read_title`. This adapter's `write_title` writes
+//!   `SetConsoleTitleW` there; the terminal only renders that. So reading the console
 //!   back is this dashboard reading its own last published record, one per
 //!   session, where the window title can only ever report the one tab in front.
 //!
@@ -269,7 +269,7 @@ impl TerminalAdapter for WindowsAdapter {
     fn sessions(&self) -> Option<Vec<TerminalSession>> {
         let registry = self.app.try_state::<crate::session_registry::SessionRegistry>()?;
         let records = registry.live_records(crate::commands::now_ms())?;
-        let tabs: Vec<TerminalSession> = records.into_iter().map(|(pid, cwd)| TerminalSession { cwd: Some(cwd), title: crate::terminal_title::read_title(pid) }).collect();
+        let tabs: Vec<TerminalSession> = records.into_iter().map(|(pid, cwd)| TerminalSession { cwd: Some(cwd), title: super::console::read_title(pid) }).collect();
         if !tabs.is_empty() && tabs.iter().all(|t| t.title.is_none()) {
             tracing::debug!(decision = "restore_scan", terminal = NAME, outcome = "no_console_answered", sessions = tabs.len(), "live sessions, but not one console title could be read");
             return None;
@@ -372,6 +372,20 @@ impl TerminalAdapter for WindowsAdapter {
             return None;
         }
         is_terminal_window(owner).then(|| surface_key(owner))
+    }
+
+    /// The console title, which every Windows terminal renders, so this one
+    /// adapter writes for all of them; see [`super::console::write_title`].
+    fn can_write_title(&self) -> bool {
+        true
+    }
+
+    fn write_title(&self, landing: Option<&super::TitleLanding>, candidates: &[u32], title: &str) -> Option<super::TitleWrite> {
+        let members = match landing {
+            Some(super::TitleLanding::Console(members)) => Some(members.as_slice()),
+            _ => None,
+        };
+        super::console::write_title(members, candidates, title, |pid| self.attached_surface(pid))
     }
 
     /// UI Automation is COM, so the reading thread must join an apartment

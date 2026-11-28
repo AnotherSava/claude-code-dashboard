@@ -168,6 +168,21 @@ impl TerminalAdapter for AgtermAdapter {
         walk_windows(self.memory.as_deref(), "restorable", |_, tree| crate::agterm::session_nodes(tree).map(session_from_node).collect())
     }
 
+    /// An OSC 0 escape to the session's tty, which agterm shows as the tab's
+    /// title and which reaches any other tty terminal the same way; see
+    /// [`super::tty::write_title`]. Needs no agterm running.
+    fn can_write_title(&self) -> bool {
+        true
+    }
+
+    fn write_title(&self, landing: Option<&super::TitleLanding>, candidates: &[u32], title: &str) -> Option<super::TitleWrite> {
+        let tty = match landing {
+            Some(super::TitleLanding::Tty(tty)) => Some(tty.as_str()),
+            _ => None,
+        };
+        super::tty::write_title(tty, candidates, title, |pid| self.attached_surface(pid))
+    }
+
     /// Whether this agterm serves a `session context` verb at all.
     ///
     /// A version check rather than a probe of the verb: 0.25.0 answers

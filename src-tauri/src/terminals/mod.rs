@@ -10,7 +10,7 @@
 //! console object and UI Automation, and agwinterm from a control pipe and a
 //! state file.
 //!
-//! Five questions and one action, six callers:
+//! Five questions and two actions, six callers:
 //!
 //! - **Did the user look at this session?** [`TerminalAdapter::poll`] and
 //!   [`TerminalAdapter::watch`] answer it as a stream of [`Observation`]s.
@@ -26,10 +26,11 @@
 //!   has stopped tracking its session, which a terminal can be wrong about in a
 //!   way no write reports.
 //! - **Where did that write land?** [`TerminalAdapter::attached_surface`] answers
-//!   it as one opaque surface key. `crate::terminal_title` consumes it while a
-//!   title write is still in flight, so every surface-keyed reader — the write's
-//!   own record, the caption watch, the stale check — names a surface the same
-//!   way.
+//!   it as one opaque surface key. Only an adapter's own
+//!   [`TerminalAdapter::write_title`] asks it, while the write is still in flight,
+//!   and hands it back on the [`TitleWrite`], so every surface-keyed reader — the
+//!   write's own record in `crate::terminal_title`, the caption watch, the stale
+//!   check — names a surface the same way.
 //! - **What should this session's context line say?**
 //!   [`TerminalAdapter::can_label`] says whether a terminal has a per-session
 //!   context line at all, [`TerminalAdapter::label_targets`] lists each session
@@ -37,6 +38,9 @@
 //!   [`TerminalAdapter::write_label`] writes one. `crate::terminals::labels`
 //!   consumes them for a terminal whose sessions carry a field of their own beside
 //!   the console title, writing a row's task there, decided from the live reading.
+//! - **Put this title on that session's tab.** [`TerminalAdapter::write_title`]
+//!   writes the status title `crate::terminal_title` builds, and says where it
+//!   landed so a blank can follow it after the agent has gone.
 //! - **End this session.** [`TerminalAdapter::close_targets`] lists the sessions
 //!   a terminal could end, by title, which for a terminal that labels is its
 //!   label targets, and [`TerminalAdapter::close_session`] ends one: the agent,
@@ -47,8 +51,8 @@
 //! They are different axes — the first is about a human, the second about a
 //! screen, the third about the gap between what a screen shows and what is behind
 //! it, the fourth and fifth about where and how this dashboard's own writing goes,
-//! the action about ending a session — and they share the seam because they share
-//! all of its vocabulary.
+//! and the two actions about writing a title and ending a session — and they
+//! share the seam because they share all of its vocabulary.
 //!
 //! **A new capability goes here too, not beside here.** Every terminal-specific
 //! fact this dashboard learns belongs behind this trait, however Windows-shaped
@@ -82,6 +86,12 @@ use std::collections::HashMap;
 pub mod agterm;
 #[cfg(target_os = "windows")]
 pub mod windows;
+/// The Windows console object's title, read and written, for the Windows
+/// adapter: the one write mechanism every Windows terminal renders.
+#[cfg(target_os = "windows")]
+pub mod console;
+/// The OSC 0 title write to a session's tty, for the macOS adapter.
+pub mod tty;
 /// Reading Windows Terminal's tab titles through UI Automation. Split out of
 /// `windows.rs` because it is the one place this project uses the `windows` crate
 /// rather than hand-declared signatures, and that file is long enough. It is
@@ -732,20 +742,59 @@ pub fn facts_at_switch(front: Front, last_input: LastInput, read_ms: i64, latest
     }
 }
 
+/// Where a title write landed, in the terms its terminal can reach it again by:
+/// the processes attached to the console it went to, or the tty device it was
+/// written to.
+///
+/// Opaque to callers, like the other identifiers a terminal mints: they store it
+/// and hand it back to [`TerminalAdapter::write_title`], and do nothing else with
+/// it. It outlives the process the write went through — a console lives as long
+/// as any process holds it, and a tty stays the tab's for as long as the tab is
+/// open — which is why a blank for a row whose agent has exited goes there
+/// first.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TitleLanding {
+    /// Built by the Windows adapter alone, so macOS never constructs it.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    Console(Vec<u32>),
+    Tty(String),
+}
+
+/// What a title write learned.
+///
+/// Deliberately not `Default`: a default value would describe a write that never
+/// happened, and the only reader that ever saw one read its empty `host` as the
+/// terminal disowning the row.
+pub struct TitleWrite {
+    /// Whether the title went in. A console reached that refused it is `false`.
+    pub ok: bool,
+    /// The process the write went through, for the log; `None` for a write sent
+    /// straight to a landing.
+    pub via: Option<u32>,
+    /// What [`TerminalAdapter::attached_surface`] made of the write, asked from
+    /// inside it; `None` is *do not know*.
+    pub host: Option<String>,
+    /// How to reach the same console or tty again.
+    pub landing: TitleLanding,
+}
+
 /// A terminal this dashboard can ask about.
 ///
-/// Five questions and one action, all in the vocabulary above. *What did the user do*
+/// Five questions and two actions, all in the vocabulary above. *What did the user do*
 /// ([`poll`](TerminalAdapter::poll) / [`watch`](TerminalAdapter::watch)), *what
 /// are you showing* ([`sessions`](TerminalAdapter::sessions)), *what are you
 /// displaying versus what is really in there*
 /// ([`front_readings`](TerminalAdapter::front_readings)), *where did that
-/// write land* ([`attached_surface`](TerminalAdapter::attached_surface)), and
+/// write land* ([`attached_surface`](TerminalAdapter::attached_surface), asked
+/// only by the adapter's own [`write_title`](TerminalAdapter::write_title)), and
 /// *what should this session's context line say*
 /// ([`label_targets`](TerminalAdapter::label_targets) /
-/// [`write_label`](TerminalAdapter::write_label)), plus *end this session*
-/// ([`close_session`](TerminalAdapter::close_session)). They are different axes — a
-/// human, a screen, the gap between a screen and what is behind it, and where and
-/// how this dashboard's own writing goes, plus ending a session — but they share the seam because they
+/// [`write_label`](TerminalAdapter::write_label)), plus *put this title on that
+/// session's tab* ([`write_title`](TerminalAdapter::write_title)) and *end this
+/// session* ([`close_session`](TerminalAdapter::close_session)). They are
+/// different axes — a human, a screen, the gap between a screen and what is
+/// behind it, and where and how this dashboard's own writing goes, plus writing a
+/// title and ending a session — but they share the seam because they
 /// share its whole vocabulary: a session named by `cwd` and `title`, which is all
 /// any caller needs and all any terminal can be relied on to have.
 ///
@@ -891,6 +940,29 @@ pub trait TerminalAdapter: Send {
     /// either.
     fn attached_surface(&self, pid: u32) -> Option<String> {
         let _ = pid;
+        None
+    }
+
+    /// Whether [`write_title`](Self::write_title) can ever write here. Asked
+    /// before every write, so it is a static answer, as
+    /// [`can_launch`](Self::can_launch) is.
+    fn can_write_title(&self) -> bool {
+        false
+    }
+
+    /// Write `title` onto the session's tab: through `landing`, where a title
+    /// this process wrote before went, and then through the `candidates`, the
+    /// pids that may own the session's terminal, nearest-first as the hook
+    /// reports them. An empty `title` blanks the tab.
+    ///
+    /// `None` means nothing could be reached, so nothing was written and nothing
+    /// was learned, and the caller retries. `Some` says whether the title went
+    /// in, where it landed, and the [`attached_surface`](Self::attached_surface)
+    /// answer for it, which only the write can ask. Which candidate to try first,
+    /// and how, is the adapter's: the Windows console is attached far-to-near,
+    /// a tty is found near-to-far.
+    fn write_title(&self, landing: Option<&TitleLanding>, candidates: &[u32], title: &str) -> Option<TitleWrite> {
+        let _ = (landing, candidates, title);
         None
     }
 

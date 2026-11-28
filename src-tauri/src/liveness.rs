@@ -113,7 +113,7 @@ pub fn images_of(table: &[Proc]) -> HashMap<u32, String> {
 /// the enumeration failed.
 #[cfg(windows)]
 pub fn process_table() -> Option<Vec<Proc>> {
-    // Hand-declared, same style as `terminal_title::push_title` — avoids a
+    // Hand-declared, same style as `terminals::console` — avoids a
     // `windows`/`windows-sys` dependency for a couple of ancient calls.
     #[link(name = "kernel32")]
     extern "system" {
