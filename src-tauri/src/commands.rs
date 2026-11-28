@@ -1489,7 +1489,8 @@ pub fn reveal_main(app: &AppHandle) {
 #[tauri::command]
 pub fn get_dialog(id: String, app: AppHandle) -> HistoryDialog {
     let live = app.try_state::<AppState>().and_then(|state| state.dialog_of(&id));
-    let dialog = live.or_else(|| app.try_state::<PromptHistoryStore>().and_then(|store| store.get(&id)).map(|s| s.dialog)).unwrap_or_default();
+    let stored = live.or_else(|| app.try_state::<PromptHistoryStore>().and_then(|store| store.get(&id)).map(|s| s.dialog)).unwrap_or_default();
+    let dialog = crate::state::without_queued_echoes(stored);
     let messages = crate::state::dialog_messages(&dialog);
     HistoryDialog { dialog, messages }
 }

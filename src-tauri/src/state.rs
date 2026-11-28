@@ -1491,6 +1491,16 @@ impl AppState {
 
                 if let Some(pending) = dialog_entry {
                     let task_start = pending.role == DialogRole::User && task_boundary;
+                    // A prompt queued while a turn runs reaches the dialog twice:
+                    // the watcher reads its `queued_command` attachment when it is
+                    // dequeued, and its `UserPromptSubmit` arrives a hook's latency
+                    // later. The watcher already skips a user entry the dialog ends
+                    // with; this is that rule from the hook's side, keeping the
+                    // entry and taking this event's task boundary onto it.
+                    if let Some(echo) = existing.dialog.last_mut().filter(|e| is_queued_echo(e, pending.role, &pending.text, now_ms)) {
+                        absorb_echo(echo, task_start, existing.status);
+                        return true;
+                    }
                     existing.dialog.push(DialogEntry {
                         boundary: None,
                         role: pending.role,
@@ -2220,6 +2230,53 @@ impl AppState {
     }
 }
 
+/// How long after the watcher's copy of a queued prompt the same prompt's
+/// `UserPromptSubmit` is taken for it rather than for a second prompt. Measured
+/// in `prompt_history.json` on 2026-11-27: 31 identical consecutive user pairs
+/// under a second apart, every one an agent message or a cross-session notice
+/// and none more than 268ms apart, while the closest pair a person typed was
+/// 2.3s apart.
+const QUEUED_ECHO_MS: i64 = 1_000;
+
+/// Whether an entry of `role` and `text` repeats the user prompt `last`, the
+/// entry the dialog ends with. The one test of "the same prompt" that both the
+/// watcher's re-read rule in `merge_dialog_entries` and the queued-echo rule in
+/// `is_queued_echo` apply, so the two arrival orders of one queued prompt
+/// cannot come to disagree about it.
+fn repeats_tail_prompt(last: &DialogEntry, role: DialogRole, text: &str) -> bool {
+    role == DialogRole::User && last.role == DialogRole::User && last.text == text
+}
+
+/// Whether an entry of `role` and `text` arriving at `at` is the same prompt
+/// `last` already records, written by the watcher from its queued attachment.
+fn is_queued_echo(last: &DialogEntry, role: DialogRole, text: &str, at: i64) -> bool {
+    repeats_tail_prompt(last, role, text) && at - last.timestamp < QUEUED_ECHO_MS
+}
+
+/// Fold a queued prompt's second copy into the entry already recording it,
+/// taking the later event's task boundary and status.
+fn absorb_echo(echo: &mut DialogEntry, task_start: bool, status: Status) {
+    echo.task_start |= task_start;
+    echo.status = status;
+}
+
+/// `dialog` with each queued echo folded into the entry before it, as
+/// `apply_set` folds one on arrival. A dialog stored before `apply_set` did
+/// that, or synced from a peer whose build does not, still holds both copies,
+/// and `commands::get_dialog` serves it through this so the history window
+/// shows the prompt once.
+pub fn without_queued_echoes(dialog: Vec<DialogEntry>) -> Vec<DialogEntry> {
+    let mut shown: Vec<DialogEntry> = Vec::with_capacity(dialog.len());
+    for entry in dialog {
+        if let Some(echo) = shown.last_mut().filter(|last| is_queued_echo(last, entry.role, &entry.text, entry.timestamp)) {
+            absorb_echo(echo, entry.task_start, entry.status);
+            continue;
+        }
+        shown.push(entry);
+    }
+    shown
+}
+
 /// Merge `incoming` dialog entries (chronological order) into `dialog` with
 /// the turn-aware semantics of the transcript watcher, which is its only
 /// consumer — a peer's entries arrive through `sync::merge_synced_dialog`,
@@ -2237,6 +2294,7 @@ impl AppState {
 ///   already merged. No caller reaches this arm: `apply_text_entries` filters
 ///   the watcher's entries down to User/Assistant, separators entering a
 ///   dialog through `mark_session_boundary` instead.
+///
 /// Returns `true` when the dialog was modified.
 pub fn merge_dialog_entries(dialog: &mut Vec<DialogEntry>, incoming: &[DialogEntry]) -> bool {
     let mut changed = false;
@@ -2251,7 +2309,7 @@ pub fn merge_dialog_entries(dialog: &mut Vec<DialogEntry>, incoming: &[DialogEnt
                 // that followed overwrote the *previous* turn's reply in the
                 // Assistant arm below, silently losing two entries strictly
                 // below the newest one.
-                if dialog.last().is_some_and(|e| e.role == DialogRole::User && e.text == entry.text) {
+                if dialog.last().is_some_and(|e| repeats_tail_prompt(e, entry.role, &entry.text)) {
                     continue;
                 }
                 if dialog.iter().any(|e| e.role == DialogRole::User && e.timestamp == entry.timestamp && e.text == entry.text) {
@@ -2391,7 +2449,7 @@ mod tests {
         }
     }
 
-    fn get<'a>(state: &'a AppState, id: &str) -> AgentSession {
+    fn get(state: &AppState, id: &str) -> AgentSession {
         state
             .snapshot()
             .into_iter()
@@ -3766,6 +3824,27 @@ why did this become the task?");
         assert_eq!(s.dialog[1].role, DialogRole::User);
         assert_eq!(s.dialog[1].text, "interrupt");
         assert_eq!(s.dialog[2].text, "final answer", "same-turn assistant texts replace");
+    }
+
+    #[test]
+    fn a_queued_prompt_the_watcher_recorded_is_not_recorded_again_by_its_hook() {
+        let prompt = |text: &str| SetInput { dialog_entry: Some(PendingDialogEntry { role: DialogRole::User, text: text.into() }), ..set("a", Status::Working, text) };
+        let state = AppState::new();
+        state.apply_set(prompt("first task"), 0, NO_CONTINUATIONS, None);
+        state.apply_text_entries("a", &[(DialogRole::User, "a message from another agent".into())], 10_000);
+        state.apply_set(prompt("a message from another agent"), 10_150, NO_CONTINUATIONS, None);
+        let users = |s: &AgentSession| s.dialog.iter().filter(|e| e.role == DialogRole::User).map(|e| (e.text.clone(), e.timestamp, e.task_start)).collect::<Vec<_>>();
+        assert_eq!(users(&get(&state, "a")), [("first task".to_string(), 0, true), ("a message from another agent".to_string(), 10_000, true)], "one entry, at the watcher's instant, carrying the hook's task boundary");
+        state.apply_set(prompt("a message from another agent"), 12_000, NO_CONTINUATIONS, None);
+        assert_eq!(users(&get(&state, "a")).len(), 3, "the same prompt sent again later is a second prompt");
+    }
+
+    #[test]
+    fn a_stored_queued_echo_is_served_once() {
+        let echo = DialogEntry { task_start: false, ..user_entry("a message", 10_000) };
+        let shown = without_queued_echoes(vec![echo, user_entry("a message", 10_150), user_entry("a message", 12_000)]);
+        let users = shown.iter().map(|e| (e.timestamp, e.task_start)).collect::<Vec<_>>();
+        assert_eq!(users, [(10_000, true), (12_000, true)], "the echo folds into the first copy, a later repeat stays");
     }
 
     #[test]

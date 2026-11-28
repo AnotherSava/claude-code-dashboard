@@ -239,12 +239,6 @@
     return `${pad(d.getHours())}:${pad(d.getMinutes())}`
   }
 
-  // One prompt recorded twice arrives as two identical user entries 9-41ms
-  // apart (measured in prompt_history.json, every case an agent message); a
-  // prompt the user genuinely sent twice is seconds apart (2.3s at the
-  // closest), so the window separates the two and a repeat stays visible.
-  const DUPLICATE_WINDOW_MS = 1000
-
   interface ShownEntry {
     entry: DialogEntry
     // Set where another agent wrote the prompt: shown as its sender and body,
@@ -252,20 +246,13 @@
     message?: DialogMessage
   }
 
-  function deduplicatedDialog(): ShownEntry[] {
+  function shownDialog(): ShownEntry[] {
     if (!history) return []
-    const d = history.dialog
     const messages = new Map(history.messages.map((m) => [m.index, m]))
-    const shown: ShownEntry[] = []
-    d.forEach((entry, i) => {
-      const next = d[i + 1]
-      const duplicate = entry.role === 'user' && next?.role === 'user' && entry.text === next.text && next.timestamp - entry.timestamp < DUPLICATE_WINDOW_MS
-      if (!duplicate) shown.push({ entry, message: messages.get(i) })
-    })
-    return shown
+    return history.dialog.map((entry, i) => ({ entry, message: messages.get(i) }))
   }
 
-  let dialog = $derived(deduplicatedDialog())
+  let dialog = $derived(shownDialog())
   let catchingUp = $derived(loadingId !== null && loadingId === sessionId)
 
   function expandEntry(idx: number) {
